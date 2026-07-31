@@ -1,0 +1,45 @@
+# Generated / derived output — all of it is regenerable from tools/, and
+# out/wdf/sample/ additionally holds extracted game assets that should not
+# live in version control.
+out/
+
+# Your working mod tree and staged assets (contains game art).
+mods/
+
+# Built Blender addon zip — regenerate with `py -3 tools/build_addon.py`.
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Where YOUR copy of the game is installed. Written by
+# `py -3 core/coroot.py --set DIR --scope repo`, and by the viewer's setup
+# page. Machine-specific by definition -- never commit it.
+.co-root
+
+# Personal data belonging to whoever runs this. login_history.json holds
+# account and character names; if you ever copy one here, it must not be
+# committed. tests/test_sanitization.py fails the build if any of it lands in
+# a tracked file.
+login_history.json
+**/login_history.json
+
+# YOUR OWN identifiers, in plaintext, for tests/test_sanitization.py to check
+# against before you publish anything. One per line; see the README section
+# "Protecting your own identifiers".
+#
+# This is per-contributor by design and must NEVER be committed -- not even as
+# hashes. Character names and account handles are short and guessable, so a
+# published hash of one is a verification oracle, not a protection. The test
+# fails loudly if this file ever lands in git's index.
+.sanitize-local
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

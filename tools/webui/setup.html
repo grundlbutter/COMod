@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Asset Viewer — setup</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/setup.css">
+</head>
+<body class="setup-body">
+
+<header>
+  <h1>CO Asset Viewer</h1>
+  <div class="mut">first run — no game install located yet</div>
+</header>
+
+<main class="setup-main">
+  <div class="setup-card">
+    <h2>Where is Conquer Online installed?</h2>
+
+    <p>
+      This repository ships <b>no game assets</b> — every texture, mesh and map it
+      shows is read straight out of your own copy of the client. It could not
+      find one, so it needs to be told where yours is.
+    </p>
+
+    <p class="mut small">
+      The install is used <b>read-only</b>. Nothing in this tool writes to it
+      except <code>comod.py install</code>, which you have to run deliberately
+      and which takes a backup first.
+    </p>
+
+    <label for="path">Install root</label>
+    <input id="path" type="text" spellcheck="false"
+           placeholder="e.g. D:\Games\Conquer Online">
+    <div class="setup-actions">
+      <button id="save" class="primary">Use this folder</button>
+      <label class="chk"><input type="checkbox" id="scope-repo">
+        remember for this checkout only</label>
+    </div>
+    <div id="msg" class="setup-msg"></div>
+
+    <h3>What a valid install root looks like</h3>
+    <p class="mut small">
+      The path is accepted only if it actually contains these — a folder is
+      never trusted because of its name:
+    </p>
+    <ul id="required" class="setup-req"></ul>
+
+    <h3>Where it looked</h3>
+    <p class="mut small">
+      Auto-detection tries the conventional paths on every drive, then the
+      Windows uninstall registry, then Steam library folders.
+    </p>
+    <div id="searched" class="setup-searched mut small">checking…</div>
+
+    <h3>Other ways to set it</h3>
+    <pre class="setup-pre">py -3 core/coroot.py --set "D:\Games\Conquer Online"
+set CO_ROOT=D:\Games\Conquer Online
+py -3 tools/coviewer.py --root "D:\Games\Conquer Online"</pre>
+
+    <h3>Everything else</h3>
+    <div id="other" class="setup-other mut small"></div>
+  </div>
+</main>
+
+<script src="/ui/setup.js"></script>
+</body>
+</html>

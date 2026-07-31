@@ -1,0 +1,290 @@
+r"""
+c3tex.py -- resolve the DDS texture that belongs to a `.c3` mesh, and make it
+readable as a file on disk.
+
+Pure stdlib, no `bpy`.  The Blender addon uses it to build a textured material;
+it is unit-testable on bare system Python.
+
+The mesh->texture link is INFERRED, and the inference is documented in
+docs/modding.md section 3: the appearance tables (`armor.ini`, `weapon.ini`,
+`armet.ini`, ...) name a `Mesh<i>` and a `Texture<i>` per sub-part, so the
+mapping is recovered by inverting those tables.  Many appearances share one
+mesh and differ only by texture, so a mesh usually has SEVERAL valid textures;
+`candidates_for_mesh` returns them in preference order and the caller picks the
+first that resolves.
+
+Resolution order for a mesh whose file is `c3/<dir>/<id>.c3`:
+
+  1. every `Texture<i>` of every appearance whose `Mesh<i>` is `<id>`
+  2. `<id>` itself as a texture id (many assets are named in pairs)
+  3. the same stem in the mesh's own subdirectory
+
+A texture may live loose on disk or inside `c3.wdf` / `data.wdf`.  `materialize`
+copies an archived one into a cache directory, because Blender needs a real
+path.  **Nothing is ever written into the game install.**
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+
+from coassets import AssetRoot, Located, DEFAULT_ROOT, dds_info   # noqa: E402
+
+__all__ = ["TextureResolver", "default_cache_dir"]
+
+
+def default_cache_dir() -> Path:
+    d = Path(tempfile.gettempdir()) / "c3_blender_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+_NUM = re.compile(r"^\d+$")
+
+
+class TextureResolver:
+    """Wraps an `AssetRoot` with a lazily built mesh-id -> texture-id index."""
+
+    def __init__(self, root: Path | str = DEFAULT_ROOT,
+                 cache_dir: Optional[Path] = None):
+        self.root = Path(root)
+        self.assets = AssetRoot(self.root)
+        self.cache = Path(cache_dir) if cache_dir else default_cache_dir()
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self._mesh2tex: Optional[dict[str, list[str]]] = None
+
+    # -- index -------------------------------------------------------------
+    def _index(self) -> dict[str, list[str]]:
+        if self._mesh2tex is not None:
+            return self._mesh2tex
+        idx: dict[str, list[str]] = {}
+        try:
+            tables = self.assets.part_tables()
+        except Exception:
+            tables = {}
+        for ini in tables.values():
+            for app in ini:
+                for pr in app.parts:
+                    if not pr.mesh or pr.mesh == "0":
+                        continue
+                    if not pr.texture or pr.texture == "0":
+                        continue
+                    for key in self._id_forms(pr.mesh):
+                        lst = idx.setdefault(key, [])
+                        if pr.texture not in lst:
+                            lst.append(pr.texture)
+        self._mesh2tex = idx
+        return idx
+
+    @staticmethod
+    def _id_forms(ident: str) -> list[str]:
+        out = []
+        for c in (ident, ident.zfill(9), ident.lstrip("0")):
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    # -- resolution --------------------------------------------------------
+    def candidates_for_mesh(self, c3_path: str | Path) -> list[str]:
+        """Texture ids worth trying for this mesh file, best first."""
+        stem = Path(str(c3_path)).stem
+        out: list[str] = []
+        if _NUM.match(stem):
+            for key in self._id_forms(stem):
+                for t in self._index().get(key, ()):
+                    if t not in out:
+                        out.append(t)
+        if stem not in out:
+            out.append(stem)
+        return out
+
+    def locate_texture(self, c3_path: str | Path) -> Optional[Located]:
+        """The first DDS that actually exists for this mesh, or None."""
+        sub = Path(str(c3_path)).parent.name.lower()
+        for tex_id in self.candidates_for_mesh(c3_path):
+            loc = self.assets.resolve_asset(tex_id, "texture")
+            if loc:
+                return loc
+        # last resort: same stem beside the mesh
+        stem = Path(str(c3_path)).stem
+        for d in (sub, "texture"):
+            if not d:
+                continue
+            loc = self.assets.locate(f"c3/{d}/{stem}.dds")
+            if loc:
+                return loc
+        return None
+
+    def materialize(self, loc: Located) -> Path:
+        """Return a real filesystem path for a Located DDS.
+
+        Loose files are used in place (read-only).  Archived entries are
+        extracted into the cache directory, never back into the install.
+        """
+        if loc.real_path is not None:
+            return loc.real_path
+        safe = loc.logical.replace("/", "_").replace("\\", "_")
+        out = self.cache / safe
+        if not out.is_file() or out.stat().st_size != loc.size:
+            out.write_bytes(self.assets.read(loc.logical))
+        return out
+
+    def texture_for_mesh(self, c3_path: str | Path):
+        """-> (real_path, Located) or (None, None)."""
+        loc = self.locate_texture(c3_path)
+        if loc is None:
+            return None, None
+        try:
+            return self.materialize(loc), loc
+        except Exception:
+            return None, loc
+
+    def close(self):
+        try:
+            self.assets.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class MotionBinding:
+    """Is it safe to ADD or REMOVE a whole mesh in this container?
+
+    A PHY chunk is bound to a MOTI chunk by POSITION (docs/modding.md 11).
+    That is fine when the only MOTI chunks involved are the ones inside the
+    file being edited -- add or remove both halves of the pair and the
+    remaining ordinals still line up.
+
+    It is NOT fine when a **shared external motion set** drives the mesh.
+    `ini/3dmotion.ini` and friends name motion-only `.c3` files whose MOTI
+    chunks replace the mesh's own, matched by ordinal. Those files are shared
+    by thousands of appearances and live in the archives, so a mod cannot
+    re-cut them. The evidence that this is real: the shipped motion sets come
+    in exactly two boneCount shapes, `[1,1,1,81]` and `[84,1,1,1]`, mirroring
+    the two mesh-name orders `[v_armet, v_l_weapon, v_r_weapon, v_body]` (362
+    files) and `[v_body, v_armet, v_l_weapon, v_r_weapon]` (126 files). The
+    skinned body sits in the slot whose motion has the matching bone count, in
+    both families. Change the mesh count and that correspondence shears.
+
+    So this classifier is **default-deny**: it says "free" only for a
+    container it can positively show is animated solely by itself -- one named
+    by `ini/3DEffectObj.ini` and not reachable from any appearance table.
+    Everything else, including anything it cannot classify, is "locked".
+    """
+
+    FREE, LOCKED, UNKNOWN = "free", "locked", "unknown"
+
+    def __init__(self, root: Path | str = DEFAULT_ROOT,
+                 assets: Optional[AssetRoot] = None):
+        self.root = Path(root)
+        self._assets = assets
+        self._own = assets is None
+        self._effect_paths: Optional[set] = None
+        self._mesh_ids: Optional[set] = None
+
+    @property
+    def assets(self) -> AssetRoot:
+        if self._assets is None:
+            self._assets = AssetRoot(self.root)
+        return self._assets
+
+    def _effects(self) -> set:
+        if self._effect_paths is None:
+            out = set()
+            p = self.root / "ini" / "3DEffectObj.ini"
+            if p.is_file():
+                for line in p.read_bytes().decode("latin-1").splitlines():
+                    if "=" in line:
+                        v = line.split("=", 1)[1].strip()
+                        out.add(v.replace("\\", "/").lower().lstrip("/"))
+            self._effect_paths = out
+        return self._effect_paths
+
+    def _appearance_meshes(self) -> set:
+        if self._mesh_ids is None:
+            out = set()
+            try:
+                tables = self.assets.part_tables()
+            except Exception:
+                tables = {}
+            for ini in tables.values():
+                for app in ini:
+                    for pr in app.parts:
+                        if pr.mesh and pr.mesh != "0":
+                            for f in (pr.mesh, pr.mesh.zfill(9),
+                                      pr.mesh.lstrip("0")):
+                                if f:
+                                    out.add(f)
+            self._mesh_ids = out
+        return self._mesh_ids
+
+    def classify(self, logical: str) -> tuple[str, str]:
+        """-> (FREE | LOCKED | UNKNOWN, human-readable reason)"""
+        norm = str(logical).replace("\\", "/").lower().lstrip("/")
+        stem = Path(norm).stem
+        in_app = (stem in self._appearance_meshes()
+                  or stem.lstrip("0") in self._appearance_meshes())
+        if in_app:
+            return (self.LOCKED,
+                    "referenced as a Mesh<i> by an appearance table, so a "
+                    "shared external motion set animates it by ordinal")
+        if norm in self._effects():
+            return (self.FREE,
+                    "named by ini/3DEffectObj.ini and not referenced by any "
+                    "appearance table: animated only by its own MOTI chunks")
+        return (self.UNKNOWN,
+                "not found in ini/3DEffectObj.ini nor in any appearance "
+                "table; cannot prove no external motion set targets it")
+
+    def close(self):
+        if self._own and self._assets is not None:
+            try:
+                self._assets.close()
+            except Exception:
+                pass
+            self._assets = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _main(argv):
+    if not argv:
+        print(__doc__)
+        return 0
+    with TextureResolver() as tr:
+        for a in argv:
+            p, loc = tr.texture_for_mesh(a)
+            if loc is None:
+                print(f"{a}: no texture found "
+                      f"(tried {tr.candidates_for_mesh(a)[:6]})")
+            else:
+                info = ""
+                try:
+                    d = dds_info(Path(p).read_bytes())
+                    if d:
+                        info = f"  {d}"
+                except Exception:
+                    pass
+                print(f"{a}\n    -> {loc}\n    -> {p}{info}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

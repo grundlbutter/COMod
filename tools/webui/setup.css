@@ -1,0 +1,97 @@
+/* setup.css -- the first-run pages: the "where is the game" setup page and
+ * the thumbnail-generation prompt that overlays the viewer.
+ *
+ * Both are things a new person sees before anything else works, so they are
+ * plain, scrollable, and readable at any window size -- no grid, no panes. */
+
+.setup-body { overflow: auto; display: block; height: auto; min-height: 100%; }
+.setup-main { display: block; padding: 24px 16px 64px; }
+
+.setup-card {
+  max-width: 720px; margin: 0 auto;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 22px 24px;
+}
+.setup-card h2 { margin: 0 0 12px; font-size: 17px; }
+.setup-card h3 {
+  margin: 22px 0 6px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--mut);
+}
+.setup-card p { margin: 8px 0; }
+.setup-card .small { font-size: 12px; }
+.setup-card code { font-family: var(--mono); color: var(--accent); }
+
+.setup-actions {
+  display: flex; align-items: center; gap: 14px; margin-top: 10px;
+  flex-wrap: wrap;
+}
+button.primary {
+  background: var(--accent); color: #0d1117; border: none;
+  padding: 8px 16px; border-radius: 5px; font: inherit; font-weight: 600;
+  cursor: pointer;
+}
+button.primary:disabled { opacity: .5; cursor: default; }
+button.primary.secondary {
+  background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+  font-weight: 400;
+}
+
+.setup-msg { margin-top: 10px; min-height: 18px; font-size: 12px; }
+.setup-msg.ok { color: var(--good); }
+.setup-msg.bad { color: var(--bad); }
+
+.setup-req { margin: 6px 0; padding-left: 18px; }
+.setup-req li { font-family: var(--mono); font-size: 12px; }
+
+.setup-searched {
+  max-height: 220px; overflow: auto; font-family: var(--mono);
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 8px 10px; white-space: pre-wrap;
+}
+.setup-pre {
+  font-family: var(--mono); font-size: 12px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px;
+  overflow-x: auto; margin: 6px 0;
+}
+.setup-other { line-height: 1.7; }
+
+/* ---- first-run overlay (thumbnails) + health panel ------------------- */
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .62);
+  display: flex; align-items: flex-start; justify-content: center;
+  overflow: auto; padding: 40px 16px; z-index: 50;
+}
+.overlay.hidden { display: none; }
+.overlay .setup-card { margin: 0 auto; }
+
+.thumb-opt {
+  display: flex; gap: 12px; align-items: flex-start;
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 12px; margin: 8px 0; background: var(--panel2);
+}
+.thumb-opt.pick { border-color: var(--accent); }
+.thumb-opt .grow { flex: 1; min-width: 0; }
+.thumb-opt b { display: block; margin-bottom: 2px; }
+.thumb-opt .cost {
+  font-family: var(--mono); font-size: 12px; color: var(--warn);
+  white-space: nowrap;
+}
+.thumb-opt .why { color: var(--mut); font-size: 12px; }
+
+.progress-track {
+  height: 8px; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 4px; overflow: hidden; margin: 8px 0 4px;
+}
+.progress-fill { height: 100%; background: var(--accent); width: 0; }
+
+.health-row { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
+.health-row .mark { width: 16px; text-align: center; }
+.health-row.ok .mark { color: var(--good); }
+.health-row.warn .mark { color: var(--warn); }
+.health-row.bad .mark { color: var(--bad); }
+.health-row .what { flex: 1; }
+.health-row .fix {
+  font-family: var(--mono); font-size: 12px; color: var(--mut);
+  white-space: pre-wrap;
+}

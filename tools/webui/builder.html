@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Character Builder</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body class="builder">
+
+<header>
+  <h1>Builder</h1>
+  <div id="modeswitch" class="modeswitch" role="tablist" aria-label="What to build">
+    <button id="mode-character" class="modebtn on" role="tab" aria-selected="true"
+            title="Assemble a player character out of appearances (M)">Character</button>
+    <button id="mode-model" class="modebtn" role="tab" aria-selected="false"
+            title="Monsters, NPCs, ghosts, mounts, roles and effects — one model, one action list (M)">Models</button>
+  </div>
+  <div id="statusline" class="mut">starting…</div>
+  <div class="spacer"></div>
+  <button id="btn-collapse-all" class="ghost" title="Collapse / expand every panel on the right (C)">Collapse panels</button>
+  <button id="btn-share" class="ghost" title="A link that restores this exact character">Copy link</button>
+  <button id="btn-reset-all" class="ghost" title="Back to the starting character">Reset</button>
+  <a class="navlink" href="/" title="The asset browser — your character is kept">Browse assets →</a>
+  <a class="navlink" href="/mapedit" title="Draw and edit a world map">MapEditor →</a>
+</header>
+
+<main id="build-main">
+
+  <!-- ------------------------------------------------ left: the slots -->
+  <aside id="slots-rail">
+    <div class="rail-head">
+      <b>Your character</b>
+      <span class="mut small">click a slot to choose</span>
+    </div>
+    <div id="slot-cards"></div>
+    <div id="slot-more-wrap">
+      <button id="btn-more-slots" class="ghost tiny">More slots ▾</button>
+      <div id="slot-cards-more" class="hidden"></div>
+    </div>
+    <div id="compat-note" class="small mut"></div>
+  </aside>
+
+  <!-- ------------------------------------------------ left: the model list -->
+  <!-- A monster is not a character with different art: c3/monster/103/ is one
+       FILE per action, most of them carrying their own geometry, and there are
+       no equip slots to fill. So this rail replaces the slot rail rather than
+       adding a slot to it. -->
+  <aside id="model-rail" class="hidden">
+    <div class="rail-head">
+      <b>Models</b>
+      <span class="mut small">pick one, then an action</span>
+    </div>
+    <input id="model-search" type="search" placeholder="search monsters, NPCs, effects…" autocomplete="off">
+    <div id="model-kinds" class="facet-axis"></div>
+    <div id="model-list" class="list" tabindex="0"></div>
+    <div id="model-count" class="small mut"></div>
+  </aside>
+
+  <!-- ------------------------------------------------ centre: the stage -->
+  <section id="centre">
+    <div id="viewport">
+      <canvas id="gl"></canvas>
+      <div id="gl-msg" class="overlay-msg">building…</div>
+      <div id="gl-stats" class="overlay-stats"></div>
+    </div>
+
+    <div id="viewcontrols">
+      <span id="anim-wrap">
+        <label>Action
+          <select id="anim-action"></select>
+        </label>
+        <button id="btn-anim-play" class="ghost" title="Play / pause (Space)">▶ play</button>
+        <label>frame <input type="range" id="anim-frame" min="0" max="0" value="0"></label>
+        <label title="The frame rate is NOT in the shipped data. 41 ms is tools/anim.py's reading; 33 ms and 50 ms are the documented alternatives. Move this rather than trusting the default.">
+          speed <input type="range" id="anim-speed" min="20" max="80" step="1" value="41"></label>
+        <span id="anim-label" class="mut small"></span>
+      </span>
+      <label class="chk hidden" id="clips-label"
+             title="ini/3dmotion.ini gives monster 103 eighty action codes over sixteen files — 404, 405, 407 and 903 are all 401.c3. Untick to see every code the ini declares, alias or not.">
+        <input type="checkbox" id="chk-clips" checked> distinct clips only</label>
+      <label class="chk" id="lock-label"
+             title="Freeze the camera completely so two characters sit in exactly the same frame. (L)">
+        <input type="checkbox" id="chk-lock"> lock camera</label>
+      <label class="chk"><input type="checkbox" id="chk-grid" checked> grid</label>
+      <label class="chk"><input type="checkbox" id="chk-wire"> wireframe</label>
+      <label class="chk hidden" id="aura-label"
+             title="The always-on glow a Super weapon carries (A)">
+        <input type="checkbox" id="chk-aura"> super aura</label>
+      <button id="btn-focus" class="ghost" title="Zoom to the head (F)">Focus head</button>
+      <button id="btn-reset" class="ghost" title="Re-frame the character (R)">Reset view</button>
+      <button id="btn-shot" class="ghost" title="Save the current frame to out/viewer/shots/">Save PNG</button>
+      <button id="btn-help" class="ghost" title="Keyboard shortcuts (?)">?</button>
+      <span id="fx-wrap" class="hidden">
+        <button id="btn-fx-play" class="ghost">▶ effect</button>
+        <label>effect <input type="range" id="fx-slider" min="0" max="1000" value="0"></label>
+        <span id="fx-label" class="mut small"></span>
+        <button id="btn-fx-stop" class="ghost" title="Stop the effect">✕</button>
+      </span>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------ right: collapsible -->
+  <aside id="right">
+
+    <section class="card hidden" id="card-model" data-card="model">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>This model</h2>
+      <div class="cardbody" id="model-body"><div class="mut small">pick a model on the left</div></div>
+    </section>
+
+    <section class="card hidden" id="card-monster" data-card="monster">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>monster.json properties</h2>
+      <div class="cardbody" id="monster-body"></div>
+    </section>
+
+    <section class="card" id="card-look" data-card="look">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>Colour &amp; variants</h2>
+      <div class="cardbody" id="look-body"><div class="mut small">pick a slot on the left</div></div>
+    </section>
+
+    <section class="card" id="card-anim" data-card="anim">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>Animation</h2>
+      <div class="cardbody" id="anim-body"></div>
+    </section>
+
+    <section class="card" id="card-fx" data-card="fx">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>Weapon effects</h2>
+      <div class="cardbody" id="fx-body"><div class="mut small">equip a weapon to see its effects</div></div>
+    </section>
+
+    <section class="card" id="card-detail" data-card="detail">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>How this is put together</h2>
+      <div class="cardbody" id="detail-body"><div class="mut small">nothing built yet</div></div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ------------------------------------------------ the slot picker -->
+<div id="picker" class="hidden" role="dialog" aria-modal="false" aria-label="Choose an item">
+  <div class="picker-inner">
+    <div class="picker-head">
+      <div>
+        <h2 id="picker-title">Choose</h2>
+        <div id="picker-sub" class="small mut"></div>
+      </div>
+      <button id="picker-close" class="ghost" title="Close (Esc)">✕</button>
+    </div>
+    <input id="picker-search" type="search" placeholder="search by name, id or colour…" autocomplete="off">
+    <div id="picker-facets"></div>
+    <div id="picker-list" class="list" tabindex="0"></div>
+    <div class="picker-foot">
+      <span id="picker-count" class="small mut"></span>
+      <div class="spacer"></div>
+      <button id="picker-clear" class="ghost tiny">Leave this slot empty</button>
+    </div>
+    <div class="small mut keyhint">
+      <kbd>↑</kbd><kbd>↓</kbd> item · <kbd>←</kbd><kbd>→</kbd> colour ·
+      <kbd>Enter</kbd> keep it · <kbd>Esc</kbd> close — the character updates as you move
+    </div>
+  </div>
+</div>
+
+<div id="help" class="hidden">
+  <div class="help-inner">
+    <div class="drawer-head">
+      <h2>Keyboard</h2>
+      <button id="help-close" class="ghost">close</button>
+    </div>
+    <table class="keys">
+      <tr><th colspan="2">Choosing</th></tr>
+      <tr><td><kbd>M</kbd></td><td>switch between <b>Character</b> and <b>Models</b> (monsters, NPCs, ghosts, mounts, roles, effects)</td></tr>
+      <tr><td><kbd>B</kbd> <kbd>H</kbd> <kbd>R</kbd><i>/</i><kbd>1</kbd>–<kbd>4</kbd></td>
+          <td>open the body / head / right-hand / left-hand picker</td></tr>
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd> <i>(models)</i></td><td>previous / next model, previewed live</td></tr>
+      <tr><td><kbd>[</kbd> <kbd>]</kbd> <i>(models)</i></td><td>previous / next action of this model</td></tr>
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>previous / next item, previewed live on the character</td></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>previous / next colour of the item you are on</td></tr>
+      <tr><td><kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Home</kbd> <kbd>End</kbd></td><td>jump</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>keep it and close</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>close the picker (what you were previewing stays equipped)</td></tr>
+      <tr><th colspan="2">Stage</th></tr>
+      <tr><td><kbd>Space</kbd></td><td>play / pause the animation</td></tr>
+      <tr><td><kbd>L</kbd></td><td>lock / unlock the camera</td></tr>
+      <tr><td><kbd>R</kbd></td><td>re-frame the character</td></tr>
+      <tr><td><kbd>F</kbd></td><td>zoom to the head</td></tr>
+      <tr><td><kbd>G</kbd> <kbd>W</kbd></td><td>grid · wireframe</td></tr>
+      <tr><td><kbd>A</kbd></td><td>the Super weapon aura on / off</td></tr>
+      <tr><td><kbd>Q</kbd></td><td>step the weapon up a quality (shift-<kbd>Q</kbd> down)</td></tr>
+      <tr><td><kbd>C</kbd></td><td>collapse / expand every panel on the right</td></tr>
+      <tr><td>drag / wheel / shift-drag</td><td>orbit · zoom · pan</td></tr>
+    </table>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="/ui/fx.js"></script>
+<script src="/ui/gl.js"></script>
+<script src="/ui/cards.js"></script>
+<script src="/ui/builder.js"></script>
+<script src="/ui/pageshot.js"></script>
+</body>
+</html>

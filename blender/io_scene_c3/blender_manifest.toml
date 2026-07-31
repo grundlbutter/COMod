@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "io_scene_c3"
+version = "1.0.0"
+name = "Conquer Online C3 (mesh)"
+tagline = "Import and export Conquer Online PHY meshes, byte-exactly"
+maintainer = "CO Client RE project"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read Conquer Online .c3 meshes and .wdf archives, write .c3 exports"

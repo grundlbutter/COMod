@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO MapEditor</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/mapedit.css">
+</head>
+<body>
+
+<header>
+  <h1>CO MapEditor</h1>
+  <div id="statusline" class="mut">starting…</div>
+  <div class="spacer"></div>
+  <a class="navlink" href="/" title="Find any asset, see where it comes from, swap a texture">← Asset browser</a>
+  <a class="navlink" href="/builder" title="Build a character out of appearances">Character builder</a>
+  <button id="btn-collapse-all" class="ghost"
+          title="Collapse / expand every panel on the right (C)">Collapse panels</button>
+  <button id="btn-mods" class="ghost">Mod staging</button>
+</header>
+
+<main>
+
+  <!-- ------------------------------------------------ left: maps + layers -->
+  <aside id="left">
+    <div class="pane">
+      <label>Map</label>
+      <input id="map-search" type="search" placeholder="map name or DocumentId…">
+      <div id="map-list" class="list" tabindex="0"></div>
+      <div id="map-more" class="mut small"></div>
+
+      <label style="margin-top:6px">Layers</label>
+      <div id="layers" class="layerbox"></div>
+
+      <label style="margin-top:6px">View</label>
+      <div class="zoomrow">
+        <button id="btn-zoom-out" class="ghost tiny" title="Zoom out (−)">−</button>
+        <span class="z" id="zoom-label">—</span>
+        <button id="btn-zoom-in" class="ghost tiny" title="Zoom in (+)">+</button>
+        <button id="btn-fit" class="ghost tiny" title="Fit the whole map (F)">fit</button>
+      </div>
+      <div class="mut small keyhint">
+        drag to pan · wheel to zoom · click to inspect · <b>F</b> fit · <b>P</b> passability
+      </div>
+      <button id="btn-shot" class="ghost tiny">Save PNG</button>
+    </div>
+  </aside>
+
+  <!-- ------------------------------------------------ centre: the map -->
+  <section id="centre">
+    <div id="mapwrap">
+      <canvas id="mapcanvas"></canvas>
+      <div id="mapmsg">Pick a map on the left.</div>
+      <div id="maphud">
+        <span>art <b id="hud-px">—</b></span>
+        <span>cell <b id="hud-cell">—</b></span>
+        <span>z <b id="hud-z">—</b></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------ right: inspector -->
+  <aside id="right">
+
+    <section class="card" id="card-map" data-card="mapedit-map">
+      <h2>This map</h2>
+      <div id="map-body" class="cardbody mut">nothing loaded</div>
+    </section>
+
+    <section class="card" id="card-insp" data-card="mapedit-insp">
+      <h2>Selected</h2>
+      <div id="insp-body" class="cardbody mut">
+        Click a puzzle tile, a TERRAIN object or a COVER sprite.
+      </div>
+    </section>
+
+    <section class="card" id="card-tex" data-card="mapedit-tex">
+      <h2>Texture</h2>
+      <div id="tex-body" class="cardbody mut">nothing selected</div>
+    </section>
+
+    <section class="card" id="card-pass" data-card="mapedit-pass">
+      <h2>Passability — integrity-checked</h2>
+      <div id="pass-body" class="cardbody mut"></div>
+    </section>
+
+    <section class="card" id="card-editable" data-card="mapedit-editable">
+      <h2>What may I change?</h2>
+      <div id="editable-body" class="cardbody mut">nothing loaded</div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ------------------------------------------------ mod drawer -->
+<div id="drawer" class="hidden">
+  <div class="drawer-inner">
+    <div class="drawer-head">
+      <h2>Mod staging</h2>
+      <button id="drawer-close" class="ghost">close</button>
+    </div>
+    <p class="mut small">
+      Staged files live in <code id="stage-dir"></code>. Nothing touches the game
+      install until you press <b>Install</b>, which runs
+      <code>comod.py install --yes</code> — the same path as the CLI, with its
+      backups and its <code>uninstall</code> revert. The map you are looking at
+      already draws through this tree, so a staged texture is on the map before
+      anything is installed.
+    </p>
+    <div id="stage-list"></div>
+    <div class="row">
+      <button id="btn-dry" class="ghost">Install (dry run)</button>
+      <button id="btn-install" class="danger">Install for real</button>
+      <button id="btn-uninstall" class="ghost">Uninstall / revert</button>
+    </div>
+    <pre id="mod-output" class="out"></pre>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="/ui/cards.js"></script>
+<script src="/ui/mapmodel.js"></script>
+<script src="/ui/mapedit.js"></script>
+<script src="/ui/pageshot.js"></script>
+</body>
+</html>

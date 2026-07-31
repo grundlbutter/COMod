@@ -1,0 +1,2346 @@
+/* app.js -- UI wiring for the CO asset viewer.
+ *
+ * Four jobs, matching the four requirements:
+ *   (a) preview textures      -- thumbnail lists + full-size decode panel
+ *   (b) swap texture files    -- drop a PNG/DDS in, see the model re-render,
+ *                                then stage + install through comod.py
+ *   (c) point at the files    -- the "Where this comes from" card
+ *   (d) render accurately     -- gl.js; this file only feeds it data
+ */
+
+'use strict';
+
+const $ = s => document.querySelector(s);
+const el = (tag, cls, txt) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt !== undefined) e.textContent = txt;
+  return e;
+};
+
+const AXIS_LABEL = { class: 'Class', gender: 'Gender', size: 'Body size', kind: 'Kind' };
+const VALUE_LABEL = {
+  any: 'Any class', unknown: 'Unclassified', 'n/a': 'n/a',
+  female: 'Female', male: 'Male', other: 'Other body',
+  small: 'Small', large: 'Large',
+  armour: 'Armour', 'base body': 'Base body', 'npc body': 'NPC body',
+};
+const lbl = v => VALUE_LABEL[v] || v;
+
+const state = {
+  mode: 'category',
+  table: null,
+  /** Category browsing: the taxonomy tree and where we are in it. */
+  categories: [],
+  cat: { id: null, sub: null, role: null, group: null },
+  maps: [],
+  mapName: null,
+  /** The end goal is "this body + this left weapon + this right weapon".
+   *  Assembly needs the sibling workstreams, but the selection model carries
+   *  the slots now so it does not have to be retrofitted later. */
+  loadout: {},               // slot name (from RolePart.ini) -> equipped part
+  partManifest: null,
+  figure: null,
+  anchors: null,
+  lastFiguredBody: null,
+  /** active facet selection: axis -> Set(values). Multi-select inside an axis
+   *  is OR; across axes it is AND. */
+  sel: { class: new Set(), gender: new Set(), size: new Set(), kind: new Set() },
+  selTags: new Set(),
+  group: false,
+  lastQuery: null,       // the last /api/appearances payload
+  /** Keyboard navigation over whatever the list is currently showing.
+   *  `items` mirrors the rendered rows exactly, so navigation always respects
+   *  the active filters and the grouped/flat mode. */
+  nav: { mode: 'appearance', items: [], index: -1, variant: 0 },
+  /** Monotonic load token. Bumped the instant a selection changes; every async
+   *  UI function captures it on entry and bails if it has moved on, so a late
+   *  response for an abandoned selection can never overwrite the current one. */
+  loadToken: 0,
+  vocabulary: {},
+  appearances: [],
+  files: [],
+  selection: null,       // {kind:'appearance'|'file', ...}
+  meshPath: null,
+  texPath: null,
+  previewToken: null,    // active un-staged texture override
+  meshData: null,
+  status: null,
+};
+
+let viewer = null;
+// exposed so the viewport can be driven from the console / a test harness
+window.state = state;
+
+// ------------------------------------------------------------------ helpers
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('json')) {
+    if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+    return r;
+  }
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// --------------------------------------------------- load throttle + ordering
+//
+// Selection must feel instant; the render is allowed to trail. So the *load* is
+// debounced (holding an arrow key fires nothing until you pause) while the row
+// highlight moves immediately. Every load carries a token; async work checks it
+// before touching the viewport or the panels, so out-of-order responses cannot
+// land on the wrong asset.
+const NAV_DEBOUNCE_MS = 130;
+let loadTimer = null;
+
+/** Capture the current token at the top of an async UI function. */
+const tokenNow = () => state.loadToken;
+/** True while `tk` is still the selection the user is waiting for. */
+const stillCurrent = tk => state.loadToken === tk;
+
+function requestLoad(fn, { immediate = false } = {}) {
+  const tk = ++state.loadToken;
+  clearTimeout(loadTimer);
+  const run = () => { if (stillCurrent(tk)) fn(tk); };
+  if (immediate) run();
+  else loadTimer = setTimeout(run, NAV_DEBOUNCE_MS);
+  return tk;
+}
+
+function toast(msg, ms = 2200) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.add('hidden'), ms);
+}
+
+function texUrl(path, { size = 0, preview = null, src = null } = {}) {
+  const p = new URLSearchParams({ path });
+  if (size) p.set('size', size);
+  if (preview) p.set('preview', preview);
+  if (src) p.set('src', src);
+  return '/api/texture?' + p.toString();
+}
+
+/** A picture of any asset, mesh included.
+ *
+ *  `/api/thumb` serves task #21's pre-rendered PNG when it has got to this
+ *  asset, the decoded texture when it has not, and 404 when there is nothing --
+ *  which the <img> shows as the checkerboard placeholder. Batch rendering is
+ *  incremental and resumable, so "no thumbnail yet" is a normal state and the
+ *  list must not look broken in it. */
+function thumbUrl(path, { size = 48 } = {}) {
+  const p = new URLSearchParams({ path });
+  if (size) p.set('size', size);
+  return '/api/thumb?' + p.toString();
+}
+
+function cmdBlock(text) {
+  const c = el('code', 'cmd', text);
+  c.title = 'click to copy';
+  c.addEventListener('click', () => {
+    navigator.clipboard.writeText(text).then(() => {
+      const o = c.textContent;
+      c.textContent = 'copied to clipboard';
+      setTimeout(() => { c.textContent = o; }, 800);
+    }, () => toast('clipboard blocked by the browser'));
+  });
+  return c;
+}
+
+function kv(pairs) {
+  const d = el('dl', 'kv');
+  for (const [k, v] of pairs) {
+    if (v === null || v === undefined || v === '') continue;
+    d.appendChild(el('dt', null, k));
+    const dd = el('dd');
+    if (v instanceof Node) dd.appendChild(v); else dd.textContent = String(v);
+    d.appendChild(dd);
+  }
+  return d;
+}
+
+// ------------------------------------------------------------------ boot
+async function boot() {
+  try {
+    viewer = new Viewer($('#gl'));
+    window.viewer = viewer;
+  } catch (e) {
+    $('#gl-msg').textContent = 'WebGL unavailable: ' + e.message;
+  }
+  // Collapsible detail panels -- the same cards.js the builder uses. This page
+  // had the `cursor: pointer` on every `.card h2` and NO listener behind it,
+  // which is the "I can see the cursor change, but it doesnt collaps" bug.
+  CardPanels.init('coviewer.collapsed', 'btn-collapse-all');
+  bindControls();
+  bindKeys();
+  if (viewer) {
+    // the lock flag survives a reload, so reflect what was restored
+    $('#chk-lock').checked = viewer.opts.lock;
+    $('#lock-label').classList.toggle('on', viewer.opts.lock);
+  }
+
+  const st = await api('/api/status');
+  state.status = st;
+  $('#statusline').textContent =
+    `${st.root} · ${st.looseFiles.toLocaleString()} loose files · ` +
+    Object.entries(st.archives).map(([k, v]) => `${k} ${v.entries.toLocaleString()}`).join(' · ') +
+    ` · ${st.knownPaths.toLocaleString()} resolvable paths` +
+    (st.numpy ? '' : ' · numpy absent (pure-python paths)');
+  $('#stage-dir').textContent = st.stageDir;
+
+  const tables = await api('/api/tables');
+  const sel = $('#table-select');
+  for (const t of tables) {
+    const o = el('option', null, `${t.name} — ${t.count} (${t.ini})`);
+    o.value = t.name;
+    sel.appendChild(o);
+  }
+  sel.value = tables.find(t => t.name === 'body') ? 'body' : (tables[0] && tables[0].name);
+  state.table = sel.value;
+  await refreshVocabulary();
+  const hadLoadout = restoreLoadout();
+  await loadPartManifest();
+  $('#view-mode').value = viewer ? viewer.viewMode : 'asset';
+  await loadCategories();          // Categories is the default landing pane
+  await fillDirs('', 'c3/mesh');
+  if (hadLoadout) { setViewMode('character'); renderFigure(); }
+}
+
+/** Repopulate the directory dropdown for an extension filter. */
+async function fillDirs(ext, prefer) {
+  const dirs = await api('/api/dirs?ext=' + encodeURIComponent(ext || ''));
+  const dsel = $('#dir-select');
+  const prev = dsel.value;
+  dsel.innerHTML = '';
+  const all = el('option', null, '(all directories)');
+  all.value = '__all__';
+  dsel.appendChild(all);
+  for (const d of dirs.slice(0, 500)) {
+    const o = el('option', null, `${d.dir || '(root)'} — ${d.count}`);
+    o.value = d.dir;
+    dsel.appendChild(o);
+  }
+  const want = [prev, prefer].find(v => v && [...dsel.options].some(o => o.value === v));
+  dsel.value = want || (dirs[0] ? dirs[0].dir : '__all__');
+}
+
+function bindControls() {
+  document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    state.mode = b.dataset.mode;
+    for (const m of ['category', 'appearance', 'map', 'files']) {
+      $('#pane-' + m).classList.toggle('hidden', state.mode !== m);
+    }
+    if (state.mode === 'files' && !state.files.length) loadFiles();
+    if (state.mode === 'category' && !state.categories.length) loadCategories();
+    if (state.mode === 'map' && !state.maps.length) loadMaps();
+    if (state.mode === 'appearance' && !state.lastQuery) loadAppearances();
+  }));
+  // ---- effect playback ----
+  $('#btn-fx-play').addEventListener('click', () => {
+    if (fx.playing) fxPause(); else fxPlay();
+  });
+  $('#btn-fx-stop').addEventListener('click', fxStop);
+  $('#fx-slider').addEventListener('input', e => {
+    fxPause();
+    viewer.resetEffects();
+    // Ribbons are path-dependent -- they are built by advancing, not sampled --
+    // so scrubbing has to replay from zero to land on the same smear.
+    const target = +e.target.value;
+    const stepMs = 1000 / 60;
+    for (let t = 0; t < target; t += stepMs) viewer.setEffectTime(t, fxParentFor);
+    fxSeek(target);
+  });
+  $('#chk-fx-swing').addEventListener('change', e => {
+    fx.swing = e.target.checked;
+    viewer.resetEffects();
+    fxSeek(0);
+    if (!fx.playing) fxPlay();
+  });
+
+  $('#cat-search').addEventListener('input', debounce(loadCategoryFiles, 240));
+  $('#map-search').addEventListener('input', debounce(renderMapList, 200));
+
+  $('#table-select').addEventListener('change', e => {
+    state.table = e.target.value;
+    for (const s of Object.values(state.sel)) s.clear();
+    loadAppearances();
+  });
+  $('#app-search').addEventListener('input', debounce(loadAppearances, 220));
+  $('#chk-group').addEventListener('change', e => {
+    state.group = e.target.checked; loadAppearances();
+  });
+  $('#btn-clear').addEventListener('click', clearFilters);
+  $('#btn-bulktag').addEventListener('click', bulkTag);
+  $('#btn-export').addEventListener('click', () => {
+    const fmt = confirm('OK for CSV (with the derived class/gender/size columns),\n' +
+                        'Cancel for raw JSON (re-importable).') ? 'csv' : 'json';
+    window.open('/api/tags/export?format=' + fmt, '_blank');
+  });
+  $('#dir-select').addEventListener('change', loadFiles);
+  $('#ext-select').addEventListener('change', async () => {
+    const ext = $('#ext-select').value;
+    await fillDirs(ext, ext === '.c3' ? 'c3/mesh' : 'c3/texture');
+    loadFiles();
+  });
+  $('#file-search').addEventListener('input', debounce(loadFiles, 260));
+
+  const rerender = () => { if (viewer) viewer.draw(); };
+  $('#cull-mode').addEventListener('change', e => { viewer.opts.cull = e.target.value; rerender(); });
+  $('#alpha-mode').addEventListener('change', e => { viewer.opts.alpha = e.target.value; rerender(); });
+  $('#shade-mode').addEventListener('change', e => { viewer.opts.shade = e.target.value; rerender(); });
+  $('#chk-wire').addEventListener('change', e => { viewer.opts.wire = e.target.checked; rerender(); });
+  $('#chk-sockets').addEventListener('change', e => { viewer.opts.sockets = e.target.checked; rerender(); });
+  $('#chk-grid').addEventListener('change', e => { viewer.opts.grid = e.target.checked; rerender(); });
+  $('#chk-vcolor').addEventListener('change', e => { viewer.opts.vcolor = e.target.checked; rerender(); });
+  $('#btn-reset').addEventListener('click', () => {
+    viewer.resetView();
+    // in character view, reset means "frame the body", not the last part
+    if (viewer.viewMode === 'character' && state.figure) renderFigure();
+  });
+  $('#btn-shot').addEventListener('click', saveShot);
+  $('#view-mode').addEventListener('change', e => {
+    setViewMode(e.target.value);
+    if (e.target.value === 'character') renderFigure();
+    else if (state.selection && state.selection.kind === 'appearance') {
+      switchToAppearance(state.selection.id);
+    }
+  });
+  $('#btn-focus').addEventListener('click', focusHead);
+  $('#chk-lock').addEventListener('change', e => {
+    viewer.setLock(e.target.checked);
+    $('#lock-label').classList.toggle('on', e.target.checked);
+    toast(e.target.checked
+      ? 'camera locked — view frozen across assets (R to reset)'
+      : 'camera unlocked — angle carries over, distance re-fits to each model');
+  });
+  $('#btn-help').addEventListener('click', toggleHelp);
+  $('#help-close').addEventListener('click', () => $('#help').classList.add('hidden'));
+  $('#help').addEventListener('click', e => {
+    if (e.target.id === 'help') $('#help').classList.add('hidden');
+  });
+  $('#frame-slider').addEventListener('input', e => {
+    viewer.opts.frame = +e.target.value;
+    $('#frame-label').textContent = `${e.target.value} / ${e.target.max}`;
+    rerender();
+  });
+
+  $('#btn-mods').addEventListener('click', openDrawer);
+  $('#drawer-close').addEventListener('click', () => $('#drawer').classList.add('hidden'));
+  $('#drawer').addEventListener('click', e => {
+    if (e.target.id === 'drawer') $('#drawer').classList.add('hidden');
+  });
+  $('#btn-dry').addEventListener('click', () => runMod('/api/install?dry=1'));
+  $('#btn-install').addEventListener('click', () => {
+    if (!confirm('This writes the staged files into the game install.\n\n' +
+                 'comod.py backs up anything it displaces and records a manifest, ' +
+                 'so "Uninstall / revert" can undo it.\n\nProceed?')) return;
+    runMod('/api/install?dry=0');
+  });
+  $('#btn-uninstall').addEventListener('click', () => {
+    if (!confirm('Revert the last install, restoring displaced originals?')) return;
+    runMod('/api/uninstall?dry=0');
+  });
+}
+
+function debounce(fn, ms) {
+  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+// ------------------------------------------------------------------ lists
+function facetQuery() {
+  const p = new URLSearchParams({
+    table: state.table,
+    q: $('#app-search').value.trim(),
+    limit: '300',
+  });
+  for (const [axis, set] of Object.entries(state.sel)) {
+    if (set.size) p.set(axis, [...set].join(','));
+  }
+  if (state.selTags.has(' untagged')) p.set('untagged', '1');
+  const tags = [...state.selTags].filter(t => t !== ' untagged');
+  if (tags.length) p.set('tag', tags.join(','));
+  if (state.group) p.set('group', 'mesh');
+  return p;
+}
+
+async function loadAppearances() {
+  const list = $('#app-list');
+  list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
+  let data;
+  try {
+    data = await api('/api/appearances?' + facetQuery().toString());
+  } catch (e) { list.innerHTML = ''; list.appendChild(el('div', 'err', e.message)); return; }
+  state.lastQuery = data;
+  renderFacets(data);
+  list.innerHTML = '';
+
+  const items = [];
+  if (data.groups) {
+    for (const g of data.groups) {
+      const built = groupRow(g, items.length);
+      list.appendChild(built.node);
+      items.push(built.item);
+    }
+    $('#app-more').textContent =
+      `${data.groups.length} of ${data.groupedTotal} distinct meshes ` +
+      `(${data.total} appearances)`;
+  } else {
+    state.appearances = data.rows;
+    for (const r of data.rows) {
+      const built = appearanceRow(r, items.length);
+      list.appendChild(built.node);
+      items.push(built.item);
+    }
+    $('#app-more').textContent =
+      `${data.rows.length} shown of ${data.total} in ${state.table}` +
+      (data.total > data.rows.length ? ' — narrow with the filters' : '');
+  }
+  navSet('appearance', items);
+  // keep the current asset selected across a filter change when it survived
+  const keep = state.selection && state.selection.kind === 'appearance'
+    ? items.findIndex(it => it.id === state.selection.id ||
+        (it.variants || []).some(v => v.id === state.selection.id))
+    : -1;
+  if (keep >= 0) {
+    const it = items[keep];
+    const v = it.variants ? Math.max(0, it.variants.findIndex(
+      x => x.id === state.selection.id)) : 0;
+    state.nav.index = keep;
+    state.nav.variant = v;
+    if (it.el) it.el.classList.add('sel');
+  }
+  $('#btn-bulktag').textContent = `Tag all ${data.total}…`;
+  $('#btn-bulktag').disabled = !data.total;
+}
+
+function facetLine(r) {
+  if (!r.class) return r.mesh || (r.meshId ? `mesh ${r.meshId} — unresolved` : 'no mesh');
+  const bits = [];
+  if (r.class && r.class !== 'unknown') bits.push(lbl(r.class));
+  if (r.gender && r.gender !== 'other') bits.push(lbl(r.gender));
+  if (r.size && r.size !== 'n/a') bits.push(lbl(r.size).toLowerCase());
+  if (r.kind && r.kind !== 'armour') bits.push(r.kind);
+  if (r.itemName) bits.push('· ' + r.itemName);
+  return bits.join(' ') || (r.mesh || '');
+}
+
+function appearanceRow(r, index) {
+  const row = el('div', 'row-item');
+  row.dataset.id = r.id;
+  row.dataset.subject = r.subject;
+  const img = el('img');
+  img.loading = 'lazy';
+  if (r.texture) img.src = texUrl(r.texture, { size: 48 });
+  const lb = el('div', 'lbl');
+  lb.appendChild(el('b', null, r.id));
+  lb.appendChild(el('span', null, facetLine(r)));
+  if (r.tags && r.tags.length) {
+    const t = el('span', 'tagline', '🏷 ' + r.tags.join(', '));
+    lb.appendChild(t);
+  }
+  row.append(img, lb);
+  row.addEventListener('click', () => navActivate(index, 0, { immediate: true }));
+  return { node: row, item: { id: r.id, mesh: r.mesh, el: row } };
+}
+
+/** Grouped-by-mesh row: one line per distinct body mesh, expanding to its
+ *  colour variants. Mesh is shared across colourways and texture is per
+ *  colour, so this is the smaller, more useful browsing unit. */
+function groupRow(g, index) {
+  const wrap = el('div');
+  const row = el('div', 'row-item grouphead');
+  const img = el('img');
+  img.loading = 'lazy';
+  if (g.texture) img.src = texUrl(g.texture, { size: 48 });
+  const lb = el('div', 'lbl');
+  lb.appendChild(el('b', null, (g.mesh || '').split('/').pop() || g.mesh));
+  lb.appendChild(el('span', null,
+    `${g.count} colour variant${g.count === 1 ? '' : 's'} · ${facetLine(g)}`));
+  row.append(img, lb);
+  const strip = el('div', 'variants hidden');
+  g.variants.forEach((v, vi_i) => {
+    const vi = el('img');
+    vi.loading = 'lazy';
+    vi.title = v.id + (v.tags.length ? '\n🏷 ' + v.tags.join(', ') : '');
+    if (v.texture) vi.src = texUrl(v.texture, { size: 40 });
+    vi.addEventListener('click', ev => {
+      ev.stopPropagation();
+      navActivate(index, vi_i, { immediate: true });
+    });
+    strip.appendChild(vi);
+  });
+  row.addEventListener('click', () => navActivate(index, 0, { immediate: true }));
+  wrap.append(row, strip);
+  return {
+    node: wrap,
+    item: {
+      mesh: g.mesh, el: row, stripEl: strip, variants: g.variants,
+      expand: () => strip.classList.remove('hidden'),
+    },
+  };
+}
+
+// ------------------------------------------------------------------ categories
+//
+// The taxonomy comes from the server (tools/catalog.py), which derives it from
+// appearance-table membership first and directory layout second. Nothing is
+// hardcoded here except the presentation.
+
+async function loadCategories() {
+  const host = $('#cat-tree');
+  host.innerHTML = '<div class="mut small" style="padding:10px">classifying…</div>';
+  let data;
+  try { data = await api('/api/categories'); }
+  catch (e) { host.innerHTML = ''; host.appendChild(el('div', 'err', e.message)); return; }
+  state.categories = data.categories;
+  host.innerHTML = '';
+  for (const c of data.categories) {
+    const row = el('div', 'cat-row');
+    const head = el('div', 'cat-head');
+    head.appendChild(el('b', null, c.label));
+    head.appendChild(el('span', 'n', c.count.toLocaleString()));
+    row.appendChild(head);
+    row.appendChild(el('div', 'blurb', c.blurb));
+    const subs = el('div', 'cat-subs');
+    for (const s of c.subs) {
+      const ch = chip(s.id, s.count, false, ev => {
+        ev.stopPropagation();
+        openCategory(c.id, s.id);
+      });
+      subs.appendChild(ch);
+    }
+    row.appendChild(subs);
+    row.addEventListener('click', () => openCategory(c.id, null));
+    host.appendChild(row);
+  }
+  $('#cat-more') && ($('#cat-more').textContent = '');
+}
+
+function openCategory(id, sub) {
+  state.cat = { id, sub, role: null, group: null };
+  $('#cat-tree').classList.add('hidden');
+  $('#cat-controls').classList.remove('hidden');
+  $('#cat-search').value = '';
+  loadCategoryFiles();
+}
+
+function closeCategory() {
+  state.cat = { id: null, sub: null, role: null, group: null };
+  $('#cat-tree').classList.remove('hidden');
+  $('#cat-controls').classList.add('hidden');
+  navSet('category', []);
+}
+
+async function loadCategoryFiles() {
+  const list = $('#cat-list');
+  list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
+  const p = new URLSearchParams({ category: state.cat.id, limit: '300' });
+  if (state.cat.sub) p.set('sub', state.cat.sub);
+  if (state.cat.role) p.set('role', state.cat.role);
+  if (state.cat.group) p.set('group', state.cat.group);
+  const q = $('#cat-search').value.trim();
+  if (q) p.set('q', q);
+  let data;
+  try { data = await api('/api/catfiles?' + p.toString()); }
+  catch (e) { list.innerHTML = ''; list.appendChild(el('div', 'err', e.message)); return; }
+
+  // breadcrumbs
+  const cb = $('#cat-crumbs');
+  cb.innerHTML = '';
+  const meta = state.categories.find(c => c.id === state.cat.id);
+  const back = el('a', null, '← all categories');
+  back.addEventListener('click', closeCategory);
+  cb.append(back, document.createTextNode(' · '),
+            el('b', null, meta ? meta.label : state.cat.id));
+  if (state.cat.sub) cb.append(document.createTextNode(' / ' + state.cat.sub));
+
+  // role + group chips
+  const fh = $('#cat-facets');
+  fh.innerHTML = '';
+  const roles = Object.entries(data.roles || {}).sort((a, b) => b[1] - a[1]);
+  if (roles.length > 1) {
+    const box = el('div', 'facet-axis');
+    box.appendChild(el('div', 'axis-name', 'Kind of file'));
+    for (const [r, n] of roles) {
+      box.appendChild(chip(r, n, state.cat.role === r, () => {
+        state.cat.role = state.cat.role === r ? null : r;
+        loadCategoryFiles();
+      }));
+    }
+    fh.appendChild(box);
+  }
+  if ((data.groups || []).length > 1) {
+    const box = el('div', 'facet-axis');
+    box.appendChild(el('div', 'axis-name',
+      state.cat.id === 'map' ? 'Region / map folder' : 'Group'));
+    for (const g of data.groups.slice(0, 60)) {
+      box.appendChild(chip(g.id, g.count, state.cat.group === g.id, () => {
+        state.cat.group = state.cat.group === g.id ? null : g.id;
+        loadCategoryFiles();
+      }));
+    }
+    fh.appendChild(box);
+  }
+
+  list.innerHTML = '';
+  const items = [];
+  for (const r of data.rows) {
+    const idx = items.length;
+    const row = unifiedRow(r, idx, `${r.source} · ${r.role} · ${r.path}`);
+    row.title = r.why;
+    list.appendChild(row);
+    items.push({ path: r.path, el: row });
+  }
+  navSet('category', items);
+  $('#cat-more').textContent =
+    `${data.rows.length} shown of ${data.total.toLocaleString()}` +
+    (data.total > data.rows.length ? ' — narrow with the filters' : '') +
+    (data.foldedAway ? ` · ${data.foldedAway.toLocaleString()} skins merged into their mesh` : '');
+}
+
+// ------------------------------------------------------------------ maps
+async function loadMaps() {
+  const list = $('#map-list');
+  list.innerHTML = '<div class="mut small" style="padding:10px">reading 136 maps…</div>';
+  let data;
+  try { data = await api('/api/maps'); }
+  catch (e) { list.innerHTML = ''; list.appendChild(el('div', 'err', e.message)); return; }
+  state.maps = data.rows;
+  renderMapList();
+}
+
+function renderMapList() {
+  const list = $('#map-list');
+  const q = $('#map-search').value.trim().toLowerCase();
+  const rows = state.maps.filter(r => !q || r.name.toLowerCase().includes(q));
+  const biggest = Math.max(1, ...state.maps.map(r => r.area));
+  list.innerHTML = '';
+  const items = [];
+  for (const r of rows) {
+    const idx = items.length;
+    const row = el('div', 'map-row');
+    const sz = el('div', 'sz', String(r.width));
+    const lb = el('div', 'lbl');
+    lb.appendChild(el('b', null, r.name));
+    lb.appendChild(el('span', null,
+      `${r.width}×${r.height} · ${r.layerCount} layers` +
+      (r.documentId ? ` · id ${r.documentId}` : '')));
+    const bar = el('div', 'scale-bar');
+    bar.style.width = Math.max(3, 100 * r.area / biggest) + '%';
+    lb.appendChild(bar);
+    row.append(sz, lb);
+    row.addEventListener('click', () => navActivate(idx, 0, { immediate: true }));
+    list.appendChild(row);
+    items.push({ mapName: r.name, el: row });
+  }
+  navSet('map', items);
+  $('#map-more').textContent =
+    `${rows.length} of ${state.maps.length} maps · largest first`;
+}
+
+async function selectMap(name) {
+  const tk = tokenNow();
+  state.selection = { kind: 'map', name };
+  state.mapName = name;
+  clearViewport(`map “${name}” — the world grid itself is not a 3D mesh; ` +
+    `its art is listed on the right.`);
+  $('#card-mappieces').classList.remove('hidden');
+  $('#card-related').classList.add('hidden');
+  const body = $('#mappieces-body');
+  body.textContent = 'resolving map art…';
+  showTagPanel('map:' + name);
+  let rec;
+  try { rec = await api('/api/map?name=' + encodeURIComponent(name)); }
+  catch (e) { body.textContent = 'failed: ' + e.message; return; }
+  if (!stillCurrent(tk)) return;
+  renderMapPieces(rec);
+  await showProvenance(rec.file);
+}
+
+function renderMapPieces(rec) {
+  const b = $('#mappieces-body');
+  b.innerHTML = '';
+  b.appendChild(kv([
+    ['map', rec.name],
+    ['size', `${rec.width} × ${rec.height} cells`],
+    ['version', rec.version],
+    ['map id', rec.documentId],
+    ['region', rec.region || '—'],
+    ['puzzle', rec.puzzle],
+    ['tile set', rec.ani],
+    ['layers', `${rec.layersDecoded} of ${rec.layerCount} decoded`],
+  ]));
+  const note = el('div', 'small mut');
+  note.style.margin = '6px 0 10px';
+  note.textContent =
+    'The big thing is the world grid; everything below is the smaller artwork ' +
+    'placed on it. Click any tile to open it.';
+  b.appendChild(note);
+
+  strip(b, `Ground tiles (${rec.tileCount})`, rec.tiles,
+        'the .pul names tile indices, the .ani turns them into these files');
+  strip(b, `Animated sprites (${rec.coverCount})`,
+        rec.covers.flatMap(c => c.frames), 'cover layers — props and animations');
+  if (rec.scenes.length) {
+    const g = el('div', 'relgroup');
+    g.appendChild(el('h3', null, `Scenery objects (${rec.scenes.length})`));
+    g.appendChild(el('div', 'note', 'map/Scene/*.scene, each made of sprite parts'));
+    const frames = (rec.scenePartDetail || [])
+      .flatMap(s => s.parts.flatMap(p => p.frames));
+    b.appendChild(g);
+    strip(b, '', frames, '');
+    const names = el('div', 'small mut');
+    names.textContent = rec.scenes.slice(0, 12).join(', ');
+    b.appendChild(names);
+  }
+  if (rec.effects.length) {
+    const g = el('div', 'relgroup');
+    g.appendChild(el('h3', null, `Effects (${rec.effects.length})`));
+    g.appendChild(el('div', 'note',
+      'keys into 3DEffect.ini — the effect meshes live under Effects'));
+    g.appendChild(el('div', 'small', rec.effects.slice(0, 20).join(', ')));
+    b.appendChild(g);
+  }
+  if (rec.sounds.length) {
+    const g = el('div', 'relgroup');
+    g.appendChild(el('h3', null, `Sounds (${rec.sounds.length})`));
+    g.appendChild(el('div', 'small mut', rec.sounds.slice(0, 8).join(', ')));
+    b.appendChild(g);
+  }
+  if (rec.error) b.appendChild(el('div', 'warn', '⚠ ' + rec.error));
+}
+
+/** A thumbnail strip of asset paths, clickable through to the asset. */
+function strip(host, title, paths, note, limit = 96) {
+  if (!paths || !paths.length) return;
+  const g = el('div', 'relgroup');
+  if (title) g.appendChild(el('h3', null, title));
+  if (note) g.appendChild(el('div', 'note', note));
+  const s = el('div', 'relstrip');
+  const seen = new Set();
+  let n = 0;
+  for (const p of paths) {
+    if (seen.has(p)) continue;
+    seen.add(p);
+    if (n++ >= limit) break;
+    s.appendChild(assetCell(p, p.split('/').pop()));
+  }
+  g.appendChild(s);
+  if (paths.length > limit) {
+    g.appendChild(el('div', 'small mut', `… ${paths.length - limit} more`));
+  }
+  host.appendChild(g);
+}
+
+function assetCell(path, label, { appearance = null } = {}) {
+  const isTex = /\.(dds|png|jpe?g|bmp)$/i.test(path);
+  const cell = el('div', 'cell' + (isTex ? '' : ' meshcell'));
+  const img = el('img');
+  img.loading = 'lazy';
+  img.alt = path;
+  img.src = thumbUrl(path, { size: 48 });
+  img.addEventListener('error', () => img.removeAttribute('src'));
+  cell.appendChild(img);
+  cell.appendChild(el('div', 'cap', label || path.split('/').pop()));
+  cell.title = path;
+  cell.addEventListener('click', () => {
+    if (appearance) { switchToAppearance(appearance); return; }
+    requestLoad(() => selectFile(path), { immediate: true });
+  });
+  return cell;
+}
+
+async function switchToAppearance(id, table) {
+  if (table && table !== state.table && $('#table-select')
+      && [...$('#table-select').options].some(o => o.value === table)) {
+    state.table = table;
+    $('#table-select').value = table;
+  }
+  requestLoad(() => selectAppearance(id), { immediate: true });
+}
+
+// ------------------------------------------------------------------ related
+async function showRelated({ id = '', table = '', path = '' } = {}) {
+  const tk = tokenNow();
+  const card = $('#card-related');
+  const b = $('#related-body');
+  b.textContent = 'looking…';
+  card.classList.remove('hidden');
+  const p = new URLSearchParams();
+  if (id) p.set('id', id);
+  if (table) p.set('table', table);
+  if (path) p.set('path', path);
+  let data;
+  try { data = await api('/api/related?' + p.toString()); }
+  catch (e) { b.textContent = 'failed: ' + e.message; return; }
+  if (!stillCurrent(tk)) return;
+  b.innerHTML = '';
+  if (!data.groups.length) {
+    b.appendChild(el('div', 'mut small', 'nothing else resolves for this asset'));
+    return;
+  }
+  for (const g of data.groups) {
+    const box = el('div', 'relgroup');
+    box.appendChild(el('h3', null, g.title));
+    if (g.note) box.appendChild(el('div', 'note', g.note));
+    if (g.components) {
+      // The entry taken apart again. The left-hand list merges a mesh and its
+      // skins into one row; here each half is its own line you can open. The
+      // authored / inferred label is meshtex.py's and is the difference between
+      // "armor.ini says so" and "there is a .dds with the same stem" -- not the
+      // same claim, so not shown the same way.
+      const ul = el('ul', 'components');
+      for (const it of g.items) {
+        const li = el('li', it.primary ? 'primary' : '');
+        const im = el('img');
+        im.loading = 'lazy';
+        im.src = thumbUrl(it.path, { size: 40 });
+        im.addEventListener('error', () => im.removeAttribute('src'));
+        const txt = el('div', 'ctext');
+        txt.appendChild(el('b', null, it.label));
+        const meta = el('span', 'flags');
+        meta.appendChild(el('span', 'role', it.role));
+        if (it.role === 'texture' && it.primarySkin === false) {
+          const s = el('span', 'badge arc', 'alt skin');
+          s.title = 'Not this mesh’s default texture: the same geometry ' +
+                    'is shipped with several skins and this is one of the others.';
+          meta.appendChild(s);
+        }
+        if (it.thumbNote) {
+          const n = el('span', 'badge stage', 'thumb');
+          n.title = it.thumbNote;
+          meta.appendChild(n);
+        }
+        if (it.kind) {
+          const k = el('span', 'badge ' + (it.kind === 'authored' ? 'loose' : 'stage'),
+                       it.kind);
+          k.title = it.kind === 'authored'
+            ? 'A shipped data file states this pairing: ' + it.method
+            : 'A naming convention measured off the corpus, not a declaration: '
+              + it.method;
+          meta.appendChild(k);
+        }
+        if (it.note) meta.appendChild(document.createTextNode(' ' + it.note));
+        txt.appendChild(meta);
+        if (it.detail) txt.appendChild(el('span', 'lab', it.detail));
+        li.append(im, txt);
+        li.title = 'open ' + it.path;
+        li.addEventListener('click', () =>
+          requestLoad(() => selectFile(it.path), { immediate: true }));
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+      b.appendChild(box);
+      continue;
+    }
+    if (g.pending) {
+      box.appendChild(el('div', 'pending',
+        'Weapon → effect linkage is still being built (tools/effects.py). ' +
+        'This panel will fill in without any change here once it lands.'));
+    } else {
+      const s = el('div', 'relstrip');
+      for (const it of g.items) {
+        s.appendChild(assetCell(it.path, it.label, { appearance: it.appearance }));
+      }
+      box.appendChild(s);
+    }
+    b.appendChild(box);
+  }
+}
+
+// ------------------------------------------------------------------ effects
+//
+// docs/effects.md is the spec; fx.js is the playback. This is the UI over it.
+//
+// A weapon has THREE separate effects and the distinction is the whole point:
+//   * aura         -- always on, the 999 wildcard action
+//   * attack trail -- per attack action; ONLY quality 6-9 weapons have one, so
+//                     "no trail" is the data, not a missing asset
+//   * impact spark -- drawn at the TARGET, never on the character. The viewer
+//                     anchors it to a separate dummy in front of the figure and
+//                     labels it, rather than pretending it hangs off the sword.
+
+const fx = {
+  playing: false,
+  t0: 0,
+  pausedAt: 0,
+  raf: null,
+  loaded: [],        // [{role, name, effect}]
+  duration: 1000,
+  swing: false,
+  anchors: {},       // role -> mat4 (base, before the swing preview)
+};
+// exposed alongside `state` and `viewer` so playback can be driven from the
+// console or a headless render check
+window.fx = fx;
+
+function fxDurationOf(def) {
+  const frames = def.effectiveFrames || def.frames || 1;
+  const cycle = frames * (def.frameIntervalMs || 33) + (def.loopIntervalMs || 0);
+  if (def.endless) return Math.max(400, cycle);
+  return (def.delayMs || 0) + cycle * Math.max(1, def.loopTime || 1);
+}
+
+/** Where each effect rides. See docs/effects.md §8 "Anchoring" -- INFERRED. */
+function fxAnchorFor(role) {
+  const a = state.anchors || {};
+  const socket = a.v_r_weapon || a.v_l_weapon;
+  const base = FX.IDENT.slice();
+  if (role === 'impact' || role === 'block') {
+    // NOT on the character: an impact effect is drawn on whatever was hit.
+    // A dummy target one body-width in front of the figure makes that visible
+    // instead of quietly wrong.
+    const b = (state.figure && state.figure.bodyBounds) || null;
+    const h = b ? (b.max[2] - b.min[2]) : 170;
+    return FX.translation(0, -h * 0.55, h * 0.5);
+  }
+  if (socket && socket.matrix) return Array.from(socket.matrix);
+  if (socket && socket.pos) return FX.translation(socket.pos[0], socket.pos[1], socket.pos[2]);
+  return base;
+}
+
+/** The swing preview: sweep the parent through an arc so a SHAP ribbon has
+ *  something to smear along. Explicitly OURS -- 3dmotion.ini is not wired in,
+ *  so this is not the game's attack animation and the tooltip says so. */
+function fxSwingMatrix(base, tNorm) {
+  if (!fx.swing) return base;
+  const ang = (-0.9 + 2.2 * tNorm);
+  const c = Math.cos(ang), s = Math.sin(ang);
+  const rot = [c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];  // yaw, Z-up
+  return FX.mul(rot, base);
+}
+
+/** One sweep, in ms. Deliberately NOT the effect's own length: the ribbon only
+ *  holds `maxPairs / subdiv` ticks of history (~7 at 60 fps for a 7-segment
+ *  trail), so sweeping over an 8-second aura would smear across 0.06 rad and
+ *  look like nothing happened. A real attack is ~12 frames at 41 ms. */
+const FX_SWING_MS = 600;
+
+function fxParentFor(inst) {
+  const base = fx.anchors[inst.role] || FX.IDENT.slice();
+  return fxSwingMatrix(base, (viewer.fxTime % FX_SWING_MS) / FX_SWING_MS);
+}
+
+async function loadEffects(list) {
+  if (!viewer) return 0;
+  fxStop();
+  fx.loaded = list || [];
+  fx.anchors = {};
+  const defs = [];
+  for (const rec of fx.loaded) {
+    if (!rec.effect) continue;
+    const keys = {};
+    for (const lay of rec.effect.layers || []) {
+      if (lay.texture) keys[lay.index] = `fx:${rec.role}:${lay.index}`;
+    }
+    fx.anchors[rec.role] = fxAnchorFor(rec.role);
+    defs.push({ def: rec.effect, role: rec.role,
+                anchor: fx.anchors[rec.role], textureKeys: keys });
+  }
+  const n = viewer.setEffects(defs);
+  // textures after setEffects: setMeshes/clear() empties the texture map
+  for (const rec of fx.loaded) {
+    for (const lay of (rec.effect && rec.effect.layers) || []) {
+      if (lay.texture) await applyNamedTexture(`fx:${rec.role}:${lay.index}`, lay.texture);
+    }
+  }
+  fx.duration = Math.max(400, ...fx.loaded
+    .filter(r => r.effect).map(r => fxDurationOf(r.effect)));
+  $('#fx-wrap').classList.toggle('hidden', n === 0);
+  $('#fx-slider').max = String(Math.round(fx.duration));
+  fxSeek(0);
+  if (n) fxPlay();
+  return n;
+}
+
+function fxPlay() {
+  if (!viewer || !viewer.fx.length) return;
+  fx.playing = true;
+  fx.t0 = performance.now() - fx.pausedAt;
+  $('#btn-fx-play').textContent = '❚❚ pause';
+  const step = () => {
+    if (!fx.playing) return;
+    let t = performance.now() - fx.t0;
+    if (t > fx.duration) { t = 0; fx.t0 = performance.now(); viewer.resetEffects(); }
+    fxSeek(t, true);
+    fx.raf = requestAnimationFrame(step);
+  };
+  cancelAnimationFrame(fx.raf);
+  fx.raf = requestAnimationFrame(step);
+}
+
+function fxPause() {
+  fx.playing = false;
+  fx.pausedAt = viewer ? viewer.fxTime : 0;
+  cancelAnimationFrame(fx.raf);
+  $('#btn-fx-play').textContent = '▶ play';
+}
+
+function fxStop() {
+  fxPause();
+  fx.pausedAt = 0;
+  fx.loaded = [];
+  if (viewer) { viewer.clearEffects(); viewer.draw(); }
+  $('#fx-wrap').classList.add('hidden');
+}
+
+function fxSeek(ms, fromRaf) {
+  if (!viewer) return;
+  const alive = viewer.setEffectTime(ms, fxParentFor);
+  if (!fromRaf) fx.pausedAt = ms;
+  $('#fx-slider').value = String(Math.round(ms));
+  const names = fx.loaded.filter(r => r.effect).map(r => r.name).join(' + ');
+  $('#fx-label').textContent =
+    `${Math.round(ms)} / ${Math.round(fx.duration)} ms · ${names}` +
+    (alive ? '' : ' · finished');
+}
+
+/** The Effects card: names, roles, resolved meshes, and a Play button each. */
+async function showEffects({ id = '', table = '' } = {}) {
+  const card = $('#card-effects');
+  const b = $('#effects-body');
+  if (!id || !['l_weapon', 'r_weapon', 'shield'].includes(table)) {
+    card.classList.add('hidden');
+    return;
+  }
+  const tk = tokenNow();
+  b.textContent = 'resolving…';
+  card.classList.remove('hidden');
+  let data;
+  try { data = await api('/api/effects?id=' + encodeURIComponent(id)); }
+  catch (e) { b.textContent = 'failed: ' + e.message; return; }
+  if (!stillCurrent(tk)) return;
+  b.innerHTML = '';
+  if (!data.available) {
+    b.appendChild(el('div', 'pending', data.error ||
+      'tools/effects.py is not importable, so effect names cannot be resolved.'));
+    return;
+  }
+  b.appendChild(kv([
+    ['weapon type', `${data.type}${data.typeName ? ' — ' + data.typeName : ''}`],
+    ['effects', data.roles.length],
+  ]));
+  if (!data.hasTrail) {
+    b.appendChild(el('div', 'note', data.trailNote));
+  }
+  const playable = data.roles.filter(r => r.found && r.effect &&
+                                     r.effect.playableParts);
+  if (playable.length) {
+    const all = el('button', 'ghost tiny', `▶ play all ${playable.length}`);
+    all.addEventListener('click', () => loadEffects(playable));
+    b.appendChild(all);
+  }
+  for (const r of data.roles) {
+    const box = el('div', 'relgroup');
+    box.appendChild(el('h3', null, `${r.role} — ${r.name}`));
+    box.appendChild(el('div', 'note', r.note));
+    if (!r.found) {
+      box.appendChild(el('div', 'warn', '⚠ ' + r.error));
+      b.appendChild(box);
+      continue;
+    }
+    const d = r.effect;
+    box.appendChild(kv([
+      ['timing', `${d.frameIntervalMs} ms/frame (${d.fps} fps)`],
+      ['length', `${d.effectiveFrames} of ${d.frames} declared frames` +
+                 (d.durationMs ? ` = ${d.durationMs} ms` : '')],
+      ['loop', d.endless ? 'endless' : `${d.loopTime}x`],
+      ['layers', `${d.layers.length}`],
+      ['parts', `${d.playableParts} drawable` +
+                (d.particleParts ? `, ${d.particleParts} particle (not decoded)` : '')],
+    ]));
+    if (d.effectiveFrames < d.frames) {
+      box.appendChild(el('div', 'note',
+        `Plays ${d.effectiveFrames} frames, not the declared ${d.frames}: the ` +
+        `alpha envelope is what says when a burst is over (docs/effects.md ` +
+        `§6.5, INFERRED). The declared length would run this for ` +
+        `${Math.round(d.frames * d.frameIntervalMs)} ms.`));
+    }
+    const s = el('div', 'relstrip');
+    for (const lay of d.layers) {
+      if (lay.texture) s.appendChild(assetCell(lay.texture,
+        `L${lay.index} ${lay.srcBlendName}/${lay.dstBlendName}`));
+      if (lay.mesh) s.appendChild(assetCell(lay.mesh, `L${lay.index} mesh`));
+    }
+    box.appendChild(s);
+    if (d.playableParts) {
+      const btn = el('button', 'ghost tiny', '▶ play this one');
+      btn.addEventListener('click', () => loadEffects([r]));
+      box.appendChild(btn);
+    } else {
+      box.appendChild(el('div', 'pending',
+        'Every layer of this effect is a PTCL/PTC3 particle system, which is ' +
+        'not decoded (docs/effects.md §6.6). Nothing is drawn rather than ' +
+        'something wrong.'));
+    }
+    b.appendChild(box);
+  }
+}
+
+/** The weapon's per-action mesh swap (ini/WeaponMotion.ini, docs/effects.md
+ *  §4.5). A weapon does not deform -- the client swaps the mesh -- so a swing
+ *  trail animating against a static weapon reads wrong. */
+async function showWeaponMotion({ id = '', table = '' } = {}) {
+  if (!id || !['l_weapon', 'r_weapon', 'shield'].includes(table)) return null;
+  let wm;
+  try { wm = await api('/api/weaponmotion?id=' + encodeURIComponent(id)); }
+  catch (e) { return null; }
+  const b = $('#effects-body');
+  const box = el('div', 'relgroup');
+  box.appendChild(el('h3', null, 'Per-action mesh'));
+  box.appendChild(el('div', 'note', wm.note));
+  const rows = [['default', wm.default || '(weapon.ini Mesh0)'],
+                ['source', wm.defaultSource]];
+  if (Object.keys(wm.actions).length) {
+    const byMesh = {};
+    for (const [act, v] of Object.entries(wm.actions))
+      (byMesh[v.mesh] = byMesh[v.mesh] || []).push(act);
+    for (const [mesh, acts] of Object.entries(byMesh))
+      rows.push(['actions ' + acts.sort().join(','), mesh]);
+  } else {
+    rows.push(['actions', 'none — this appearance has no WeaponMotion rows, ' +
+                          'so weapon.ini Mesh0 stands for every action']);
+  }
+  box.appendChild(kv(rows));
+  if (Object.keys(wm.actions).length) {
+    const sel = el('select');
+    for (const act of ['999', ...Object.keys(wm.actions).filter(a => a !== '999').sort()]) {
+      const o = el('option', null, act === '999' ? '999 (default)' : 'action ' + act);
+      o.value = act;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', async () => {
+      const r = await api(`/api/weaponmotion?id=${encodeURIComponent(id)}` +
+                          `&action=${encodeURIComponent(sel.value)}`);
+      if (r.scene && r.chosen) {
+        state.meshPath = r.chosen;
+        await loadMesh(r.chosen, r.texture || state.texPath);
+        toast(`action ${sel.value}: ${r.chosen}`);
+      }
+    });
+    const w = el('div', 'small');
+    w.appendChild(el('span', 'mut', 'show mesh for '));
+    w.appendChild(sel);
+    box.appendChild(w);
+  }
+  b.appendChild(box);
+  return wm;
+}
+
+// ------------------------------------------------------------------ equip
+//
+// The character is the subject; everything else hangs off a named socket.
+// Slots come from ini/RolePart.ini via /api/parts, so the list is whatever the
+// client actually composes rather than a guess. Hair and headgear share one
+// slot because that is what the game does -- a helmet replaces the hair.
+
+async function loadPartManifest() {
+  try {
+    state.partManifest = await api('/api/parts');
+  } catch (e) { state.partManifest = null; }
+  renderLoadout();
+}
+
+function equippedSlots() {
+  const m = state.partManifest;
+  if (!m) return [];
+  return m.slots.filter(s => s.available || state.loadout[s.name]);
+}
+
+function renderLoadout() {
+  const b = $('#loadout-body');
+  b.innerHTML = '';
+  const m = state.partManifest;
+  $('#mode-pill').textContent =
+    (viewer && viewer.viewMode === 'character') ? 'character view' : 'asset view';
+  $('#mode-pill').className = 'badge ' +
+    ((viewer && viewer.viewMode === 'character') ? 'loose' : 'arc');
+
+  if (!m) {
+    b.appendChild(el('div', 'mut small', 'part manifest unavailable'));
+    return;
+  }
+  const note = el('div', 'small mut');
+  note.textContent = `${m.socketCount} attachment points from RolePart.ini. ` +
+    'Pick a body, then equip parts — the figure re-renders as you go.';
+  b.appendChild(note);
+
+  const row = el('div', 'slots');
+  row.style.cssText = 'margin-top:8px;flex-wrap:wrap';
+  for (const s of equippedSlots()) {
+    const v = state.loadout[s.name];
+    const slot = el('div', 'slot' + (v ? ' filled' : ''));
+    slot.style.flex = '0 0 30%';
+    slot.appendChild(el('div', 'cap', s.label));
+    if (v) {
+      const img = el('img');
+      if (v.texture) img.src = texUrl(v.texture, { size: 54 });
+      slot.appendChild(img);
+      slot.appendChild(el('div', 'who', v.id + (v.headKind === 'hair'
+        ? ' · ' + (v.hairColour || 'hair') : '')));
+      const rr = el('div', 'row');
+      rr.style.cssText = 'justify-content:center;gap:3px;margin-top:2px';
+      const view = el('button', 'ghost tiny', 'view');
+      view.title = 'inspect this part on its own, then come back — the loadout is kept';
+      view.addEventListener('click', ev => {
+        ev.stopPropagation();
+        setViewMode('asset');
+        switchToAppearance(v.id, v.table);
+      });
+      const rm = el('button', 'ghost tiny', '✕');
+      rm.title = 'unequip';
+      rm.addEventListener('click', ev => {
+        ev.stopPropagation();
+        state.loadout[s.name] = null;
+        renderLoadout();
+        if (viewer.viewMode === 'character') renderFigure();
+      });
+      rr.append(view, rm);
+      slot.appendChild(rr);
+    } else {
+      const e2 = el('div', 'empty', s.available ? 'empty' : 'not shipped');
+      e2.title = s.note || '';
+      slot.appendChild(e2);
+    }
+    row.appendChild(slot);
+  }
+  b.appendChild(row);
+
+  const acts = el('div', 'row');
+  const goChar = el('button', state.loadout.body ? 'primary' : 'ghost',
+                    'Character view');
+  goChar.disabled = !state.loadout.body;
+  goChar.addEventListener('click', () => { setViewMode('character'); renderFigure(); });
+  const share = el('button', 'ghost tiny', 'Copy link');
+  share.title = 'a URL that restores this exact loadout';
+  share.addEventListener('click', copyLoadoutLink);
+  const clr = el('button', 'ghost tiny', 'Clear all');
+  clr.addEventListener('click', () => {
+    state.loadout = {};
+    saveLoadout(); renderLoadout(); clearViewport('loadout cleared');
+  });
+  acts.append(goChar, share, clr);
+  b.appendChild(acts);
+  saveLoadout();
+}
+
+function saveLoadout() {
+  try { localStorage.setItem('coviewer.loadout', JSON.stringify(state.loadout)); }
+  catch (e) { /* ignore */ }
+}
+
+function restoreLoadout() {
+  const fromUrl = new URLSearchParams(location.hash.replace(/^#/, ''));
+  if (fromUrl.get('body')) {
+    const out = {};
+    for (const [k, v] of fromUrl.entries()) out[k] = { id: v, table: k };
+    state.loadout = out;
+    return true;
+  }
+  try {
+    const s = JSON.parse(localStorage.getItem('coviewer.loadout') || 'null');
+    if (s && typeof s === 'object') { state.loadout = s; return !!s.body; }
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
+function loadoutParams() {
+  const p = new URLSearchParams();
+  for (const [slot, v] of Object.entries(state.loadout)) {
+    if (v && v.id) p.set(slot, v.id);
+  }
+  return p;
+}
+
+function copyLoadoutLink() {
+  const url = location.origin + location.pathname + '#' + loadoutParams().toString();
+  navigator.clipboard.writeText(url).then(
+    () => toast('loadout link copied'),
+    () => toast('clipboard blocked; the link is in the address bar'));
+  location.hash = loadoutParams().toString();
+}
+
+/** Which slots may a given appearance table be equipped into? */
+function slotsForTable(table) {
+  const m = state.partManifest;
+  if (!m) return [];
+  const direct = m.slots.filter(s => s.name === table);
+  if (direct.length) return direct;
+  // weapon.ini backs both hands; armor.ini backs body and mix_body
+  if (table === 'l_weapon' || table === 'r_weapon') {
+    return m.slots.filter(s => s.name === 'l_weapon' || s.name === 'r_weapon');
+  }
+  if (table === 'mix_body') return m.slots.filter(s => s.name === 'body');
+  if (table.startsWith('mix_armet')) {
+    return m.slots.filter(s => s.name === table.replace('mix_', ''));
+  }
+  return [];
+}
+
+function loadoutAssignControls(rec, part) {
+  const wrap = el('div', 'row');
+  for (const s of slotsForTable(rec.table)) {
+    const btn = el('button', 'ghost tiny', 'equip → ' + s.label.toLowerCase());
+    btn.addEventListener('click', () => {
+      // head covering is one slot: equipping a helmet replaces the hair
+      for (const grp of (state.partManifest.exclusive || [])) {
+        if (grp.includes(s.name)) {
+          for (const other of grp) if (other !== s.name) state.loadout[other] = null;
+        }
+      }
+      state.loadout[s.name] = {
+        id: rec.id, table: rec.table, mesh: part && part.mesh,
+        texture: part && part.texture,
+        headKind: rec.headKind, hairColour: rec.hairColour,
+      };
+      renderLoadout();
+      if (s.name === 'body') setViewMode('character');
+      if (viewer.viewMode === 'character') renderFigure();
+      toast(`${rec.id} → ${s.label}`);
+    });
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
+// ------------------------------------------------------------------ modes
+function setViewMode(mode) {
+  if (!viewer) return;
+  const changed = viewer.viewMode !== mode;
+  viewer.setViewMode(mode);
+  $('#view-mode').value = viewer.viewMode;
+  $('#chk-lock').checked = viewer.opts.lock;
+  $('#lock-label').classList.toggle('on', viewer.opts.lock);
+  renderLoadout();
+  return changed;
+}
+
+/** Draw the assembled character: body plus every equipped part at its socket. */
+async function renderFigure() {
+  if (!state.loadout.body) {
+    clearViewport('pick a body to start a character');
+    return;
+  }
+  const tk = tokenNow();
+  const p = loadoutParams();
+  p.set('bodyTable', state.loadout.body.table || 'body');
+  $('#gl-msg').textContent = 'assembling…';
+  $('#gl-msg').classList.remove('hidden');
+  let fig;
+  try { fig = await api('/api/figure?' + p.toString()); }
+  catch (e) { clearViewport('assembly failed: ' + e.message); return; }
+  if (!stillCurrent(tk)) return;
+  state.figure = fig;
+
+  const defs = [];
+  for (const m of fig.body.scene.meshes) defs.push({ meta: m, textureKey: 'body' });
+  for (const part of fig.parts) {
+    for (const m of part.scene.meshes) {
+      defs.push({ meta: m, textureKey: 'slot:' + part.slot,
+                  translate: part.translate, matrix: part.matrix,
+                  slot: part.slot });
+    }
+  }
+  // Frame on the BODY only, and only when the body itself changed: equipping a
+  // long weapon must never yank the camera back.
+  const bodyChanged = state.lastFiguredBody !== fig.body.id;
+  state.lastFiguredBody = fig.body.id;
+  viewer.setMeshes(defs, {
+    frameOn: fig.bodyBounds,
+    keepFraming: !bodyChanged,
+  });
+  await applyNamedTexture('body', fig.body.texture);
+  for (const part of fig.parts) {
+    await applyNamedTexture('slot:' + part.slot, part.texture);
+  }
+  if (!stillCurrent(tk)) return;
+  state.anchors = fig.anchors;
+  // setMeshes() clears the GL state, effects included; re-attach whatever was
+  // playing so equipping a part does not silently kill the aura.
+  if (fx.loaded.length) loadEffects(fx.loaded);
+  $('#gl-msg').classList.add('hidden');
+  $('#gl-stats').textContent = viewer.stats +
+    `\ncharacter: ${fig.body.id}` +
+    fig.parts.map(p => ` + ${p.slot}:${p.id}`).join('');
+  renderFigurePanel(fig);
+  viewer.draw();
+}
+
+function applyNamedTexture(key, texPath) {
+  if (!texPath) return Promise.resolve(false);
+  const tk = tokenNow();
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      if (!stillCurrent(tk)) return resolve(false);
+      viewer.setTexture(key, img); viewer.draw(); resolve(true);
+    };
+    img.onerror = () => resolve(false);
+    img.src = texUrl(texPath, {});
+  });
+}
+
+function renderFigurePanel(fig) {
+  const b = $('#mesh-body');
+  b.innerHTML = '';
+  b.appendChild(kv([
+    ['character', fig.body.id],
+    ['body mesh', fig.body.mesh],
+    ['parts', fig.parts.length],
+    ['attachment', fig.attachConfidence],
+  ]));
+  const n = el('div', 'small mut');
+  n.style.margin = '6px 0';
+  n.textContent = fig.attachNote;
+  b.appendChild(n);
+  for (const w of fig.warnings || []) b.appendChild(el('div', 'warn', '⚠ ' + w));
+  const bodyH = fig.bodyBounds
+    ? (fig.bodyBounds.max[2] - fig.bodyBounds.min[2]) : null;
+  const ul = el('ul', 'chunks');
+  for (const p of fig.parts) {
+    const li = el('li');
+    li.appendChild(el('b', null, `${p.label}: ${p.id}`));
+    li.appendChild(el('div', 'flags',
+      `socket ${p.socket} · ${p.anchorSource} [${p.anchorConfidence}]` +
+      (p.headKind ? ` · ${p.headKind}` : '') +
+      (p.hairColour ? ` · ${p.hairColour}` : '')));
+    // The transform chain, stage by stage. Stated numerically on purpose: a
+    // regression should read as "scale 4.0 on partMotion", not "looks big".
+    if (p.bboxRender && bodyH) {
+      const r = p.bboxRender.longest / bodyH;
+      li.appendChild(el('div', 'flags' + (r > 1.2 ? ' warn' : ''),
+        `authored size ${p.bboxRender.longest.toFixed(1)} = ` +
+        `${r.toFixed(2)}x the body's ${bodyH.toFixed(1)} height`));
+    }
+    for (const s of (p.attachChain && p.attachChain.stages) || []) {
+      const d = s.decomposed;
+      li.appendChild(el('div', 'flags mut',
+        `${s.name}: ${s.applied}` +
+        (d ? ` · scale ${d.scale.map(v => v.toFixed(3)).join('/')}` +
+             ` · t ${d.translate.map(v => v.toFixed(1)).join(', ')}` : '') +
+        ` — ${s.note}`));
+    }
+    ul.appendChild(li);
+  }
+  b.appendChild(ul);
+  if (fig.parts.length && fig.parts[0].attachChain) {
+    b.appendChild(el('div', 'note', fig.parts[0].attachChain.note));
+  }
+}
+
+// ------------------------------------------------------------------ navigation
+//
+// One ordered list of "entries" mirroring exactly what is rendered, so arrow
+// keys move through the filtered / grouped view rather than the underlying set.
+//
+//   Up / Down      previous / next entry
+//   Left / Right   previous / next colour variant of the current entry's mesh
+//   PgUp / PgDn    +/- 10 entries      Home / End   first / last
+//
+// In grouped mode an entry is a mesh and its variants are the group's colour
+// ways. In flat mode an entry is one appearance and its "variants" are the
+// other rows sharing the same mesh -- which are 10 apart in the ID ordering,
+// so Left/Right is a genuine shortcut there rather than a duplicate of Down.
+
+function navSet(mode, items) {
+  state.nav = { mode, items, index: -1, variant: 0 };
+}
+
+/** Rows sharing a mesh, as index lists, for Left/Right in flat mode. */
+function navSiblingIndices(i) {
+  const items = state.nav.items;
+  const mesh = items[i] && items[i].mesh;
+  if (!mesh) return [i];
+  const out = [];
+  for (let k = 0; k < items.length; k++) if (items[k].mesh === mesh) out.push(k);
+  return out.length ? out : [i];
+}
+
+function navActivate(i, variant, { immediate = false } = {}) {
+  const items = state.nav.items;
+  if (!items.length) return;
+  i = Math.max(0, Math.min(items.length - 1, i));
+  const it = items[i];
+  state.nav.index = i;
+
+  document.querySelectorAll('.row-item.sel, .map-row.sel')
+    .forEach(x => x.classList.remove('sel'));
+  if (it.el) {
+    it.el.classList.add('sel');
+    it.el.scrollIntoView({ block: 'nearest' });
+  }
+
+  if (it.variants && it.variants.length) {
+    const v = Math.max(0, Math.min(it.variants.length - 1, variant || 0));
+    state.nav.variant = v;
+    if (it.expand) it.expand();
+    if (it.stripEl) {
+      const imgs = [...it.stripEl.querySelectorAll('img')];
+      imgs.forEach((x, k) => x.classList.toggle('sel', k === v));
+      if (imgs[v]) imgs[v].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    requestLoad(() => selectAppearance(it.variants[v].id), { immediate });
+  } else if (it.mapName) {
+    state.nav.variant = 0;
+    requestLoad(() => selectMap(it.mapName), { immediate });
+  } else if (it.path) {
+    state.nav.variant = 0;
+    requestLoad(() => selectFile(it.path), { immediate });
+  } else if (it.id) {
+    state.nav.variant = 0;
+    requestLoad(() => selectAppearance(it.id), { immediate });
+  }
+}
+
+function navMove(delta) {
+  const n = state.nav.items.length;
+  if (!n) return;
+  const cur = state.nav.index < 0 ? -1 : state.nav.index;
+  let next = cur < 0 ? (delta > 0 ? 0 : n - 1) : cur + delta;
+  next = Math.max(0, Math.min(n - 1, next));
+  if (next === cur) return;
+  navActivate(next, 0);
+}
+
+function navMoveVariant(delta) {
+  const it = state.nav.items[state.nav.index];
+  if (!it) { navMove(delta); return; }
+  if (it.variants && it.variants.length > 1) {
+    const n = it.variants.length;
+    const v = (state.nav.variant + delta + n) % n;
+    navActivate(state.nav.index, v);
+    return;
+  }
+  // flat mode: hop to the next row sharing this mesh
+  const sibs = navSiblingIndices(state.nav.index);
+  if (sibs.length < 2) { navMove(delta); return; }
+  const at = sibs.indexOf(state.nav.index);
+  const nxt = sibs[(at + delta + sibs.length) % sibs.length];
+  navActivate(nxt, 0);
+}
+
+function navJump(where) {
+  const n = state.nav.items.length;
+  if (!n) return;
+  navActivate(where === 'home' ? 0 : n - 1, 0);
+}
+
+const TEXT_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+function typingInAField() {
+  const a = document.activeElement;
+  return !!a && (TEXT_TAGS.has(a.tagName) || a.isContentEditable);
+}
+
+function bindKeys() {
+  window.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // Never steal keys from a text field -- the search box has to keep working.
+    // Escape is the documented way back out to the list.
+    if (typingInAField()) {
+      if (e.key === 'Escape') { document.activeElement.blur(); e.preventDefault(); }
+      return;
+    }
+
+    switch (e.key) {
+      case 'ArrowDown': navMove(1); break;
+      case 'ArrowUp': navMove(-1); break;
+      case 'ArrowRight': navMoveVariant(1); break;
+      case 'ArrowLeft': navMoveVariant(-1); break;
+      case 'PageDown': navMove(10); break;
+      case 'PageUp': navMove(-10); break;
+      case 'Home': navJump('home'); break;
+      case 'End': navJump('end'); break;
+      case '/': $(state.mode === 'files' ? '#file-search' : '#app-search').focus(); break;
+      case '?': toggleHelp(); break;
+      case ' ':
+        if (viewer && viewer.fx.length) { fx.playing ? fxPause() : fxPlay(); }
+        else return;
+        break;
+      case 'Escape': $('#help').classList.add('hidden'); return;
+      default:
+        switch (e.key.toLowerCase()) {
+          case 'l': $('#chk-lock').click(); break;
+          case 'r': $('#btn-reset').click(); break;
+          case 'v': {
+            const next = viewer.viewMode === 'character' ? 'asset' : 'character';
+            setViewMode(next);
+            if (next === 'character') renderFigure();
+            toast(next + ' view');
+            break;
+          }
+          case 'f': focusHead(); break;
+          case 'w': $('#chk-wire').click(); break;
+          case 'g': $('#chk-grid').click(); break;
+          case 's': $('#chk-sockets').click(); break;
+          case 'c': CardPanels.toggleAll(); $('#btn-collapse-all').textContent =
+            CardPanels.anyOpen() ? 'Collapse panels' : 'Expand panels'; break;
+          default: return;
+        }
+    }
+    e.preventDefault();
+  });
+}
+
+/** Zoom to the head socket -- attachments are small and the body is large, so
+ *  inspecting a helmet otherwise means hunting for it. */
+function focusHead() {
+  if (!viewer) return;
+  const a = state.anchors && (state.anchors.v_armet || state.anchors.v_head);
+  if (!a) { toast('no head socket on this asset'); return; }
+  viewer.focusOn(a.pos, viewer.radius * 0.16);
+  toast('focused on the head socket — R to go back');
+}
+
+function toggleHelp() {
+  $('#help').classList.toggle('hidden');
+}
+
+// ------------------------------------------------------------------ facets
+function chip(text, count, on, onClick, cls) {
+  const c = el('span', 'chip' + (on ? ' on' : '') + (count === 0 ? ' zero' : '') +
+                       (cls ? ' ' + cls : ''));
+  c.appendChild(document.createTextNode(text));
+  if (count !== null && count !== undefined) c.appendChild(el('span', 'n', String(count)));
+  if (onClick) c.addEventListener('click', onClick);
+  return c;
+}
+
+function renderFacets(data) {
+  const host = $('#facets');
+  host.innerHTML = '';
+  if (!data.isBodyTable) {
+    // Non-body tables have no class/gender/size axes; only tags apply.
+    renderTagFacet(host, data);
+    return;
+  }
+  for (const axis of ['class', 'gender', 'size']) {
+    const counts = data.facets[axis] || {};
+    const order = (data.facetOrder[axis] || []).filter(v => v in counts || state.sel[axis].has(v));
+    const rest = Object.keys(counts).filter(v => !order.includes(v)).sort();
+    const box = el('div', 'facet-axis');
+    box.appendChild(el('div', 'axis-name', AXIS_LABEL[axis]));
+    for (const v of [...order, ...rest]) {
+      const on = state.sel[axis].has(v);
+      const c = chip(lbl(v), counts[v] || 0, on, () => {
+        on ? state.sel[axis].delete(v) : state.sel[axis].add(v);
+        loadAppearances();
+      });
+      if (axis === 'size' && data.bodyMetrics) {
+        const m = Object.entries(data.bodyMetrics)
+          .filter(([k]) => true).map(([k, mm]) => mm);
+        c.title = 'Body size is the first 3 digits of the appearance id. ' +
+          'Measured heights: 001 female small 168, 002 female large 171, ' +
+          '003 male small 176, 004 male large 196.';
+      }
+      if (axis === 'class') {
+        c.title = v === 'any'
+          ? 'Wearable by every class — the item series has requiredProfession 0 ' +
+            '(basic clothes, event outfits and the modern garments).'
+          : v === 'unknown'
+            ? 'No item in itemtype.json backs this armour series, so no class ' +
+              'can be derived. Shown, never hidden.'
+            : `Derived from itemtype.json requiredProfession for this armour series.`;
+      }
+      box.appendChild(c);
+    }
+    host.appendChild(box);
+  }
+  renderTagFacet(host, data);
+}
+
+function renderTagFacet(host, data) {
+  const counts = data.tagCounts || {};
+  const known = { ...state.vocabulary, ...counts };
+  const names = Object.keys(known).sort((a, b) => (counts[b] || 0) - (counts[a] || 0) ||
+                                                  a.localeCompare(b));
+  const box = el('div', 'facet-axis');
+  box.appendChild(el('div', 'axis-name', 'Your tags'));
+  if (!names.length) {
+    box.appendChild(el('span', 'mut small',
+      'none yet — select an asset and add one in the Tags panel'));
+  }
+  for (const t of names) {
+    const on = state.selTags.has(t);
+    box.appendChild(chip(t, counts[t] || 0, on, () => {
+      on ? state.selTags.delete(t) : state.selTags.add(t);
+      loadAppearances();
+    }, 'tag'));
+  }
+  const U = ' untagged';
+  const onU = state.selTags.has(U);
+  box.appendChild(chip('untagged', null, onU, () => {
+    onU ? state.selTags.delete(U) : state.selTags.add(U);
+    loadAppearances();
+  }, 'tag'));
+  host.appendChild(box);
+}
+
+function clearFilters() {
+  for (const s of Object.values(state.sel)) s.clear();
+  state.selTags.clear();
+  $('#app-search').value = '';
+  loadAppearances();
+}
+
+async function refreshVocabulary() {
+  try {
+    const v = await api('/api/tags');
+    state.vocabulary = v.vocabulary || {};
+  } catch (e) { /* non-fatal */ }
+}
+
+async function bulkTag() {
+  const data = state.lastQuery;
+  if (!data || !data.allSubjects || !data.allSubjects.length) return;
+  const n = data.allSubjects.length;
+  const answer = prompt(
+    `Tag all ${n} matching appearance${n === 1 ? '' : 's'}.\n\n` +
+    `Space-separated tags to ADD. Prefix a tag with "-" to remove it instead.\n` +
+    `Existing tags in use: ${Object.keys(state.vocabulary).join(', ') || '(none)'}`, '');
+  if (!answer) return;
+  const parts = answer.split(/\s+/).filter(Boolean);
+  const add = parts.filter(t => !t.startsWith('-'));
+  const del = parts.filter(t => t.startsWith('-')).map(t => t.slice(1)).filter(Boolean);
+  try {
+    if (add.length) await api('/api/tags', { method: 'POST', body: JSON.stringify(
+      { action: 'add', subjects: data.allSubjects, tags: add }) });
+    if (del.length) await api('/api/tags', { method: 'POST', body: JSON.stringify(
+      { action: 'remove', subjects: data.allSubjects, tags: del }) });
+  } catch (e) { return toast('tagging failed: ' + e.message, 4000); }
+  toast(`tagged ${n} appearance${n === 1 ? '' : 's'}`);
+  await refreshVocabulary();
+  await loadAppearances();
+  if (state.selection && state.selection.kind === 'appearance') {
+    showTagPanel('app:' + state.selection.id);
+  }
+}
+
+async function loadFiles() {
+  const list = $('#file-list');
+  list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
+  const dir = $('#dir-select').value || '';
+  const p = new URLSearchParams({
+    dir: dir === '__all__' ? '' : dir,
+    ext: $('#ext-select').value || '',
+    q: $('#file-search').value.trim(),
+    limit: '300',
+  });
+  const data = await api('/api/files?' + p.toString());
+  state.files = data.rows;
+  list.innerHTML = '';
+  const items = [];
+  for (const r of data.rows) {
+    const idx = items.length;
+    list.appendChild(unifiedRow(r, idx, `${r.source} · ${r.path}`));
+    items.push({ path: r.path, el: list.lastChild });
+  }
+  navSet('files', items);
+  $('#file-more').textContent =
+    `${data.rows.length} shown of ${data.total}` +
+    (data.total > data.rows.length ? ' — narrow with the filter' : '') +
+    (data.unified ? ' · mesh + skins merged into one entry' : '');
+  $('#file-more').title = data.unifiedNote || '';
+}
+
+/** One row of a unified list: the asset, its picture, and -- when a mesh has
+ *  absorbed textures -- a count so the merge is visible rather than silent.
+ *  Clicking still selects the row; the right-hand panel is where the mesh and
+ *  each texture become separately selectable. */
+function unifiedRow(r, index, subtitle) {
+  const row = el('div', 'row-item');
+  const img = el('img');
+  img.loading = 'lazy';
+  img.src = thumbUrl(r.thumb || r.path, { size: 48 });
+  img.addEventListener('error', () => { img.removeAttribute('src'); });
+  const lb = el('div', 'lbl');
+  const head = el('b', null, r.path.split('/').pop());
+  lb.appendChild(head);
+  lb.appendChild(el('span', null, subtitle));
+  if (r.folded) {
+    const f = el('span', 'foldline',
+      `+ ${r.folded} skin${r.folded === 1 ? '' : 's'} in this entry`);
+    f.title = (r.textures || []).join('\n');
+    lb.appendChild(f);
+  }
+  if (r.tags && r.tags.length) lb.appendChild(el('span', 'tagline', '🏷 ' + r.tags.join(', ')));
+  row.append(img, lb);
+  row.addEventListener('click', () => navActivate(index, 0, { immediate: true }));
+  return row;
+}
+
+// ------------------------------------------------------------------ selection
+async function selectAppearance(id) {
+  const tk = tokenNow();
+  state.previewToken = null;
+  let res;
+  try {
+    res = await api(`/api/appearance?id=${encodeURIComponent(id)}` +
+                    `&table=${encodeURIComponent(state.table)}`);
+  } catch (e) { if (stillCurrent(tk)) showError(e.message); return; }
+  if (!stillCurrent(tk)) return;          // the user has already moved on
+  const rec = res[0];
+  const part = rec.parts.find(p => p.mesh) || rec.parts[0];
+  state.selection = { kind: 'appearance', id, table: state.table, rec, part };
+  state.meshPath = part ? part.mesh : null;
+  state.texPath = part ? part.texture : null;
+
+  if (viewer && viewer.viewMode !== 'asset') setViewMode('asset');
+  renderMeshPanelPlaceholder(rec, part);
+  $('#mesh-body').appendChild(loadoutAssignControls(rec, part));
+  showTagPanel('app:' + id);
+  showRelated({ id, table: rec.table });
+  showEffects({ id, table: rec.table }).then(() =>
+    showWeaponMotion({ id, table: rec.table }));
+  $('#card-mappieces').classList.add('hidden');
+  await Promise.all([
+    state.meshPath ? loadMesh(state.meshPath, state.texPath) : clearViewport(
+      part ? `appearance ${id}: mesh ${part.meshId} does not resolve to a shipped file` :
+             `appearance ${id} has no parts`),
+    state.texPath ? showProvenance(state.texPath) : showProvenance(state.meshPath),
+    state.texPath ? showTexturePanel(state.texPath) : clearTexturePanel(),
+  ]);
+}
+
+async function selectFile(path) {
+  const tk = tokenNow();
+  state.previewToken = null;
+  state.selection = { kind: 'file', path };
+  showTagPanel('file:' + path);
+  showRelated({ path });
+  $('#card-effects').classList.add('hidden');
+  fxStop();
+  $('#card-mappieces').classList.add('hidden');
+  if (path.endsWith('.c3')) {
+    state.meshPath = path; state.texPath = null;
+    $('#mesh-body').innerHTML = '';
+    // A bare .c3 has no appearance row telling us which skin belongs to it;
+    // the server inverts the appearance tables to guess one (see c3tex.py).
+    const guessed = await loadMesh(path, null, { guessTexture: true });
+    if (!stillCurrent(tk)) return;
+    if (guessed) {
+      state.texPath = guessed;
+      await applyTexture(guessed, null);
+      await showTexturePanel(guessed, { guessed: true });
+    } else {
+      clearTexturePanel('no texture could be inferred for this mesh — the ' +
+        'appearance tables do not pair it with one. Drawn untextured (white).');
+    }
+  } else {
+    state.texPath = path;
+    await showTexturePanel(path);
+    if (!stillCurrent(tk)) return;
+    // if the texture is referenced by an appearance, offer to load that mesh
+    const pv = await api('/api/provenance?path=' + encodeURIComponent(path));
+    if (!stillCurrent(tk)) return;
+    const ref = (pv.references || []).find(r => r.kind === 'texture');
+    if (ref) {
+      const rec = await api(`/api/appearance?id=${encodeURIComponent(ref.appearance)}` +
+                            `&table=${encodeURIComponent(ref.table)}`);
+      if (!stillCurrent(tk)) return;
+      const part = rec[0].parts.find(p => p.texture === path) || rec[0].parts[0];
+      if (part && part.mesh) { state.meshPath = part.mesh; await loadMesh(part.mesh, path); }
+      else clearViewport('no mesh resolves for this texture');
+    } else {
+      clearViewport('no appearance in the ini tables references this texture, so ' +
+                    'there is no mesh to put it on. The 2D preview is on the right.');
+    }
+  }
+  if (!stillCurrent(tk)) return;
+  await showProvenance(path);
+}
+
+function clearViewport(msg) {
+  if (viewer) { viewer.clear(); viewer.draw(); }
+  $('#gl-msg').textContent = msg || '';
+  $('#gl-msg').classList.toggle('hidden', !msg);
+  $('#gl-stats').textContent = '';
+  $('#frame-wrap').classList.add('hidden');
+}
+
+// ------------------------------------------------------------------ mesh
+async function loadMesh(meshPath, texPath, { guessTexture = false } = {}) {
+  const tk = tokenNow();
+  $('#gl-msg').textContent = 'loading mesh…';
+  $('#gl-msg').classList.remove('hidden');
+  let data;
+  try {
+    data = await api('/api/mesh?path=' + encodeURIComponent(meshPath) +
+                     (guessTexture ? '&guesstex=1' : ''));
+  } catch (e) {
+    if (stillCurrent(tk)) clearViewport('mesh load failed: ' + e.message);
+    return null;
+  }
+  // A mesh that arrived for an abandoned selection must never reach the viewport.
+  if (!stillCurrent(tk)) return null;
+  state.meshData = data;
+  if (guessTexture && data.guessedTexture) texPath = data.guessedTexture;
+
+  const defs = data.meshes.map(m => ({ meta: m, textureKey: texPath ? 'main' : null }));
+  viewer.setMeshes(defs);
+
+  if (texPath) await applyTexture(texPath, state.previewToken);
+
+  $('#gl-msg').classList.add('hidden');
+  $('#gl-stats').textContent = viewer.stats;
+
+  // The C3Key alpha track's own last keyframe is the useful range. C3Phy+0x190
+  // ("frameCount") is 0/1/2 on meshes whose alpha keys run out to frame 70, so
+  // it is not the animation length and must not drive the slider.
+  const keyFrames = data.meshes.flatMap(m => m.keys.alphas.map(k => k.frame));
+  const maxFrame = Math.max(0, ...keyFrames);
+  const hasKeys = keyFrames.length > 1;
+  $('#frame-wrap').classList.toggle('hidden', !(hasKeys && maxFrame > 0));
+  if (hasKeys && maxFrame > 0) {
+    const s = $('#frame-slider');
+    s.max = maxFrame; s.value = 0;
+    viewer.opts.frame = 0;
+    $('#frame-label').textContent = `0 / ${maxFrame}`;
+  } else {
+    viewer.opts.frame = 0;
+  }
+  renderMeshPanel(data);
+  viewer.draw();
+  return texPath;
+}
+
+async function applyTexture(texPath, previewToken) {
+  const tk = tokenNow();
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      // a texture decoded for a selection the user has left must not be applied
+      if (!stillCurrent(tk)) return resolve(false);
+      viewer.setTexture('main', img);
+      viewer.draw();
+      resolve(true);
+    };
+    img.onerror = () => { resolve(false); };
+    img.src = texUrl(texPath, { preview: previewToken });
+  });
+}
+
+function renderMeshPanelPlaceholder(rec, part) {
+  const b = $('#mesh-body');
+  b.innerHTML = '';
+  b.appendChild(kv([
+    ['appearance', rec.id],
+    ['table', `${rec.table} (${rec.ini})`],
+    ['parts', rec.parts.length],
+    ['material', part ? part.material : ''],
+  ]));
+  if (rec.parts.length > 1) {
+    const p = el('div', 'small mut',
+      'This appearance has several parts. The viewport shows part ' +
+      (part ? part.index : 0) + '; the others are listed under Where this comes from.');
+    b.appendChild(p);
+  }
+}
+
+function renderMeshPanel(data) {
+  const b = $('#mesh-body');
+  const head = kv([
+    ['file', data.path],
+    ['chunks', `${data.chunkCount} (${data.meshes.length} PHY)`],
+  ]);
+  b.appendChild(head);
+
+  const ul = el('ul', 'chunks');
+  data.meshes.forEach((m, i) => {
+    const li = el('li');
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = !m.isSocket;
+    cb.addEventListener('change', () => {
+      const entry = viewer.meshes.find(x => x.meta.index === m.index);
+      if (entry) { entry.visible = cb.checked; viewer.draw(); }
+    });
+    const lab = el('label', 'chk');
+    lab.appendChild(cb);
+    lab.appendChild(el('span', null,
+      `${m.name || '(unnamed)'} — ${m.tag}` + (m.isSocket ? '  [socket]' : '')));
+    li.appendChild(lab);
+    const flags = [];
+    flags.push(`${m.vertexCount} verts (${m.vertexCountA}+${m.vertexCountB})`);
+    flags.push(`${m.faceCount} tris`);
+    if (m.bones.length) flags.push(`${m.bones.length} bones`);
+    if (m.skinned) flags.push('skinned');
+    if (m.twoSided) flags.push('2SID two-sided');
+    if (m.billboard) flags.push('billboard ' + m.billboard);
+    if (!m.matrixIdentity) flags.push('non-identity matrix (applied)');
+    if (!m.normalsFromFile) flags.push('normals generated');
+    if (m.isC3ExpColor) flags.push('C3EXP_COLOR');
+    if (m.keys.alphas.length) flags.push(`${m.keys.alphas.length} alpha keys`);
+    if (m.keys.changeTexs.length) flags.push(`${m.keys.changeTexs.length} chgtex keys`);
+    li.appendChild(el('div', 'flags', flags.join(' · ')));
+    if (m.label) {
+      const lb = el('div', 'lab', '3DSMax source: ' + m.label);
+      lb.title = 'The PHY chunk label is normally the texture path from the ' +
+                 'original 3DSMax export — what this mesh was authored against.';
+      li.appendChild(lb);
+    }
+    ul.appendChild(li);
+  });
+  b.appendChild(ul);
+
+  if (data.otherChunks.length) {
+    const o = el('div', 'small mut');
+    o.textContent = 'other chunks: ' +
+      data.otherChunks.map(c => `${c.tag}(${c.size}B)`).join(', ');
+    b.appendChild(o);
+  }
+}
+
+// ------------------------------------------------------------------ provenance
+async function showProvenance(path) {
+  const b = $('#prov-body');
+  if (!path) { b.textContent = 'nothing selected'; return; }
+  b.textContent = 'loading…';
+  let pv;
+  try { pv = await api('/api/provenance?path=' + encodeURIComponent(path)); }
+  catch (e) { b.textContent = 'error: ' + e.message; return; }
+
+  b.innerHTML = '';
+  const badge = el('span', 'badge ' +
+    (!pv.exists ? 'none' : pv.source === 'loose' ? 'loose' : 'arc'),
+    !pv.exists ? 'NOT FOUND' :
+    pv.source === 'loose' ? 'LOOSE FILE WINS' : `FROM ${pv.source.toUpperCase()}`);
+  const line = el('div');
+  line.appendChild(badge);
+  if (pv.staged) {
+    line.appendChild(document.createTextNode(' '));
+    line.appendChild(el('span', 'badge stage', 'STAGED MOD PENDING'));
+  }
+  b.appendChild(line);
+
+  const note = el('div', 'small mut');
+  note.style.marginTop = '6px';
+  note.textContent = pv.source === 'loose'
+    ? (pv.overriding
+        ? `A loose file on disk is overriding the copy inside ${pv.shadowed_archive}. The game reads the loose one.`
+        : 'This asset only exists as a loose file on disk; there is no archive copy.')
+    : pv.exists
+      ? 'No loose file shadows this, so the game reads it out of the archive. Dropping a file at this path would override it.'
+      : 'The client cannot resolve this path at all.';
+  b.appendChild(note);
+
+  const rows = [
+    ['logical', pv.logical],
+    ['resolves to', pv.source || '—'],
+    ['on disk', pv.real_path],
+    ['size', pv.size ? pv.size.toLocaleString() + ' bytes' : ''],
+    ['name hash', pv.name_hash],
+  ];
+  if (pv.archive_offset >= 0)
+    rows.push(['archive slice', `offset ${pv.archive_offset.toLocaleString()}, ` +
+                                `${pv.archive_size.toLocaleString()} bytes`]);
+  if (pv.overriding)
+    rows.push(['shadowing', `${pv.shadowed_archive} copy (${pv.shadowed_size.toLocaleString()} bytes)`]);
+  if (pv.dds)
+    rows.push(['format', `${pv.dds.width}x${pv.dds.height} ${pv.dds.format}` +
+                          ` mips=${pv.dds.mipmaps}${pv.dds.has_alpha ? ' +alpha' : ''}`]);
+  if (pv.staged)
+    rows.push(['staged file', pv.stagedPath]);
+  b.appendChild(kv(rows));
+
+  if (pv.referenceCount) {
+    const h = el('div', 'small mut');
+    h.style.marginTop = '8px';
+    h.textContent = `referenced by ${pv.referenceCount} appearance entr` +
+                    (pv.referenceCount === 1 ? 'y' : 'ies') + ':';
+    b.appendChild(h);
+    const list = el('div', 'small');
+    list.style.cssText = 'max-height:96px;overflow:auto;font-family:var(--mono);font-size:11px';
+    list.textContent = pv.references
+      .map(r => `${r.appearance} (${r.table}/${r.ini}, part ${r.part}, as ${r.kind})`)
+      .join('\n');
+    b.appendChild(list);
+  }
+
+  if (pv.commands && pv.commands.length) {
+    const h = el('div', 'small mut');
+    h.style.marginTop = '8px';
+    h.textContent = 'next actions — click to copy:';
+    b.appendChild(h);
+    pv.commands.forEach(c => b.appendChild(cmdBlock(c)));
+  }
+}
+
+// ------------------------------------------------------------------ tag panel
+function clearTagPanel(msg) {
+  $('#tags-body').innerHTML = '';
+  $('#tags-body').appendChild(el('div', 'mut', msg || 'nothing selected'));
+}
+
+/** The Tags card for one subject.
+ *  Derived tags (green, from bodyfacets.py) are recomputed server-side on every
+ *  request and are never written to tags.json, so nothing automatic can ever
+ *  overwrite a tag the user typed. */
+async function showTagPanel(subject) {
+  const b = $('#tags-body');
+  b.innerHTML = '';
+  let data;
+  try { data = await api('/api/tags?subject=' + encodeURIComponent(subject)); }
+  catch (e) { b.appendChild(el('div', 'err', e.message)); return; }
+
+  if (data.auto && data.auto.length) {
+    const head = el('div', 'small mut', 'derived automatically — not editable, recomputed each time');
+    b.appendChild(head);
+    const row = el('div', 'tagrow');
+    for (const t of data.auto) row.appendChild(chip(t, null, false, null, 'auto'));
+    b.appendChild(row);
+  }
+
+  const head2 = el('div', 'small mut', 'your tags');
+  head2.style.marginTop = '9px';
+  b.appendChild(head2);
+  const row = el('div', 'tagrow');
+  if (!data.tags.length) row.appendChild(el('span', 'mut small', 'none yet'));
+  for (const t of data.tags) {
+    const c = chip(t, null, true, null, 'tag');
+    const x = el('span', 'x', '×');
+    x.title = 'remove this tag';
+    x.addEventListener('click', async ev => {
+      ev.stopPropagation();
+      await api('/api/tags', { method: 'POST', body: JSON.stringify(
+        { action: 'remove', subjects: [subject], tags: [t] }) });
+      await refreshVocabulary();
+      await showTagPanel(subject);
+      loadAppearances();
+    });
+    c.appendChild(x);
+    row.appendChild(c);
+  }
+  b.appendChild(row);
+
+  const input = el('input');
+  input.type = 'text';
+  input.placeholder = 'add tags (space separated), Enter to save';
+  input.setAttribute('list', 'tagvocab');
+  input.addEventListener('keydown', async e => {
+    if (e.key !== 'Enter') return;
+    const tags = input.value.split(/\s+/).filter(Boolean);
+    if (!tags.length) return;
+    input.value = '';
+    try {
+      await api('/api/tags', { method: 'POST', body: JSON.stringify(
+        { action: 'add', subjects: [subject], tags }) });
+    } catch (err) { return toast(err.message, 4000); }
+    await refreshVocabulary();
+    await showTagPanel(subject);
+    loadAppearances();
+  });
+  b.appendChild(input);
+
+  let dl = document.getElementById('tagvocab');
+  if (!dl) { dl = el('datalist'); dl.id = 'tagvocab'; document.body.appendChild(dl); }
+  dl.innerHTML = '';
+  for (const t of Object.keys(state.vocabulary)) {
+    const o = el('option'); o.value = t; dl.appendChild(o);
+  }
+
+  const note = el('textarea');
+  note.placeholder = 'note (free text, saved with the tags)';
+  note.value = data.note || '';
+  let noteTimer;
+  note.addEventListener('input', () => {
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(() => api('/api/tags', { method: 'POST', body: JSON.stringify(
+      { action: 'note', subjects: [subject], note: note.value }) })
+      .then(() => toast('note saved', 1200))
+      .catch(e => toast(e.message, 3000)), 800);
+  });
+  b.appendChild(note);
+
+  const foot = el('div', 'small mut');
+  foot.style.marginTop = '6px';
+  foot.textContent = 'subject: ' + subject;
+  b.appendChild(foot);
+}
+
+// ------------------------------------------------------------------ texture panel
+function clearTexturePanel(msg) {
+  $('#tex-body').innerHTML = '';
+  $('#tex-body').appendChild(el('div', 'mut', msg || 'nothing selected'));
+}
+
+async function showTexturePanel(path, { guessed = false } = {}) {
+  const b = $('#tex-body');
+  b.innerHTML = '';
+  const img = el('img', 'texpreview');
+  img.src = texUrl(path, { preview: state.previewToken });
+  img.alt = path;
+  b.appendChild(img);
+  b.appendChild(el('div', 'small mut', path));
+  if (guessed) {
+    const g = el('div', 'small mut',
+      'Inferred from the appearance tables — this mesh is not opened through a ' +
+      'specific appearance, and many appearances share one mesh with different ' +
+      'skins, so another texture may be the one you want.');
+    g.style.marginTop = '4px';
+    b.appendChild(g);
+  }
+
+  // --- swap controls ---------------------------------------------------
+  const row = el('div', 'row');
+  const file = el('input');
+  file.type = 'file';
+  file.accept = '.png,.dds,.bmp,.jpg,.jpeg,.tga,image/*';
+  file.style.cssText = 'font-size:11px;max-width:100%';
+  row.appendChild(file);
+  b.appendChild(row);
+
+  const fmtRow = el('div', 'row');
+  const fmt = el('select');
+  fmt.style.width = 'auto';
+  for (const f of ['(match original)', 'DXT1', 'DXT3', 'DXT5']) {
+    const o = el('option', null, f); o.value = (f[0] === '(' ? '' : f); fmt.appendChild(o);
+  }
+  const fl = el('label', null, 'DDS format');
+  fl.appendChild(fmt);
+  fmtRow.appendChild(fl);
+  b.appendChild(fmtRow);
+
+  const msg = el('div');
+  b.appendChild(msg);
+
+  const btnRow = el('div', 'row');
+  const bStage = el('button', 'primary', 'Stage this swap');
+  const bRevert = el('button', 'ghost', 'Discard preview');
+  bStage.disabled = true; bRevert.disabled = true;
+  btnRow.append(bStage, bRevert);
+  b.appendChild(btnRow);
+
+  file.addEventListener('change', async () => {
+    const f = file.files[0];
+    if (!f) return;
+    msg.innerHTML = '';
+    const buf = await f.arrayBuffer();
+    let res;
+    try {
+      res = await api(`/api/preview?path=${encodeURIComponent(path)}` +
+                      `&name=${encodeURIComponent(f.name)}` +
+                      `&format=${encodeURIComponent(fmt.value)}`,
+                      { method: 'POST', body: buf });
+    } catch (e) {
+      msg.appendChild(el('div', 'err', 'preview failed: ' + e.message));
+      return;
+    }
+    state.previewToken = res.token;
+    img.src = texUrl(path, { preview: res.token }) + '&t=' + Date.now();
+    if (state.meshPath) await applyTexture(path, res.token);
+    msg.appendChild(el('div', 'small',
+      `previewing ${f.name} → ${res.info.width}x${res.info.height} ${res.info.format}, ` +
+      `${res.bytes.toLocaleString()} bytes. Nothing has been written to the game.`));
+    for (const w of res.warnings) msg.appendChild(el('div', 'warn', '⚠ ' + w));
+    bStage.disabled = false; bRevert.disabled = false;
+  });
+
+  bRevert.addEventListener('click', async () => {
+    state.previewToken = null;
+    img.src = texUrl(path) + '&t=' + Date.now();
+    if (state.meshPath) await applyTexture(path, null);
+    msg.innerHTML = '';
+    bStage.disabled = true; bRevert.disabled = true;
+    file.value = '';
+  });
+
+  bStage.addEventListener('click', async () => {
+    if (!state.previewToken) return;
+    try {
+      const r = await api(`/api/stage?path=${encodeURIComponent(path)}` +
+                          `&token=${state.previewToken}`, { method: 'POST' });
+      toast('staged → ' + r.staged);
+      await showProvenance(path);
+      openDrawer();
+    } catch (e) { msg.appendChild(el('div', 'err', 'stage failed: ' + e.message)); }
+  });
+}
+
+/** Save the current viewport frame to out/viewer/shots/. The canvas is created
+ *  with preserveDrawingBuffer so toDataURL always has a valid frame. */
+async function saveShot(name) {
+  if (!viewer) return null;
+  const base = typeof name === 'string' && name
+    ? name
+    : (state.meshPath || state.texPath || 'viewport')
+        .replace(/[^a-z0-9]+/gi, '_').replace(/^_|_$/g, '');
+  const url = viewer.snapshot();
+  try {
+    const r = await api('/api/snapshot?name=' + encodeURIComponent(base),
+                        { method: 'POST', body: url });
+    toast('saved ' + r.file, 3000);
+    return r.file;
+  } catch (e) { toast('snapshot failed: ' + e.message, 4000); return null; }
+}
+window.saveShot = saveShot;
+
+function showError(m) {
+  clearViewport(m);
+  toast(m, 4000);
+}
+
+// ------------------------------------------------------------------ mod drawer
+async function openDrawer() {
+  $('#drawer').classList.remove('hidden');
+  await refreshStage();
+}
+
+async function refreshStage() {
+  const data = await api('/api/stage');
+  const host = $('#stage-list');
+  host.innerHTML = '';
+  if (!data.rows.length) {
+    host.appendChild(el('p', 'mut', 'Nothing staged yet. Pick a texture, load a ' +
+      'replacement image, then press "Stage this swap".'));
+    return;
+  }
+  const t = el('table', 'stage');
+  t.innerHTML = '<tr><th>status<th>logical path<th>orig<th>new<th>from<th></tr>';
+  for (const r of data.rows) {
+    const tr = el('tr');
+    const st = el('td');
+    st.appendChild(el('span', 'badge ' + (r.status === 'MODIFIED' ? 'stage' :
+                                          r.status === 'NEW' ? 'loose' : 'arc'), r.status));
+    tr.appendChild(st);
+    tr.appendChild(el('td', null, r.logical));
+    tr.appendChild(el('td', null, r.oldBytes ? r.oldBytes.toLocaleString() : '—'));
+    tr.appendChild(el('td', null, r.newBytes.toLocaleString()));
+    tr.appendChild(el('td', null, r.originalSource || '—'));
+    const act = el('td');
+    const rm = el('button', 'ghost', 'unstage');
+    rm.addEventListener('click', async () => {
+      await api('/api/unstage?path=' + encodeURIComponent(r.logical), { method: 'POST' });
+      await refreshStage();
+      if (state.texPath) showProvenance(state.texPath);
+    });
+    act.appendChild(rm);
+    tr.appendChild(act);
+    t.appendChild(tr);
+  }
+  host.appendChild(t);
+}
+
+async function runMod(url) {
+  const out = $('#mod-output');
+  out.textContent = 'running…';
+  try {
+    const r = await api(url, { method: 'POST' });
+    out.textContent = `$ ${r.cmd}\n\n${r.stdout}${r.stderr ? '\n' + r.stderr : ''}` +
+                      `\n[exit ${r.returncode}]`;
+  } catch (e) { out.textContent = 'failed: ' + e.message; }
+  await refreshStage();
+  const st = await api('/api/status');
+  state.status = st;
+}
+
+boot().catch(e => {
+  document.getElementById('statusline').textContent = 'startup failed: ' + e.message;
+  console.error(e);
+});

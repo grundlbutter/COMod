@@ -1,0 +1,124 @@
+/* mapedit.css -- the MapEditor page.
+ *
+ * THE ONE RULE, INHERITED
+ * -----------------------
+ * `ui.css` carries no literal colour and a test enforces it; the same
+ * discipline applies here. Every colour below resolves through one of
+ * `style.css`'s `:root` tokens (`--bg`, `--panel`, `--panel2`, `--line`,
+ * `--fg`, `--mut`, `--accent`, `--good`, `--warn`, `--bad`, `--mono`), so
+ * re-theming the viewer re-themes the map editor, and
+ * `test_viewer.py::MapEditorUi` fails the build on a hex literal here.
+ *
+ * The map canvas itself is *not* skinned, and must not be: it draws the
+ * game's own art at the game's own projection, and tinting it would be
+ * lying about the asset.
+ */
+
+#mapwrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The checkerboard says "transparent", which matters here: with the ground
+ * layer off you are looking through the map, not at a black one. */
+#mapcanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(45deg, var(--panel2) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--panel2) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--panel2) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--panel2) 75%);
+  background-size: 24px 24px;
+  background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+}
+#mapcanvas.dragging { cursor: grabbing; }
+#mapcanvas.painting { cursor: crosshair; }
+
+#maphud {
+  position: absolute;
+  left: 10px; bottom: 10px;
+  display: flex; gap: 10px; align-items: center;
+  padding: 5px 9px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 11px/1.4 var(--mono);
+  color: var(--mut);
+  pointer-events: none;
+}
+#maphud b { color: var(--fg); font-weight: 600; }
+
+#mapmsg {
+  position: absolute;
+  inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  text-align: center;
+  padding: 24px;
+  color: var(--mut);
+  pointer-events: none;
+}
+#mapmsg.hidden { display: none; }
+
+/* -- left rail ---------------------------------------------------------- */
+
+.layerbox { display: flex; flex-direction: column; gap: 3px; }
+.layerbox .lrow {
+  display: flex; align-items: center; gap: 7px;
+  padding: 4px 6px; border-radius: 4px;
+  border: 1px solid transparent;
+}
+.layerbox .lrow:hover { background: var(--panel2); }
+.layerbox .lrow.on { border-color: var(--line); }
+.layerbox .lrow span.name { flex: 1; }
+.layerbox .lrow span.count { color: var(--mut); font: 11px var(--mono); }
+
+.maprow {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 5px 7px; border-radius: 4px; cursor: pointer;
+  border: 1px solid transparent;
+}
+.maprow:hover { background: var(--panel2); }
+.maprow.sel { background: var(--panel2); border-color: var(--accent); }
+.maprow.undrawable { opacity: .62; }
+.maprow .nm { flex: 1; }
+.maprow .sz { color: var(--mut); font: 11px var(--mono); }
+
+.zoomrow { display: flex; gap: 4px; align-items: center; }
+.zoomrow button { flex: 0 0 auto; }
+.zoomrow .z { flex: 1; text-align: center; font: 11px var(--mono); color: var(--mut); }
+
+/* -- inspector ---------------------------------------------------------- */
+
+.insp { display: flex; flex-direction: column; gap: 3px; }
+.insp .r { display: grid; grid-template-columns: 132px 1fr; gap: 8px; align-items: baseline; }
+.insp .r > .k { color: var(--mut); font-size: 11px; }
+.insp .r > .v { word-break: break-word; white-space: pre-wrap; }
+.insp .r > .v.mono { font: 11px/1.5 var(--mono); }
+.insp .note { color: var(--mut); font-size: 11px; margin-top: 1px; }
+.insp .assetlink {
+  background: none; border: none; padding: 0; margin: 0;
+  color: var(--accent); cursor: pointer; font: inherit; text-align: left;
+}
+
+.badge.free { background: var(--panel2); color: var(--good); border-color: var(--good); }
+.badge.checked { background: var(--panel2); color: var(--warn); border-color: var(--warn); }
+
+.gate {
+  border: 1px solid var(--warn);
+  border-radius: 5px;
+  padding: 9px;
+  background: var(--panel2);
+}
+.gate h3 { margin: 0 0 5px; font-size: 12px; color: var(--warn); }
+.gate p { margin: 0 0 7px; font-size: 11px; color: var(--mut); }
+
+.pendlist { max-height: 130px; overflow: auto; font: 11px var(--mono); color: var(--mut); }

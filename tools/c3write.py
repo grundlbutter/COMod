@@ -1,0 +1,601 @@
+r"""
+c3write.py -- serializer for the C3 `PHY*` chunk body and the MAXFILE C3
+container.  The inverse of `core/c3phy.py`.
+
+Design rule: **byte-exactness first.**  Anything the loader reads but does not
+interpret -- the 36-byte legacy gap, `unknown0`, the raw name/label bytes, the
+unsorted bounding-box pair, the A/B count split -- is carried through verbatim
+by `c3phy.parse_phy` and re-emitted here unchanged.  The gate for this file is
+`tests/test_roundtrip.py`: parse every PHY chunk in the corpus, re-serialize,
+and require the bytes to be identical.
+
+    from c3phy import parse_phy
+    from c3write import serialize_phy
+    assert serialize_phy(parse_phy(tag, body)) == body
+
+Field order is exactly `docs/modding.md` section 9.4, which was recovered from
+`graphic.dll!Phy_Load`.  Nothing here is guessed; every write mirrors a read
+whose RVA is cited in c3phy.py.
+
+CLI:
+
+    py -3 tools/c3write.py verify <file.c3> [...]     # round-trip one or more
+    py -3 tools/c3write.py corpus [--limit N]         # the full corpus gate
+"""
+
+from __future__ import annotations
+
+import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+
+from c3phy import (                                              # noqa: E402
+    C3_MAGIC, LEGACY_GAP, VARIANTS, VERTEX_STRIDE,
+    C3Key, PhyMesh, Vertex, iter_chunks, parse_phy,
+)
+
+__all__ = [
+    "serialize_phy", "build_c3", "replace_phy_chunks",
+    "recompute_bounds", "PhyWriteError",
+]
+
+
+class PhyWriteError(ValueError):
+    pass
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def _u32(v: int) -> bytes:
+    if not (0 <= int(v) <= 0xFFFFFFFF):
+        raise PhyWriteError(f"u32 out of range: {v}")
+    return struct.pack("<I", int(v))
+
+
+def _f(v: float) -> bytes:
+    return struct.pack("<f", v)
+
+
+def _f3(t) -> bytes:
+    return struct.pack("<3f", *t)
+
+
+def _name_bytes(m: PhyMesh) -> bytes:
+    """The nameLen-prefixed name.
+
+    `name_raw` is what was actually on disk (it can carry bytes after an
+    embedded NUL, and it is *not* NUL-terminated by rule -- the length prefix
+    is authoritative).  Prefer it; fall back to encoding `name` when a mesh was
+    built from scratch.
+    """
+    if m.name_raw:
+        return m.name_raw
+    return m.name.encode("latin-1", "replace")
+
+
+def _label_bytes(m: PhyMesh) -> bytes:
+    """The labelLen-prefixed label.
+
+    Usually the original 3DSMax source-texture path, and very often GBK.  The
+    parser decodes it latin-1 (a byte-preserving codec), so re-encoding latin-1
+    is lossless; but `label_raw` is used when present so no codec is involved
+    at all.
+    """
+    if m.label_raw:
+        return m.label_raw
+    return m.label.encode("latin-1", "replace")
+
+
+# --------------------------------------------------------------------------
+# vertices
+# --------------------------------------------------------------------------
+
+def _encode_vertex(v: Vertex, has_normal: bool, has_uv1: bool,
+                   legacy_gap: bool, step: bool) -> bytes:
+    """Rebuild the 60-byte in-memory image, then slice out the on-disk record.
+
+    Mirrors `_decode_vertex` + the per-variant read pattern in section 9.2:
+
+        has_normal && legacy_gap :  0x0C, gap 0x24, 0x28
+        has_normal && step       :  0x3C in one block
+        has_normal               :  0x34
+        !has_normal && legacy_gap:  0x0C, gap 0x24, 0x1C
+        !has_normal              :  0x28
+    """
+    img = bytearray(VERTEX_STRIDE)
+    struct.pack_into("<5f", img, 0x00, v.px, v.py, v.pz, v.u0, v.v0)
+    struct.pack_into("<3I", img, 0x14,
+                     int(v.unknown4) & 0xFFFFFFFF,
+                     int(v.bone0) & 0xFFFFFFFF,
+                     int(v.bone1) & 0xFFFFFFFF)
+    struct.pack_into("<2f", img, 0x20, v.weight0, v.weight1)
+    if has_normal:
+        struct.pack_into("<3f", img, 0x28, v.nx, v.ny, v.nz)
+    if has_uv1:
+        struct.pack_into("<2f", img, 0x34, v.u1, v.v1)
+
+    if step:
+        return bytes(img)                       # whole 0x3C block
+
+    tail = 0x28 if has_normal else 0x1C
+    if legacy_gap:
+        gap = v.gap or b"\x00" * LEGACY_GAP
+        if len(gap) != LEGACY_GAP:
+            gap = (gap + b"\x00" * LEGACY_GAP)[:LEGACY_GAP]
+        return bytes(img[0x00:0x0C]) + gap + bytes(img[0x0C:0x0C + tail])
+    return bytes(img[0x00:0x0C + tail])
+
+
+# --------------------------------------------------------------------------
+# the chunk body
+# --------------------------------------------------------------------------
+
+def serialize_phy(m: PhyMesh, *, tag: bytes | None = None) -> bytes:
+    """Serialize a `PhyMesh` back to a PHY chunk body.
+
+    For a mesh straight out of `parse_phy` with nothing changed, the result is
+    byte-identical to the input.
+    """
+    tag = tag or m.tag
+    if isinstance(tag, str):
+        tag = tag.encode()
+    if tag not in VARIANTS:
+        raise PhyWriteError(f"not a known PHY variant: {tag!r}")
+    var = VARIANTS[tag]
+    has_normal = var["has_normal"]
+    has_uv1 = var["step"]
+
+    out = bytearray()
+
+    # ---- name -------------------------------------------------------------
+    nb = _name_bytes(m)
+    out += _u32(len(nb))
+    out += nb
+
+    # ---- unknown0 + the two-u32 vertex count split ------------------------
+    # `unknown0` is read and never used by the engine (values 0/1/2 observed).
+    # Preserved rather than forced to 0 so unmodified meshes stay byte-exact.
+    out += _u32(m.unknown0)
+
+    n_verts = len(m.vertices)
+    a, b = int(m.vertex_count_a), int(m.vertex_count_b)
+    if a + b != n_verts:
+        # Geometry changed.  Keep the partition when it is still expressible
+        # (edits that only touched group B, or only group A), else collapse to
+        # a single group -- the loader adds them, so this is always valid.
+        if b and n_verts >= a:
+            b = n_verts - a
+        else:
+            a, b = n_verts, 0
+    out += _u32(a)
+    out += _u32(b)
+
+    # ---- vertices ---------------------------------------------------------
+    for v in m.vertices:
+        out += _encode_vertex(v, has_normal, has_uv1,
+                              var["legacy_gap"], var["step"])
+
+    # ---- the two-u32 face count split, then the u16 index block -----------
+    n_faces = len(m.faces)
+    fa, fb = int(m.face_count_a), int(m.face_count_b)
+    if fa + fb != n_faces:
+        if fb and n_faces >= fa:
+            fb = n_faces - fa
+        else:
+            fa, fb = n_faces, 0
+    out += _u32(fa)
+    out += _u32(fb)
+
+    if n_verts > 0xFFFF:
+        raise PhyWriteError(
+            f"{n_verts} vertices exceeds the u16 index limit of 65535")
+    flat = []
+    for f in m.faces:
+        if len(f) != 3:
+            raise PhyWriteError("faces must be triangles (triangle LIST)")
+        for i in f:
+            if not (0 <= i <= 0xFFFF):
+                raise PhyWriteError(f"index {i} out of u16 range")
+            flat.append(int(i))
+    out += struct.pack(f"<{len(flat)}H", *flat)
+
+    # ---- label ------------------------------------------------------------
+    lb = _label_bytes(m)
+    out += _u32(len(lb))
+    out += lb
+
+    # ---- bounding box (stored as an unsorted pair) ------------------------
+    # The loader sorts componentwise, so either order loads the same; write
+    # back the original pair when we have it so unmodified meshes match.
+    if m.bbox_a and m.bbox_b:
+        out += _f3(m.bbox_a) + _f3(m.bbox_b)
+    else:
+        out += _f3(m.bbox_min) + _f3(m.bbox_max)
+
+    # ---- the 4x4 matrix ---------------------------------------------------
+    mat = tuple(m.matrix) if m.matrix else (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0)
+    if len(mat) != 16:
+        raise PhyWriteError(f"matrix must be 16 floats, got {len(mat)}")
+    out += struct.pack("<16f", *mat)
+
+    # ---- frame count + the three C3Key channels ---------------------------
+    out += _u32(m.frame_count)
+    keys = m.keys or C3Key()
+    for slot in ("alphas", "draws", "change_texs"):
+        arr = getattr(keys, slot) or []
+        out += _u32(len(arr))
+        for rec in arr:
+            if len(rec) != 16:
+                raise PhyWriteError(f"C3Key {slot} record must be 16 bytes")
+            out += rec
+
+    # ---- optional trailing tags, in the loader's probe order --------------
+    if m.step is not None:
+        out += b"STEP" + _u32(m.step[0]) + _u32(m.step[1])
+    if m.two_sided:
+        out += b"2SID"
+    if m.billboard:
+        out += (b"BILB", b"BIB2", b"BIB3", b"BIB4")[m.billboard - 1]
+
+    # PHY5's STEP1/STEP2 region is kept verbatim: no PHY5 chunk ships in this
+    # build, so the structural write path is unvalidated and re-emitting the
+    # original bytes is the only honest option.
+    if var["step"] and m.phy5_raw:
+        out += m.phy5_raw
+
+    # Anything the parser did not consume.  Corpus-wide this is empty.
+    if m.tail_raw:
+        out += m.tail_raw
+
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------
+# container
+# --------------------------------------------------------------------------
+
+def build_c3(chunks) -> bytes:
+    """Build a MAXFILE C3 container from an iterable of (tag, body)."""
+    out = bytearray(C3_MAGIC)
+    for tag, body in chunks:
+        if isinstance(tag, str):
+            tag = tag.encode()
+        if len(tag) != 4:
+            raise PhyWriteError(f"chunk tag must be 4 bytes: {tag!r}")
+        out += tag + _u32(len(body)) + body
+    return bytes(out)
+
+
+def replace_phy_chunks(original: bytes, meshes) -> bytes:
+    """Rebuild a .c3, substituting the PHY chunks with `meshes` in order.
+
+    Non-PHY chunks (MOTI, CAME, PTCL, ...) pass through untouched, which is
+    what makes an import/export cycle safe: the addon only ever understands
+    the geometry chunks.
+
+    Strict: the mesh count must equal the original's PHY count.  For adding or
+    removing meshes use `rebuild_c3(..., allow_structural=True)`.
+    """
+    it = iter(meshes)
+    out = []
+    for tag, body in iter_chunks(original):
+        if tag in VARIANTS:
+            try:
+                m = next(it)
+            except StopIteration:
+                raise PhyWriteError(
+                    "fewer meshes supplied than PHY chunks in the original")
+            out.append((m.tag or tag, serialize_phy(m)))
+        else:
+            out.append((tag, body))
+    for _extra in it:
+        raise PhyWriteError(
+            "more meshes supplied than PHY chunks in the original")
+    return build_c3(out)
+
+
+# --------------------------------------------------------------------------
+# adding and removing whole meshes
+#
+# A PHY chunk is bound to a MOTI chunk POSITIONALLY: the i-th PHY in a
+# container is animated by the i-th MOTI.  Established two ways --
+#
+#   * code: `graphic.dll!MeshCreate` (RVA 0x28360) loads the geometry and then
+#     calls `MotionCreate` (0x28470) on the SAME file, and the combined walker
+#     `sub_28D5B` dispatches each chunk on its tag into a per-tag list.  Only
+#     the relative order WITHIN a tag matters, which is why both the
+#     interleaved `PMPMPM...` and the grouped `PPPP MMMM` layouts work.
+#   * data: on all 792 multi-mesh containers the i-th MOTI's `boneCount` covers
+#     the i-th PHY's bone palette; a reversed or shifted pairing only fits 34%.
+#
+# and every container that has any PHY has exactly as many MOTI chunks --
+# 5,083 of 5,083, no exceptions.  So a writer that changes the mesh count MUST
+# change the motion count identically, or the pairing shears.
+#
+# See docs/modding.md section 11 for the full derivation, including why this is
+# still NOT safe for meshes driven by a shared external motion set.
+# --------------------------------------------------------------------------
+
+MOTI_TAG = b"MOTI"
+
+_IDENTITY_MAT = struct.pack(
+    "<16f", 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+
+def synth_moti(bone_count: int, frame_count: int = 1) -> bytes:
+    """A neutral MOTI: one KKEY key at frame 0, identity for every bone.
+
+    `Motion_GetMatrix` clamps to key 0 for every frame when there is only one
+    key (RVA 0x551A0), so this is a static, do-nothing motion track -- the
+    right default for a mesh the user just added, which has no animation to
+    inherit.  `frame_count` should match the container's other tracks so the
+    shared clock does not change length.
+
+    Layout per docs/effects.md 6.2:
+        u32 boneCount ; u32 frameCount ; "KKEY" ; u32 keyCount
+        keyCount x { u32 frame ; float[16] matrix[boneCount] }
+        u32 extraChannels
+    """
+    bone_count = max(1, int(bone_count))
+    if bone_count > 255:
+        raise PhyWriteError(
+            f"MOTI boneCount {bone_count} exceeds the engine's limit of 255")
+    return (struct.pack("<II", bone_count, max(1, int(frame_count)))
+            + b"KKEY" + struct.pack("<I", 1) + struct.pack("<I", 0)
+            + _IDENTITY_MAT * bone_count
+            + struct.pack("<I", 0))
+
+
+def _slot_plan(chunks, n_new: int, n_old: int):
+    """Which chunk slots hold PHY and which hold MOTI, after a count change.
+
+    Returns a list of slot descriptors preserving the container's original
+    interleaving: `("phy", None)`, `("moti", None)` and `("raw", tag, body)`.
+    Surplus pairs are appended after the last existing slot of their own tag;
+    removed pairs drop the trailing slots.  That keeps `PMPM...` interleaved
+    and `PPPPMMMM` grouped, and in both cases the i-th PHY still meets the
+    i-th MOTI.
+    """
+    slots = []
+    for tag, body in chunks:
+        if tag in VARIANTS:
+            slots.append(["phy"])
+        elif tag == MOTI_TAG:
+            slots.append(["moti"])
+        else:
+            slots.append(["raw", tag, body])
+
+    delta = n_new - n_old
+    for kind in ("phy", "moti"):
+        # `s` may already be None from the previous pass's removals
+        idx = [i for i, s in enumerate(slots) if s and s[0] == kind]
+        if delta > 0:
+            at = idx[-1] + 1 if idx else len(slots)
+            for _ in range(delta):
+                slots.insert(at, [kind])
+                at += 1
+        elif delta < 0:
+            for i in idx[delta:]:
+                slots[i] = None
+    return [s for s in slots if s is not None]
+
+
+def rebuild_c3(original: bytes, meshes, *, allow_structural: bool = False,
+               moti_for_new=None) -> bytes:
+    """Rebuild a container, optionally adding or removing whole meshes.
+
+    Each mesh's `source_index` says which original PHY slot it came from;
+    `None` means it is new.  Meshes whose original slot is absent from the list
+    are removed, and their paired MOTI chunk is removed with them.  New meshes
+    get a synthesised static MOTI (see `synth_moti`).
+
+    With `allow_structural=False` (the default) any change to the mesh count is
+    refused, so the ordinary export path cannot restructure a container by
+    accident.
+    """
+    chunks = list(iter_chunks(original))
+    phy_bodies = [b for t, b in chunks if t in VARIANTS]
+    moti_bodies = [b for t, b in chunks if t == MOTI_TAG]
+    n_old = len(phy_bodies)
+    n_new = len(meshes)
+
+    if n_new != n_old:
+        if not allow_structural:
+            raise PhyWriteError(
+                f"the source container has {n_old} PHY chunks but {n_new} "
+                f"meshes were supplied. Adding or removing meshes needs "
+                f"allow_structural=True, and is only safe when the container "
+                f"is animated by its own MOTI chunks -- see "
+                f"docs/modding.md section 11.")
+        if moti_bodies and len(moti_bodies) != n_old:
+            raise PhyWriteError(
+                f"container has {n_old} PHY but {len(moti_bodies)} MOTI "
+                f"chunks; refusing to guess the pairing")
+
+    # the frame count new tracks should adopt, so the shared clock is unchanged
+    frame_count = 1
+    for b in moti_bodies:
+        try:
+            frame_count = max(frame_count, struct.unpack_from("<I", b, 4)[0])
+        except struct.error:
+            pass
+
+    out_phy, out_moti = [], []
+    seen = set()
+    for m in meshes:
+        si = m.source_index
+        if si is not None:
+            if si in seen:
+                raise PhyWriteError(
+                    f"two meshes both claim source_index {si}")
+            if not (0 <= si < n_old):
+                raise PhyWriteError(
+                    f"source_index {si} is outside the original's "
+                    f"{n_old} PHY chunks")
+            seen.add(si)
+        out_phy.append(serialize_phy(m))
+        if si is not None and si < len(moti_bodies):
+            out_moti.append(moti_bodies[si])        # its own motion, verbatim
+        elif moti_bodies:
+            bones = m.bones
+            need = (max(bones) + 1) if bones else 1
+            out_moti.append((moti_for_new or synth_moti)(need, frame_count))
+
+    tags = [m.tag for m in meshes]
+    plan = _slot_plan(chunks, len(out_phy), n_old)
+    result, pi, mi = [], 0, 0
+    for s in plan:
+        if s[0] == "phy":
+            result.append((tags[pi], out_phy[pi]))
+            pi += 1
+        elif s[0] == "moti":
+            if mi < len(out_moti):
+                result.append((MOTI_TAG, out_moti[mi]))
+            mi += 1
+        else:
+            result.append((s[1], s[2]))
+    return build_c3(result)
+
+
+# --------------------------------------------------------------------------
+# geometry helpers an exporter needs
+# --------------------------------------------------------------------------
+
+def recompute_bounds(m: PhyMesh) -> None:
+    """Recompute the declared AABB from the vertices, matrix applied.
+
+    Section 9.5 note 6: the shipped bbox matches the true extents ~95% of the
+    time but the origin only ~50%, so it is not a reliable AABB -- but it IS
+    what the engine frustum-culls against.  Call this only on meshes whose
+    geometry actually changed; leave it alone otherwise so the original bytes
+    survive.
+    """
+    if not m.vertices:
+        return
+    a = m.matrix if len(m.matrix) == 16 else None
+    pts = []
+    for v in m.vertices:
+        x, y, z = v.px, v.py, v.pz
+        if a:
+            r0, r1, r2, r3 = a[0:3], a[4:7], a[8:11], a[12:15]
+            x, y, z = (
+                v.px * r0[0] + v.py * r1[0] + v.pz * r2[0] + r3[0],
+                v.px * r0[1] + v.py * r1[1] + v.pz * r2[1] + r3[1],
+                v.px * r0[2] + v.py * r1[2] + v.pz * r2[2] + r3[2],
+            )
+        pts.append((x, y, z))
+    lo = tuple(min(p[i] for p in pts) for i in range(3))
+    hi = tuple(max(p[i] for p in pts) for i in range(3))
+    # round-trip through float32 so the in-memory value equals what we write
+    lo = struct.unpack("<3f", struct.pack("<3f", *lo))
+    hi = struct.unpack("<3f", struct.pack("<3f", *hi))
+    m.bbox_min, m.bbox_max = lo, hi
+    m.bbox_a, m.bbox_b = lo, hi
+
+
+IDENTITY_MATRIX = (1.0, 0.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0, 0.0,
+                   0.0, 0.0, 1.0, 0.0,
+                   0.0, 0.0, 0.0, 1.0)
+
+
+def unbake_matrix(m: PhyMesh) -> bool:
+    """Inverse of `c3phy.apply_matrix_to`, for an importer that baked.
+
+    Returns False when the matrix is singular (never seen in the corpus).
+    """
+    a = m.matrix
+    if len(a) != 16:
+        return False
+    r = [[a[0], a[1], a[2]], [a[4], a[5], a[6]], [a[8], a[9], a[10]]]
+    t = (a[12], a[13], a[14])
+    det = (r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+           - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+           + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]))
+    if abs(det) < 1e-20:
+        return False
+    inv = [[0.0] * 3 for _ in range(3)]
+    for i in range(3):
+        for j in range(3):
+            a1, a2 = [k for k in range(3) if k != j]
+            b1, b2 = [k for k in range(3) if k != i]
+            minor = (r[a1][b1] * r[a2][b2] - r[a1][b2] * r[a2][b1])
+            inv[i][j] = ((-1) ** (i + j)) * minor / det
+    for v in m.vertices:
+        x, y, z = v.px - t[0], v.py - t[1], v.pz - t[2]
+        v.px = x * inv[0][0] + y * inv[1][0] + z * inv[2][0]
+        v.py = x * inv[0][1] + y * inv[1][1] + z * inv[2][1]
+        v.pz = x * inv[0][2] + y * inv[1][2] + z * inv[2][2]
+    return True
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _verify_blob(blob: bytes) -> tuple[int, int, list[str]]:
+    """Round-trip every PHY chunk in a container.  -> (ok, total, problems)"""
+    ok = total = 0
+    problems = []
+    for tag, body in iter_chunks(blob):
+        if tag not in VARIANTS:
+            continue
+        total += 1
+        try:
+            m = parse_phy(tag, body)
+            got = serialize_phy(m)
+        except Exception as e:                                  # noqa: BLE001
+            problems.append(f"{tag.decode(errors='replace')}: {e!r}")
+            continue
+        if got == body:
+            ok += 1
+        else:
+            where = next((i for i in range(min(len(got), len(body)))
+                          if got[i] != body[i]), min(len(got), len(body)))
+            problems.append(
+                f"{tag.decode(errors='replace')} {m.name!r}: "
+                f"len {len(got)} vs {len(body)}, first diff at 0x{where:X}")
+    return ok, total, problems
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "verify":
+        tot_ok = tot = 0
+        for a in rest:
+            blob = Path(a).read_bytes()
+            ok, n, probs = _verify_blob(blob)
+            tot_ok += ok
+            tot += n
+            status = "OK" if ok == n else "FAIL"
+            print(f"{status:4s} {Path(a).name}: {ok}/{n} chunks byte-exact")
+            for p in probs:
+                print(f"       {p}")
+        print(f"\n{tot_ok}/{tot} PHY chunks byte-exact")
+        return 0 if tot_ok == tot else 1
+
+    if cmd == "corpus":
+        import test_roundtrip                                   # noqa
+        return test_roundtrip.main(rest)
+
+    print(f"unknown command {cmd!r}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    raise SystemExit(main(sys.argv[1:]))

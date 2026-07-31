@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt
+      # The PII gate. CI can only check the committed hash list -- each
+      # contributor's own identifiers are checked by their local
+      # .sanitize-local, which by design never reaches a CI runner.
+      - run: python tests/test_sanitization.py
+      # The main suite. Tests that need a game install skip cleanly when it
+      # is absent, so this exercises the format code, the synthetic-data
+      # paths, path confinement and CSRF.
+      - run: python tools/test_viewer.py

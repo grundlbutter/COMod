@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+r"""
+health.py -- "will this actually run here?", answered in one place.
+
+The Asset Viewer calls this on first run and shows the result; you can also
+run it without a browser:
+
+    py -3 tools/coviewer.py --health        # same report, on the console
+    py -3 tools/health.py                   # ditto
+    py -3 tools/health.py --json
+    py -3 tools/health.py --bootstrap       # build the missing data in out/
+
+It checks, and says how to fix, every prerequisite the repository actually
+has:
+
+  * **the game install** -- where it was found and *how* (registry, default
+    path, `CO_ROOT`, saved config), and that `c3.wdf`, `data.wdf`, `ini/` and
+    `bin/64/` all exist and can be opened;
+  * **Python** -- 3.11 or newer;
+  * **Pillow** (required: every texture the viewer shows is re-encoded to PNG
+    through it) and **numpy** (optional for browsing, required to *generate*
+    thumbnails);
+  * **derived data** -- `out/` is generated and gitignored, so a fresh clone
+    starts empty, and until the WDF filename recovery has run the catalogue
+    can only see loose files.  `--bootstrap` runs the generators in the order
+    they depend on each other;
+  * **thumbnails** -- whether `out/thumbs/` has been generated, how complete
+    it is, and what generating it would cost in time and disk on *this*
+    machine.  Generating them is **opt-in**: nothing here starts a render.
+
+Nothing here writes to the game install.  The report is written to
+`out/health.json` so it can be inspected after the fact.
+
+Design note: this module imports `tools/thumbs.py` for the thumbnail facts
+rather than restating them, and never renders anything itself.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+
+import coroot                                      # noqa: E402
+
+REPORT_PATH = REPO / "out" / "health.json"
+
+#: Minimum Python this codebase is known to work on.  Everything here is
+#: stdlib plus numpy/Pillow; the syntax floor is `X | Y` unions in annotations
+#: with `from __future__ import annotations`, plus `dict[str, int]` builtins.
+#: Developed and verified on 3.14.
+MIN_PYTHON = (3, 11)
+VERIFIED_PYTHON = "3.14.6"
+
+#: Measured on the full corpus of this install, `--size 256 --ss 2`.
+#: Used to tell someone what they are agreeing to *before* they agree.
+THUMB_FACTS = {
+    "meshes": {"count": 4950, "megabytes": 124},
+    "textures": {"count": 66834, "megabytes": 486},
+    "manifests": {"count": 2, "megabytes": 27},
+}
+#: Wall-clock x worker-count from the reference run: 82 s for meshes and 144 s
+#: for textures at 20 workers.  Divided by the worker count to estimate a
+#: different machine.  Scaling is not perfectly linear -- disk and the serial
+#: manifest write do not parallelise -- so the estimate is reported as a range
+#: with the low end at the linear figure.
+MESH_CORE_SECONDS = 82 * 20
+TEXTURE_CORE_SECONDS = 144 * 20
+#: The reference run itself, quoted so nobody has to trust the extrapolation.
+REFERENCE_RUN = ("226 s total (82 s meshes + 144 s textures) with 20 worker "
+                 "processes on a 24-core desktop; ~14 s for a warm re-run")
+
+
+# ---------------------------------------------------------------------------
+# individual checks
+# ---------------------------------------------------------------------------
+
+def check_python() -> dict:
+    v = sys.version_info
+    ok = (v.major, v.minor) >= MIN_PYTHON
+    return {
+        "name": "Python",
+        "ok": ok,
+        "value": f"{v.major}.{v.minor}.{v.micro}",
+        "detail": f"{sys.executable}  ({platform.python_implementation()})",
+        "requirement": f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ "
+                       f"(developed and verified on {VERIFIED_PYTHON})",
+        "fix": None if ok else
+               "Install Python "
+               f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer from python.org, "
+               "then re-run.",
+    }
+
+
+def _package(name: str, import_name: str, required: bool, why: str,
+             fix: str) -> dict:
+    rec = {"name": name, "required": required, "present": False,
+           "version": None, "why": why, "fix": fix}
+    try:
+        mod = __import__(import_name)
+        rec["present"] = True
+        rec["version"] = getattr(mod, "__version__", "unknown")
+        rec["fix"] = None
+    except Exception as e:                          # pragma: no cover
+        rec["error"] = f"{type(e).__name__}: {e}"
+    rec["ok"] = rec["present"] or not required
+    return rec
+
+
+def check_packages() -> list[dict]:
+    return [
+        _package("Pillow", "PIL", True,
+                 "every texture the viewer displays is re-encoded to PNG "
+                 "through Pillow, and staged .dds files are written with it",
+                 "pip install pillow"),
+        _package("numpy", "numpy", False,
+                 "optional for browsing (texture decode is just slower "
+                 "without it) but REQUIRED to generate thumbnails -- "
+                 "tools/thumbs.py is a pure-numpy renderer",
+                 "pip install numpy"),
+    ]
+
+
+def check_install(explicit=None) -> dict:
+    """Where the game is, how that was decided, and whether it is complete."""
+    rep = coroot.search_report(explicit) if explicit else coroot.last_report()
+    out: dict = {
+        "found": bool(rep.get("found")),
+        "searched": rep.get("tried") or [],
+        "searchedCount": rep.get("triedCount", len(rep.get("tried") or [])),
+    }
+    if rep.get("found"):
+        f = rep["found"]
+        out.update({"path": f["path"], "source": f["source"],
+                    "detail": f["detail"]})
+        out["files"] = coroot.describe_root(f["path"])
+        out["ok"] = out["files"]["ok"]
+        if not out["ok"]:
+            bad = [p["name"] for p in out["files"]["parts"]
+                   if not (p["exists"] and p["readable"])]
+            out["fix"] = ("These are missing or unreadable: "
+                          + ", ".join(bad)
+                          + ". Repair or reinstall the client, or point the "
+                            "tools at a different copy with "
+                            "`py -3 core/coroot.py --set DIR`.")
+    else:
+        out.update({"path": None, "source": None, "ok": False,
+                    "detail": "no install found",
+                    "fix": coroot.RootNotFound(rep).message()})
+    # An explicitly-configured path that got rejected is worth saying out
+    # loud: silently falling through to auto-discovery looks like the setting
+    # was ignored.
+    out["rejectedOverrides"] = [
+        t for t in out["searched"]
+        if not t["ok"] and t["source"] in ("explicit", "env", "repo-config",
+                                           "user-config")
+    ]
+    #: How the person can override whatever was decided.
+    out["overrides"] = {
+        "cli": "--root \"D:\\path\\to\\install\"  (any tool)",
+        "env": f"{coroot.ENV_VAR}=D:\\path\\to\\install",
+        "save": "py -3 core/coroot.py --set \"D:\\path\\to\\install\"",
+        "repoFile": str(coroot.repo_config_path()),
+        "userFile": str(coroot.user_config_path()),
+    }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# derived data -- the one-off build a fresh clone needs
+# ---------------------------------------------------------------------------
+
+#: `out/` is generated and gitignored, so a fresh clone starts empty.  Most of
+#: it is optional, but the WDF filename tables are not: the archives store a
+#: *hash* of each filename, not the name, so until they are recovered the
+#: catalogue can only see the ~53,000 loose files and none of the ~25,000
+#: archived ones.
+#:
+#: Order matters.  `wdf_recover.py` must run before `meshtex.py`, because
+#: meshtex caches a mesh index built from whatever name tables existed at the
+#: time -- run it first and you get a silently half-sized index that looks
+#: fine.  (Found the hard way while verifying a relocated checkout.)
+#:
+#: (relative artefact, what produces it, roughly how long, why it matters)
+DERIVED = [
+    ("out/wdf/c3_names.json",
+     ["tools/wdf_recover.py"], "5-9 min",
+     "recovers 24,426 of the 24,757 filenames hashed in the two .wdf "
+     "archives. Without it nothing inside the archives can be named, "
+     "browsed or exported."),
+    ("out/dll/wdf_name_recovery.json",
+     ["tools/wdf_names.py"], "20 s",
+     "the smaller name table coassets.py loads by default."),
+    ("out/meshtex/coverage.json",
+     ["tools/meshtex.py", "--coverage"], "15 s",
+     "which texture belongs to which mesh. Drives the merged catalogue rows "
+     "and the thumbnail work list. MUST be built after wdf_recover."),
+    ("out/effects/linkage.json",
+     ["tools/effects.py", "--linkage"], "6 s",
+     "weapon/action to 3D effect linkage."),
+]
+
+
+def check_derived() -> dict:
+    """Which generated artefacts a fresh clone is still missing."""
+    artefacts = []
+    for rel, argv, cost, why in DERIVED:
+        p = REPO / rel
+        artefacts.append({
+            "path": rel, "exists": p.is_file(),
+            "bytes": p.stat().st_size if p.is_file() else 0,
+            "command": "py -3 " + " ".join(argv), "cost": cost, "why": why,
+        })
+    missing = [a for a in artefacts if not a["exists"]]
+    return {
+        "dir": str(REPO / "out"),
+        "artefacts": artefacts,
+        "missing": [a["path"] for a in missing],
+        "ok": not missing,
+        "fix": ("Build it in one step: `py -3 tools/health.py --bootstrap` "
+                "(about 6-10 minutes, once). Or run each command listed in "
+                "the report, in order."),
+    }
+
+
+def bootstrap(only_missing: bool = True) -> int:
+    """Run the derived-data builders, in dependency order.
+
+    Deliberately a thin sequencer over the existing tools -- it adds the
+    ordering constraint and nothing else.
+    """
+    import subprocess                                # noqa: PLC0415
+    todo = [(rel, argv, cost) for rel, argv, cost, _ in DERIVED
+            if not only_missing or not (REPO / rel).is_file()]
+    if not todo:
+        print("derived data is already built; nothing to do "
+              "(use --bootstrap-all to force)")
+        return 0
+    print(f"building {len(todo)} artefact(s) into {REPO / 'out'}\n")
+    for i, (rel, argv, cost) in enumerate(todo, 1):
+        cmd = [sys.executable, str(REPO / argv[0]), *argv[1:]]
+        print(f"[{i}/{len(todo)}] {rel}  (~{cost})")
+        print(f"        {' '.join(argv)}")
+        t0 = time.time()
+        r = subprocess.run(cmd, cwd=str(REPO), stdout=subprocess.DEVNULL)
+        if r.returncode != 0:
+            print(f"        FAILED (exit {r.returncode}). Re-run it directly "
+                  f"to see why:\n        py -3 {' '.join(argv)}")
+            return r.returncode
+        got = REPO / rel
+        print(f"        done in {time.time() - t0:.0f} s"
+              + (f", {got.stat().st_size / 1e6:.1f} MB" if got.is_file() else ""))
+    print("\nderived data built.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# thumbnails
+# ---------------------------------------------------------------------------
+
+def default_jobs() -> int:
+    """The worker count tools/thumbs.py would pick if not told otherwise."""
+    return max(1, (os.cpu_count() or 2) - 1)
+
+
+def estimate_seconds(jobs: int, meshes: bool = True,
+                     textures: bool = True) -> tuple[int, int]:
+    """(optimistic, pessimistic) seconds for a cold run at `jobs` workers."""
+    core = 0
+    if meshes:
+        core += MESH_CORE_SECONDS
+    if textures:
+        core += TEXTURE_CORE_SECONDS
+    low = max(20, int(core / max(1, jobs)))
+    # Doubling, not tripling: the reference run's own wall clock sat at the
+    # linear figure, and a slower machine loses to per-core speed and disk
+    # rather than to scaling.  On a 4-core laptop this lands at roughly
+    # 25-50 minutes for the full run, which matches the range people report.
+    return low, low * 2
+
+
+def human_duration(seconds: int) -> str:
+    if seconds < 90:
+        return f"{seconds} s"
+    m = seconds / 60.0
+    return f"{m:.0f} min" if m < 90 else f"{m / 60:.1f} h"
+
+
+def thumbnail_state() -> dict:
+    """What `out/thumbs/` currently holds, and what filling it would cost.
+
+    Everything factual comes from `tools/thumbs.py` (its output directory and
+    manifest); this function only reads and describes.
+    """
+    import thumbs                                   # noqa: PLC0415
+
+    out_dir = thumbs.OUT_DIR
+    manifest = thumbs.MANIFEST
+    state: dict = {
+        "dir": str(out_dir),
+        "exists": out_dir.is_dir(),
+        "manifest": str(manifest),
+        "meshes": 0, "textures": 0, "bytes": 0,
+        "generated": None,
+    }
+    if manifest.is_file():
+        try:
+            doc = json.loads(manifest.read_text("utf-8"))
+            counts = doc.get("counts") or {}
+            state.update({
+                "meshes": int(counts.get("meshes", 0) or 0),
+                "textures": int(counts.get("textures", 0) or 0),
+                "bytes": int(counts.get("bytes", 0) or 0),
+                "generated": doc.get("generated"),
+            })
+        except (OSError, ValueError) as e:
+            state["error"] = f"manifest unreadable: {e}"
+
+    want_m = THUMB_FACTS["meshes"]["count"]
+    want_t = THUMB_FACTS["textures"]["count"]
+    have_m, have_t = state["meshes"], state["textures"]
+    if have_m == 0 and have_t == 0:
+        state["status"] = "none"
+    elif have_m >= want_m * 0.95 and have_t >= want_t * 0.95:
+        state["status"] = "complete"
+    elif have_m >= want_m * 0.95:
+        state["status"] = "meshes-only"
+    else:
+        state["status"] = "partial"
+
+    jobs = default_jobs()
+    total_mb = sum(f["megabytes"] for f in THUMB_FACTS.values())
+    mesh_mb = (THUMB_FACTS["meshes"]["megabytes"]
+               + THUMB_FACTS["manifests"]["megabytes"])
+    m_low, m_high = estimate_seconds(jobs, True, False)
+    a_low, a_high = estimate_seconds(jobs, True, True)
+    state["plan"] = {
+        "cpus": os.cpu_count(),
+        "jobs": jobs,
+        "reference": REFERENCE_RUN,
+        "resumable": True,
+        "options": [
+            {
+                "id": "meshes",
+                "label": "Meshes only  (recommended)",
+                "count": want_m,
+                "megabytes": mesh_mb,
+                "estimate": f"{human_duration(m_low)}-{human_duration(m_high)}",
+                "why": "The 4,950 model thumbnails are what the character "
+                       "builder and model mode use. This is the half that "
+                       "matters and about a third of the cost.",
+                "argv": ["--all", "--resume"],
+            },
+            {
+                "id": "all",
+                "label": "Everything (meshes + textures)",
+                "count": want_m + want_t,
+                "megabytes": total_mb,
+                "estimate": f"{human_duration(a_low)}-{human_duration(a_high)}",
+                "why": "Adds thumbnails for all 66,834 textures. Nice for "
+                       "browsing the texture library; most of the time and "
+                       "nearly all of the disk.",
+                "argv": ["--all", "--textures", "--resume"],
+            },
+            {
+                "id": "textures",
+                "label": "Textures only (finish a meshes-only run)",
+                "count": want_t,
+                "megabytes": THUMB_FACTS["textures"]["megabytes"],
+                "estimate": f"{human_duration(a_low - m_low)}-"
+                            f"{human_duration(a_high - m_high)}",
+                "why": "Use this later, after meshes, to fill in the rest.",
+                "argv": ["--textures", "--resume"],
+            },
+        ],
+        "declining": "The viewer works without any of this. Assets that have "
+                     "no thumbnail show a placeholder tile; everything else "
+                     "— search, the 3D viewport, the builder, staging, "
+                     "installing — is unaffected.",
+        "cli": "py -3 tools/thumbs.py --all --textures --resume",
+    }
+    state["decision"] = coroot.read_settings().get("thumbnails") or None
+    state["ok"] = state["status"] in ("complete", "meshes-only")
+    return state
+
+
+def remember_thumbnail_choice(choice: str) -> dict:
+    """Persist the answer so the first-run prompt does not nag.
+
+    ``choice`` is one of ``meshes`` / ``all`` / ``textures`` (started a run),
+    ``later`` (ask again next launch) or ``never`` (stop asking).
+    """
+    rec = {"choice": choice, "when": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if choice == "later":
+        coroot.write_settings(thumbnails=None)
+        return rec
+    coroot.write_settings(thumbnails=rec)
+    return rec
+
+
+def should_prompt(state: Optional[dict] = None) -> bool:
+    """Ask about generating thumbnails?  Only when there are none *and* the
+    person has not already said no."""
+    st = state or thumbnail_state()
+    if st["status"] != "none":
+        return False
+    d = st.get("decision") or {}
+    return d.get("choice") != "never"
+
+
+# ---------------------------------------------------------------------------
+# the whole report
+# ---------------------------------------------------------------------------
+
+def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
+    rep: dict = {
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "repo": str(REPO),
+        "platform": f"{platform.system()} {platform.release()}",
+        "install": check_install(explicit),
+        "python": check_python(),
+        "packages": check_packages(),
+        "derived": check_derived(),
+    }
+    if with_thumbnails:
+        try:
+            rep["thumbnails"] = thumbnail_state()
+        except Exception as e:                       # pragma: no cover
+            rep["thumbnails"] = {"status": "unknown", "ok": False,
+                                 "error": f"{type(e).__name__}: {e}"}
+
+    problems = []
+    for t in rep["install"].get("rejectedOverrides", []):
+        problems.append({
+            "severity": "warning",
+            "what": f"The install root configured via {t['source']} "
+                    f"({t['path']}) was rejected: {t['verdict']}."
+                    + (" Auto-detection was used instead."
+                       if rep["install"]["ok"] else ""),
+            "fix": "Correct it, or clear it with "
+                   "`py -3 core/coroot.py --forget`."})
+    if not rep["install"]["ok"]:
+        problems.append({"severity": "error",
+                         "what": "The game install was not found (or is "
+                                 "incomplete).",
+                         "fix": rep["install"].get("fix", "")})
+    if not rep["python"]["ok"]:
+        problems.append({"severity": "error",
+                         "what": f"Python {rep['python']['value']} is older "
+                                 f"than {MIN_PYTHON[0]}.{MIN_PYTHON[1]}.",
+                         "fix": rep["python"]["fix"]})
+    for p in rep["packages"]:
+        if not p["present"]:
+            problems.append({
+                "severity": "error" if p["required"] else "warning",
+                "what": f"{p['name']} is not installed -- {p['why']}",
+                "fix": p["fix"]})
+    der = rep["derived"]
+    if not der["ok"]:
+        problems.append({
+            "severity": "warning",
+            "what": f"{len(der['missing'])} generated artefact(s) have not "
+                    "been built yet, so the catalogue can only see loose "
+                    "files — the .wdf archives store a hash of each "
+                    "filename, not the name, and the recovery has not run.",
+            "fix": der["fix"]})
+
+    th = rep.get("thumbnails") or {}
+    if th.get("status") == "none":
+        problems.append({
+            "severity": "info",
+            "what": "No thumbnails have been generated. Grids show "
+                    "placeholders until they are.",
+            "fix": th.get("plan", {}).get("cli", "py -3 tools/thumbs.py --all")})
+    elif th.get("status") == "meshes-only":
+        problems.append({
+            "severity": "info",
+            "what": "Mesh thumbnails are present; texture thumbnails are not.",
+            "fix": "py -3 tools/thumbs.py --textures --resume"})
+
+    rep["problems"] = problems
+    rep["ok"] = not any(p["severity"] == "error" for p in problems)
+    return rep
+
+
+def write_report(rep: dict, path: Path = REPORT_PATH) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rep, indent=1), "utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# console rendering
+# ---------------------------------------------------------------------------
+
+_MARK = {True: "  ok  ", False: " FAIL ", None: " ---- "}
+
+
+def render_text(rep: dict) -> str:
+    L: list[str] = []
+    add = L.append
+    add("")
+    add("  COMod -- health check")
+    add("  " + "-" * 54)
+    add(f"  repo      : {rep['repo']}")
+    add(f"  platform  : {rep['platform']}")
+    add("")
+
+    i = rep["install"]
+    add(f"{_MARK[bool(i['ok'])]}game install")
+    if i["found"]:
+        add(f"         {i['path']}")
+        add(f"         found via {i['source']} -- {i['detail']}")
+        for part in i.get("files", {}).get("parts", []):
+            state = ("ok" if part["exists"] and part["readable"]
+                     else "MISSING" if not part["exists"] else "UNREADABLE")
+            size = (f"  {part['bytes'] / 1e6:,.0f} MB"
+                    if part.get("bytes") else "")
+            add(f"           {state:<10} {part['name']}{size}")
+    else:
+        add(f"         searched {i['searchedCount']} location(s), found nothing")
+        for t in i["searched"][:8]:
+            add(f"           {t['path']}  --  {t['verdict']}")
+
+    p = rep["python"]
+    add(f"{_MARK[p['ok']]}Python {p['value']}   (need {p['requirement']})")
+    add(f"         {p['detail']}")
+
+    for pkg in rep["packages"]:
+        tag = "required" if pkg["required"] else "optional"
+        mark = _MARK[bool(pkg["present"])] if pkg["required"] else (
+            _MARK[True] if pkg["present"] else " warn ")
+        ver = f" {pkg['version']}" if pkg["present"] else " not installed"
+        add(f"{mark}{pkg['name']}{ver}   ({tag})")
+
+    der = rep.get("derived") or {}
+    add(f"{_MARK[bool(der.get('ok'))] if der.get('ok') else ' warn '}"
+        f"derived data in out/  "
+        f"({sum(1 for a in der.get('artefacts', []) if a['exists'])}"
+        f"/{len(der.get('artefacts', []))} built)")
+    for a in der.get("artefacts", []):
+        add(f"           {'ok' if a['exists'] else 'MISSING':<10} {a['path']}"
+            + (f"  {a['bytes'] / 1e6:,.1f} MB" if a["exists"]
+               else f"   <- {a['command']}   (~{a['cost']})"))
+
+    th = rep.get("thumbnails") or {}
+    if th:
+        status = th.get("status", "unknown")
+        mark = _MARK[True] if th.get("ok") else " info "
+        add(f"{mark}thumbnails: {status}")
+        add(f"         {th.get('dir')}")
+        if status != "none":
+            add(f"         {th.get('meshes', 0):,} mesh + "
+                f"{th.get('textures', 0):,} texture, "
+                f"{th.get('bytes', 0) / 1e6:,.0f} MB of PNG "
+                f"(~{sum(f['megabytes'] for f in THUMB_FACTS.values())} MB "
+                f"on disk with the manifests), "
+                f"generated {th.get('generated')}")
+        plan = th.get("plan") or {}
+        if status == "none" and plan:
+            add(f"         nothing generated yet. Estimates for this machine "
+                f"({plan.get('cpus')} cores, {plan.get('jobs')} workers):")
+            for opt in plan.get("options", [])[:2]:
+                add(f"           {opt['label']:<34} "
+                    f"{opt['estimate']:>12}   {opt['megabytes']:>4} MB")
+            add(f"         reference: {plan.get('reference')}")
+            add("         Generation is opt-in and resumable; the viewer "
+                "works without it.")
+
+    add("")
+    if rep["problems"]:
+        add("  What to do:")
+        for prob in rep["problems"]:
+            add(f"    [{prob['severity']}] {prob['what']}")
+            for line in str(prob["fix"]).splitlines():
+                add(f"        {line}")
+    add("")
+    add("  RESULT: " + ("PASS -- everything required is present"
+                        if rep["ok"] else
+                        "FAIL -- see above"))
+    add("")
+    return "\n".join(L)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="Check that this checkout can run.")
+    coroot.add_root_argument(ap)
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    ap.add_argument("--no-write", action="store_true",
+                    help="do not write out/health.json")
+    ap.add_argument("--bootstrap", action="store_true",
+                    help="build the missing generated data in out/ "
+                         "(one-off, about 6-10 minutes on a fresh clone)")
+    ap.add_argument("--bootstrap-all", action="store_true",
+                    help="rebuild all of it, even what already exists")
+    a = ap.parse_args(argv)
+
+    if a.bootstrap or a.bootstrap_all:
+        rc = bootstrap(only_missing=not a.bootstrap_all)
+        if rc:
+            return rc
+        print()
+
+    rep = collect(a.root)
+    if not a.no_write:
+        try:
+            rep["writtenTo"] = str(write_report(rep))
+        except OSError as e:
+            rep["writtenTo"] = f"(could not write: {e})"
+    if a.json:
+        print(json.dumps(rep, indent=1))
+    else:
+        print(render_text(rep))
+        if rep.get("writtenTo"):
+            print(f"  full report: {rep['writtenTo']}\n")
+    return 0 if rep["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

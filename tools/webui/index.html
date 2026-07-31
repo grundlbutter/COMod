@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Asset Viewer</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/setup.css">
+</head>
+<body>
+
+<header>
+  <h1>CO Asset Viewer</h1>
+  <div id="statusline" class="mut">starting…</div>
+  <div class="spacer"></div>
+  <a class="navlink" href="/builder" id="link-builder"
+     title="Build a character: pick a body, then hair, headgear and weapons that fit it. Your loadout carries over.">→ Character builder</a>
+  <a class="navlink" href="/mapedit" id="link-mapedit"
+     title="Draw a world map as the game draws it — background, base puzzle, TERRAIN and COVER — and edit its art.">→ MapEditor</a>
+  <button id="btn-collapse-all" class="ghost"
+          title="Collapse / expand every panel on the right (C)">Collapse panels</button>
+  <button id="btn-health" class="ghost"
+          title="Where the game install was found, what is installed, and the state of the thumbnail cache">Health &amp; thumbnails</button>
+  <button id="btn-mods" class="ghost">Mod staging</button>
+</header>
+
+<main>
+
+  <!-- ------------------------------------------------ left: catalogue -->
+  <aside id="left">
+    <div class="tabs">
+      <button class="tab active" data-mode="category">Categories</button>
+      <button class="tab" data-mode="appearance">Appearances</button>
+      <button class="tab" data-mode="map">Maps</button>
+      <button class="tab" data-mode="files">Files</button>
+    </div>
+
+    <div id="pane-category" class="pane">
+      <div id="cat-tree" class="list"></div>
+      <div id="cat-controls" class="hidden">
+        <div id="cat-crumbs" class="small mut"></div>
+        <div id="cat-facets"></div>
+        <input id="cat-search" type="search" placeholder="filter path…">
+        <div id="cat-list" class="list"></div>
+        <div id="cat-more" class="mut small"></div>
+        <div class="mut small keyhint">↑↓ move · <b>?</b> for keys</div>
+      </div>
+    </div>
+
+    <div id="pane-map" class="pane hidden">
+      <input id="map-search" type="search" placeholder="filter map name…">
+      <div id="map-list" class="list"></div>
+      <div id="map-more" class="mut small"></div>
+      <div class="mut small keyhint">↑↓ move · <b>?</b> for keys</div>
+    </div>
+
+    <div id="pane-appearance" class="pane hidden">
+      <label>Part table
+        <select id="table-select"></select>
+      </label>
+      <input id="app-search" type="search" placeholder="id, item name, mesh or tag…">
+
+      <div id="facets"></div>
+
+      <div class="facet-actions">
+        <label class="chk"><input type="checkbox" id="chk-group"> group by mesh</label>
+        <button id="btn-clear" class="ghost tiny">Clear filters</button>
+        <button id="btn-bulktag" class="ghost tiny">Tag all…</button>
+        <button id="btn-export" class="ghost tiny">Export tags</button>
+      </div>
+
+      <div id="app-list" class="list" tabindex="0"></div>
+      <div id="app-more" class="mut small"></div>
+      <div class="mut small keyhint">↑↓ move · ←→ colour variants · <b>?</b> for keys</div>
+    </div>
+
+    <div id="pane-files" class="pane hidden">
+      <label>Directory
+        <select id="dir-select"></select>
+      </label>
+      <label title="‘Everything’ merges a mesh and the textures authored for it into one entry. Narrowing to one kind of file necessarily shows them apart again.">Type
+        <select id="ext-select">
+          <option value="" selected>everything (mesh + skins merged)</option>
+          <option value=".dds">textures (.dds) only</option>
+          <option value=".c3">meshes (.c3) only</option>
+        </select>
+      </label>
+      <input id="file-search" type="search" placeholder="filter path…">
+      <div id="file-list" class="list" tabindex="0"></div>
+      <div id="file-more" class="mut small"></div>
+      <div class="mut small keyhint">↑↓ move · <b>?</b> for keys</div>
+    </div>
+  </aside>
+
+  <!-- ------------------------------------------------ centre: viewport -->
+  <section id="centre">
+    <div id="viewport">
+      <canvas id="gl"></canvas>
+      <div id="gl-msg" class="overlay-msg">Pick an asset on the left.</div>
+      <div id="gl-stats" class="overlay-stats"></div>
+    </div>
+
+    <div id="viewcontrols">
+      <label title="Game-accurate culling: C3 triangles are D3D clockwise-front. After the (x,y,-z) conversion that is back-face culling with counter-clockwise front faces, which is what 'game' does here.">
+        Culling
+        <select id="cull-mode">
+          <option value="game" selected>game (D3D CW-front)</option>
+          <option value="none">none (two-sided)</option>
+          <option value="front">inverted (debug)</option>
+        </select>
+      </label>
+      <label title="How texture alpha is resolved. The engine's per-frame alpha comes from the C3Key track; the blend state itself has not been recovered, so these are the standard options.">
+        Alpha
+        <select id="alpha-mode">
+          <option value="blend" selected>blend</option>
+          <option value="test">alpha test</option>
+          <option value="opaque">ignore alpha</option>
+        </select>
+      </label>
+      <label title="Flat texture is closest to the raw asset. Shading is an inspection aid, not the game's lighting model.">
+        Shading
+        <select id="shade-mode">
+          <option value="unlit" selected>unlit (texture)</option>
+          <option value="lit">lit (inspection)</option>
+          <option value="normals">normals</option>
+          <option value="uv">uv0 checker</option>
+        </select>
+      </label>
+      <label class="chk"><input type="checkbox" id="chk-wire"> wireframe</label>
+      <label class="chk"><input type="checkbox" id="chk-sockets"> show sockets</label>
+      <label class="chk"><input type="checkbox" id="chk-grid" checked> grid</label>
+      <label class="chk"><input type="checkbox" id="chk-vcolor"> vertex colour</label>
+      <label class="chk" id="lock-label"
+             title="Off: the camera angle carries over between assets and the distance re-fits to each model. On: the whole view is frozen — angle, zoom and pan — so colour variants of one mesh sit in exactly the same frame. (L)">
+        <input type="checkbox" id="chk-lock"> lock camera</label>
+      <label class="chk" id="mode-label"
+             title="Character view: the body is the subject, parts attach at sockets and the camera stays on the body. Asset view: whatever you pick is the subject and the camera fits it. (V)">
+        View
+        <select id="view-mode">
+          <option value="asset">asset</option>
+          <option value="character">character</option>
+        </select></label>
+      <button id="btn-focus" class="ghost" title="Zoom to the head socket (F)">Focus head</button>
+      <button id="btn-reset" class="ghost" title="Re-frame the current model (R)">Reset view</button>
+      <button id="btn-shot" class="ghost" title="Save the current viewport to out/viewer/shots/">Save PNG</button>
+      <button id="btn-help" class="ghost" title="Keyboard shortcuts (?)">?</button>
+      <span id="frame-wrap" class="hidden">
+        <label>C3Key frame <input type="range" id="frame-slider" min="0" max="0" value="0"></label>
+        <span id="frame-label" class="mut small"></span>
+      </span>
+      <span id="fx-wrap" class="hidden">
+        <button id="btn-fx-play" class="ghost" title="Play / pause the effect (Space)">▶ play</button>
+        <label>effect <input type="range" id="fx-slider" min="0" max="1000" value="0"></label>
+        <span id="fx-label" class="mut small"></span>
+        <label class="chk" title="Sweep the parent transform through an arc so a SHAP trail actually smears. This is the VIEWER's motion, not the game's attack animation — 3dmotion.ini is not wired in.">
+          <input type="checkbox" id="chk-fx-swing"> swing preview</label>
+        <button id="btn-fx-stop" class="ghost" title="Stop and clear the effect">✕</button>
+      </span>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------ right: detail -->
+  <aside id="right">
+
+    <section class="card" id="card-prov" data-card="prov">
+      <h2>Where this comes from</h2>
+      <div id="prov-body" class="cardbody mut">nothing selected</div>
+    </section>
+
+    <section class="card" id="card-loadout" data-card="loadout">
+      <h2>Equip <span id="mode-pill" class="badge arc">asset view</span></h2>
+      <div class="cardbody">
+        <p class="small mut" style="margin:0 0 8px">
+          Assembling a whole character is easier on the
+          <a href="/builder" class="navlink-inline">character builder</a> — click a
+          slot, search and filter, see it on the figure. This panel stays for
+          equipping whatever you happen to be looking at.
+        </p>
+        <div id="loadout-body"></div>
+      </div>
+    </section>
+
+    <section class="card hidden" id="card-related" data-card="related">
+      <h2>What goes with this</h2>
+      <div id="related-body" class="cardbody mut"></div>
+    </section>
+
+    <section class="card hidden" id="card-effects" data-card="effects">
+      <h2>Effects</h2>
+      <div id="effects-body" class="cardbody mut"></div>
+    </section>
+
+    <section class="card hidden" id="card-mappieces" data-card="mappieces">
+      <h2>Pieces on this map</h2>
+      <div id="mappieces-body" class="cardbody mut"></div>
+    </section>
+
+    <section class="card" id="card-tags" data-card="tags">
+      <h2>Tags</h2>
+      <div id="tags-body" class="cardbody mut">nothing selected</div>
+    </section>
+
+    <section class="card" id="card-tex" data-card="tex">
+      <h2>Texture</h2>
+      <div id="tex-body" class="cardbody mut">nothing selected</div>
+    </section>
+
+    <section class="card" id="card-mesh" data-card="mesh">
+      <h2>Mesh</h2>
+      <div id="mesh-body" class="cardbody mut">nothing selected</div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ------------------------------------------------ mod drawer -->
+<div id="drawer" class="hidden">
+  <div class="drawer-inner">
+    <div class="drawer-head">
+      <h2>Mod staging</h2>
+      <button id="drawer-close" class="ghost">close</button>
+    </div>
+    <p class="mut small">
+      Staged files live in <code id="stage-dir"></code>. Nothing touches the game
+      install until you press <b>Install</b>, which runs
+      <code>comod.py install --yes</code> — the same path as the CLI, with its
+      backups and its <code>uninstall</code> revert.
+    </p>
+    <div id="stage-list"></div>
+    <div class="row">
+      <button id="btn-dry" class="ghost">Install (dry run)</button>
+      <button id="btn-install" class="danger">Install for real</button>
+      <button id="btn-uninstall" class="ghost">Uninstall / revert</button>
+    </div>
+    <pre id="mod-output" class="out"></pre>
+  </div>
+</div>
+
+<div id="help" class="hidden">
+  <div class="help-inner">
+    <div class="drawer-head">
+      <h2>Keyboard</h2>
+      <button id="help-close" class="ghost">close</button>
+    </div>
+    <table class="keys">
+      <tr><th colspan="2">Asset list</th></tr>
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>previous / next entry — follows the current filters and grouping</td></tr>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>previous / next colour variant of the current mesh</td></tr>
+      <tr><td><kbd>PgUp</kbd> <kbd>PgDn</kbd></td><td>jump 10 entries</td></tr>
+      <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first / last entry</td></tr>
+      <tr><td><kbd>/</kbd></td><td>jump to the search box</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>leave the search box (arrow keys never fire while you are typing)</td></tr>
+      <tr><th colspan="2">Viewport</th></tr>
+      <tr><td><kbd>L</kbd></td><td>lock / unlock the camera</td></tr>
+      <tr><td><kbd>R</kbd></td><td>reset the view to fit the current model</td></tr>
+      <tr><td><kbd>W</kbd> <kbd>G</kbd> <kbd>S</kbd></td><td>wireframe · grid · sockets</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>play / pause the loaded effect</td></tr>
+      <tr><td><kbd>C</kbd></td><td>collapse / expand every panel on the right (or click a panel heading)</td></tr>
+      <tr><td>drag / wheel / shift-drag</td><td>orbit · zoom · pan</td></tr>
+      <tr><th colspan="2">Camera behaviour</th></tr>
+      <tr><td>unlocked</td><td>the <b>angle carries over</b> from asset to asset; the distance re-fits to
+        each model so a 5-unit weapon and a 170-unit body both fill the frame</td></tr>
+      <tr><td>locked</td><td>the view is <b>completely frozen</b> — angle, zoom, pan and orbit centre.
+        Best for flipping through colour variants of one mesh. <kbd>R</kbd> always gets you back.</td></tr>
+    </table>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<!-- First run: the health report, and the thumbnail question. Generation is
+     never started without an answer -- see firstrun.js. -->
+<div id="firstrun" class="overlay hidden">
+  <div class="setup-card" id="firstrun-card"></div>
+</div>
+
+<script src="/ui/fx.js"></script>
+<script src="/ui/gl.js"></script>
+<script src="/ui/cards.js"></script>
+<script src="/ui/app.js"></script>
+<script src="/ui/firstrun.js"></script>
+<script src="/ui/pageshot.js"></script>
+</body>
+</html>

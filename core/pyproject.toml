@@ -1,0 +1,54 @@
+# COre -- the shared foundation under the COMod tools.
+#
+# WHY FLAT TOP-LEVEL MODULES AND NOT A PACKAGE
+# --------------------------------------------
+# `import coroot` appears in 34 files, `import coassets` in 21, `import c3phy`
+# in 18 -- across every consumer of these formats. Making COre a package would mean
+# rewriting every one of those to `from cocore import coroot`, and an import
+# rewrite across ~50 files is the change that breaks something quietly.
+#
+# A distribution can install *top-level modules* rather than a package, so
+# `pip install co-core` puts `coroot` on the import path exactly where every
+# existing consumer already expects it. Zero churn, and the same spelling works
+# whether a consumer pip-installed COre or is running from a checkout with
+# `core/` on `sys.path`.
+#
+# The cost, stated honestly: these names are unqualified, so `dds` in
+# particular could collide with an unrelated package in the same environment.
+# Acceptable for a project whose consumers are its own repositories; if
+# COre is ever published to PyPI for a wider audience, that is the moment to pay
+# the rewrite and become `cocore`.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "co-core"
+version = "0.1.0"
+description = "Install discovery, path safety, and the Conquer Online asset and map formats"
+readme = "README.md"
+requires-python = ">=3.10"
+# Deliberately none. Every module here is standard library only -- `dds.py` will
+# use numpy if it happens to be installed and is correct without it, which is
+# what keeps the foundation installable anywhere.
+dependencies = []
+
+[project.optional-dependencies]
+# Only speeds up geometry and image packing; never required for correctness.
+fast = ["numpy>=1.24"]
+
+[tool.setuptools]
+# The set is closed under its own imports: coassets needs coroot, safepath,
+# tqhash and wdf; dmap needs coroot; the rest are leaves that import only the
+# standard library. `tools/test_viewer.py::CoreBoundary` enforces that.
+py-modules = [
+    "coroot",     # install discovery: --root -> CO_ROOT -> saved config -> autodiscovery
+    "safepath",   # confine an untrusted relative path to a trusted root
+    "tqhash",     # the TQ filename hash
+    "wdf",        # WDF archive reader
+    "dds",        # DDS / BC decoding
+    "c3phy",      # C3 / PHY mesh parsing
+    "dmap",       # DMap map grids
+    "coassets",   # the asset VFS that ties the above together
+]
