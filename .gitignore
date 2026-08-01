@@ -9,11 +9,23 @@ mods/
 # Built Blender addon zip — regenerate with `py -3 tools/build_addon.py`.
 build/
 
+# Local server / capture run output. Runtime artefacts, and a live run can
+# record gameplay state — keep it out of version control.
+sessions/
+
+# Third-party server emulators you clone to test against. CoEmu is GPL-3;
+# vendoring it here would raise copyleft questions for this whole repository.
+# It stays a separate project you install yourself — see docs/server_setup.md.
+server/
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Per-machine Claude Code settings
+.claude/settings.local.json
 
 # Where YOUR copy of the game is installed. Written by
 # `py -3 core/coroot.py --set DIR --scope repo`, and by the viewer's setup
@@ -23,7 +35,7 @@ __pycache__/
 # Personal data belonging to whoever runs this. login_history.json holds
 # account and character names; if you ever copy one here, it must not be
 # committed. tests/test_sanitization.py fails the build if any of it lands in
-# a tracked file.
+# a tracked file. See docs/sanitization.md.
 login_history.json
 **/login_history.json
 

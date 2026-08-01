@@ -10,6 +10,11 @@
 
 <header>
   <h1>CO Asset Viewer</h1>
+  <label id="server-label" class="hidden"
+         title="Which client's asset namespace to browse: the baseline install, or a community server catalogued in the COmmunity Library. Linkages (mesh ↔ texture ↔ motion) come from the selected server's own tables.">
+    Server
+    <select id="server-select"></select>
+  </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
   <a class="navlink" href="/builder" id="link-builder"
@@ -82,6 +87,15 @@
           <option value="" selected>everything (mesh + skins merged)</option>
           <option value=".dds">textures (.dds) only</option>
           <option value=".c3">meshes (.c3) only</option>
+        </select>
+      </label>
+      <label id="origin-label" class="hidden"
+             title="Where this server's bytes come from: files unique to the server (library) or files shared with the baseline install.">
+        Origin
+        <select id="source-select">
+          <option value="" selected>everything</option>
+          <option value="library">this server only (library)</option>
+          <option value="baseline">shared with baseline</option>
         </select>
       </label>
       <input id="file-search" type="search" placeholder="filter path…">

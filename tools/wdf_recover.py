@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 wdf_recover.py -- recover WDF entry filenames by dictionary + pattern attack.
 
 The WDF index stores only a u32 name hash (core/wdf.py).  core/tqhash.py has
@@ -22,9 +22,24 @@ spurious hits, i.e. ~6 per million candidates.  This tool verifies every hit
 that it can (payload magic must agree with the extension) and reports the
 residual expectation so the number is never silently trusted.
 
+A DatPkg community client (.tpi/.tpd, see core/tpd.py) is a third, very rich
+wordlist source: its index stores ~130k **plaintext** asset paths in the same
+TQ-hash namespace the WDF client hashes.  Point `--tpi` at those indexes and
+every path they name is tried directly, and its numeric basenames feed the
+pattern enumerator -- which is what recovers the custom-numbered reskins in a
+community client's own garments*.wdf archives.
+
 Usage:
-    python tools/wdf_recover.py                    # full run, writes out/wdf/
+    python tools/wdf_recover.py                    # baseline c3/data, out/wdf/
     python tools/wdf_recover.py --no-enumerate     # dictionary only
+    python tools/wdf_recover.py \                   # + a DatPkg client as a
+        --tpi "D:/Zephyr Conquer 1057"             #   wordlist (dir or *.tpi)
+    python tools/wdf_recover.py \                   # recover a DIFFERENT set of
+        --root "D:/Zephyr Conquer 1057" \           #   archives (community
+        --archives garments.wdf garments1.wdf \     #   garments), seeded from
+        --tpi "D:/Zephyr Conquer 1057" \            #   the baseline names and
+        --seed out/wdf/c3_names.json \              #   the DatPkg wordlist
+        --max-digits 7 --out out/garments
 """
 from __future__ import annotations
 
@@ -42,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import coroot                            # noqa: E402
 from tqhash import (MAGIC_A, MAGIC_B, SEED_V, SEED_H1, SEED_H2, ROUND_K,
                     OR_A, AND_A, OR_B, AND_B, MASK32, normalise_path, tq_hash)
+from tpd import read_index
 from wdf import WdfArchive, detect_magic
 
 ROOT_DEFAULT = coroot.default_root()
@@ -158,6 +174,34 @@ def harvest_strings(root: Path, max_file: int = 12_000_000) -> set[str]:
     return out
 
 
+def harvest_tpi(paths) -> set[str]:
+    """Plaintext asset paths out of every DatPkg .tpi index in `paths`.
+
+    Each element of `paths` is either a .tpi file or a directory scanned
+    (non-recursively) for *.tpi.  The names are stored already normalised
+    (forward slashes) in the DatPkg namespace, which is byte-identical to the
+    namespace the WDF client hashes, so they can be hashed as-is.
+    """
+    out: set[str] = set()
+    files: list[Path] = []
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            files.extend(sorted(p.glob("*.tpi")))
+        elif p.is_file():
+            files.append(p)
+    for f in files:
+        try:
+            entries = read_index(f)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  !! skipped {f}: {exc}", flush=True)
+            continue
+        for e in entries:
+            out.add(normalise_path(e.name).lstrip("/"))
+        print(f"  tpi {f.name}: {len(entries)} names", flush=True)
+    return out
+
+
 def ext_permute(words) -> set[str]:
     out = set()
     for w in words:
@@ -174,9 +218,9 @@ def ext_permute(words) -> set[str]:
 # ---------------------------------------------------------------------------
 
 class Recovery:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, archives=ARCHIVES):
         self.root = root
-        self.arcs = {a: WdfArchive(root / a) for a in ARCHIVES if (root / a).exists()}
+        self.arcs = {a: WdfArchive(root / a) for a in archives if (root / a).exists()}
         self.want: dict[int, str] = {}
         for a, ar in self.arcs.items():
             for e in ar:
@@ -254,13 +298,22 @@ def main() -> int:
     ap.add_argument("--root", type=Path, default=ROOT_DEFAULT)
     ap.add_argument("--out", type=Path,
                     default=Path(__file__).resolve().parents[1] / "out" / "wdf")
+    ap.add_argument("--archives", nargs="+", default=list(ARCHIVES),
+                    help="archive filenames under --root to recover "
+                         "(default: the baseline c3.wdf data.wdf)")
+    ap.add_argument("--tpi", nargs="+", type=Path, default=[],
+                    help="DatPkg .tpi files or dirs to mine for a plaintext "
+                         "wordlist (see core/tpd.py)")
+    ap.add_argument("--max-digits", type=int, default=4,
+                    help="widest numeric run to brute-force per directory "
+                         "pattern; 10**N candidates each (default 4)")
     ap.add_argument("--no-enumerate", action="store_true")
     ap.add_argument("--seed", type=Path,
                     help="existing hash->name JSON to seed from")
     a = ap.parse_args()
 
     t0 = time.time()
-    r = Recovery(a.root)
+    r = Recovery(a.root, a.archives)
     print(f"targets: {len(r.want)} hashes across {list(r.arcs)}", flush=True)
 
     if a.seed and a.seed.exists():
@@ -274,15 +327,21 @@ def main() -> int:
 
     loose = harvest_loose(a.root)
     strings = harvest_strings(a.root)
-    print(f"loose paths: {len(loose)}, path-ish strings: {len(strings)}", flush=True)
+    tpi = harvest_tpi(a.tpi) if a.tpi else set()
+    print(f"loose paths: {len(loose)}, path-ish strings: {len(strings)}, "
+          f"tpi names: {len(tpi)}", flush=True)
 
-    r.try_paths(loose | strings)
+    # tpi names are real observed strings -> same "dict" (near-certain) origin.
+    r.try_paths(loose | strings | tpi)
     r.report("dictionary", t0)
-    r.try_paths(ext_permute(loose | strings))
+    r.try_paths(ext_permute(loose | strings | tpi))
     r.report("+ extension permute", t0)
 
     if not a.no_enumerate:
-        known = set(loose) | set(r.found.values())
+        # tpi names seed BOTH the directory list and the observed number
+        # patterns, so a DatPkg client's numbering conventions get brute-forced
+        # in the target archives even when the exact paths differ.
+        known = set(loose) | set(tpi) | set(r.found.values())
         dirs = sorted({n[:n.rfind("/")] for n in known if "/" in n})
         pats = build_patterns(known)
         # patterns common enough to be worth trying in EVERY directory
@@ -290,15 +349,19 @@ def main() -> int:
         for d, ps in pats.items():
             for p in ps:
                 glob_pats[p] += 1
+        # Universal patterns get tried in EVERY directory, so they must stay
+        # narrow (<= 4 digits) no matter how wide --max-digits opens per-dir
+        # enumeration: a 6-digit "universal" would be 10**6 * len(dirs) hashes.
+        # Wide numeric series (mesh/texture ids) are dir-specific, not universal.
         universal = [p for p, c in glob_pats.most_common(12)
-                     if p[1] <= 4 and c >= 3]
+                     if p[1] <= min(a.max_digits, 4) and c >= 3]
         print(f"dirs={len(dirs)} universal patterns={universal}", flush=True)
 
         # per-directory: its own observed patterns, then the universal ones
         for idx, d in enumerate(dirs):
             todo = set(pats.get(d, ())) | set(universal)
             for (lit, nd, ext) in todo:
-                if nd > 4:
+                if nd > a.max_digits:
                     continue
                 sfx = [f"/{lit}{i:0{nd}d}{ext}" for i in range(10 ** nd)]
                 r.try_prefixed(d, sfx)
@@ -321,11 +384,18 @@ def main() -> int:
                  ".gif": "GIF"}
     summary = {}
     suspect_total = 0
+    rejected_total = 0
     for name, ar in r.arcs.items():
         stem = name.split(".")[0]
         mine = {e.hash: r.found[e.hash] for e in ar if e.hash in r.found}
-        # consistency check: extension vs detected payload magic
-        suspect = []
+        # consistency check: extension vs detected payload magic.  A name whose
+        # extension disagrees with the payload's magic is either a birthday
+        # collision from pattern enumeration or a real file with a misleading
+        # extension.  For an ENUMERATED name we treat the mismatch as proof of a
+        # false positive and drop it -- the string was never observed, so there
+        # is nothing to vouch for it.  A DICTIONARY name came from a real string
+        # on disk, so we keep it and merely flag the mismatch.
+        suspect, rejected = [], []
         for e in ar:
             nm = mine.get(e.hash)
             if not nm:
@@ -334,9 +404,20 @@ def main() -> int:
             want_magic = EXT_MAGIC.get(ext)
             got = detect_magic(ar.peek(e, 32))[0]
             if want_magic and got != want_magic:
-                suspect.append({"hash": f"{e.hash:08x}", "name": nm,
-                                "detected": got, "expected": want_magic})
+                rec = {"hash": f"{e.hash:08x}", "name": nm,
+                       "detected": got, "expected": want_magic,
+                       "origin": r.origin.get(e.hash, "?")}
+                if r.origin.get(e.hash) == "enum":
+                    rejected.append(rec)
+                else:
+                    suspect.append(rec)
+        for rec in rejected:
+            del mine[int(rec["hash"], 16)]
         suspect_total += len(suspect)
+        rejected_total += len(rejected)
+        if rejected:
+            (outdir / f"{stem}_rejected_names.json").write_text(
+                json.dumps(rejected, indent=1), encoding="utf-8")
         (outdir / f"{stem}_names.json").write_text(
             json.dumps({f"{h:08x}": v for h, v in sorted(mine.items())}, indent=1),
             encoding="utf-8")
@@ -352,6 +433,7 @@ def main() -> int:
             "from_pattern_enumeration": len(mine) - n_dict,
             "unresolved": len(ar) - len(mine),
             "extension_magic_mismatches": len(suspect),
+            "enum_false_positives_dropped": len(rejected),
             "unresolved_by_magic": dict(Counter(
                 detect_magic(ar.peek(e, 32))[0] for e in ar if e.hash not in mine)),
             "payload_histogram": ar.histogram(),
@@ -367,10 +449,13 @@ def main() -> int:
         "expected_false_positives_dict_only":
             round(r.tested_dict * len(r.want) / 2 ** 32, 3),
         "observed_extension_magic_mismatches": suspect_total,
+        "enum_false_positives_dropped": rejected_total,
         "note": ("Names marked from_observed_strings came from real strings found "
                  "on disk and are effectively certain. Names from "
                  "from_pattern_enumeration carry the birthday risk above, spread "
-                 "across that subset."),
+                 "across that subset; enumerated names whose extension disagreed "
+                 "with the payload magic were dropped (see *_rejected_names.json) "
+                 "and are NOT counted in names_recovered."),
         "seconds": round(time.time() - t0, 1),
     }
     (outdir / "name_recovery_summary.json").write_text(

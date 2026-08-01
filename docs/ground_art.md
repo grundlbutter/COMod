@@ -1,14 +1,5 @@
 # Ground art — where a map's painted background sits on the cell grid
 
-> **Note.** This document was written in the full development tree that this
-> repository was extracted from. References to `docs/CONTEXT.md`,
-> `docs/STATUS.md`, `docs/movement.md`, `tools/coplay.py`, `client/...` or the
-> static-analysis tooling (`disfn`, `xref`, `riprefs`, `readtrace`, `vtable`,
-> `d3dlayout`, `dll_analysis`) point at that tree and are not part of this
-> repository. Every tool and command shown from `core/` and `tools/` that is
-> not on that list ships here and works as written.
-
-
 The last missing piece of the map system. `docs/movement.md` §5 ended with
 
 > *"Placing it needs an origin and an isometric projection that neither the

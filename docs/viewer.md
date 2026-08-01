@@ -1,6 +1,6 @@
 # CO Asset Viewer
 
-A local web app for looking at Conquer Online's textures and meshes,
+A local web app for looking at Classic Conquer 2.0's textures and meshes,
 seeing exactly which file on disk backs each one, and swapping a texture with a
 live 3D preview before committing anything — **and, on its own page, building a
 character out of them.**

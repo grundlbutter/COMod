@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import AssetRoot, C3File, DEFAULT_ROOT, parse_ini   # noqa: E402
 import c3phy                                                      # noqa: E402
+import coroot                                                     # noqa: E402
 
 __all__ = ["Match", "MeshTextureIndex", "METHODS"]
 
@@ -234,17 +235,20 @@ class MeshTextureIndex:
         for p in self.root.rglob("*"):
             if p.is_file():
                 self.universe.add(_norm(str(p.relative_to(self.root))))
+        self.names_loaded = False
         for fn in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
-            f = REPO / fn
-            if f.is_file():
+            f = coroot.find_derived(fn)
+            if f is not None:
                 self.universe.update(_norm(v) for v in
                                      json.loads(f.read_text("utf-8")).values())
-        f = REPO / "out/dll/wdf_name_recovery.json"
-        if f.is_file():
+                self.names_loaded = True
+        f = coroot.find_derived("out/dll/wdf_name_recovery.json")
+        if f is not None:
             try:
                 self.universe.update(
                     _norm(v) for v in
                     json.loads(f.read_text("utf-8"))["resolved"].values())
+                self.names_loaded = True
             except Exception:
                 pass
         self.textures = {p for p in self.universe if p.endswith(".dds")}
@@ -757,36 +761,61 @@ class MeshTextureIndex:
     # -- mesh census (cached) ----------------------------------------------
     CACHE = REPO / "out" / "meshtex" / "mesh_index.json"
 
+    def _cache_covers(self, idx: dict) -> bool:
+        """Does a cached census cover the current universe?
+
+        The census is complete by construction -- ``scan_meshes`` walks every
+        known ``.c3`` -- so a cache missing more than a sliver of today's
+        universe was built against a smaller one, typically before name
+        recovery ran, and must not be trusted.  A healthy cache misses
+        nothing (measured: 6390 of 6390); the sliver only absorbs files
+        added or renamed since the scan."""
+        missing = sum(1 for p in self.c3_files if p not in idx)
+        return missing <= max(8, len(self.c3_files) // 200)
+
     def _load_mesh_index(self) -> dict[str, dict]:
         if self._mesh_index is not None:
             return self._mesh_index
-        if self.CACHE.is_file() and not self._cache_is_stale():
+        cached = coroot.find_derived("out/meshtex/mesh_index.json")
+        if cached is not None and not self._cache_is_stale(cached):
             try:
-                self._mesh_index = json.loads(self.CACHE.read_text("utf-8"))
-                return self._mesh_index
+                idx = json.loads(cached.read_text("utf-8"))
             except Exception:
-                pass
+                idx = None
+            if idx is not None:
+                if self._cache_covers(idx):
+                    self._mesh_index = idx
+                    return self._mesh_index
+                print(f"[meshtex] ignoring stale mesh index {cached}: it has "
+                      f"{len(idx)} entries but the universe has "
+                      f"{len(self.c3_files)} .c3 files (was it built before "
+                      "name recovery?) -- rescanning",
+                      file=sys.stderr)
         self._mesh_index = self.scan_meshes()
         return self._mesh_index
 
-    def _cache_is_stale(self) -> bool:
+    def _cache_is_stale(self, cache: Path) -> bool:
         """True when a WDF name table postdates the cached index.
 
         The index is built from whatever names existed at the time, so an
         index cached *before* `wdf_recover.py` ran is silently half-sized and
-        looks perfectly healthy.  Guard: any name table newer than the cache
-        invalidates it.  (Found the hard way -- running the viewer or tests
-        before `health.py --bootstrap` used to poison this cache.)
+        looks perfectly healthy.  (Found the hard way -- running the viewer
+        or tests before `health.py --bootstrap` used to poison this cache.)
+        Two independent guards close the trap: this mtime check -- any name
+        table newer than the cache invalidates it -- and `_cache_covers`,
+        which rejects a cache that no longer spans the universe regardless
+        of timestamps.  Name tables resolve through `coroot.find_derived`,
+        same as the cache itself.
         """
         try:
-            cached = self.CACHE.stat().st_mtime
+            cached = cache.stat().st_mtime
         except OSError:
             return True
         for fn in ("out/wdf/c3_names.json", "out/wdf/data_names.json",
                    "out/dll/wdf_name_recovery.json"):
-            p = REPO / fn
+            p = coroot.find_derived(fn)
             try:
-                if p.stat().st_mtime > cached:
+                if p is not None and p.stat().st_mtime > cached:
                     return True
             except OSError:
                 continue
@@ -834,7 +863,12 @@ class MeshTextureIndex:
 
     def scan_meshes(self, progress: bool = False) -> dict[str, dict]:
         """Parse every `.c3` in the universe.  ~2 minutes; cached in
-        out/meshtex/mesh_index.json."""
+        out/meshtex/mesh_index.json.
+
+        The cache is only written when the recovered name tables were
+        loaded: a census taken without them sees only loose files, and
+        persisting it would poison every later run with a half-sized index
+        that looks fine."""
         out: dict[str, dict] = {}
         paths = sorted(self.c3_files)
         for i, p in enumerate(paths):
@@ -843,6 +877,14 @@ class MeshTextureIndex:
             rec = self._scan_one(p)
             if rec is not None:
                 out[p] = rec
+        if not self.names_loaded:
+            print("[meshtex] WARNING: no recovered name tables "
+                  "(out/wdf/*_names.json, out/dll/wdf_name_recovery.json) -- "
+                  f"this census sees only {len(paths)} loose .c3 files and "
+                  "none of the ~25,000 archived assets. It will NOT be "
+                  "cached. Run `py -3 tools/health.py --bootstrap` first.",
+                  file=sys.stderr)
+            return out
         self.CACHE.parent.mkdir(parents=True, exist_ok=True)
         self.CACHE.write_text(json.dumps(out), "utf-8")
         return out

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""thumbs.py -- batch thumbnail renderer for the Conquer Online assets.
+r"""thumbs.py -- batch thumbnail renderer for the Classic Conquer 2.0 assets.
 
 Renders a square PNG preview for every `.c3` mesh that `tools/meshtex.py`
 resolves to a texture (4,950 of 4,964), plus optional decode-and-downscale
@@ -678,12 +678,16 @@ def out_path(kind: str, logical: str) -> Path:
     return OUT_DIR / kind / (stem + ".png")
 
 
-def load_worklist(idx_path: Path = COVERAGE) -> tuple[list[Job], list[str]]:
-    """Mesh work list, straight out of `out/meshtex/coverage.json`.
+def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]]:
+    """Mesh work list, straight out of `out/meshtex/coverage.json` (a linked
+    worktree reads the primary checkout's copy).
 
     Falls back to building a `meshtex.MeshTextureIndex` live (~2 min, it has to
     parse every `.c3`) if that file has not been generated.
     """
+    if idx_path is None:
+        import coroot
+        idx_path = coroot.find_derived("out/meshtex/coverage.json") or COVERAGE
     if idx_path.is_file():
         doc = json.loads(idx_path.read_text("utf-8"))
         jobs, unmatched = [], []

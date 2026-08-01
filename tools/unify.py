@@ -70,6 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import DEFAULT_ROOT                        # noqa: E402
+import coroot                                            # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 COVERAGE = REPO / "out" / "meshtex" / "coverage.json"
@@ -104,13 +105,16 @@ class UnifiedIndex:
 
     def __init__(self, root: Path = DEFAULT_ROOT,
                  exists: Optional[Callable[[str], bool]] = None,
-                 coverage: Path = COVERAGE):
+                 coverage: Optional[Path] = None):
         self.root = Path(root)
         self._exists = exists or (lambda p: True)
         self.mesh_matches: dict[str, list[dict]] = {}
         self.source = ""
         self.error = ""
-        self._load(coverage)
+        # a linked worktree reads the primary checkout's coverage.json
+        self._load(coverage
+                   or coroot.find_derived("out/meshtex/coverage.json")
+                   or COVERAGE)
 
         #: texture -> [(mesh, match)] over every *owning* pairing
         self.texture_owners: dict[str, list[tuple[str, dict]]] = {}
@@ -302,7 +306,9 @@ class UnifiedIndex:
                 continue
             fp = Path(f)
             if not fp.is_absolute():
-                fp = THUMB_DIR / f
+                # against the manifest's own directory, so a manifest read
+                # from the primary checkout names that checkout's images
+                fp = path.parent / f
             out[_norm(str(logical))] = {**rec, "file": str(fp)}
         return out
 
@@ -326,6 +332,14 @@ class UnifiedIndex:
                 if p.is_file():
                     self._thumbs = self._read_manifest(p)
                     break
+            else:
+                # nothing local: a linked worktree inherits the primary
+                # checkout's render, same name priority
+                for name in THUMB_MANIFEST_NAMES:
+                    p = coroot.find_derived("out/thumbs/" + name)
+                    if p is not None and p.is_file():
+                        self._thumbs = self._read_manifest(p)
+                        break
         return self._thumbs
 
     _tex_thumbs: Optional[dict] = None
@@ -334,6 +348,8 @@ class UnifiedIndex:
         """The texture half of the manifest, loaded lazily (23 MB, ~0.2 s)."""
         if self._tex_thumbs is None:
             p = THUMB_DIR / "manifest.json"
+            if not p.is_file():
+                p = coroot.find_derived("out/thumbs/manifest.json") or p
             self._tex_thumbs = self._read_manifest(p) if p.is_file() else {}
         return self._tex_thumbs
 

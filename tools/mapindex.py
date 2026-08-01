@@ -192,9 +192,10 @@ class MapIndex:
                         self._own_assets.load_names()
                     except Exception:
                         pass
+                    import coroot
                     for rel in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
-                        f = Path(__file__).resolve().parent.parent / rel
-                        if f.is_file():
+                        f = coroot.find_derived(rel)
+                        if f is not None:
                             tbl = json.loads(f.read_text("utf-8"))
                             (self._own_assets._names or {}).update(
                                 {int(k, 16): v for k, v in tbl.items()})

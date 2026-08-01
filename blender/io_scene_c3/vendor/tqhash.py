@@ -2,7 +2,7 @@
 # Edit core/tqhash.py, not this file.
 r"""
 tqhash.py -- the TQ Digital string hash used to key WDF archive entries,
-recovered by static analysis of `TqPackageWdf.dll` (Conquer Online,
+recovered by static analysis of `TqPackageWdf.dll` (Classic Conquer 2.0,
 bin/64, timestamp 2026-07-11T03:44:33Z, linker 14.51, PE32+ AMD64).
 
 =============================================================================

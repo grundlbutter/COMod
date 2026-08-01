@@ -684,7 +684,7 @@ draw the quad with world, uv + uvOffset, colour alpha, blend (ASB, ADB)
 a one-bone effect quad it is 0 on every vertex.
 
 Vertex positions, UVs and indices come from the `PHY` chunk exactly as
-`docs/modding.md` §9.3–§9.4 describes; `tools/c3phy.parse_phy` already does it.
+`docs/modding.md` §9.3–§9.4 describes; `core/c3phy.parse_phy` already does it.
 Apply the same coordinate conversion the rest of the project uses —
 `(x, y, −z)`, UV `(u, 1 − v)`, keep index order (`docs/modding.md` §9.7).
 

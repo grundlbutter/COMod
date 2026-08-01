@@ -47,6 +47,7 @@ sys.path.insert(0, str(HERE))
 
 import bodyfacets                                # noqa: E402
 import c3phy                                     # noqa: E402
+import coroot                                    # noqa: E402
 import dds                                       # noqa: E402
 from coassets import DEFAULT_ROOT                # noqa: E402
 
@@ -57,6 +58,19 @@ try:
     HAVE_PIL = True
 except ImportError:                              # pragma: no cover
     HAVE_PIL = False
+
+# Extraction-boundary capabilities.  This suite ships to COMod (docs/repo_split.md),
+# and COMod deliberately leaves behind the open client and the static-analysis
+# tooling.  A test whose subject was left behind must SKIP there, not error: an
+# extracted repo that cannot run its own test suite is indistinguishable from a
+# broken one, and "24 errors" is not a reviewable signal.
+#
+# Probed by file rather than by import because that is what the absence actually
+# looks like after an extraction, and because importing `packmeasure` for the
+# side effect of finding out would drag in `pe` -- a module COMod does not have.
+HAVE_CLIENT = (PROJECT / "client" / "gamemap.py").is_file()
+HAVE_PLAY_UI = (HERE / "webui" / "play.js").is_file()
+HAVE_PACKMEASURE = (HERE / "packmeasure.py").is_file()
 
 
 def _thumbs_rendered(kind: str = "meshes") -> bool:
@@ -69,8 +83,8 @@ def _thumbs_rendered(kind: str = "meshes") -> bool:
     would fail for a reason that is a user's deliberate choice, not a bug.
     """
     name = "manifest_meshes.json" if kind == "meshes" else "manifest.json"
-    p = PROJECT / "out" / "thumbs" / name
-    if not p.is_file():
+    p = coroot.find_derived("out/thumbs/" + name)
+    if p is None:
         return False
     try:
         counts = json.loads(p.read_text("utf-8")).get("counts") or {}
@@ -339,7 +353,7 @@ class DdsCorpus(unittest.TestCase):
 class MeshPipeline(unittest.TestCase):
     """What the WebGL viewport actually receives."""
 
-    OBJ_DIR = PROJECT / "out" / "c3" / "obj"
+    OBJ_DIR = coroot.find_derived("out/c3/obj") or (PROJECT / "out" / "c3" / "obj")
 
     @classmethod
     def setUpClass(cls):
@@ -3156,9 +3170,9 @@ class DefaultView(unittest.TestCase):
     def test_the_viewport_and_the_thumbnails_agree_on_the_front(self):
         src = self.GL.read_text("utf-8")
         yaw = float(re.search(r"const DEFAULT_YAW = (-?[\d.]+);", src).group(1))
-        manifest = PROJECT / "out" / "thumbs" / "manifest_meshes.json"
         if not _thumbs_rendered("meshes"):
             self.skipTest("mesh thumbnails not fully rendered")
+        manifest = coroot.find_derived("out/thumbs/manifest_meshes.json")
         r = json.loads(manifest.read_text("utf-8")).get("renderer", {})
         self.assertIn("yaw", r)
         self.assertAlmostEqual(yaw, r["yaw"], places=6,
@@ -4009,13 +4023,15 @@ class TerrainMesh(unittest.TestCase):
 
     @staticmethod
     def _grid():
+        # Guarded here rather than on each caller: eight of this class's ten
+        # tests reach the client through this helper, and raising SkipTest from
+        # inside it skips exactly those, leaving the two that need no grid to
+        # run normally.  A class-level decorator would silently over-skip them.
+        if not HAVE_CLIENT:
+            raise unittest.SkipTest("client/ not present in this tree")
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            raise unittest.SkipTest("cross-checks against the open client's "
-                                    "gamemap, which is a separate project")
+        from client import gamemap as GM
         # A room with a pillar, so blocked and walkable both appear.
         rows = [
             "########",
@@ -4062,17 +4078,14 @@ class TerrainMesh(unittest.TestCase):
         self.assertEqual((w["x0"], w["y0"]), (0, 0))
         self.assertEqual((w["x1"], w["y1"]), (g.width - 1, g.height - 1))
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     def test_indices_stay_inside_a_uint16_buffer(self):
         """gl.js uploads indices as Uint16Array; >65535 vertices would wrap
         silently and draw garbage."""
         import terrain
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         big = GM.GameMap(1, "big", 400, 400, bytes(400 * 400))
         m = terrain.build_patch(big, 200, 200, radius=terrain.DEFAULT_RADIUS)
         self.assertLess(m["vertexCount"], 65536)
@@ -4094,15 +4107,12 @@ class TerrainMesh(unittest.TestCase):
         vx, vy = c[0] - a[0], c[1] - a[1]
         self.assertGreater(ux * vy - uy * vx, 0)
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     def test_elevation_reaches_the_geometry(self):
         import terrain
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         g = GM.GameMap(1, "hill", 3, 3, bytes([1] * 9),
                        elevation=[0, 0, 0, 0, 7, 0, 0, 0, 0])
         m = terrain.build_patch(g, 1, 1, radius=1)
@@ -4209,17 +4219,14 @@ class PuzzlePlacement(unittest.TestCase):
         self.assertEqual(rect[2] - rect[0], (49 + 49) * 32)
         self.assertEqual(rect[3] - rect[1], (49 + 49) * 16)
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     def test_terrain_uvs_switch_to_the_art_without_moving_a_vertex(self):
         """The placement is linear in the same corner coordinates the mesh
         already uses, so turning the art on must change UVs and nothing else."""
         import terrain
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         pm = _synthetic_puzzle()
         g = GM.GameMap(1, "synthetic", pm.map_width, pm.map_height,
                        bytes([1]) * (pm.map_width * pm.map_height))
@@ -4245,6 +4252,7 @@ class PuzzlePlacement(unittest.TestCase):
         bad = [r["name"] for r in res["rows"] if r["status"] == "mismatch"]
         self.assertEqual(bad, ["sky"])
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_every_walkable_cell_of_four_different_maps_is_on_painted_art(self):
         """The sharp test: a cell you can stand on must be on the picture. Four
@@ -4259,11 +4267,7 @@ class PuzzlePlacement(unittest.TestCase):
         import puzzle
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         lib = puzzle.PuzzleLibrary()
         maps = GM.MapLibrary()
         for name in ("newbie", "arena", "boa", "Dcloister"):
@@ -4277,6 +4281,7 @@ class PuzzlePlacement(unittest.TestCase):
                 self.assertEqual(cov["offImage"], 0)
                 self.assertEqual(cov["onEmptyTile"], 0)
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_cells_off_the_art_on_newbie_are_exactly_the_scene_layers(self):
         """Task #27 measured 100.00% of `newbie`'s walkable cells on painted
@@ -4287,11 +4292,7 @@ class PuzzlePlacement(unittest.TestCase):
         import puzzle
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         pm = puzzle.PuzzleLibrary().get("newbie")
         grid = GM.MapLibrary().load(pm.map_id)
         cov = puzzle.coverage(pm, grid)
@@ -4310,17 +4311,14 @@ class PuzzlePlacement(unittest.TestCase):
         self.assertEqual(cov["sceneryOnEmptyTile"], 101)
         self.assertEqual(cov["sceneryOnArt"], 10)
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     def test_a_map_with_no_placeable_art_degrades_with_a_reason(self):
         """The four `.pux` maps, and any client with no install, must fall back
         to the passability shading rather than raise."""
         import terrain
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         g = GM.GameMap.from_cells(9002, "no-such-map-anywhere", 3, 1, ["..."])
         pm, why = terrain.open_puzzle(g)
         self.assertIsNone(pm)
@@ -4346,17 +4344,14 @@ class PuzzlePlacement(unittest.TestCase):
                         o, p = (oy * w + ox) * 3, (sy * w1 + sx) * 3
                         self.assertEqual(small[o:o + 3], full[p:p + 3])
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_ground_texture_is_a_png_the_size_of_the_rect(self):
         import puzzle
         import terrain
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         pm = puzzle.PuzzleLibrary().get("arena")
         grid = GM.MapLibrary().load(pm.map_id)
         patch = terrain.build_patch(grid, 48, 48, radius=8, puzzle=pm)
@@ -4366,6 +4361,98 @@ class PuzzlePlacement(unittest.TestCase):
         r = patch["ground"]["rect"]
         self.assertEqual(w, (r[2] - r[0]) // 2)
         self.assertEqual(h, (r[3] - r[1]) // 2)
+
+
+@unittest.skipUnless(HAVE_PLAY_UI, "tools/webui/play.js not present in this tree")
+class GameClientPage(unittest.TestCase):
+    """`tools/coplay.py` and its page. The seams that matter are the ones it
+    shares with the viewer -- if those drift, the game client silently grows a
+    second copy of something that already works."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (HERE / "webui" / "play.js").read_text("utf-8")
+        cls.html = (HERE / "webui" / "play.html").read_text("utf-8")
+        cls.py = (HERE / "coplay.py").read_text("utf-8")
+
+    def test_the_page_reuses_gl_js_rather_than_its_own_renderer(self):
+        self.assertIn('src="/ui/gl.js"', self.html)
+        self.assertIn("new Viewer(", self.js)
+        self.assertNotIn("createShader", self.js)
+
+    def test_the_character_comes_from_the_builders_own_endpoint(self):
+        """Not a second assembly path: /api/figure is tools/builder.py +
+        tools/parts.py, the same code the character builder uses."""
+        self.assertIn("/api/figure?", self.js)
+
+    def test_the_server_subclasses_the_viewers_handler(self):
+        self.assertIn("class PlayHandler(coviewer.Handler)", self.py)
+        self.assertIn("return super()._route()", self.py)
+
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
+    def test_the_direction_table_in_the_page_matches_client_world(self):
+        """Two copies of the table exist -- Python and JavaScript -- and a
+        rotation in either would look plausible on screen. Pin them together."""
+        sys.path.insert(0, str(PROJECT))
+        from client import world as W
+        m = re.search(r"const DIR_DELTA = \[(.*?)\];", self.js, re.S)
+        self.assertIsNotNone(m)
+        pairs = re.findall(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", m.group(1))
+        self.assertEqual(len(pairs), 8)
+        for d, (dx, dy) in enumerate(pairs):
+            self.assertEqual((int(dx), int(dy)), W.DELTAS[d],
+                             f"play.js direction {d} disagrees with client/world.py")
+
+    def test_the_page_scale_matches_terrain_py(self):
+        import terrain
+        for name, want in (("CELL", terrain.CELL), ("ZSCALE", terrain.ZSCALE)):
+            m = re.search(rf"const {name} = ([\d.]+);", self.js)
+            self.assertIsNotNone(m, f"play.js is missing {name}")
+            self.assertEqual(float(m.group(1)), want,
+                             f"{name} differs between play.js and terrain.py")
+
+    def test_lookface_maps_to_a_body_appearance(self):
+        sys.path.insert(0, str(PROJECT))
+        import coplay
+        # 301003 -> avatar 30, body 1003 -> male small -> prefix 003
+        self.assertEqual(coplay.body_appearance(301003), "003000000")
+        self.assertEqual(coplay.body_appearance(301004), "004000000")
+        self.assertEqual(coplay.body_appearance(302001), "001000000")
+        self.assertEqual(coplay.body_appearance(302002), "002000000")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_body_appearance_it_can_produce_really_ships(self):
+        sys.path.insert(0, str(PROJECT))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+        import coplay
+        from coassets import parse_ini
+        armor = parse_ini(ROOT / "ini" / "armor.ini")
+        for body in (1003, 1004, 2001, 2002):
+            ident = coplay.body_appearance(body)
+            self.assertIn(ident, armor,
+                          f"body {body} -> {ident}, which armor.ini does not have")
+
+    def test_textures_survive_a_rebuild(self):
+        """setMeshes() calls clear(), which deletes uploaded textures. The page
+        must re-apply them or the map turns white the moment the character
+        loads -- which is exactly what happened."""
+        self.assertIn("textureUrls", self.js)
+        self.assertIn("function applyTextures()", self.js)
+
+    def test_the_camera_is_never_reframed_by_setmeshes(self):
+        """_frame() fits to the terrain patch (~5000 units) and parks the camera
+        far enough away that the character is a few pixels."""
+        self.assertIn("keepFraming: true", self.js)
+
+    def test_shots_land_in_the_projects_own_output_tree(self):
+        self.assertIn('"out" / "viewer" / "shots"', self.py)
+        self.assertNotIn("game_root /", self.py.split("def post_shot")[1][:800])
+
+
+# ---------------------------------------------------------------------------
+# Scene / cover layers -- docs/map_scenery.md
+# ---------------------------------------------------------------------------
+
 class SceneFormat(unittest.TestCase):
     """`map/Scene/*.scene`: the part header and the per-cell array."""
 
@@ -4450,6 +4537,7 @@ class SceneFormat(unittest.TestCase):
 class ScenePassability(unittest.TestCase):
     """A TERRAIN layer carries passability, and it replaces the cell grid."""
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_newbie_bridge_joins_two_islands_that_the_grid_leaves_apart(self):
         """The whole finding in one assertion. `newbie`'s starting island and
@@ -4459,11 +4547,7 @@ class ScenePassability(unittest.TestCase):
         import scene
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         base = GM.MapLibrary(scenery=False).load(1010)
         over = GM.MapLibrary().load(1010)
         self.assertEqual(base.walkable_count, 1561)
@@ -4479,6 +4563,7 @@ class ScenePassability(unittest.TestCase):
         self.assertTrue(over.walkable(69, 106))
         self.assertTrue(over.from_scenery(69, 106))
 
+    @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_cells_run_backwards_from_the_layer_origin(self):
         """The rule that took the most work to pin. Part cell (i, j) lands on
@@ -4490,11 +4575,7 @@ class ScenePassability(unittest.TestCase):
         import coroot
         import sys as _sys
         _sys.path.insert(0, str(PROJECT))
-        try:
-            from client import gamemap as GM
-        except ImportError:
-            self.skipTest("cross-checks against the open client's "
-                          "gamemap, which is a separate project")
+        from client import gamemap as GM
         root = Path(coroot.default_root())
         d = dmap.parse(root / "map" / "map" / "newbie.DMap", verify=False)
         lib = scene.SceneLibrary(root)
@@ -4523,8 +4604,8 @@ class ScenePassability(unittest.TestCase):
         second number, i.e. let a player walk through the walls of every
         building placed as scenery."""
         import json
-        rep = PROJECT / "out" / "wdf" / "scene_survey.json"
-        if not rep.is_file():
+        rep = coroot.find_derived("out/wdf/scene_survey.json")
+        if rep is None:
             self.skipTest("run `py -3 tools/scene.py --verify -o "
                           "out/wdf/scene_survey.json` first")
         t = json.loads(rep.read_text("utf-8"))["totals"]
@@ -4902,23 +4983,19 @@ class IsometricCamera(unittest.TestCase):
         # the fixed camera must actually be enforced, not merely set once
         self.assertIn("!this.opts.fixedCamera", js)
 
+    @unittest.skipUnless(HAVE_PLAY_UI, "tools/webui/play.js not present in this tree")
     def test_play_js_uses_it_and_keeps_a_debug_escape_hatch(self):
-        pj = Path(__file__).resolve().parent / "webui" / "play.js"
-        if not pj.is_file():
-            self.skipTest("play.js belongs to the open client, a separate project")
-        js = pj.read_text("utf-8")
+        js = (Path(__file__).resolve().parent / "webui" / "play.js").read_text("utf-8")
         self.assertIn("viewer.setIsoCamera(freecam)", js)
         self.assertIn("freecam", js)
         self.assertNotIn("viewer.cam.pitch = 0.72;\n  viewer.cam.dist", js)
 
+    @unittest.skipUnless(HAVE_PLAY_UI, "tools/webui/play.js not present in this tree")
     def test_the_cover_layer_draws_after_the_character(self):
         """A cover is *defined* as the sprite in front of the player, so it
         cannot be depth-sorted with everything else."""
         gl = (Path(__file__).resolve().parent / "webui" / "gl.js").read_text("utf-8")
-        pj = Path(__file__).resolve().parent / "webui" / "play.js"
-        if not pj.is_file():
-            self.skipTest("play.js belongs to the open client, a separate project")
-        play = pj.read_text("utf-8")
+        play = (Path(__file__).resolve().parent / "webui" / "play.js").read_text("utf-8")
         self.assertIn("meta.overlay", gl)
         self.assertIn("gl.depthFunc(overlayOn ? gl.ALWAYS : gl.LEQUAL)", gl)
         self.assertIn("overlay: true", play)
@@ -5639,6 +5716,61 @@ class Csrf(unittest.TestCase):
         self.assertIn("'GET'", js)
         self.assertIn("X-CO-Token", js)
         self.assertIn('meta[name="co-csrf"]', js)
+
+
+@unittest.skipUnless(HAVE_PACKMEASURE, "tools/packmeasure.py not present in this tree")
+class PackMeasure(unittest.TestCase):
+    """`tools/packmeasure.py` -- entropy bands, on synthetic input.
+
+    The interesting output of that tool is a judgement ("is this region
+    encrypted?"), and a judgement built on a miscalibrated band would be
+    confidently wrong. So the bands are pinned against data whose entropy is
+    known by construction rather than against the game binaries, which is also
+    what lets these tests run with no install present.
+    """
+
+    def setUp(self):
+        import packmeasure
+        self.pm = packmeasure
+
+    def test_entropy_of_known_inputs(self):
+        self.assertEqual(self.pm.entropy(b""), 0.0)
+        self.assertEqual(self.pm.entropy(b"\x00" * 4096), 0.0,
+                         "one repeated symbol carries no information")
+        # 256 distinct symbols, uniform -> exactly 8 bits/byte.
+        self.assertAlmostEqual(self.pm.entropy(bytes(range(256)) * 16), 8.0, places=6)
+        # Two symbols, equally likely -> exactly 1 bit/byte.
+        self.assertAlmostEqual(self.pm.entropy(b"AB" * 2048), 1.0, places=6)
+
+    def test_bands_classify_the_way_the_report_claims(self):
+        self.assertEqual(self.pm.band(7.99), "ENCRYPTED/COMPRESSED")
+        self.assertEqual(self.pm.band(6.30), "code-like")
+        self.assertEqual(self.pm.band(0.0), "zeros")
+        # The boundary that matters: a packed payload must not read as "code".
+        self.assertNotEqual(self.pm.band(7.50), self.pm.band(6.30))
+
+    def test_random_bytes_land_in_the_encrypted_band(self):
+        """The calibration the whole verdict rests on: os.urandom is the best
+        available stand-in for correctly encrypted output."""
+        self.assertGreater(self.pm.entropy(os.urandom(262144)), 7.95)
+
+    def test_printable_ratio(self):
+        self.assertAlmostEqual(self.pm.printable_ratio(b"hello world"), 1.0)
+        self.assertAlmostEqual(self.pm.printable_ratio(bytes(256)), 0.0)
+
+    def test_it_measures_and_does_not_unpack(self):
+        """A guard on intent, not just behaviour. `docs/CONTEXT.md` forbids
+        unpacking, and this tool sits close enough to that line that the
+        prohibition is worth asserting in the suite rather than trusting to a
+        docstring."""
+        src = (Path(__file__).resolve().parent / "packmeasure.py").read_text("utf-8")
+        for forbidden in ("subprocess", "CreateProcess", "WriteProcessMemory",
+                          "ctypes", "OpenProcess", "os.system"):
+            with self.subTest(api=forbidden):
+                self.assertNotIn(forbidden, src)
+        self.assertIn("read_bytes", src, "it reads the file and nothing else")
+
+
 class CoreBoundary(unittest.TestCase):
     """COre must stay extractable, which means it must not reach upwards.
 
@@ -5658,7 +5790,7 @@ class CoreBoundary(unittest.TestCase):
     #: The declared members. Kept here rather than globbed so that *adding* a
     #: module to COre is a deliberate act with a test change attached.
     MEMBERS = {"coroot", "safepath", "tqhash", "wdf", "dds", "c3phy",
-               "dmap", "coassets"}
+               "dmap", "tpd", "coassets", "colibrary"}
 
     def test_the_directory_holds_exactly_the_declared_modules(self):
         on_disk = {p.stem for p in self.CORE.glob("*.py")}

@@ -358,6 +358,60 @@ class Viewer {
    *  the zoom control so the wheel behaves the same under both projections. */
   get isoHalfHeight() { return Math.max(1, this.cam.dist * 0.5); }
 
+  /** Where a click lands on the ground plane, in world units.
+   *
+   *  `px`/`py` are canvas-relative CSS pixels; `groundZ` is the height of the
+   *  plane to hit. Returns `[x, y, z]`, or null when the view is edge-on and
+   *  the ray never meets the plane.
+   *
+   *  THE BASIS IS REDERIVED THE WAY `lookAt` DERIVES IT, DELIBERATELY.
+   *  `_basis()` computes `right = cross(dir, up)` while `M4.lookAt` computes
+   *  `x = cross(up, z)` -- the same axis with the opposite sign. Picking that
+   *  borrowed `_basis()` would be mirrored in X, and the bug would look like
+   *  "clicking left walks right", which is exactly the sort of thing that gets
+   *  patched with a stray minus sign instead of understood. So this mirrors
+   *  the render path: same `z`, same fallback when `z` is parallel to up.
+   */
+  screenToGround(px, py, groundZ = 0) {
+    const c = this.canvas;
+    const w = c.clientWidth || c.width, h = c.clientHeight || c.height;
+    if (!w || !h) return null;
+    const ndcX = (px / w) * 2 - 1;
+    const ndcY = 1 - (py / h) * 2;
+
+    const f = this._basis();
+    const ctr = [this.center[0] + this.cam.pan[0],
+                 this.center[1] + this.cam.pan[1],
+                 this.center[2] + this.cam.pan[2]];
+    const z = f.dir;                       // eye - ctr, normalised
+    let x = cross([0, 0, 1], z);
+    if (len(x) < 1e-6) x = cross([0, 1, 0], z);
+    x = norm(x);
+    const y = cross(z, x);
+
+    const aspect = c.width / Math.max(1, c.height);
+    let origin, ray;
+    if (this.opts.projection === 'iso') {
+      const hh = this.isoHalfHeight, hw = hh * aspect;
+      origin = [ctr[0] + x[0] * ndcX * hw + y[0] * ndcY * hh,
+                ctr[1] + x[1] * ndcX * hw + y[1] * ndcY * hh,
+                ctr[2] + x[2] * ndcX * hw + y[2] * ndcY * hh];
+      ray = [-z[0], -z[1], -z[2]];
+    } else {
+      const t = Math.tan(45 * Math.PI / 360);
+      origin = [ctr[0] + z[0] * this.cam.dist,
+                ctr[1] + z[1] * this.cam.dist,
+                ctr[2] + z[2] * this.cam.dist];
+      ray = norm([x[0] * ndcX * t * aspect + y[0] * ndcY * t - z[0],
+                  x[1] * ndcX * t * aspect + y[1] * ndcY * t - z[1],
+                  x[2] * ndcX * t * aspect + y[2] * ndcY * t - z[2]]);
+    }
+    if (Math.abs(ray[2]) < 1e-9) return null;
+    const t = (groundZ - origin[2]) / ray[2];
+    if (!isFinite(t)) return null;
+    return [origin[0] + ray[0] * t, origin[1] + ray[1] * t, groundZ];
+  }
+
   _basis() {
     const cp = Math.cos(this.cam.pitch), sp = Math.sin(this.cam.pitch);
     const cy = Math.cos(this.cam.yaw), sy = Math.sin(this.cam.yaw);
@@ -560,6 +614,16 @@ class Viewer {
         })(),
         slot: d.slot || null,
         socket: d.socket || null,
+        // The world placement a socket matrix composes onto. The builder
+        // leaves this null because its figure stands at the origin, so a
+        // socket matrix *is* the model matrix there. A character standing on
+        // a map has a placement as well, and `setPose` has to multiply rather
+        // than overwrite or the sword drops to the world origin on frame 1.
+        base: d.base ? new Float32Array(d.base) : null,
+        // The socket-relative matrix this part was built with. Kept so the
+        // caller can re-place a moving figure without rebuilding the scene:
+        // `model = base * local`.
+        local: d.local ? new Float32Array(d.local) : null,
         centroid: [(m.bboxRender[0][0] + m.bboxRender[1][0]) / 2 + (d.translate ? d.translate[0] : 0),
                    (m.bboxRender[0][1] + m.bboxRender[1][1]) / 2 + (d.translate ? d.translate[1] : 0),
                    (m.bboxRender[0][2] + m.bboxRender[1][2]) / 2 + (d.translate ? d.translate[2] : 0)],
@@ -607,9 +671,20 @@ class Viewer {
   setPose(positions, sockets) {
     const gl = this.gl;
     for (const m of this.meshes) {
-      if (m.slot) {
-        const mat = sockets && m.socket && sockets[m.socket];
-        if (mat && mat.length === 16) m.model = new Float32Array(mat);
+      // Socket-attached geometry -- a weapon, a helmet -- is moved by its
+      // socket matrix, not by rewriting vertices.
+      //
+      // This tests `socket`, not `slot`, and the difference matters: the game
+      // view tags the player's *body* meshes with a slot (`_player`) so it can
+      // find them again, and testing `slot` here skipped them, which is why a
+      // placed character could never animate. A mesh is socket-driven when it
+      // has a socket; a slot is just a label.
+      if (m.socket) {
+        const mat = sockets && sockets[m.socket];
+        if (mat && mat.length === 16) {
+          m.model = m.base ? M4.mul(m.base, new Float32Array(mat))
+                           : new Float32Array(mat);
+        }
         continue;
       }
       const p = positions && positions[m.meta.index];

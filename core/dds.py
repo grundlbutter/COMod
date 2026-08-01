@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""
 dds.py -- DirectDraw Surface reader and a self-contained block-compression
-decoder, written for the Conquer Online asset viewer.
+decoder, written for the Classic Conquer 2.0 asset viewer.
 
 Why not just use Pillow?  Pillow *does* read DXT1/DXT3/DXT5 and it agrees with
 this module on every archived texture in this install (see tools/test_viewer.py,

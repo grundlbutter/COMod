@@ -1130,10 +1130,10 @@ def _scan_paths(root: Path, assets) -> list[str]:
         prefix = (rel + "/") if rel else ""
         for f in files:
             out.add((prefix + f).lower())
-    repo = Path(__file__).resolve().parent.parent
+    import coroot
     for rel in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
-        p = repo / rel
-        if p.is_file():
+        p = coroot.find_derived(rel)
+        if p is not None:
             try:
                 out.update(v.lower()
                            for v in json.loads(p.read_text("utf-8")).values())
@@ -1152,8 +1152,9 @@ def _coverage(root: Path):
     when the file has not been generated, in which case the caller opens the
     `.c3` itself.
     """
-    p = Path(__file__).resolve().parent.parent / "out" / "meshtex" / "coverage.json"
-    if not p.is_file():
+    import coroot
+    p = coroot.find_derived("out/meshtex/coverage.json")
+    if p is None:
         return None
     try:
         data = json.loads(p.read_text("utf-8"))

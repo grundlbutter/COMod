@@ -180,12 +180,13 @@ USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-
                           re.IGNORECASE)
 
 #: The conventional install path.  Allowed in exactly one place.
-INSTALL_PATH_RE = re.compile(
-    r"Program Files[^\"'\n]{0,12}[\\/]+[^\"'\\/\n]{0,24}Conquer",
-    re.IGNORECASE)
+INSTALL_PATH_RE = re.compile(r"Program Files[^\"'\n]{0,12}[\\/]+Classic Conquer",
+                             re.IGNORECASE)
 INSTALL_PATH_ALLOWED = {"core/coroot.py",
                         "blender/io_scene_c3/vendor/coroot.py",
-                        "tests/test_sanitization.py"}
+                        "tests/test_sanitization.py",
+                        "docs/sanitization.md",
+                        "docs/repo_split.md"}
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 

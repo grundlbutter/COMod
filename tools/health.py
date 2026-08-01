@@ -188,8 +188,12 @@ def check_install(explicit=None) -> dict:
 #:
 #: Order matters.  `wdf_recover.py` must run before `meshtex.py`, because
 #: meshtex caches a mesh index built from whatever name tables existed at the
-#: time -- run it first and you get a silently half-sized index that looks
-#: fine.  (Found the hard way while verifying a relocated checkout.)
+#: time.  Running them out of order used to leave a silently half-sized index
+#: that looked fine (found the hard way while verifying a relocated checkout);
+#: meshtex now refuses to persist a census taken without the name tables and
+#: discards a cache that no longer covers the universe, so the order is
+#: enforced rather than merely documented.  Linked git worktrees inherit all
+#: of these artefacts from the primary checkout (`coroot.find_derived`).
 #:
 #: (relative artefact, what produces it, roughly how long, why it matters)
 DERIVED = [
@@ -208,17 +212,98 @@ DERIVED = [
     ("out/effects/linkage.json",
      ["tools/effects.py", "--linkage"], "6 s",
      "weapon/action to 3D effect linkage."),
+    ("out/opcodes.json",
+     ["tools/build_opcodes.py"], "2 s",
+     "the protocol opcode table."),
+    # Genuinely optional, and reported for the same reason CoEmu is: a
+    # gitignored dependency is otherwise invisible. Skipping it costs the
+    # pictures and nothing else -- skins resolve token by token, so an unbuilt
+    # `classic` falls back to the `plain` skin's value for each missing image
+    # and the in-game UI draws a flat gold frame instead of a bitmap one.
+    ("out/skins/classic/manifest.json",
+     ["tools/skinbuild.py"], "1 s",
+     "the `classic` UI skin: the 9-slice frame and window captions from the "
+     "game's own data/Interface/. Optional -- docs/ui.md §3."),
 ]
 
 
+def check_local_server() -> dict:
+    """Rust and CoEmu -- the local test server. **Entirely optional.**
+
+    Reported because a gitignored dependency is otherwise invisible: a fresh
+    clone has no `server/` directory and nothing tells you a toolchain exists.
+    Nothing here being present is a perfectly healthy state -- `client/` and its
+    whole test suite run on Python alone against `client/simserver.py`. CoEmu
+    only buys you a second, independent peer to send real packets at.
+
+    CoEmu is GPL-3 and lives in the gitignored `server/`; see
+    docs/server_setup.md for why it is not vendored.
+    """
+    coemu = REPO / "server" / "coemu"
+    exe = ".exe" if os.name == "nt" else ""
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        candidate = Path.home() / ".cargo" / "bin" / f"cargo{exe}"
+        cargo = str(candidate) if candidate.exists() else None
+
+    built = [n for n in ("auth-server", "game-server")
+             if (coemu / "target" / "debug" / f"{n}{exe}").exists()]
+    cloned = (coemu / "Cargo.toml").exists()
+    db = coemu / "data" / "coemu.db"
+    maps = coemu / "data" / "GameMaps" / "map"
+    dmaps = len(list(maps.glob("*.DMap"))) if maps.exists() else 0
+
+    ready = bool(cargo and cloned and len(built) == 2 and db.exists())
+    parts = [
+        {"name": "Rust (cargo)", "present": bool(cargo),
+         "detail": cargo or "not installed",
+         "fix": "https://rustup.rs, then `rustup default nightly`. On Windows, "
+                "`rustup default nightly-x86_64-pc-windows-gnu` avoids a "
+                "multi-GB Visual Studio Build Tools install if you already "
+                "have MinGW."},
+        {"name": "CoEmu clone", "present": cloned,
+         "detail": "server/coemu" if cloned else "not cloned",
+         "fix": "py -3 tools/setup_coemu.py --step clone"},
+        {"name": "CoEmu binaries", "present": len(built) == 2,
+         "detail": ", ".join(built) if built else "not built",
+         "fix": "py -3 tools/setup_coemu.py --step patch --step build"},
+        {"name": "CoEmu database", "present": db.exists(),
+         "detail": "data/coemu.db" if db.exists() else "not created",
+         "fix": "py -3 tools/setup_coemu.py --step db"},
+        {"name": "CoEmu map data", "present": dmaps > 0,
+         "detail": f"{dmaps} .DMap file(s)" if dmaps else "none copied",
+         "fix": "py -3 tools/setup_coemu.py --step maps  "
+                "(reads your game install; login works without it, "
+                "entering the world does not)"},
+    ]
+    return {
+        "optional": True,
+        "ok": True,                       # never fails the health check
+        "ready": ready,
+        "parts": parts,
+        "why": "an optional local Conquer Online 5017 server (CoEmu, GPL-3, "
+               "kept in the gitignored server/) for client/ to talk to. "
+               "Not needed: py -3 tests/test_client.py and "
+               "py -3 -m client selftest run on Python alone.",
+        "fix": "py -3 tools/setup_coemu.py --check",
+        "docs": "docs/server_setup.md",
+    }
+
+
 def check_derived() -> dict:
-    """Which generated artefacts a fresh clone is still missing."""
+    """Which generated artefacts a fresh clone is still missing.
+
+    An artefact counts as present when `coroot.find_derived` can read it --
+    from this checkout, or from the primary checkout when this is a linked
+    git worktree.  Inherited artefacts are reported as such."""
     artefacts = []
     for rel, argv, cost, why in DERIVED:
-        p = REPO / rel
+        p = coroot.find_derived(rel)
+        found = p is not None and p.is_file()
         artefacts.append({
-            "path": rel, "exists": p.is_file(),
-            "bytes": p.stat().st_size if p.is_file() else 0,
+            "path": rel, "exists": found,
+            "inherited": found and not (REPO / rel).is_file(),
+            "bytes": p.stat().st_size if found else 0,
             "command": "py -3 " + " ".join(argv), "cost": cost, "why": why,
         })
     missing = [a for a in artefacts if not a["exists"]]
@@ -226,6 +311,7 @@ def check_derived() -> dict:
         "dir": str(REPO / "out"),
         "artefacts": artefacts,
         "missing": [a["path"] for a in missing],
+        "inherited": [a["path"] for a in artefacts if a["inherited"]],
         "ok": not missing,
         "fix": ("Build it in one step: `py -3 tools/health.py --bootstrap` "
                 "(about 6-10 minutes, once). Or run each command listed in "
@@ -241,7 +327,7 @@ def bootstrap(only_missing: bool = True) -> int:
     """
     import subprocess                                # noqa: PLC0415
     todo = [(rel, argv, cost) for rel, argv, cost, _ in DERIVED
-            if not only_missing or not (REPO / rel).is_file()]
+            if not only_missing or coroot.find_derived(rel) is None]
     if not todo:
         print("derived data is already built; nothing to do "
               "(use --bootstrap-all to force)")
@@ -431,6 +517,7 @@ def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
         "python": check_python(),
         "packages": check_packages(),
         "derived": check_derived(),
+        "localServer": check_local_server(),
     }
     if with_thumbnails:
         try:
@@ -475,6 +562,19 @@ def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
                     "filename, not the name, and the recovery has not run.",
             "fix": der["fix"]})
 
+    ls = rep.get("localServer") or {}
+    if not ls.get("ready"):
+        missing = [p["name"] for p in ls.get("parts", []) if not p["present"]]
+        problems.append({
+            "severity": "info",
+            "what": "The optional local test server is not set up ("
+                    + ", ".join(missing) + " missing). Nothing needs it: "
+                    "client/ tests and `py -3 -m client selftest` run without "
+                    "it. It gives client/ a real server to exchange packets "
+                    "with.",
+            "fix": "py -3 tools/setup_coemu.py --check   "
+                   "(see docs/server_setup.md)"})
+
     th = rep.get("thumbnails") or {}
     if th.get("status") == "none":
         problems.append({
@@ -510,7 +610,7 @@ def render_text(rep: dict) -> str:
     L: list[str] = []
     add = L.append
     add("")
-    add("  COMod -- health check")
+    add("  Conquer Online RE toolkit -- health check")
     add("  " + "-" * 54)
     add(f"  repo      : {rep['repo']}")
     add(f"  platform  : {rep['platform']}")
@@ -549,9 +649,23 @@ def render_text(rep: dict) -> str:
         f"({sum(1 for a in der.get('artefacts', []) if a['exists'])}"
         f"/{len(der.get('artefacts', []))} built)")
     for a in der.get("artefacts", []):
-        add(f"           {'ok' if a['exists'] else 'MISSING':<10} {a['path']}"
+        state = ("inherited" if a.get("inherited")
+                 else "ok" if a["exists"] else "MISSING")
+        add(f"           {state:<10} {a['path']}"
             + (f"  {a['bytes'] / 1e6:,.1f} MB" if a["exists"]
                else f"   <- {a['command']}   (~{a['cost']})"))
+
+    ls = rep.get("localServer") or {}
+    if ls:
+        mark = _MARK[True] if ls.get("ready") else " info "
+        add(f"{mark}local test server (optional): "
+            + ("ready" if ls.get("ready") else "not set up"))
+        for part in ls.get("parts", []):
+            add(f"           {'ok' if part['present'] else '--':<10} "
+                f"{part['name']}: {part['detail']}")
+        if not ls.get("ready"):
+            add("         Optional. client/ and its 39 tests run without it; "
+                "see docs/server_setup.md.")
 
     th = rep.get("thumbnails") or {}
     if th:

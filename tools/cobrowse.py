@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cobrowse.py -- visual asset browser for Conquer Online.
+cobrowse.py -- visual asset browser for Classic Conquer 2.0.
 
 Builds a self-contained HTML page of texture thumbnails so you can *see* what
 an appearance ID actually looks like before editing it. Every tile carries the

@@ -1,14 +1,5 @@
 # Part attachment — how the client puts a helmet on a head
 
-> **Note.** This document was written in the full development tree that this
-> repository was extracted from. References to `docs/CONTEXT.md`,
-> `docs/STATUS.md`, `docs/movement.md`, `tools/coplay.py`, `client/...` or the
-> static-analysis tooling (`disfn`, `xref`, `riprefs`, `readtrace`, `vtable`,
-> `d3dlayout`, `dll_analysis`) point at that tree and are not part of this
-> repository. Every tool and command shown from `core/` and `tools/` that is
-> not on that list ships here and works as written.
-
-
 How `ImConquer` positions, orients and scales an equipped part on a character.
 Recovered by disassembling `Role3D.dll` and `graphic.dll` instruction by
 instruction, then applied to the shipped assets and checked numerically.

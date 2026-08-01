@@ -1,13 +1,4 @@
-# Graphics modding — Conquer Online
-
-> **Note.** This document was written in the full development tree that this
-> repository was extracted from. References to `docs/CONTEXT.md`,
-> `docs/STATUS.md`, `docs/movement.md`, `tools/coplay.py`, `client/...` or the
-> static-analysis tooling (`disfn`, `xref`, `riprefs`, `readtrace`, `vtable`,
-> `d3dlayout`, `dll_analysis`) point at that tree and are not part of this
-> repository. Every tool and command shown from `core/` and `tools/` that is
-> not on that list ships here and works as written.
-
+# Graphics modding — Classic Conquer 2.0
 
 How the client's visual assets are laid out, which file backs which in-game
 thing, and how to change one. Everything below is marked **VERIFIED** (proven
@@ -558,7 +549,7 @@ has_normal               :  Read(v+0x00, 0x34)
 
 When a variant does not store normals, the engine **generates** them
 (RVA `0x5A8C0`): accumulate the face normal onto each of the triangle's three
-vertices, then normalise. `tools/c3phy.generate_normals()` reproduces it.
+vertices, then normalise. `core/c3phy.generate_normals()` reproduces it.
 
 ### 9.3 The vertex record — VERIFIED
 

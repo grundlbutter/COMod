@@ -1,14 +1,5 @@
 # The MapEditor — drawing a world map, and changing it
 
-> **Note.** This document was written in the full development tree that this
-> repository was extracted from. References to `docs/CONTEXT.md`,
-> `docs/STATUS.md`, `docs/movement.md`, `tools/coplay.py`, `client/...` or the
-> static-analysis tooling (`disfn`, `xref`, `riprefs`, `readtrace`, `vtable`,
-> `d3dlayout`, `dll_analysis`) point at that tree and are not part of this
-> repository. Every tool and command shown from `core/` and `tools/` that is
-> not on that list ships here and works as written.
-
-
 `docs/ground_art.md` recovered where a map's painted background sits.
 `docs/map_scenery.md` placed the TERRAIN objects and COVER sprites on top of it
 and found that the TERRAIN layers carry passability. Both ended with a picture

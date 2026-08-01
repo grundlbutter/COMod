@@ -72,6 +72,50 @@ let viewer = null;
 // exposed so the viewport can be driven from the console / a test harness
 window.state = state;
 
+// ------------------------------------------------------------- server picker
+//
+// One selector, top left: the baseline install ("base") or any server profile
+// catalogued in the COmmunity Library. Switching swaps the whole catalogue on
+// the server side -- namespace, appearance tables, provenance -- then reloads
+// the page, because every pane caches derived state.
+async function initServerPicker(st) {
+  let doc;
+  try { doc = await api('/api/servers'); } catch (e) { return; }
+  const sel = $('#server-select');
+  const label = $('#server-label');
+  if (!doc.servers || !doc.servers.length) { label.classList.add('hidden'); return; }
+  sel.innerHTML = '';
+  const b = el('option', null, 'base — ' + (doc.base || 'install'));
+  b.value = '';
+  sel.appendChild(b);
+  for (const s of doc.servers) {
+    const o = el('option', null,
+      s.name + (s.clientVersion ? ` (v${s.clientVersion})` : '') +
+      (s.files ? ` — ${s.files.toLocaleString()} files` : ''));
+    o.value = s.name;
+    sel.appendChild(o);
+  }
+  sel.value = doc.current || '';
+  $('#origin-label').classList.toggle('hidden', !doc.current);
+  label.classList.remove('hidden');
+  sel.addEventListener('change', async () => {
+    const name = sel.value;
+    sel.disabled = true;
+    toast(name ? `switching to ${name}… (first switch builds the catalogue)`
+               : 'switching to the baseline install…', 8000);
+    try {
+      await api('/api/server', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: name }) });
+      location.reload();
+    } catch (e) {
+      sel.disabled = false;
+      toast('switch failed: ' + e.message, 6000);
+      sel.value = doc.current || '';
+    }
+  });
+}
+
 // ------------------------------------------------------------------ helpers
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -185,7 +229,9 @@ async function boot() {
 
   const st = await api('/api/status');
   state.status = st;
+  await initServerPicker(st);
   $('#statusline').textContent =
+    (st.server ? `server: ${st.server} · ` : '') +
     `${st.root} · ${st.looseFiles.toLocaleString()} loose files · ` +
     Object.entries(st.archives).map(([k, v]) => `${k} ${v.entries.toLocaleString()}`).join(' · ') +
     ` · ${st.knownPaths.toLocaleString()} resolvable paths` +
@@ -283,6 +329,7 @@ function bindControls() {
     window.open('/api/tags/export?format=' + fmt, '_blank');
   });
   $('#dir-select').addEventListener('change', loadFiles);
+  $('#source-select').addEventListener('change', loadFiles);
   $('#ext-select').addEventListener('change', async () => {
     const ext = $('#ext-select').value;
     await fillDirs(ext, ext === '.c3' ? 'c3/mesh' : 'c3/texture');
@@ -1732,6 +1779,8 @@ async function loadFiles() {
     q: $('#file-search').value.trim(),
     limit: '300',
   });
+  const origin = $('#source-select').value;
+  if (origin) p.set('source', origin);
   const data = await api('/api/files?' + p.toString());
   state.files = data.rows;
   list.innerHTML = '';

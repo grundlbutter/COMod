@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-coviewer.py -- the Conquer Online asset viewer.
+coviewer.py -- the Classic Conquer 2.0 asset viewer.
 
     py -3 tools/coviewer.py
 
@@ -331,13 +331,17 @@ class Catalog:
     resolve, plus the appearance tables and a reverse map from asset file back
     to the appearance IDs that reference it."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, server_view=None):
         self.root = Path(root)
-        self.assets = AssetRoot(self.root)
+        #: a colibrary.ServerView when browsing an imported community client;
+        #: the namespace and the appearance tables then come from that
+        #: client's profile instead of the install.
+        self.server_view = server_view
+        self.assets = server_view or AssetRoot(self.root)
         self.names: dict[int, str] = {}
         for rel in NAME_TABLES:
-            p = PROJECT / rel
-            if p.is_file():
+            p = coroot.find_derived(rel)
+            if p is not None:
                 self.names.update({int(k, 16): v
                                    for k, v in json.loads(p.read_text("utf-8")).items()})
         if not self.names:
@@ -351,7 +355,8 @@ class Catalog:
         self.assets._names = self.names
 
         self.loose: set[str] = set()
-        self._scan_loose()
+        if self.server_view is None:
+            self._scan_loose()
 
         # archive entry lookup: logical path -> (archive, entry)
         self.arc_by_hash = {}
@@ -360,10 +365,15 @@ class Catalog:
                 self.arc_by_hash.setdefault(e.hash, (aname, e))
 
         self.archived: dict[str, str] = {}       # logical -> archive name
-        for h, nm in self.names.items():
-            hit = self.arc_by_hash.get(h)
-            if hit:
-                self.archived[nm.lower()] = hit[0]
+        if self.server_view is not None:
+            _labels = {"l": "library", "b": "baseline", "w": "baseline"}
+            for key, ref in self.server_view.filemap.items():
+                self.archived[key] = _labels.get(ref[0], "baseline")
+        else:
+            for h, nm in self.names.items():
+                hit = self.arc_by_hash.get(h)
+                if hit:
+                    self.archived[nm.lower()] = hit[0]
 
         self.all_paths: list[str] = sorted(set(self.loose) | set(self.archived))
         self._path_set = set(self.all_paths)
@@ -397,7 +407,9 @@ class Catalog:
                 self.texres = c3tex.TextureResolver.__new__(c3tex.TextureResolver)
                 self.texres.root = self.root
                 self.texres.assets = self.assets
-                self.texres.cache = OUTDIR / "texcache"
+                self.texres.cache = OUTDIR / (
+                    "texcache-" + server_view.server if server_view
+                    else "texcache")
                 self.texres.cache.mkdir(parents=True, exist_ok=True)
                 self.texres._mesh2tex = None
             except Exception as e:                       # pragma: no cover
@@ -673,6 +685,16 @@ class Catalog:
         key = logical.lower()
         h = tq_hash(key)
         pv = Provenance(logical=key, exists=False, name_hash=f"0x{h:08x}")
+
+        if self.server_view is not None:
+            loc = self.assets.locate(key)
+            if loc is not None:
+                pv.exists = True
+                pv.source = loc.source
+                if loc.real_path:
+                    pv.real_path = str(loc.real_path)
+                pv.size = loc.size
+            return pv
 
         arc_hit = self.arc_by_hash.get(h)
         real = self.root / key
@@ -973,6 +995,13 @@ class ViewerServer(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.catalog = catalog
         self.game_root = root
+        #: multi-view state: the COmmunity Library (if configured), which view
+        #: is active ("" = the baseline install), and the built catalogues so
+        #: switching back is instant. See /api/servers.
+        self.library: Optional[Path] = None
+        self.server_name: str = ""
+        self.views: dict[str, Catalog] = {}
+        self.view_lock = threading.Lock()
         self.tex_cache: dict[tuple, bytes] = {}
         self.rows_cache: dict[str, list] = {}
         self.cache_lock = threading.RLock()
@@ -1164,6 +1193,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/uninstall": self.post_uninstall,
                 "/api/snapshot": self.post_snapshot,
                 "/api/tags": self.post_tags,
+                "/api/server": self.post_server,
                 "/api/setroot": self.post_setroot,
                 "/api/thumbs/start": self.post_thumbs_start,
                 "/api/thumbs/cancel": self.post_thumbs_cancel,
@@ -1206,6 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
 
         routes = {
             "/api/status": self.api_status,
+            "/api/servers": self.api_servers,
             "/api/tables": self.api_tables,
             "/api/appearances": self.api_appearances,
             "/api/appearance": self.api_appearance,
@@ -1327,6 +1358,7 @@ class Handler(BaseHTTPRequestHandler):
                 for name, a in c.assets._archives.items()}
         return self._json({
             "root": str(c.root),
+            "server": getattr(self.server, "server_name", ""),
             "archives": arcs,
             "looseFiles": len(c.loose),
             "recoveredNames": len(c.names),
@@ -1338,6 +1370,75 @@ class Handler(BaseHTTPRequestHandler):
             "stagedCount": len(_staged_files()),
             "installed": (PROJECT / "mods" / "manifest.json").is_file(),
         })
+
+    # -- API: server views ---------------------------------------------------
+    def api_servers(self, arg):
+        """The selectable asset sources: the baseline install plus every
+        server profile catalogued in the COmmunity Library."""
+        srv = self.server
+        lib = srv.library                              # type: ignore[attr-defined]
+        servers = []
+        if lib:
+            from colibrary import list_servers
+            for name in list_servers(lib):
+                prof = {}
+                pf = Path(lib) / "servers" / name / "profile.json"
+                try:
+                    if pf.is_file():
+                        prof = json.loads(pf.read_text("utf-8"))
+                except ValueError:
+                    pass
+                servers.append({"name": name,
+                                "files": prof.get("files"),
+                                "clientVersion": prof.get("clientVersion"),
+                                "importedAt": prof.get("importedAt"),
+                                "client": prof.get("client")})
+        return self._json({
+            "current": srv.server_name,                # type: ignore[attr-defined]
+            "library": str(lib) if lib else None,
+            "base": str(srv.game_root) if srv.game_root else None,
+            "servers": servers})
+
+    def post_server(self, body: bytes, arg):
+        """Switch the active view. Builds a server catalogue on first use and
+        caches it, so flipping back and forth costs one build each."""
+        srv = self.server
+        try:
+            req = json.loads(body or b"{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        name = str(req.get("server") or "")
+        if srv.game_root is None:                      # type: ignore[attr-defined]
+            return self._error(503, "no install configured")
+        if name and not srv.library:                   # type: ignore[attr-defined]
+            return self._error(400, "no COmmunity Library configured -- "
+                               "start the viewer with --library DIR once")
+        with srv.view_lock:                            # type: ignore[attr-defined]
+            if name == srv.server_name:                # type: ignore[attr-defined]
+                return self._json({"ok": True, "current": name,
+                                   "unchanged": True})
+            cat = srv.views.get(name)                  # type: ignore[attr-defined]
+            if cat is None:
+                try:
+                    if name:
+                        from colibrary import ServerView
+                        view = ServerView(srv.library, name, srv.game_root)
+                        cat = Catalog(srv.game_root, view)
+                    else:
+                        cat = Catalog(srv.game_root)
+                except Exception as e:
+                    return self._error(500,
+                                       f"could not open view {name!r}: {e}")
+                srv.views[name] = cat                  # type: ignore[attr-defined]
+            srv.catalog = cat                          # type: ignore[attr-defined]
+            srv.server_name = name                     # type: ignore[attr-defined]
+            # decoded-texture and row caches are keyed by logical path, and
+            # the same path can mean different bytes in a different view.
+            with srv.cache_lock:                       # type: ignore[attr-defined]
+                srv.tex_cache.clear()                  # type: ignore[attr-defined]
+                srv.rows_cache.clear()                 # type: ignore[attr-defined]
+        return self._json({"ok": True, "current": name,
+                           "knownPaths": len(cat.all_paths)})
 
     # -- API: health / setup / thumbnails -----------------------------------
     def api_health(self, arg):
@@ -2991,6 +3092,13 @@ class Handler(BaseHTTPRequestHandler):
             u.refresh_thumbs()
         f = u.thumb_for(path)
         note = u.thumb_note(path)
+        sv = self.cat.server_view
+        if f and sv is not None:
+            ref = sv.filemap.get(sv._norm(path))
+            if ref is not None and ref[0] == "l":
+                # the pre-rendered thumbnail shows the *baseline* bytes; this
+                # view's bytes differ. Fall through to decoding the real ones.
+                f = None
         if f:
             try:
                 data = Path(f).read_bytes()
@@ -3043,9 +3151,13 @@ class Handler(BaseHTTPRequestHandler):
         unified = arg("unified", "1") != "0" and not ext
         u = c.unified if unified else None
 
+        src = arg("source", "")
         rows = []
         for p in c.all_paths:
             if ext and not p.endswith(ext):
+                continue
+            if src and (("loose" if p in c.loose
+                         else c.archived.get(p, "?")) != src):
                 continue
             if d:
                 if recursive:
@@ -3417,13 +3529,15 @@ def _staged_files() -> list[Path]:
 
 # ---------------------------------------------------------------------------
 
-def build_catalog(root: Path) -> Catalog:
-    return Catalog(root)
+def build_catalog(root: Path, server_view=None) -> Catalog:
+    return Catalog(root, server_view)
 
 
 def serve(root: Optional[Path], port: int, host: str = "127.0.0.1",
           open_browser: bool = True,
-          found: "Optional[coroot.Found]" = None) -> None:
+          found: "Optional[coroot.Found]" = None,
+          server_view=None, library: "Optional[Path]" = None,
+          server_name: str = "") -> None:
     r"""Serve the viewer.  ``root=None`` starts in **setup mode**.
 
     Setup mode is not an error path bolted on: a fresh clone on a machine
@@ -3443,9 +3557,13 @@ def serve(root: Optional[Path], port: int, host: str = "127.0.0.1",
     else:
         _log(f"install root: {root}"
              + (f"   (found via {found.source}: {found.detail})" if found else ""))
-        cat = build_catalog(root)
+        cat = build_catalog(root, server_view)
 
     httpd = ViewerServer((host, port), Handler, cat, root)
+    httpd.library = Path(library) if library else None
+    httpd.server_name = server_name if (server_name and cat) else ""
+    if cat is not None:
+        httpd.views[httpd.server_name] = cat
     #: How the root was resolved, so the health panel can say "registry" or
     #: "CO_ROOT" rather than re-deriving it and possibly disagreeing.
     httpd.root_found = found                       # type: ignore[attr-defined]
@@ -3493,6 +3611,13 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     coroot.add_root_argument(ap)
     ap.add_argument("--port", type=int, default=8731)
+    ap.add_argument("--library", metavar="DIR",
+                    help="COmmunity Library root (for --server)")
+    ap.add_argument("--server", metavar="NAME",
+                    help="browse an imported community client through its "
+                         "server profile: its own appearance/motion tables "
+                         "and file namespace (see tools/assetdiff.py "
+                         "--server)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--health", "--doctor", dest="health", action="store_true",
                     help="run the first-run health check on the console and "
@@ -3516,8 +3641,28 @@ def main(argv=None) -> int:
         raise SystemExit(
             f"--root {args.root} is not a Conquer Online install: missing "
             + ", ".join(coroot.missing_parts(args.root)))
+    # The COmmunity Library: given once with --library, remembered in the
+    # per-user config after that, so the server picker in the UI just works.
+    library = args.library or coroot.read_settings().get("community_library")
+    if args.library:
+        saved = coroot.write_settings(community_library=str(Path(args.library)))
+        _log(f"library: {args.library}  (remembered in {saved})")
+    server_view = None
+    if args.server:
+        if not library:
+            raise SystemExit("--server needs --library DIR "
+                             "(the COmmunity Library root)")
+        if found is None:
+            raise SystemExit("--server still needs the baseline install "
+                             "(the library only stores what differs from it)")
+        from colibrary import ServerView
+        server_view = ServerView(library, args.server, found.path)
+        _log(f"server view: {args.server}  "
+             f"({len(server_view.filemap)} paths from {library})")
     serve(found.path if found else None, args.port,
-          open_browser=not args.no_browser, found=found)
+          open_browser=not args.no_browser, found=found,
+          server_view=server_view, library=library,
+          server_name=args.server or "")
     return 0
 
 

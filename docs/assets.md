@@ -18,19 +18,30 @@ Every field is marked **verified** or **inferred**:
 | Result | Value |
 |---|---|
 | WDF name-hash recovered | yes — exact, from `TqPackageWdf.dll` |
-| Filenames recovered, `c3.wdf` | **10,160 / 10,238 = 99.24 %** |
-| Filenames recovered, `data.wdf` | **14,266 / 14,519 = 98.26 %** |
-| Filenames recovered, combined | **24,426 / 24,757 = 98.66 %** |
+| Filenames recovered, `c3.wdf` | **10,206 / 10,238 = 99.69 %** |
+| Filenames recovered, `data.wdf` | **14,435 / 14,519 = 99.42 %** |
+| Filenames recovered, combined | **24,641 / 24,757 = 99.53 %** |
 | DMap files parsed | 136 / 136 header+grid+portals |
 | DMap cell-grid row checksums reproduced | 58,245 / 58,898 = **98.89 %** (133/136 files at 100 %) |
 | DMap files consuming every byte to EOF | 119 / 136 |
+
+The last ~0.9 % of WDF names came from a **DatPkg community client as a
+wordlist**: its `.tpi` indexes (§6) store ~130k plaintext paths in the same
+TQ-hash namespace, so `wdf_recover.py --tpi <client>` hashes them directly and
+mines their numbering conventions for the enumerator. Of the 24,641 names,
+24,415 are now confirmed by a real observed string (was ~24,043); enumeration
+contributes the rest, and enumerated candidates whose payload magic disagreed
+with the extension are dropped (`out/wdf/*_rejected_names.json`), not counted.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `core/wdf.py` | WDF reader: module + CLI (`index`, `stats`, `list`, `extract`, `extract-type`, `extract-all`) |
-| `tools/wdf_recover.py` | Filename recovery: wordlist harvest, prefix-cached hashing, pattern enumeration |
+| `tools/wdf_recover.py` | Filename recovery: wordlist harvest (loose files, embedded strings, DatPkg `.tpi` indexes), prefix-cached hashing, pattern enumeration. `--archives` targets any WDF set; `--tpi` adds a DatPkg client as a wordlist |
+| `tools/garment_recover.py` | Corroborated numeric-ID recovery for community `garments*.wdf` (mesh↔texture pairing + run detection) — the guard that keeps birthday collisions out of the name tables |
+| `tools/apply_recovered_names.py` | Renames the extracted `garments-unnamed/` library files to their recovered names and rewrites the COmmunity Library manifest (dry-run by default) |
+| `core/tpd.py` | NetDragonDatPkg `.tpi/.tpd` reader (§6); `read_index()` supplies the wordlist |
 | `core/tqhash.py` | The TQ name hash (written by the DLL workstream, validated here) |
 | `core/dmap.py` | DMap parser + PNG/PGM renderer |
 | `tools/inidb.py` | `ini/` loader and schema profiler |
@@ -388,9 +399,11 @@ undecoded. `refs/conquer-online-wiki/Files/C3.md` is the reference to start from
 ## 5. Reproducing
 
 ```bash
-py -3 core/wdf.py stats  "$ROOT/c3.wdf"      # $ROOT: py -3 core/coroot.py
-py -3 tools/wdf_recover.py                    # ~8 min, writes out/wdf/
-py -3 core/dmap.py summary                   # writes out/wdf/dmap_summary.json
+py -3 core/wdf.py stats  "$ROOT/c3.wdf"       # $ROOT: py -3 core/coroot.py
+py -3 tools/wdf_recover.py                    # baseline, writes out/wdf/
+py -3 tools/wdf_recover.py --tpi "$ZEPHYR"    # + DatPkg wordlist -> 99.53%
+py -3 tools/garment_recover.py --root "$ZEPHYR" --out out/garments  # 0 confirmed
+py -3 core/dmap.py summary                    # writes out/wdf/dmap_summary.json
 py -3 core/dmap.py render "…/map/map/dragon.DMap" -o out/wdf/render/dragon.png
 py -3 tools/inidb.py schemas                  # writes out/ini/schemas.json
 ```
@@ -398,3 +411,98 @@ py -3 tools/inidb.py schemas                  # writes out/ini/schemas.json
 `out/wdf/sample/` holds 387 extracted payloads — up to 50 per detected type,
 written under their recovered paths. Full extraction is available via
 `wdf.py extract-all --yes` but is deliberately not run by default.
+
+---
+
+## 6. NetDragonDatPkg — .tpi / .tpd (community clients)
+
+Older and community clients (seen: "Zephyr Conquer", `version.dat` = 1064)
+ship `c3.tpi/c3.tpd` and `data.tpi/data.tpd` instead of the WDF pair. Reader:
+`core/tpd.py`. Everything below is **verified** against both Zephyr pairs
+(53,609 + 76,923 entries): every offset/size cross-checked for contiguity,
+`sum(compressed) + 0x20 == tpd file size` exactly, and every payload
+decompresses to the size the index promises.
+
+- Both files open with the 16-byte magic `"NetDragonDatPkg\0"`.
+- `.tpi`: `u32 ×4` (1000, 0, 1, 3 — constant), then at `0x20`
+  `u32 indexOffset` (= 0x30), `u32 fileCount`, two more u32s (~index length,
+  0). Entries are variable-length, back to back:
+  `u8 nameLen · name · u16 flag(=1) · u32 uncompSize · u32 compSize ·
+  u32 compSize(dup) · u32 uncompSize(dup) · u32 offset`.
+- **Names are plaintext** forward-slash paths in the same logical namespace
+  the WDF clients hash (`data/arrow.dds`, `c3/0001/000/001.c3`) — so
+  `tq_hash(name)` matches entries across packaging schemes, and a DatPkg
+  client is a free wordlist for WDF name recovery.
+- `.tpd`: same 0x20-byte header, then raw zlib streams (`78 DA`) laid out
+  contiguously; first payload at 0x20.
+
+`tools/assetdiff.py` builds on this: content-hash diff of a second client
+install against the baseline (both packagings + loose files), with optional
+extraction of everything unique into a library tree.
+
+With `--server NAME` it also writes `<library>/servers/NAME/` — a **server
+profile**: `filemap.json` mapping every logical path the client ships to
+where its bytes now live (library, baseline path, or baseline archive entry
+by hash — content dedup means 6,892 Zephyr paths resolve to a *different*
+baseline path), plus a verbatim snapshot of the client's `ini/` linkage
+tables. `core/colibrary.py::ServerView` subclasses `AssetRoot` over that
+profile, so `resolve_appearance`, the viewer and `comod` resolve
+mesh/texture/motion linkages exactly as that server's client would:
+
+```bash
+py -3 tools/coviewer.py --library "D:\COmmunity Library" --server zephyr
+py -3 tools/comod.py   --library "D:\COmmunity Library" --server zephyr show 900119
+```
+
+The viewer also switches at runtime: pass `--library` once (it is remembered
+in the per-user config) and a **Server** selector appears in the header —
+baseline install or any catalogued profile; the Files pane gains an
+**Origin** filter (everything / this server only / shared with baseline).
+`GET /api/servers` lists views, `POST /api/server` switches; catalogues are
+built lazily and cached per view, and the texture cache is kept per view so
+the same path never shows another server's bytes.
+
+`tools/colibrary.py materialize NAME --to DIR` writes a server's combined
+tree (every logical path, bytes pulled from library or baseline) as plain
+files. The destination is guarded: never under Program Files (the baseline
+install is a read-only source), never inside the baseline root or the
+library repo.
+### 6.1 Using a DatPkg client as a WDF wordlist
+
+`wdf_recover.py --tpi <client-dir-or-.tpi>` mines those ~130k plaintext paths.
+Against the baseline this lifted combined recovery from 24,426 → **24,641 /
+24,757 (99.53 %)** and, more usefully, moved ~370 names from "guessed by
+enumeration" to "confirmed by an observed string" (24,415 dictionary-certain,
+up from ~24,043). Enumerated candidates whose payload magic contradicts the
+extension are now dropped rather than counted (`out/wdf/*_rejected_names.json`).
+
+### 6.2 The community garments\*.wdf names are **not** recoverable
+
+Zephyr ships five `garments*.wdf` archives (14,051 unique-hash entries, custom
+fashion) keyed by the same `tq_hash` — one `TqPackageWdf.dll`, and `package.ini`
+lists them beside `c3.tpd`. `assetdiff.py` extracted every unique payload to
+`<library>/garments-unnamed/`, but the *names* resist every recovery avenue,
+and this was checked rather than assumed:
+
+- **Wordlist** — the 130k DatPkg paths plus every loose/embedded string: **0**
+  of 14,051 hit. The garments share **no** path (zero hash overlap) with the
+  baseline c3/data indexes.
+- **Numeric enumeration** — `c3/{mesh,texture,hair,weapon,npc}/<5–7 digits>`.
+  The hit count tracks the birthday-collision expectation ~1:1 (e.g. one 100-dir
+  block tested 161 M candidates for +519 "hits" against +527 expected false
+  positives), i.e. essentially all noise. `tools/garment_recover.py` guards
+  against trusting these by requiring **corroboration** — an id that hashes to a
+  real entry in *two* sibling slots (`c3/mesh/<id>.c3` **and**
+  `c3/texture/<id>.dds`), or a contiguous ≥3 run — since two independent hashes
+  colliding at one id by chance is negligible. Corroborated names found: **0**.
+- **Hierarchical `c3/GGGG/MMM/NNN`** (the body-mesh layout): 48 magic-plausible
+  hits vs 59 expected by chance — noise, no clusters.
+- **Payload inspection** — `.c3` meshes embed only a 3ds object name
+  (`v_body`, `Cylinder02`), never an asset path.
+
+Conclusion: these paths are computed in client code from item IDs and stored as
+strings nowhere on disk, so they cannot be dictionary-recovered, and a 32-bit
+hash against 14 k targets makes blind enumeration birthday-limited. The extracted
+payloads keep their content-hash filenames; `apply_recovered_names.py` (dry-run
+by default) is ready to rename any that a future signal *does* resolve, but as of
+this pass it renames nothing — the honest result is 0, not a table of guesses.

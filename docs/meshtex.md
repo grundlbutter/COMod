@@ -395,6 +395,14 @@ tables load on the first `matches()` call (~4 s); the mesh census parses every
 `.c3` (~2 min) and is cached in `out/meshtex/mesh_index.json`. `matches()` on a
 single mesh does not need the census unless the `label_sibling` rule is reached.
 
+The census cache defends itself two ways. It is **never written when the
+recovered name tables were absent** — such a census sees only loose files, and
+persisting it would poison every later run with a half-sized index that looks
+fine — and a cache that no longer covers the current universe is **discarded
+with a warning and rebuilt**, not trusted. Name tables, and the cache itself,
+are located through `coroot.find_derived`, so a linked git worktree reads the
+primary checkout's copies instead of silently starting from nothing.
+
 ### Output files
 
 | file | contents |

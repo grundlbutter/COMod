@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-comod.py -- graphics modding workbench for Conquer Online.
+comod.py -- graphics modding workbench for Classic Conquer 2.0.
 
 The whole workflow rests on one verified fact: the client resolves an asset by
 trying a loose file on disk *first*, and only falls back to the .wdf archives if
@@ -44,6 +44,18 @@ import safepath                   # noqa: E402
 from coassets import (            # noqa: E402
     DEFAULT_ROOT, AssetRoot, C3File, DMap, dds_info, find_items,
 )
+from colibrary import ServerView  # noqa: E402
+
+
+def open_view(args) -> AssetRoot:
+    """The asset namespace a read-side command works against: the baseline
+    install, or -- with --library/--server -- one imported community client,
+    resolved through its own tables and filemap (core/colibrary.py)."""
+    if getattr(args, "server", None):
+        if not getattr(args, "library", None):
+            sys.exit("--server needs --library DIR (the COmmunity Library)")
+        return ServerView(args.library, args.server, args.root)
+    return AssetRoot(args.root)
 
 PROJECT = Path(__file__).resolve().parent.parent
 STAGE = PROJECT / "mods" / "stage"
@@ -77,14 +89,14 @@ def cmd_find_item(args) -> int:
 
 
 def cmd_tables(args) -> int:
-    with AssetRoot(args.root) as R:
+    with open_view(args) as R:
         for part, ini in sorted(R.part_tables().items()):
             print(f"  {part:16s} {ini.name:14s} {len(ini):6d} appearances")
     return 0
 
 
 def cmd_show(args) -> int:
-    with AssetRoot(args.root) as R:
+    with open_view(args) as R:
         res = R.resolve_appearance(args.ident, args.table)
         if not res:
             print(f"appearance {args.ident!r} not found in any part table.")
@@ -112,7 +124,7 @@ def cmd_show(args) -> int:
 
 
 def cmd_info(args) -> int:
-    with AssetRoot(args.root) as R:
+    with open_view(args) as R:
         loc = R.locate(args.logical)
         if not loc:
             print(f"not found: {args.logical}")
@@ -159,7 +171,7 @@ def cmd_map(args) -> int:
 def cmd_extract(args) -> int:
     out = Path(args.out) if args.out else WORK
     out.mkdir(parents=True, exist_ok=True)
-    with AssetRoot(args.root) as R:
+    with open_view(args) as R:
         loc = R.locate(args.logical)
         if not loc:
             print(f"not found: {args.logical}")
@@ -450,10 +462,15 @@ def cmd_uninstall(args) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Graphics modding workbench for Conquer Online",
+        description="Graphics modding workbench for Classic Conquer 2.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
     ap.add_argument("--root", default=str(DEFAULT_ROOT), help="game install root")
+    ap.add_argument("--library", metavar="DIR",
+                    help="COmmunity Library root (for --server)")
+    ap.add_argument("--server", metavar="NAME",
+                    help="browse an imported community client by its server "
+                         "profile (tables/show/info/extract only)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("find-item", help="search itemtype.json by name")

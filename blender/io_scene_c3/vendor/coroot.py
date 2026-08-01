@@ -26,12 +26,18 @@ because it looks right.
 Nothing here writes to the game install.  The only file this module ever
 writes is its own config, and only when something explicitly asks it to.
 
+One repo-side question is also answered here: where a derived artefact
+(``out/...``, gitignored, built from the install) can be *read* from.
+``find_derived`` looks in this checkout first, then -- in a linked ``git
+worktree`` -- in the primary checkout, so a fresh worktree inherits the
+``out/`` tree it cannot have yet instead of silently starting without it.
+
 CLI::
 
     py -3 core/coroot.py                  # where is it, and how was it found
     py -3 core/coroot.py --json
     py -3 core/coroot.py --search         # show every candidate and its verdict
-    py -3 core/coroot.py --set "D:\\Games\\Conquer Online"
+    py -3 core/coroot.py --set "D:\\Games\\Classic Conquer 2.0"
     py -3 core/coroot.py --forget
 
 Pure stdlib, no imports from the rest of the project: it is vendored verbatim
@@ -52,7 +58,8 @@ __all__ = [
     "ENV_VAR", "CONVENTIONAL_ROOT", "REQUIRED", "RootNotFound", "Found",
     "missing_parts", "looks_like_root", "describe_root",
     "user_config_path", "repo_config_path", "config_root", "save_root",
-    "forget_root", "iter_candidates", "discover", "search_report",
+    "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
+    "iter_candidates", "discover", "search_report",
     "find", "resolve", "game_root", "default_root", "bin_dir",
     "add_root_argument", "root_from_args", "invalidate_cache",
 ]
@@ -62,7 +69,7 @@ ENV_VAR = "CO_ROOT"
 
 #: The most common install location.  A *starting guess* for discovery and the
 #: string shown in help text -- never assumed to be correct.
-CONVENTIONAL_ROOT = r"C:\Program Files\Conquer Online"
+CONVENTIONAL_ROOT = r"C:\Program Files\Classic Conquer 2.0"
 
 #: What a real install must contain.  ``(relative path, kind)`` where kind is
 #: "file" or "dir".  These four are what every tool in the repo actually opens:
@@ -75,11 +82,11 @@ REQUIRED: tuple[tuple[str, str], ...] = (
 )
 
 #: Directory names an install has been seen under, or plausibly could be.
-#: Only used to *generate* candidates; each is still validated.  Discovery
-#: also scans each parent directory for any folder whose name contains
-#: "conquer" (see ``_conventional_candidates``), so a client branded
-#: differently is still found as long as it kept the word.
+#: Only used to *generate* candidates; each is still validated.
 _INSTALL_DIR_NAMES = (
+    "Classic Conquer 2.0",
+    "Classic Conquer",
+    "ClassicConquer",
     "Conquer Online 2.0",
     "Conquer Online",
     "ConquerOnline",
@@ -91,7 +98,7 @@ _PARENTS = (
     "Program Files (x86)",
     "Games",
     "Program Files/Games",
-    "",                       # e.g. D:\Conquer Online
+    "",                       # e.g. D:\Classic Conquer 2.0
 )
 
 _UNINSTALL_KEYS = (
@@ -141,8 +148,8 @@ class RootNotFound(RuntimeError):
             "Tell the tools where it is, any one of these:",
             f"  py -3 core/coroot.py --set \"{CONVENTIONAL_ROOT}\"   "
             "(remembers it for next time)",
-            "  set CO_ROOT=D:\\path\\to\\Conquer Online",
-            "  ...or pass --root \"D:\\path\\to\\Conquer Online\" to any tool",
+            "  set CO_ROOT=D:\\path\\to\\Classic Conquer 2.0",
+            "  ...or pass --root \"D:\\path\\to\\Classic Conquer 2.0\" to any tool",
             "",
             "A valid install root contains: "
             + ", ".join(n + ("/" if k == "dir" else "") for n, k in REQUIRED),
@@ -232,7 +239,7 @@ def _repo_dir() -> Optional[Path]:
     """
     here = Path(__file__).resolve()
     for d in here.parents:
-        if (d / "tools" / "coroot.py").is_file() or (d / ".git").exists():
+        if (d / "core" / "coroot.py").is_file() or (d / ".git").exists():
             return d
     return None
 
@@ -346,6 +353,90 @@ def forget_root(scope: str = "all") -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# derived artifacts (repo-side, gitignored)
+# ---------------------------------------------------------------------------
+
+#: Environment kill switch: set to ``0`` (or ``off``/``no``) to make
+#: ``find_derived`` look only at this checkout.  Exists so tests can simulate
+#: a checkout with no derived data; never needed in normal use.
+DERIVED_FALLBACK_VAR = "CO_DERIVED_FALLBACK"
+
+_PRIMARY_UNSET = object()
+_primary_checkout: object = _PRIMARY_UNSET
+
+
+def primary_checkout() -> Optional[Path]:
+    """The primary checkout, when this one is a linked ``git worktree``.
+
+    Everything under ``out/`` is derived from the user's install and
+    gitignored, so a fresh worktree starts without it -- and the catalogue
+    tools would quietly shrink to loose files (the failure ``health.py``
+    documents).  A linked worktree can instead *read* the primary checkout's
+    artefacts; this answers where that is.
+
+    Pure stdlib, no ``git`` subprocess.  In a linked worktree ``<repo>/.git``
+    is a *file*, ``gitdir: <primary>/.git/worktrees/<name>``, and that
+    directory's ``commondir`` file points back at the shared ``.git``; the
+    primary checkout is its parent.  The answer is validated the way install
+    roots are -- the candidate must actually contain ``core/coroot.py`` -- a
+    path is never trusted because it looks right.  None in a primary
+    checkout, a bare repo, or the vendored Blender copy.
+    """
+    global _primary_checkout
+    if _primary_checkout is _PRIMARY_UNSET:
+        _primary_checkout = _find_primary_checkout()
+    return _primary_checkout  # type: ignore[return-value]
+
+
+def _find_primary_checkout() -> Optional[Path]:
+    repo = _repo_dir()
+    if repo is None:
+        return None
+    dotgit = repo / ".git"
+    if not dotgit.is_file():          # a directory: this *is* the primary
+        return None
+    try:
+        first = dotgit.read_text("utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not first.startswith("gitdir:"):
+        return None
+    gitdir = Path(first[len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        gitdir = (repo / gitdir).resolve()
+    try:
+        rel = (gitdir / "commondir").read_text("utf-8").strip()
+    except OSError:
+        return None
+    common = Path(rel) if Path(rel).is_absolute() else (gitdir / rel).resolve()
+    primary = common.parent
+    if primary == repo or not (primary / "core" / "coroot.py").is_file():
+        return None
+    return primary
+
+
+def find_derived(rel: str) -> Optional[Path]:
+    """Locate a derived artefact (an ``out/...`` path) for **reading**.
+
+    This checkout first; failing that, the primary checkout when running in
+    a linked worktree.  None when neither has it -- and a caller that would
+    degrade without the artefact must then say so out loud rather than carry
+    on with less (``meshtex.scan_meshes`` is the cautionary tale).  Never
+    used for writing: everything that builds an artefact writes into its own
+    checkout.
+    """
+    repo = _repo_dir()
+    if repo is not None and (repo / rel).exists():
+        return repo / rel
+    if os.environ.get(DERIVED_FALLBACK_VAR, "").strip().lower() in ("0", "off", "no"):
+        return None
+    primary = primary_checkout()
+    if primary is not None and (primary / rel).exists():
+        return primary / rel
+    return None
+
+
+# ---------------------------------------------------------------------------
 # discovery
 # ---------------------------------------------------------------------------
 
@@ -366,44 +457,21 @@ def _drives() -> list[str]:
 
 
 def _conventional_candidates() -> Iterator[tuple[Path, str, str]]:
-    """Cheapest first: the handful of paths an installer would pick.
-
-    Two passes.  First the fixed names under each conventional parent --
-    stat calls only, no directory listing.  Then one shallow scan of each
-    parent that exists, yielding any child whose name mentions conquer;
-    that is what finds an install whose folder carries a server's own
-    branding, without this module having to know any brand names.
-    """
+    """Cheapest first: the handful of paths an installer would pick."""
     seen = set()
     drives = _drives() or [""]
-    parents: list[Path] = []
     for drive in drives:
         for parent in _PARENTS:
-            base = (Path(drive) / parent) if parent else Path(drive)
-            parents.append(base)
             for name in _INSTALL_DIR_NAMES:
-                p = base / name
+                if drive:
+                    p = Path(drive) / parent / name if parent else Path(drive) / name
+                else:
+                    p = Path(parent) / name if parent else Path(name)
                 key = str(p).lower()
                 if key in seen:
                     continue
                 seen.add(key)
                 yield p, "default-path", f"conventional install path {p}"
-    for base in parents:
-        try:
-            entries = list(base.iterdir())
-        except OSError:
-            continue
-        for d in entries:
-            try:
-                if not d.is_dir() or "conquer" not in d.name.lower():
-                    continue
-            except OSError:
-                continue
-            key = str(d).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            yield d, "default-path", f"folder mentioning conquer under {base}"
 
 
 def _registry_candidates() -> Iterator[tuple[Path, str, str]]:
@@ -606,7 +674,9 @@ _cache: dict = {}
 
 def invalidate_cache() -> None:
     """Forget the memoised answer (after --set, or a path typed in the UI)."""
+    global _primary_checkout
     _cache.clear()
+    _primary_checkout = _PRIMARY_UNSET
 
 
 def find(explicit=None, *, use_cache: bool = True) -> Optional[Found]:

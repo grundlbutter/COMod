@@ -1,9 +1,9 @@
-# COre -- the shared foundation under the COMod tools.
+# COre -- the shared foundation under COMod, COmpanion and VibeCo.
 #
 # WHY FLAT TOP-LEVEL MODULES AND NOT A PACKAGE
 # --------------------------------------------
 # `import coroot` appears in 34 files, `import coassets` in 21, `import c3phy`
-# in 18 -- across every consumer of these formats. Making COre a package would mean
+# in 18 -- across four future repositories. Making COre a package would mean
 # rewriting every one of those to `from cocore import coroot`, and an import
 # rewrite across ~50 files is the change that breaks something quietly.
 #
@@ -15,7 +15,7 @@
 #
 # The cost, stated honestly: these names are unqualified, so `dds` in
 # particular could collide with an unrelated package in the same environment.
-# Acceptable for a project whose consumers are its own repositories; if
+# Acceptable for a project whose consumers are its own four repositories; if
 # COre is ever published to PyPI for a wider audience, that is the moment to pay
 # the rewrite and become `cocore`.
 
@@ -50,5 +50,7 @@ py-modules = [
     "dds",        # DDS / BC decoding
     "c3phy",      # C3 / PHY mesh parsing
     "dmap",       # DMap map grids
+    "tpd",        # NetDragon DatPkg .tpi/.tpd reader
     "coassets",   # the asset VFS that ties the above together
+    "colibrary",  # per-server views over a COmmunity Library checkout
 ]

@@ -2,7 +2,7 @@
 # Edit core/wdf.py, not this file.
 #!/usr/bin/env python3
 """
-wdf.py -- reader for TQ Digital WDF archives (Conquer Online "Conquer Online").
+wdf.py -- reader for TQ Digital WDF archives (Conquer Online "Classic Conquer 2.0").
 
 Archive layout (VERIFIED against c3.wdf and data.wdf, see docs/assets.md):
 

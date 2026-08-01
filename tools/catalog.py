@@ -482,8 +482,9 @@ class AssetCatalog:
         """`out/effects/linkage.json` from task #13. Loaded once, lazily."""
         if self._linkage is None:
             self._linkage = {}
-            p = Path(__file__).resolve().parent.parent / "out" / "effects" / "linkage.json"
-            if p.is_file():
+            import coroot
+            p = coroot.find_derived("out/effects/linkage.json")
+            if p is not None:
                 try:
                     self._linkage = json.loads(p.read_text("utf-8"))
                 except Exception:

@@ -321,6 +321,11 @@ Every one of these takes `--root DIR` and otherwise auto-detects.
 | `tools/mapedit.py` | **The MapEditor's model.** Per-layer map tiles you can toggle, hit testing that alpha-tests a sprite, and a verdict on which side of the install's `integrity.json` anything falls. `--list` shows every map and the state of its art; `docs/mapeditor.md` has the rest. |
 | `tools/scene.py` | **The scenery layers.** Places `map/Scene/*.scene` objects and `COVER` sprites, and applies the passability a scene carries. `--verify` over the corpus; `docs/map_scenery.md` has the evidence. |
 | `tools/wdf_recover.py`, `tools/wdf_names.py` | Recover the filenames behind the hashes in the `.wdf` archives. |
+| `core/tpd.py` | Read NetDragon "DatPkg" archives — a plaintext `.tpi` index beside a `.tpd` payload. Some community clients ship these instead of `.wdf`. |
+| `tools/assetdiff.py` | What does another client's asset set add or change, against a baseline install. Extracts only what is genuinely new. |
+| `tools/garment_recover.py` | Recover garment names by numeric-id corroboration — an id that hits in two sibling slots (`c3/mesh/<id>.c3` + `c3/texture/<id>.dds`) is certain, where either slot alone is mostly birthday collisions. `docs/assets.md` §6 has the arithmetic. |
+| `tools/apply_recovered_names.py` | Give the extracted unnamed files their recovered names. Dry-run by default; `--apply` moves files and rewrites the manifest. |
+| `core/colibrary.py` / `tools/colibrary.py` | Per-server views over a COmmunity Library checkout — resolve linkages the way a given client would. Reads a library; does not contain one. |
 
 ---
 
