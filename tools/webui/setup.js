@@ -62,7 +62,11 @@ $('#save').addEventListener('click', async () => {
     const r = await fetch('/api/setroot', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, scope: $('#scope-repo').checked ? 'repo' : 'user' }),
+      body: JSON.stringify({
+        path,
+        kind: (document.querySelector('input[name="kind"]:checked') || {}).value || '',
+        scope: $('#scope-repo').checked ? 'repo' : 'user',
+      }),
     });
     const j = await r.json();
     if (!r.ok || !j.ok) {
@@ -83,3 +87,36 @@ $('#path').addEventListener('keydown', e => {
 });
 
 load();
+
+
+/* The client-kind picker is the plugin registry, rendered. Nothing here
+   knows what plugins exist -- /api/plugins discovers them, so a
+   contributor's module shows up by being present. */
+(async () => {
+  const host = document.getElementById('kinds');
+  if (!host) return;
+  let d;
+  try { d = await (await fetch('/api/plugins')).json(); }
+  catch (e) { host.textContent = 'could not list parser plugins: ' + e.message; return; }
+  host.innerHTML = '';
+  for (const p of d.plugins) {
+    const lab = document.createElement('label');
+    lab.className = 'chk';
+    const r = document.createElement('input');
+    r.type = 'radio'; r.name = 'kind'; r.value = p.name;
+    if (p.name === (d.suggested || d.current)) r.checked = true;
+    lab.appendChild(r);
+    lab.appendChild(document.createTextNode(' ' + p.label));
+    if (p.notes) {
+      const n = document.createElement('div');
+      n.className = 'mut small';
+      n.textContent = p.notes;
+      lab.appendChild(n);
+    }
+    host.appendChild(lab);
+  }
+  if (!host.querySelector('input:checked')) {
+    const first = host.querySelector('input');
+    if (first) first.checked = true;
+  }
+})();

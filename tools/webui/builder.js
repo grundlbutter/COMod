@@ -85,9 +85,19 @@ const B = {
   /** the model mode. `zoom` is monster.json's zoomPercent when a row has been
    *  paired, 100 otherwise; `row` is that paired row, which is the USER's
    *  assertion because monster.json carries no link to the art at all. */
+  // `adhoc` is a mesh opened straight from the asset browser by logical
+  // path. It has no catalogue key -- that is the whole point: any .c3 the
+  // browser can show should be openable here, not just catalogued models.
+  adhoc: null,
+  /** `source` picks what the rail lists. `catalogue` is the model families
+   *  the client's own directory convention describes; `path` is every mesh
+   *  under `path` in the active view, which is the only way to reach art
+   *  that convention does not name -- a recovered garment archive, or the
+   *  Collection, where a model lives at collection/<category>/<entry>.c3. */
   model: { key: '', kind: '', action: '', data: null, list: [], index: -1,
            kinds: [], meta: null, q: '', zoom: 100, row: null,
-           distinctOnly: true, raf: null },
+           distinctOnly: true, raf: null,
+           source: 'catalogue', path: '', dirs: [] },
   /** `${slot}:${id}` -> the quality ladder of that weapon's family. Cached
    *  because arrowing through a picker asks for it on every keypress. */
   qualityCache: {},
@@ -101,7 +111,25 @@ let viewer = null;
 
 // ---------------------------------------------------------------- plumbing
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  // A bare "NetworkError" says the request never completed and nothing about
+  // why. Name the request and the two things that actually cause it, so the
+  // toast is a lead rather than a dead end.
+  let r;
+  try {
+    try {
+      r = await fetch(path, opts);
+    } catch (first) {
+      // A connection that died in the pool fails this attempt and nothing after it.
+      // Chrome retries a POST like that for us; Firefox does not.
+      r = await fetch(path, opts);
+    }
+  } catch (e) {
+    const how = (opts && opts.method) || 'GET';
+    throw new Error(
+      `${how} ${path} never reached the viewer (${e.message}). Either it is `
+      + `no longer running at ${location.origin}, or something is blocking `
+      + `${how} requests to localhost. Use "Test connection" to tell which.`);
+  }
   const ct = r.headers.get('content-type') || '';
   if (!ct.includes('json')) {
     if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -183,6 +211,50 @@ function chip(text, count, on, onClick, cls) {
   return c;
 }
 
+// -------------------------------------------------------------- server picker
+//
+// The active view is one process-wide choice, shared with the asset browser --
+// so this stage was always drawing from *some* namespace and had no way to say
+// which. Switching reloads, because the model list, the appearance tables and
+// every cached clip are derived from it.
+async function initServerPicker() {
+  const sel = $('#server-select');
+  const label = $('#server-label');
+  if (!sel) return;
+  let doc;
+  try { doc = await api('/api/servers'); } catch (e) { return; }
+  if (!doc.servers || !doc.servers.length) return;
+  sel.innerHTML = '';
+  const b = el('option', null, 'base — ' + (doc.base || 'install'));
+  b.value = '';
+  sel.appendChild(b);
+  for (const s of doc.servers) {
+    const o = el('option', null,
+      s.name + (s.clientVersion ? ` (v${s.clientVersion})` : '') +
+      (s.files ? ` — ${s.files.toLocaleString()} files` : ''));
+    o.value = s.name;
+    sel.appendChild(o);
+  }
+  sel.value = doc.current || '';
+  label.classList.remove('hidden');
+  sel.addEventListener('change', async () => {
+    const name = sel.value;
+    sel.disabled = true;
+    toast(name ? `switching to ${name}… (first switch builds the catalogue)`
+               : 'switching to the baseline install…', 8000);
+    try {
+      await api('/api/server', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: name }) });
+      location.reload();
+    } catch (e) {
+      sel.disabled = false;
+      toast('switch failed: ' + e.message, 6000);
+      sel.value = doc.current || '';
+    }
+  });
+}
+
 // ---------------------------------------------------------------- boot
 async function boot() {
   try {
@@ -195,6 +267,9 @@ async function boot() {
   restoreCollapsed();
   bindControls();
   bindKeys();
+  initServerPicker();
+  Swap.configure({ api, toast, onChange: () => renderCollect({ force: true }) });
+  Swap.initDrawer();
 
   try {
     B.status = await api('/api/status');
@@ -226,6 +301,7 @@ async function boot() {
   applyMode({ rebuild: false });
   if (B.mode === 'model') await loadModelList({ select: B.model.key });
   await rebuild({ reframe: true });
+  renderCollect();
   if (B.mode === 'character') showLookFor('body');
 }
 
@@ -1079,6 +1155,16 @@ function renderDetailPanel(fig) {
     ul.appendChild(li);
   }
   b.appendChild(ul);
+  // A socket correction is the viewer deliberately disagreeing with the
+  // client. It is stated, in full, at the point it changes what you see --
+  // an invisible correction is indistinguishable from a broken reader, and
+  // this one must never be mistaken for how the real client behaves.
+  for (const [sock, note] of Object.entries(fig.socketCorrections || {})) {
+    const w = el('div', 'note');
+    w.appendChild(el('b', null, `⚠ ${sock}: corrected, not what the client draws. `));
+    w.appendChild(document.createTextNode(note));
+    b.appendChild(w);
+  }
   b.appendChild(el('div', 'note', fig.attachNote));
 }
 
@@ -1523,6 +1609,7 @@ function restoreModelState() {
     const s = JSON.parse(localStorage.getItem(MODEL_KEY) || 'null');
     if (s && typeof s === 'object') {
       if (s.mode === 'model' || s.mode === 'character') B.mode = s.mode;
+      B.adhoc = s.adhoc || null;
       B.model.key = s.key || '';
       B.model.action = s.action || '';
       B.model.kind = s.kind || '';
@@ -1530,14 +1617,23 @@ function restoreModelState() {
       B.model.zoom = +s.zoom || 100;
       B.model.row = s.row || null;
       if (s.distinctOnly !== undefined) B.model.distinctOnly = !!s.distinctOnly;
+      if (s.source === 'path' || s.source === 'catalogue') B.model.source = s.source;
+      B.model.path = s.path || '';
     }
   } catch (e) { /* ignore */ }
   // A link that names a model wins over whatever was last open.
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
   if (h.get('model')) {
     B.mode = 'model';
+    B.adhoc = null;
     B.model.key = h.get('model');
     if (h.get('action')) B.model.action = h.get('action');
+    if (h.get('zoom')) B.model.zoom = +h.get('zoom') || 100;
+  } else if (h.get('mesh')) {
+    // ...and a link that names a bare mesh path wins the same way.
+    B.mode = 'model';
+    B.adhoc = { mesh: h.get('mesh'), tex: h.get('tex') || '' };
+    B.model.key = '';
     if (h.get('zoom')) B.model.zoom = +h.get('zoom') || 100;
   }
 }
@@ -1545,9 +1641,19 @@ function restoreModelState() {
 function saveModelState() {
   try {
     localStorage.setItem(MODEL_KEY, JSON.stringify({
-      mode: B.mode, key: B.model.key, action: B.model.action,
+      mode: B.mode, key: B.model.key,
+      // Only what identifies the mesh. `data` and `clip` are a decoded mesh
+      // and its baked frames -- 298 KB for a monster, megabytes for a
+      // 120-frame collected action -- and both are re-fetched on restore
+      // regardless. Two callers (the ad-hoc ACTION select, setModelZoom) run
+      // once those are attached, and overflowing the quota here fails into
+      // the catch below: the page would simply stop remembering anything.
+      adhoc: B.adhoc ? { mesh: B.adhoc.mesh, tex: B.adhoc.tex || '',
+                         action: B.adhoc.action || '' } : null,
+      action: B.model.action,
       kind: B.model.kind, q: B.model.q, zoom: B.model.zoom,
       row: B.model.row, distinctOnly: B.model.distinctOnly,
+      source: B.model.source, path: B.model.path,
     }));
   } catch (e) { /* ignore */ }
 }
@@ -1597,6 +1703,8 @@ async function setMode(mode) {
 
 // ---------------------------------------------------------------- the list
 async function loadModelList({ select = '' } = {}) {
+  renderModelSource();
+  if (B.model.source === 'path') return loadPathList();
   const host = $('#model-list');
   host.innerHTML = '<div class="mut small" style="padding:12px">loading…</div>';
   const p = new URLSearchParams({ limit: '600' });
@@ -1613,10 +1721,132 @@ async function loadModelList({ select = '' } = {}) {
   const want = select || B.model.key;
   const i = data.models.findIndex(m => m.key === want);
   if (i >= 0) highlightModel(i, { load: false });
-  else if (data.models.length && !B.model.key) highlightModel(0, { load: false });
+  // Do NOT fall back to the first model while an ad-hoc mesh is open: that
+  // auto-pick would count as a list selection and evict the very mesh the
+  // link asked for.
+  else if (data.models.length && !B.model.key && !B.adhoc) {
+    highlightModel(0, { load: false });
+  }
   $('#model-count').textContent =
     `${data.total} model${data.total === 1 ? '' : 's'} shown of ${data.pool}` +
     (data.models.length < data.total ? ` (first ${data.models.length})` : '');
+}
+
+/** Catalogue or by-path, and the controls each one needs. */
+function renderModelSource() {
+  const host = $('#model-source');
+  if (!host) return;
+  const byPath = B.model.source === 'path';
+  host.innerHTML = '';
+  host.appendChild(el('div', 'axis-name', 'List'));
+  const pick = (src, label, why) => {
+    const c = chip(label, null, B.model.source === src, () => {
+      if (B.model.source === src) return;
+      B.model.source = src;
+      B.model.index = -1;
+      saveModelState();
+      loadModelList();
+    });
+    c.title = why;
+    host.appendChild(c);
+  };
+  pick('catalogue', 'Catalogue',
+       'Model families the client’s own layout describes: monsters, '
+       + 'NPCs, ghosts, mounts, roles, effects.');
+  pick('path', 'By path',
+       'Every mesh under a path in the selected view — including art no '
+       + 'catalogue names, like the Collection and the recovered archives.');
+  $('#model-search').classList.toggle('hidden', byPath);
+  $('#model-path').classList.toggle('hidden', !byPath);
+  $('#model-kinds').classList.toggle('hidden', byPath);
+  $('#model-crumbs').classList.toggle('hidden', !byPath);
+  if (byPath && $('#model-path').value !== B.model.path) {
+    $('#model-path').value = B.model.path;
+  }
+}
+
+/** Every mesh under a path prefix, in whatever view is selected.
+ *
+ *  Deliberately the same `/api/files` the asset browser uses, so anything
+ *  visible there is openable here; and rows open as ad-hoc meshes, which is
+ *  the path that already handles geometry with no catalogue entry.
+ */
+async function loadPathList() {
+  const host = $('#model-list');
+  host.innerHTML = '<div class="mut small" style="padding:12px">loading…</div>';
+  const prefix = (B.model.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const p = new URLSearchParams({ ext: '.c3', limit: '400', unified: '0',
+                                  dir: prefix.replace(/\/+$/, '') });
+  let data, dirs = [];
+  try {
+    [data, dirs] = await Promise.all([
+      api('/api/files?' + p.toString()),
+      api('/api/dirs?ext=.c3').catch(() => []),
+    ]);
+  } catch (e) {
+    host.innerHTML = '';
+    host.appendChild(el('div', 'err', e.message));
+    return;
+  }
+  B.model.dirs = dirs;
+  // A motion file is not a model. They are still reachable by clearing the
+  // filter, but listing an entry's twelve action files beside it turns a
+  // folder of three NPCs into thirty-nine rows of mostly noise.
+  const rows = data.rows.filter(r => !/__motion-[^/]*\.c3$/.test(r.path));
+  const hiddenParts = data.rows.length - rows.length;
+  B.model.list = rows.map(r => ({ key: 'path:' + r.path, path: r.path,
+                                  label: r.path.split('/').pop(),
+                                  dir: r.path.split('/').slice(0, -1).join('/'),
+                                  kind: 'path' }));
+  renderPathCrumbs(prefix);
+  renderModelList();
+  $('#model-count').textContent =
+    `${rows.length} mesh${rows.length === 1 ? '' : 'es'} of ${data.total}`
+    + (hiddenParts ? ` · ${hiddenParts} action file(s) not listed` : '');
+  if (!rows.length) {
+    host.innerHTML = '';
+    host.appendChild(el('div', 'mut small',
+      prefix ? `nothing under ${prefix} in this view`
+             : 'no meshes in this view'));
+  }
+}
+
+/** Clickable folders under the current prefix, so a path is navigable
+ *  rather than something you have to already know how to spell. */
+function renderPathCrumbs(prefix) {
+  const host = $('#model-crumbs');
+  if (!host) return;
+  host.innerHTML = '';
+  host.appendChild(el('div', 'axis-name', 'Folder'));
+  const go = (to) => {
+    B.model.path = to;
+    $('#model-path').value = to;
+    saveModelState();
+    loadPathList();
+  };
+  if (prefix) {
+    const up = prefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
+    host.appendChild(chip('↑ ' + (up || 'all'), null, false,
+                          () => go(up ? up + '/' : '')));
+  }
+  const base = prefix.replace(/\/+$/, '');
+  const seen = new Map();
+  for (const d of (B.model.dirs || [])) {
+    const dir = d.dir || '';
+    if (base) {
+      if (!dir.startsWith(base + '/')) continue;
+    } else if (!dir) continue;
+    const next = dir.slice(base ? base.length + 1 : 0).split('/')[0];
+    if (!next) continue;
+    seen.set(next, (seen.get(next) || 0) + d.count);
+  }
+  for (const [name, n] of [...seen].sort((a, b) => a[0].localeCompare(b[0]))) {
+    host.appendChild(chip(name, n, false,
+                          () => go((base ? base + '/' : '') + name + '/')));
+  }
+  if (!seen.size && !prefix) {
+    host.appendChild(el('span', 'mut small', 'no folders in this view'));
+  }
 }
 
 function renderModelKinds(data) {
@@ -1646,10 +1876,20 @@ function renderModelList() {
   B.model.list.forEach((m, i) => {
     const row = el('div', 'row-item');
     row.dataset.key = m.key;
-    row.appendChild(setThumb(el('img'), m.thumb, 48));
+    row.appendChild(setThumb(el('img'), m.thumb || m.path, 48));
     const lb = el('div', 'lbl');
     lb.appendChild(el('b', null, m.label || m.key));
     const bits = [];
+    if (m.kind === 'path') {
+      // No clip or action counts here: they cost a parse per row, and this
+      // list exists precisely for meshes the catalogue never measured.
+      lb.appendChild(el('span', null, m.path));
+      lb.appendChild(el('span', 'kindline', m.dir || '(root)'));
+      row.appendChild(lb);
+      row.addEventListener('click', () => highlightModel(i));
+      host.appendChild(row);
+      return;
+    }
     if (m.kind === 'effect') bits.push('effect');
     else {
       bits.push(`${m.clips} clip${m.clips === 1 ? '' : 's'}`);
@@ -1684,6 +1924,28 @@ function highlightModel(i, { load = true, immediate = false } = {}) {
   i = Math.max(0, Math.min(list.length - 1, i));
   const m = list[i];
   B.model.index = i;
+  // A by-path row IS an ad-hoc mesh -- same route a #mesh= link takes, which
+  // is what lets geometry with no catalogue entry onto the stage at all.
+  if (m.kind === 'path') {
+    B.model.key = m.key;
+    if (!B.adhoc || B.adhoc.mesh !== m.path) {
+      B.adhoc = { mesh: m.path, tex: '' };
+    }
+    markModelSelection();
+    const r = $('#model-list').querySelector(`.row-item[data-key="${cssEsc(m.key)}"]`);
+    if (r) r.scrollIntoView({ block: 'nearest' });
+    saveModelState();
+    if (!load) { renderModelPanel(); return; }
+    requestLoad(tk => {
+      if (!stillCurrent(tk)) return;
+      rebuildAdhoc({ reframe: true });
+    }, { immediate });
+    return;
+  }
+  // Only a real pick (one that loads) leaves the ad-hoc mesh. Restoring the
+  // saved selection at boot passes load:false, and clearing on that would
+  // evict the mesh a #mesh= link just asked for.
+  if (load && B.adhoc) B.adhoc = null;
   if (m.key !== B.model.key) {
     B.model.key = m.key;
     B.model.data = null;
@@ -1803,6 +2065,7 @@ function scaledBounds(b) {
 
 async function rebuildModel({ reframe = false } = {}) {
   stopModelEffect();
+  if (B.adhoc && B.adhoc.mesh) return rebuildAdhoc({ reframe });
   if (!B.model.key) {
     if (viewer) { viewer.clear(); viewer.draw(); }
     $('#gl-msg').textContent = 'pick a model on the left';
@@ -1823,6 +2086,7 @@ async function rebuildModel({ reframe = false } = {}) {
     }
     if (!stillCurrent(tk)) return;
     B.model.data = info;
+    B.model.tex = null;   // a colour choice belongs to one model
     $('#card-monster').classList.toggle('hidden', info.kind !== 'monster');
   }
   if (info.kind === 'effect') return showEffectModel(info, tk);
@@ -1830,9 +2094,17 @@ async function rebuildModel({ reframe = false } = {}) {
   fillModelActions();
   const d = await fetchModelClip(B.model.action);
   if (!stillCurrent(tk)) return;
-  if (!d || !d.frames || !d.scene) {
+  if (!d || !d.frames || !d.scene || !d.scene.meshes.length) {
+    // Clear the stage. Leaving the previous model's meshes up made a failed
+    // clip read as "it switched back to the old model and stopped
+    // animating" -- a wrong answer on screen beats an error only in a
+    // corner nobody reads. An empty stage plus the reason is the truth.
+    if (viewer) { viewer.clear(); viewer.draw(); }
+    $('#gl-stats').textContent = '';
     $('#gl-msg').textContent =
       (d && d.error) || 'no motion ships for this action';
+    $('#gl-msg').classList.remove('hidden');
+    B.anim.seq = []; B.anim.data = null;
     renderModelPanel();
     renderAnimPanel();
     return;
@@ -1843,7 +2115,7 @@ async function rebuildModel({ reframe = false } = {}) {
                                           matrix: mat }));
   viewer.setMeshes(defs, { frameOn: scaledBounds(d.bounds),
                            keepFraming: !reframe });
-  await applyNamedTexture('model', d.texture);
+  await applyNamedTexture('model', B.model.tex || d.texture);
   if (!stillCurrent(tk)) return;
   $('#gl-msg').classList.add('hidden');
   $('#gl-stats').textContent = viewer.stats +
@@ -1857,6 +2129,413 @@ async function rebuildModel({ reframe = false } = {}) {
   renderModelPanel();
   renderMonsterPanel();
   renderAnimPanel();
+  renderCollect();
+  viewer.draw();
+}
+
+// ------------------------------------------------------------- collection
+//
+// Same card as the asset browser's, driven from whatever the model stage is
+// showing: an ad-hoc mesh opened by path, or a catalogued model's own files.
+let collectionMeta = null;
+
+function currentCollectable() {
+  if (B.adhoc && B.adhoc.mesh) {
+    return { mesh: B.adhoc.mesh, tex: B.adhoc.resolvedTex || B.adhoc.tex || '',
+             name: B.adhoc.mesh.split('/').pop().replace(/\.c3$/i, '') };
+  }
+  const d = B.model.data;
+  if (d && d.mesh) {
+    return { mesh: d.mesh, tex: d.texture || '', name: d.label || d.key || '' };
+  }
+  return null;
+}
+
+function guessCategory(p) {
+  const k = (p || '').toLowerCase();
+  if (k.includes('/monster/')) return 'Monsters';
+  if (k.includes('/npc/')) return 'NPCs';
+  if (k.includes('/mount/')) return 'Mounts';
+  if (k.includes('/weapon')) return 'Weapons';
+  if (k.includes('/shield')) return 'Shields';
+  if (k.includes('/armet') || k.includes('/hair')) return 'Headgear';
+  if (k.includes('garment')) return 'Garments';
+  if (k.includes('/effect/')) return 'Effects';
+  if (k.startsWith('data/map') || k.includes('/map/')) return 'Maps';
+  if (k.startsWith('data/interface') || k.includes('icon')) return 'UI';
+  if (/^c3\/\d{4}\//.test(k)) return 'Characters';
+  return 'Other';
+}
+
+let collectFor = null;
+
+async function renderCollect({ force = false } = {}) {
+  const host = $('#collect-body');
+  if (!host) return;
+  const subj = (currentCollectable() || {}).mesh || '';
+  // See app.js: a rebuild discards half-typed input, and this is
+  // called whenever the stage changes for any reason.
+  if (!force && collectFor === subj && host.querySelector('input')) {
+    return;
+  }
+  collectFor = subj;
+  host.innerHTML = '';
+  if (!collectionMeta) {
+    try { collectionMeta = await api('/api/keep'); }
+    catch (e) { host.appendChild(el('div', 'mut small', 'unavailable')); return; }
+  }
+  if (!collectionMeta.library) {
+    host.appendChild(el('div', 'mut small',
+      'No COmmunity Library configured.'));
+    return;
+  }
+  const total = Object.values(collectionMeta.counts || {})
+    .reduce((a, b) => a + b, 0);
+  host.appendChild(el('div', 'mut small', `${total} collected`));
+
+  const cur = currentCollectable();
+  if (!cur) {
+    host.appendChild(el('div', 'mut small', 'Nothing on the stage to collect.'));
+    return;
+  }
+  // Matched by the path it came from OR by the Collection's own copy, so the
+  // view you go to in order to look at what you kept is not the one view
+  // that fails to recognise it. See Swap.entryFor.
+  const hit = Swap.entryFor(collectionMeta.entries, cur.mesh);
+  const existing = hit && hit.entry;
+  if (hit && hit.isCopy) { renderCollectedCopy(host, existing, cur); return; }
+
+  const catSel = el('select');
+  for (const c of Object.keys(collectionMeta.categories || {})) {
+    const o = el('option', null, c);
+    o.value = c;
+    catSel.appendChild(o);
+  }
+  catSel.value = existing ? existing.category : guessCategory(cur.mesh);
+  const nameIn = el('input');
+  nameIn.type = 'text';
+  nameIn.placeholder = 'name (optional)';
+  nameIn.value = existing ? existing.name : cur.name;
+  nameIn.style.width = '100%';
+  nameIn.style.marginTop = '4px';
+  const go = el('button', 'primary', existing ? 'Update entry' : 'Collect');
+  go.style.marginTop = '6px';
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      const r = await api('/api/keep/add', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: cur.mesh, texture: cur.tex,
+                               category: catSel.value,
+                               name: nameIn.value.trim() }) });
+      collectionMeta = null;
+      const np = (r.entry.parts || []).length;
+      toast(`collected ${r.entry.id}` + (np ? ` (+${np} motion/effect files)` : ''));
+      renderCollect({ force: true });
+    } catch (e) {
+      toast('collect failed: ' + e.message, 5000);
+      go.disabled = false;
+    }
+  });
+  host.appendChild(catSel);
+  host.appendChild(nameIn);
+  host.appendChild(go);
+  const diag = el('button', 'ghost tiny', 'Test connection');
+  diag.style.marginLeft = '6px';
+  diag.addEventListener('click', () => diagnoseCollect(host));
+  host.appendChild(diag);
+  host.appendChild(el('div', 'mut small', cur.mesh));
+  if (existing) {
+    const info = el('div', 'mut small');
+    info.style.marginTop = '4px';
+    info.textContent = `already collected as ${existing.id}`
+      + ((existing.parts || []).length
+         ? ` with ${existing.parts.length} motion/effect file(s)` : '');
+    host.appendChild(info);
+
+    // This page could collect and nothing else -- no replace, no remove, no
+    // drawer -- which is what "my mod staging is gone" describes from the
+    // page where you actually decide one model should stand in for another.
+    const panel = el('div', 'swap-panel');
+    panel.style.marginTop = '8px';
+    const swap = el('button', 'ghost tiny', 'Replace an asset with this…');
+    swap.title = 'Write this entry over the asset it replaces, choosing '
+               + 'whether its skin and animations travel with it.';
+    swap.addEventListener('click', () => {
+      if (panel.childElementCount) { panel.innerHTML = ''; return; }
+      Swap.replacePanel(panel, existing,
+                        { defaultTarget: existing.swapFor || cur.mesh });
+    });
+    host.appendChild(swap);
+
+    const drop = el('button', 'ghost tiny', 'Remove');
+    drop.style.marginLeft = '6px';
+    drop.title = 'Drop this entry from the Collection and delete its files.';
+    drop.addEventListener('click', async () => {
+      try {
+        await api('/api/keep/remove', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: existing.id }) });
+        collectionMeta = null;
+        toast('removed from the collection');
+        renderCollect({ force: true });
+      } catch (e) { toast('remove failed: ' + e.message, 5000); }
+    });
+    host.appendChild(drop);
+    host.appendChild(panel);
+  }
+}
+
+/** The card when the thing on the stage IS a Collection entry's own copy.
+ *
+ *  Browsing the `collection` view and finding what you kept is the obvious
+ *  way to go and use it, so this is where Replace has to be. What must NOT
+ *  be here is Collect: posting this path would file a second entry whose
+ *  source is the first entry's copy, and the Collection is a set of
+ *  decisions, not a chain of them.
+ */
+function renderCollectedCopy(host, entry, cur) {
+  host.innerHTML = '';
+  host.appendChild(el('div', 'mut small',
+    `In the Collection as ${entry.id} — ${entry.category}.`));
+  const nMotion = (entry.parts || []).filter(p => p.role === 'motion').length;
+  const nOther = (entry.parts || []).length - nMotion;
+  host.appendChild(el('div', 'mut small',
+    (entry.skins && entry.skins.length ? 'skin kept' : 'no skin')
+    + (nMotion ? ` · ${nMotion} animation file(s)` : ' · no animations')
+    + (nOther ? ` · ${nOther} effect/sound file(s)` : '')));
+
+  const panel = el('div', 'swap-panel');
+  panel.style.marginTop = '8px';
+  const swap = el('button', 'ghost tiny', 'Replace an asset with this…');
+  swap.title = 'Write this entry over the asset it replaces, choosing '
+             + 'whether its skin and animations travel with it.';
+  swap.addEventListener('click', () => {
+    if (panel.childElementCount) { panel.innerHTML = ''; return; }
+    // The original is the default target: replacing what it was collected
+    // from is the common case, and every other target is a path away.
+    Swap.replacePanel(panel, entry,
+                      { defaultTarget: entry.swapFor || entry.sourceMesh });
+  });
+  host.appendChild(swap);
+
+  const drop = el('button', 'ghost tiny', 'Remove');
+  drop.style.marginLeft = '6px';
+  drop.title = 'Drop this entry from the Collection and delete its files.';
+  drop.addEventListener('click', async () => {
+    try {
+      await api('/api/keep/remove', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: entry.id }) });
+      collectionMeta = null;
+      toast('removed from the collection');
+      renderCollect({ force: true });
+    } catch (e) { toast('remove failed: ' + e.message, 5000); }
+  });
+  host.appendChild(drop);
+  host.appendChild(panel);
+
+  if (entry.sourceMesh) {
+    const from = el('div', 'mut small');
+    from.style.marginTop = '6px';
+    from.textContent = 'collected from '
+      + (entry.server ? entry.server + ':' : '') + entry.sourceMesh;
+    host.appendChild(from);
+  }
+}
+
+
+/** Say which layer failed, because "NetworkError" alone does not.
+ *  GET works but POST does not => something is refusing non-GET requests to
+ *  loopback (security software, an extension), not the feature. */
+const UI_BUILD = 'ui-2026-08-04-e-name';
+
+async function diagnoseCollect(host) {
+  const out = el('div', 'mut small');
+  out.style.marginTop = '6px';
+  out.style.whiteSpace = 'pre-wrap';
+  out.textContent = 'checking…';
+  host.appendChild(out);
+  const lines = [];
+  try {
+    await api('/api/keep');
+    lines.push('GET  /api/collection: ok');
+  } catch (e) { lines.push('GET  /api/collection: ' + e.message); }
+  try {
+    const r = await api('/api/ping', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    lines.push('POST /api/ping: ok (origin ' + (r.origin || 'none') + ')');
+  } catch (e) {
+    lines.push('POST /api/ping: ' + e.message);
+    lines.push('→ If GET works and POST does not, something between this '
+             + 'page and the viewer is refusing POSTs to localhost — a '
+             + 'browser extension or security software that filters local '
+             + 'traffic. The viewer itself is answering.');
+  }
+  lines.push('page origin: ' + location.origin);
+  lines.push('ui build: ' + UI_BUILD);
+  // Exercise the real endpoint, not just a no-op POST: a
+  // failing Collect and a failing request look identical
+  // from the outside, and they are not the same problem.
+  const subject = (typeof state !== 'undefined' && state.meshPath)
+    || (typeof B !== 'undefined' && B.adhoc && B.adhoc.mesh) || '';
+  if (subject) {
+    try {
+      const d = await api('/api/keep/add', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: subject, dryRun: true,
+                               category: 'Other' }) });
+      lines.push('POST /api/keep/add (dry run): ok — '
+                 + d.parts + ' part(s), ' + d.skins + ' skin(s)');
+    } catch (e) {
+      lines.push('POST /api/keep/add (dry run): ' + e.message);
+    }
+  } else {
+    lines.push('POST /api/collect: not tried (nothing selected)');
+  }
+  out.textContent = lines.join('\n');
+}
+
+/** The ACTION dropdown for an ad-hoc mesh.
+ *
+ *  The old client splits geometry from animation: c3/npc/001/1.c3 is the
+ *  model and 100/101/190.c3 beside it are MOTI-only action files. The
+ *  model's own track is usually a two-frame idle, which is why this looked
+ *  like "no animation" -- the real clips are the siblings.
+ */
+/** At or below this, a container's own MOTI is a bind pose rather than a
+ *  clip. Measured, not guessed: collected NPCs carry exactly 2. */
+const OWN_TRACK_POSE_FRAMES = 2;
+
+function fillAdhocActions() {
+  const sel = $('#anim-action');
+  if (!sel) return;
+  sel.innerHTML = '';
+  // Say what the own track actually holds. Offering it as an unqualified
+  // choice beside the real actions is what made picking it look like a
+  // failure -- it plays, it just has nothing to show.
+  const n = B.adhoc ? B.adhoc.ownFrames : undefined;
+  const own = el('option', null,
+    n === 0 ? 'this file\u2019s own track (empty)'
+    : (n > 0 && n <= OWN_TRACK_POSE_FRAMES)
+      ? `this file\u2019s own track (${n} frames \u2014 a pose)`
+      : 'this file\u2019s own track');
+  own.value = '';
+  sel.appendChild(own);
+  for (const a of (B.adhoc.actions || [])) {
+    const o = el('option', null, `${a.code} — ${a.label}`);
+    o.value = a.path;
+    sel.appendChild(o);
+  }
+  sel.value = B.adhoc.action || '';
+  sel.disabled = false;
+  sel.onchange = async () => {
+    B.adhoc.action = sel.value;
+    saveModelState();
+    await rebuildAdhoc({ reframe: false });
+  };
+}
+
+/** A mesh opened by path from the asset browser.
+ *
+ *  Deliberately not routed through /api/model: that endpoint answers for
+ *  catalogued models (monsters, NPCs, effects) and a garment recovered from
+ *  a community archive is in no catalogue. The geometry comes from the same
+ *  /api/mesh the browser itself uses, so anything visible there is visible
+ *  here, with this stage's camera, zoom and lighting.
+ */
+async function rebuildAdhoc({ reframe = false } = {}) {
+  const tk = tokenNow();
+  const path = B.adhoc.mesh;
+  $('#gl-msg').textContent = 'loading…';
+  $('#gl-msg').classList.remove('hidden');
+  let d;
+  try {
+    d = await api('/api/mesh?path=' + encodeURIComponent(path) + '&guesstex=1');
+  } catch (e) {
+    $('#gl-msg').textContent = 'could not load ' + path + ': ' + e.message;
+    renderModelPanel();
+    return;
+  }
+  if (!stillCurrent(tk)) return;
+  if (!d.meshes || !d.meshes.length) {
+    $('#gl-msg').textContent = d.note ||
+      'no drawable geometry in ' + path;
+    renderModelPanel();
+    return;
+  }
+  const tex = B.adhoc.tex || d.guessedTexture || '';
+  const mat = zoomMatrix();
+
+  // The clip is fetched first so its bounds can frame the camera in the same
+  // call that uploads the meshes -- `frameOn` is a setMeshes option, not a
+  // method on the viewer.
+  let clip = null;
+  try {
+    const q = new URLSearchParams({ path });
+    if (B.adhoc.action) q.set('motion', B.adhoc.action);
+    clip = await api('/api/meshanim?' + q.toString());
+  } catch (e) { clip = null; }
+  if (!stillCurrent(tk)) return;
+  const playable = clip && clip.frames > 0 && !clip.error;
+  // How the *container's own* track plays is only knowable from a fetch that
+  // asked for it. Recorded once, so selecting an action later cannot make
+  // the own-track option look richer than it is.
+  if (!B.adhoc.action) B.adhoc.ownFrames = playable ? clip.frames : 0;
+
+  // A model whose geometry and animation live in separate files carries a
+  // token track of its own: measured on a collected NPC, 2 frames against
+  // the 50, 120 and 120 of its three real actions. So the default selection
+  // was a static pose, and "this file's own track" read as broken rather
+  // than as "the clips are in the ACTION list". Open on the first real
+  // action instead.
+  //
+  // Once per mesh, and only when nothing was chosen: selecting the own track
+  // back deliberately has to stick, pose or not.
+  const ownIsAPose = !playable || clip.frames <= OWN_TRACK_POSE_FRAMES;
+  if (ownIsAPose && !B.adhoc.action && !B.adhoc.autoActioned
+      && clip && (clip.actions || []).length) {
+    B.adhoc.autoActioned = true;
+    B.adhoc.action = clip.actions[0].path;
+    return rebuildAdhoc({ reframe });
+  }
+
+  viewer.setMeshes(d.meshes.map(m => ({ meta: m, textureKey: tex ? 'model' : null,
+                                        matrix: mat })),
+                   { keepFraming: !reframe,
+                     frameOn: playable && clip.bounds
+                       ? scaledBounds(clip.bounds) : undefined });
+  if (tex) await applyNamedTexture('model', tex);
+  if (!stillCurrent(tk)) return;
+  B.adhoc.data = d;
+  B.adhoc.resolvedTex = tex;
+  $('#gl-msg').classList.add('hidden');
+  $('#gl-stats').textContent = viewer.stats + '\n' + path +
+    (tex ? ' · ' + tex : ' · untextured');
+
+  // Most of these containers carry their own MOTI, one per PHY chunk, so
+  // they animate without belonging to any catalogue. Fetch it and hand it
+  // to the same animation UI the catalogued models use.
+  B.anim.seq = [];
+  B.anim.data = null;
+  B.adhoc.actions = (clip && clip.actions) || [];
+  fillAdhocActions();
+  if (playable) {
+    B.adhoc.clip = clip;
+    B.anim.seq = [clip];
+    B.anim.data = clip;
+    B.anim.seqAt = 0;
+    B.anim.frame = 0;
+    syncAnimUi();
+    renderAnimPanel();
+  } else {
+    B.adhoc.clip = null;
+    B.adhoc.clipError = (clip && clip.error) || 'no motion in this container';
+    syncAnimUi();
+    renderAnimPanel();
+  }
+  renderModelPanel();
+  renderCollect();
   viewer.draw();
 }
 
@@ -1952,6 +2631,48 @@ function modelEffectLoop(info) {
 function renderModelPanel() {
   const b = $('#model-body');
   b.innerHTML = '';
+  if (B.adhoc && B.adhoc.mesh) {
+    b.appendChild(el('div', 'small',
+      'Opened from the asset browser, not from the model catalogue.'));
+    b.appendChild(kv([
+      ['mesh', B.adhoc.mesh],
+      ['texture', B.adhoc.resolvedTex || '(none resolved)'],
+      ['chunks', String(((B.adhoc.data || {}).meshes || []).length)],
+      ['motion', B.adhoc.clip
+        ? `${B.adhoc.clip.frames} frames, ${B.adhoc.clip.loop}`
+        : (B.adhoc.clipError || 'none')],
+      ['action', B.adhoc.action
+        ? B.adhoc.action.split('/').pop()
+        : (B.adhoc.actions && B.adhoc.actions.length
+           ? 'own track (' + B.adhoc.actions.length + ' more beside it)'
+           : 'own track')],
+    ]));
+    b.appendChild(el('div', 'mut small',
+      !B.adhoc.clip
+        ? 'Nothing to play: this container has geometry but no motion track.'
+        : B.adhoc.action
+          ? 'Motion comes from ' + B.adhoc.action.split('/').pop()
+            + ', a MOTI-only file beside this model, bound over its PHY '
+            + 'chunks by ordinal — press play.'
+          : 'Motion is this file’s own MOTI track — often just a '
+            + 'short idle. The real clips are the sibling action files in '
+            + 'the ACTION list.'));
+    b.appendChild(el('div', 'mut small', 'Pick anything in the Models list '
+                     + 'to leave this mesh.'));
+    const back = el('a', 'navlink-inline', '← back to this asset in the browser');
+    back.href = '/#file=' + encodeURIComponent(B.adhoc.mesh);
+    b.appendChild(back);
+    const clear = el('button', 'ghost tiny', 'Leave this mesh');
+    clear.style.marginTop = '8px';
+    clear.addEventListener('click', async () => {
+      B.adhoc = null;
+      saveModelState();
+      await loadModelList({ select: B.model.key });
+      await rebuildModel({ reframe: true });
+    });
+    b.appendChild(clear);
+    return;
+  }
   const info = B.model.data;
   if (!info) {
     b.appendChild(el('div', 'mut small', 'pick a model on the left'));
@@ -2038,6 +2759,31 @@ function renderMonsterPanel() {
   rst.addEventListener('click', () => setModelZoom(100));
   row.appendChild(rst);
   b.appendChild(row);
+
+  // 6090 ships monster colourways as sibling texture files (the leading
+  // digit of the 9-digit id), not as table rows — ThunderApe's nine skins.
+  const cw = info.colourways || [];
+  if (cw.length > 1) {
+    b.appendChild(el('div', 'small mut',
+                     `${cw.length} colourways ship for this body`));
+    const strip = el('div', 'variants');
+    const current = B.model.tex || info.texture;
+    for (const p of cw) {
+      const img = document.createElement('img');
+      img.src = '/api/texture?path=' + encodeURIComponent(p);
+      img.title = p;
+      img.loading = 'lazy';
+      if (p === current) img.classList.add('sel');
+      img.addEventListener('click', async () => {
+        B.model.tex = p;
+        await applyNamedTexture('model', p);
+        if (viewer) viewer.draw();
+        renderMonsterPanel();
+      });
+      strip.appendChild(img);
+    }
+    b.appendChild(strip);
+  }
 
   if (B.model.row) {
     const r = B.model.row;
@@ -2200,6 +2946,11 @@ function bindControls() {
     B.model.q = e.target.value.trim();
     loadModelList();
   }, 220));
+  $('#model-path').addEventListener('input', debounce(e => {
+    B.model.path = e.target.value.trim();
+    saveModelState();
+    loadPathList();
+  }, 260));
   $('#chk-clips').addEventListener('change', e => {
     B.model.distinctOnly = e.target.checked;
     saveModelState();
@@ -2207,10 +2958,22 @@ function bindControls() {
   });
 
   $('#anim-action').addEventListener('change', async e => {
+    // An ad-hoc mesh drives this select itself (fillAdhocActions), and its
+    // values are motion FILE PATHS, not action codes -- selectModelAction
+    // would misread them.
+    if (B.adhoc && B.adhoc.mesh) return;
     if (B.mode === 'model') { selectModelAction(e.target.value); return; }
     animPause();
     B.anim.action = e.target.value;
     B.anim.frame = 0;
+    // Rebuild as well as re-clip. /api/figure is asked for a pose AT this
+    // action, and everything derived from it -- the extent in the stats
+    // line, the socket rows and the "pose" key in the how-it-is-built panel
+    // -- otherwise keeps describing the action you just navigated away from.
+    // That panel is the one you read to check which motion is in play, so a
+    // stale answer there is the same class of bug as the hardcoded weapon
+    // set it used to carry.
+    await rebuild({ reframe: false });
     await ensureAnim();
     showAnimFrame(0);
     renderAnimPanel();

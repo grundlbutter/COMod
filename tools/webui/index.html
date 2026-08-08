@@ -10,10 +10,10 @@
 
 <header>
   <h1>CO Asset Viewer</h1>
-  <label id="server-label" class="hidden"
-         title="Which client's asset namespace to browse: the baseline install, or a community server catalogued in the COmmunity Library. Linkages (mesh ↔ texture ↔ motion) come from the selected server's own tables.">
-    Server
-    <select id="server-select"></select>
+  <label id="path-label" class="hidden"
+         title="What to browse — an installed client, or a server in your COmmunity Library. The parser plugin follows the path, so tables, id conventions and linkages all change with it. Each keeps its own derived indexes.">
+    Path
+    <select id="path-select"></select>
   </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
@@ -25,6 +25,8 @@
           title="Collapse / expand every panel on the right (C)">Collapse panels</button>
   <button id="btn-health" class="ghost"
           title="Where the game install was found, what is installed, and the state of the thumbnail cache">Health &amp; thumbnails</button>
+  <button id="btn-library" class="ghost"
+          title="Choose the COmmunity Library folder — the imported community-server assets this viewer can browse.">Asset library</button>
   <button id="btn-mods" class="ghost">Mod staging</button>
 </header>
 
@@ -79,9 +81,16 @@
     </div>
 
     <div id="pane-files" class="pane hidden">
-      <label>Directory
-        <select id="dir-select"></select>
-      </label>
+      <div id="dir-picker">
+        <div class="dir-head">
+          <span class="small mut">Folders</span>
+          <button id="dir-expand" class="ghost tiny" type="button"
+                  title="Open every folder">expand all</button>
+          <button id="dir-collapse" class="ghost tiny" type="button"
+                  title="Close every folder">collapse all</button>
+        </div>
+        <div id="dir-tree" class="dirtree"></div>
+      </div>
       <label title="‘Everything’ merges a mesh and the textures authored for it into one entry. Narrowing to one kind of file necessarily shows them apart again.">Type
         <select id="ext-select">
           <option value="" selected>everything (mesh + skins merged)</option>
@@ -175,6 +184,18 @@
   <!-- ------------------------------------------------ right: detail -->
   <aside id="right">
 
+    <section class="card" id="card-collect" data-card="collect">
+      <h2>Collection</h2>
+      <div class="cardbody">
+        <p class="small mut" style="margin:0 0 8px">
+          Keep this asset in the library&#39;s curated Collection &mdash; filed by
+          category, viewable, and stageable over an existing asset as a swap.
+          Its motion files come along with it.
+        </p>
+        <div id="collect-body"></div>
+      </div>
+    </section>
+
     <section class="card" id="card-prov" data-card="prov">
       <h2>Where this comes from</h2>
       <div id="prov-body" class="cardbody mut">nothing selected</div>
@@ -189,6 +210,7 @@
           slot, search and filter, see it on the figure. This panel stays for
           equipping whatever you happen to be looking at.
         </p>
+        <div id="model-open" class="small" style="margin:0 0 10px"></div>
         <div id="loadout-body"></div>
       </div>
     </section>
@@ -240,12 +262,54 @@
       backups and its <code>uninstall</code> revert.
     </p>
     <div id="stage-list"></div>
+    <!-- Which install to write to. There is usually more than one Conquer on a
+         machine -- a baseline, a community client, a copy kept for comparison --
+         and "install" silently meaning whichever one the viewer happens to be
+         browsing is a guess made on the user's behalf about a folder that gets
+         written to. Backups and the revert manifest are kept per install root,
+         so each one can be reverted on its own. -->
+    <label class="small mut" style="display:block;margin-top:8px">
+      Install into
+      <select id="install-select" style="max-width:100%"></select>
+    </label>
+    <input id="install-path" type="text" autocomplete="off"
+           style="width:100%;margin-top:4px"
+           placeholder="or paste the path to another game install">
+    <div id="install-note" class="small mut" style="margin-top:4px"></div>
     <div class="row">
       <button id="btn-dry" class="ghost">Install (dry run)</button>
       <button id="btn-install" class="danger">Install for real</button>
       <button id="btn-uninstall" class="ghost">Uninstall / revert</button>
     </div>
     <pre id="mod-output" class="out"></pre>
+  </div>
+</div>
+
+<!-- ------------------------------------------------ asset library -->
+<div id="libdrawer" class="hidden">
+  <div class="drawer-inner">
+    <div class="drawer-head">
+      <h2>Asset library</h2>
+      <button id="libdrawer-close" class="ghost">close</button>
+    </div>
+    <p class="mut small">
+      A <b>COmmunity Library</b> is a folder holding assets imported from other
+      Conquer clients — one <code>servers/&lt;name&gt;/</code> profile per
+      server. Pick one here and its servers appear in the <b>Server</b> menu at
+      the top left. Your game install in Program Files is never modified.
+    </p>
+    <div id="lib-current" class="small"></div>
+    <div id="lib-found"></div>
+    <label class="small" style="display:block;margin-top:10px">
+      Or paste a folder path
+      <input id="lib-path" type="text" spellcheck="false"
+             placeholder="C:\path\to\COmmunity Library" style="width:100%">
+    </label>
+    <div class="row">
+      <button id="lib-save">Use this folder</button>
+      <button id="lib-clear" class="ghost">Forget the library</button>
+    </div>
+    <pre id="lib-output" class="out"></pre>
   </div>
 </div>
 
@@ -290,8 +354,10 @@
 <script src="/ui/fx.js"></script>
 <script src="/ui/gl.js"></script>
 <script src="/ui/cards.js"></script>
+<script src="/ui/swap.js"></script>
 <script src="/ui/app.js"></script>
 <script src="/ui/firstrun.js"></script>
+<script src="/ui/basepicker.js"></script>
 <script src="/ui/pageshot.js"></script>
 </body>
 </html>

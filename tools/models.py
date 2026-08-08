@@ -101,6 +101,7 @@ from typing import Callable, Iterable, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
+import tqdat                                              # noqa: E402
 from coassets import DEFAULT_ROOT, parse_ini              # noqa: E402
 
 try:                                                      # task #20, imported
@@ -306,6 +307,17 @@ class MonsterRow:
     asb: int = 5
     adb: int = 6
     body_type: int = 0
+    #: The part slots -- the monster's additional art. Absent from CCO's
+    #: monster.json but present in every official Monster.dat, where they were
+    #: previously dropped on the floor: tqdat kept them under `raw` and nothing
+    #: read it, so the properties panel showed a monster as a bare body.
+    armet: int = 0
+    armet_color: int = 0
+    r_weapon: int = 0
+    l_weapon: int = 0
+    l_weapon_color: int = 0
+    misc: int = 0
+    mount: int = 0
 
     def to_json(self) -> dict:
         return {"type": self.type, "name": self.name,
@@ -314,17 +326,52 @@ class MonsterRow:
                 "bornAction": self.born_action, "bornEffect": self.born_effect,
                 "bornSound": self.born_sound, "actResCtrl": self.act_res_ctrl,
                 "asb": self.asb, "adb": self.adb, "bodyType": self.body_type,
+                "armet": self.armet, "armetColor": self.armet_color,
+                "rWeapon": self.r_weapon, "lWeapon": self.l_weapon,
+                "lWeaponColor": self.l_weapon_color,
+                "misc": self.misc, "mount": self.mount,
+                "parts": {k: v for k, v in (
+                    ("armet", self.armet), ("rWeapon", self.r_weapon),
+                    ("lWeapon", self.l_weapon), ("misc", self.misc),
+                    ("mount", self.mount)) if v},
                 "scale": round(self.zoom_percent / 100.0, 4)}
 
 
-def load_monster_rows(root: Path | str = DEFAULT_ROOT) -> list[MonsterRow]:
-    p = Path(root) / "ini" / "monster.json"
-    if not p.is_file():
-        return []
+def _part(row: dict, json_key: str, dat_key: str) -> int:
+    """A monster part slot, from the json shape or the .dat section behind it.
+
+    Monster.dat carries these as `Armet`, `RWeapon` and so on; tqdat now maps
+    them to camelCase, but older parses left them only inside `raw`, so both
+    are accepted. A missing or non-numeric slot is 0, which means "no part".
+    """
+    v = row.get(json_key)
+    if v in (None, ""):
+        v = (row.get("raw") or {}).get(dat_key)
     try:
-        raw = json.loads(p.read_text("utf-8", errors="replace"))
-    except Exception:                                     # pragma: no cover
-        return []
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_monster_rows(root: Path | str = DEFAULT_ROOT) -> list[MonsterRow]:
+    """CCO's plain ini/monster.json, or -- on an official root, which ships
+    the same rows only TQ-cipher-encrypted -- ini/Monster.dat via ``tqdat``,
+    which already returns them in the json shape. Either way absence or an
+    unreadable table yields no rows: monster rows are optional render
+    properties here, not structure."""
+    raw: list = []
+    p = Path(root) / "ini" / "monster.json"
+    q = Path(root) / "ini" / "Monster.dat"
+    if p.is_file():
+        try:
+            raw = json.loads(p.read_text("utf-8", errors="replace"))
+        except Exception:                                 # pragma: no cover
+            return []
+    elif q.is_file():
+        try:
+            raw = tqdat.read_monster(q)
+        except ValueError:
+            return []
     out = []
     for r in raw:
         try:
@@ -339,7 +386,18 @@ def load_monster_rows(root: Path | str = DEFAULT_ROOT) -> list[MonsterRow]:
                 born_sound=str(r.get("bornSound", "") or ""),
                 act_res_ctrl=int(r.get("actResCtrl", 0) or 0),
                 asb=int(r.get("asb", 5) or 5), adb=int(r.get("adb", 6) or 6),
-                body_type=int(r.get("bodyType", 0) or 0)))
+                body_type=int(r.get("bodyType", 0) or 0),
+                # Part slots. `raw` is the fallback so this keeps working
+                # against a Monster.dat parsed by an older tqdat that only kept
+                # them there, and against any monster.json that spells them
+                # differently.
+                armet=_part(r, "armet", "Armet"),
+                armet_color=_part(r, "armetColor", "ArmetColor"),
+                r_weapon=_part(r, "rWeapon", "RWeapon"),
+                l_weapon=_part(r, "lWeapon", "LWeapon"),
+                l_weapon_color=_part(r, "lWeaponColor", "LWeaponColor"),
+                misc=_part(r, "misc", "Misc"),
+                mount=_part(r, "mount", "Mount")))
         except Exception:                                 # pragma: no cover
             continue
     return out
@@ -382,7 +440,11 @@ class ModelCatalogue:
                  has_geometry: Optional[Callable[[str], Optional[bool]]] = None,
                  texture_for: Optional[Callable[[str], Optional[dict]]] = None,
                  effect_names: Optional[Callable[[], list[str]]] = None,
-                 motion_index=None):
+                 motion_index=None,
+                 entity_names: Optional[dict] = None,
+                 entity_textures: Optional[dict] = None,
+                 flat_npc_art: Optional[dict] = None,
+                 plugin=None):
         self.root = Path(root)
         self.paths: set[str] = {p.replace("\\", "/").lower()
                                 for p in (paths or [])}
@@ -391,6 +453,27 @@ class ModelCatalogue:
         self._geom_hint = has_geometry
         self._texture_for = texture_for
         self._effect_names = effect_names
+        #: (kind, directory) -> a name from server/entity data, e.g.
+        #: ("monster", "103") -> "ThunderApe". Labels only -- nothing here
+        #: resolves art, and a missing name falls back to "Monster 103".
+        self._entity_names = entity_names or {}
+        #: mesh path (lower) -> texture path, from the NPC tables' resolved
+        #: plans. The client's own answer: it outranks every meshtex guess,
+        #: which is what fixes the "no texture / wrong texture" NPC dirs.
+        self.entity_textures: dict[str, str] = {
+            k.lower(): v for k, v in (entity_textures or {}).items()}
+        #: flat-NPC look ("001") -> (geometry, texture) from the same plans.
+        #: The look's real body is `simple_object -> 3DObj`, not the motion
+        #: file's embedded copy -- npcart's founding lesson.
+        self.flat_npc_art: dict[str, tuple[str, str]] = dict(
+            flat_npc_art or {})
+        #: The parser plugin (`plugins/`), which owns every per-client
+        #: convention this module used to hard-code: which texture family a
+        #: directory skins from, where a flat family keeps its real body.
+        #: None means "no plugin claimed this install", and then nothing
+        #: below invents a convention -- meshtex's ranked guess stands, and
+        #: is labelled as the guess it is.
+        self.plugin = plugin
         self._geom_cache: dict[str, bool] = {}
 
         self.index = motion_index
@@ -441,8 +524,23 @@ class ModelCatalogue:
         return bool(val)
 
     def texture(self, mesh: str) -> tuple[str, str, str]:
-        """`(path, method, kind)` for a mesh, through meshtex when supplied."""
-        if not mesh or self._texture_for is None:
+        """`(path, method, kind)` for a mesh: the NPC tables' answer when
+        they have one, meshtex's ranked guess otherwise. The tables are the
+        client's own linkage and outrank any inference -- the same
+        precedence `texture_for_mesh` applies in the viewer."""
+        if not mesh:
+            return "", "", ""
+        hit = self.entity_textures.get(mesh.lower())
+        if hit:
+            return hit, "npc tables", "authored"
+        # Family conventions -- which texture an NPC directory or a mount
+        # skins from -- are the plugin's, because they differ per client and
+        # a convention applied to the wrong client crosses namespaces.
+        if self.plugin is not None:
+            hit = self.plugin.texture_for_mesh(mesh, self._exists)
+            if hit:
+                return hit
+        if self._texture_for is None:
             return "", "", ""
         try:
             rec = self._texture_for(mesh)
@@ -545,7 +643,9 @@ class ModelCatalogue:
                       directory=dirpath, shape=shape, actions=actions,
                       files=len(files))
             m.shapes = all_shapes
-            m.label = _default_label(kind, d)
+            named = self._entity_names.get((kind, d))
+            m.label = (f"{named} ({d})" if named
+                       else _default_label(kind, d))
             m.detail = _layout_of(actions, base)
             self.models.append(m)
 
@@ -647,12 +747,23 @@ class ModelCatalogue:
         for grp, acts in sorted(groups.items()):
             actions = []
             base = ""
+            # A short-stem sibling (999118.c3 or 9992640.c3) is the
+            # skeleton layout hiding in flat clothing: it carries the
+            # family's one real body, and the 9-digit files beside it are
+            # motion sets whose embedded "geometry" renders as shards.
+            # Verified by eye on looks 118 and 256-273: the short stem is
+            # the person/object, the action files are not.
+            if self.plugin is not None:
+                base = self.plugin.flat_family_base(
+                    grp, self.paths, self.has_geometry) or ""
+            skeleton = bool(base)
+            if not base:
+                for code, path in sorted(acts.items()):
+                    if self.has_geometry(path):
+                        base = path
+                        break
             for code, path in sorted(acts.items()):
-                sc = self.has_geometry(path)
-                if sc and not base:
-                    base = path
-            for code, path in sorted(acts.items()):
-                sc = self.has_geometry(path)
+                sc = (not skeleton) and self.has_geometry(path)
                 a = ModelAction(code=code, motion=path,
                                 mesh=path if sc else base,
                                 self_contained=sc, available=bool(sc or base),
@@ -666,6 +777,14 @@ class ModelCatalogue:
                 continue                                  # pragma: no cover
             actions = _mark_aliases(sorted(actions, key=_action_sort))
             rep = base or actions[0].mesh
+            # The look's real body: `simple_object -> 3DObj`, when the NPC
+            # tables resolve it. The motion files' embedded PHY is a copy
+            # the client never draws, and which copy `has_geometry` finds
+            # first is an accident of file order -- the accident that put
+            # the wrong mesh on look 001.
+            art = self.flat_npc_art.get(grp)
+            if art and art[0]:
+                rep = art[0]
             tex, meth, tkind = self.texture(rep)
             m = Model(kind="npc_simple", ident=grp, mesh=rep, texture=tex,
                       texture_method=meth, texture_kind=tkind,
@@ -1153,7 +1272,10 @@ def _coverage(root: Path):
     `.c3` itself.
     """
     import coroot
-    p = coroot.find_derived("out/meshtex/coverage.json")
+    # Keyed to `root`, not to whatever install the process happens to be
+    # configured with: this runs once per catalogue, and the viewer holds one
+    # catalogue per base when comparing 6090 against 5517.
+    p = coroot.find_derived("out/meshtex/coverage.json", root)
     if p is None:
         return None
     try:

@@ -807,6 +807,10 @@ further here.
 * `PTCL` / `PTC3` particle systems (§6.6) — reachable in `graphic.dll`, not done.
 * What spawns and despawns an effect instance, and the exact hit moment inside an
   attack motion. That logic is in the packed `ImConquer.exe`.
+  **The spawn *triggers* are now mapped in `docs/world_effects.md`**: map
+  EFFECT layers, `MsgName` 1015 actions 9/10, `MsgMagicEffect` 1105 +
+  `magictype.json`, and status bits via `statuseffect.ini`. The per-instance
+  lifetime management stays exe-side.
 * `MOTI`'s trailing `extraChannelCount` block — read and discarded by the engine,
   so its content is unknown and irrelevant to playback.
 * `3DEffectInfo.ini`, `MagicEffect.ini` and `effect.ini` (the legacy 2D `.ani`

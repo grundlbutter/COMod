@@ -12,6 +12,40 @@ ground truth is inside the Themida-packed `ImConquer.exe`).
 Companion tool: **`tools/attach.py`** — module + CLI. Every number below comes
 out of `py -3 tools/attach.py --validate`.
 
+> ## ⚠ THE VIEWER APPLIES ONE CORRECTION. THE ENGINE DOES NOT. DO NOT PORT IT.
+>
+> Nothing in this document describes a correction. Everything here is what the
+> real client does, and that is what a compatible client must reproduce —
+> **artefacts included**.
+>
+> There is exactly one place the app deliberately disagrees with the shipped
+> data: `plugins.Plugin.socket_correction`, which `Patch6090` uses to replace
+> the **female** `v_l_weapon` dummy basis (body shapes 001 and 002) with CCO's
+> own, because this lineage ships it degenerate — rows as short as 0.012, which
+> flattens a held weapon to a sliver and points it the wrong way. Only the 3×3
+> is borrowed: the socket's *translation* is identical between the two clients
+> to 0.0000, at rest and mid-swing, so the hand does not move. `docs/handoff_5517_base_prep.md` §6.5a has the
+> measurements, and the four separate checks showing the engine does **not**
+> repair it: the composition multiplies the basis in unmodified, the follow
+> chain is one link deep, `Motion_GetMatrix_Blend` reduces to the plain fetch,
+> and `RoleView` never branches on body shape.
+>
+> The correction is **viewer-only by construction**, not by convention:
+>
+> * Applied in `coviewer.apply_socket_corrections` and nowhere else.
+> * `tools/attach.py` and `tools/parts.py` — what `client/` and any engine port
+>   read — return the shipped value unchanged. Verified: `parts.socket_anchors`
+>   still reports rows `(0.208, 0.974, 0.293)` for the socket where the viewer
+>   serves CCO's orientation, and neither file nor `client/` mentions the hook.
+> * Without a declared CCO install it degrades to unit-scaling the rows and
+>   says so in the note, rather than silently doing less than it claims.
+> * Every corrected socket is named in the `/api/figure` payload and stated on
+>   screen, so it cannot be mistaken for client behaviour.
+>
+> **Writing the client rewrite? Read `attach.py`, not the viewer.** A rewrite
+> that inherits this correction has stopped being compatible, and the first
+> thing it will disagree with is a screenshot of the real client.
+
 ```bash
 py -3 tools/attach.py --body 002135000 --armet 002119342 --r-weapon 410009
 py -3 tools/attach.py --sockets 002135000            # every socket on a body

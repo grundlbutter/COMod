@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import AssetRoot, C3File, DEFAULT_ROOT          # noqa: E402
+import coroot                                                  # noqa: E402
 import c3phy                                                   # noqa: E402
 
 WILDCARD = "999"
@@ -961,19 +962,37 @@ class EffectDB:
                 es.motion_meshes[mid[len(appearance):]] = mesh
         return es
 
+    @staticmethod
+    def _field_matches(rule_val: str, query: str) -> bool:
+        r"""One key field, compared so that a padding change cannot hide a row.
+
+        **CCO writes the action field three wide and 6090 writes it four,
+        zero-padded** -- `999.100.135.999` against `999.0100.130.300`, over
+        10,267 of 10,299 rows. A string comparison therefore misses every
+        non-wildcard row on 6090, which is why no weapon reported an
+        always-on aura and every super effect went quiet. Same number, same
+        meaning, different width; compare numerically when both sides are
+        numeric and fall back to the literal match when they are not.
+        """
+        if rule_val == WILDCARD or rule_val == query:
+            return True
+        if rule_val.isdigit() and query.isdigit():
+            return int(rule_val) == int(query)
+        return False
+
     def lookup_action_effect(self, appearance: str, action: str,
                              shape: str = WILDCARD) -> Optional[str]:
         """Most specific matching Action3DEffect row, or None."""
         hi, lo = self.split_appearance(appearance)
         best: Optional[ActionEffectRule] = None
         for r in self.action_rules:
-            if r.shape not in (WILDCARD, shape):
+            if not self._field_matches(r.shape, shape):
                 continue
-            if r.action not in (WILDCARD, action):
+            if not self._field_matches(r.action, action):
                 continue
-            if r.group_hi not in (WILDCARD, hi):
+            if not self._field_matches(r.group_hi, hi):
                 continue
-            if r.group_lo not in (WILDCARD, lo):
+            if not self._field_matches(r.group_lo, lo):
                 continue
             if best is None or r.specificity > best.specificity:
                 best = r
@@ -1512,8 +1531,8 @@ def main(argv: list[str]) -> int:
     if args.validate:
         print(json.dumps(validate(db), indent=2, ensure_ascii=False))
     if args.linkage:
-        out = Path(args.out) if args.out else \
-            Path(__file__).resolve().parent.parent / "out" / "effects" / "linkage.json"
+        out = (Path(args.out) if args.out
+               else coroot.derived_path("out/effects/linkage.json"))
         out.parent.mkdir(parents=True, exist_ok=True)
         doc = build_linkage(db)
         text = (json.dumps(doc, indent=1, ensure_ascii=False) if args.pretty

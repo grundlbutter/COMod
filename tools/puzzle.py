@@ -335,6 +335,42 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
 # loading
 # ---------------------------------------------------------------------------
 
+def _parse_ani(path: Path) -> dict:
+    """`ani/<name>.ani` -> {"Puzzle72": ["data/.../canyon072.dds", ...]}.
+
+    The same shape the shipped `.json` has, so callers cannot tell which
+    source answered.  Frames are kept in index order; the ground renderer
+    uses frame 0.
+    """
+    out: dict[str, list[str]] = {}
+    section = ""
+    frames: dict[int, str] = {}
+
+    def flush():
+        if section and frames:
+            out[section] = [frames[k] for k in sorted(frames)]
+
+    try:
+        text = path.read_text("latin-1", errors="replace")
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith((";", "#")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            flush()
+            section, frames = line[1:-1].strip(), {}
+            continue
+        if "=" not in line:
+            continue
+        k, v = (x.strip() for x in line.split("=", 1))
+        if k.lower().startswith("frame") and k[5:].isdigit():
+            frames[int(k[5:])] = v.replace("\\", "/").lstrip("/").lower()
+    flush()
+    return out
+
+
 class PuzzleLibrary:
     """`GameMap.json` + `map/map/*.DMap` + `map/puzzle/*.pul`, joined.
 
@@ -354,6 +390,8 @@ class PuzzleLibrary:
                 self.reason = f"could not resolve the game install: {e}"
         self._grid_size: dict[str, int] = {}
         self._doc_id: dict[str, int] = {}
+        #: DocumentId -> file stem. See by_id.
+        self._id_stem: dict[int, str] = {}
         self._assets: Optional[AssetRoot] = None
         self._ani: dict[str, dict] = {}
         self._cache: dict[str, Optional[PuzzleMap]] = {}
@@ -368,13 +406,27 @@ class PuzzleLibrary:
             self.reason = self.reason or "no game install found (core/coroot.py)"
             return
         p = self._root / "ini" / "GameMap.json"
-        if not p.is_file():
-            self.reason = f"{p} is missing"
-            return
-        try:
-            rows = json.loads(p.read_text("utf-8", errors="replace"))
-        except Exception as e:                           # noqa: BLE001
-            self.reason = f"{p} did not parse: {e}"
+        q = self._root / "ini" / "GameMap.dat"
+        if p.is_file():
+            try:
+                rows = json.loads(p.read_text("utf-8", errors="replace"))
+            except Exception as e:                       # noqa: BLE001
+                self.reason = f"{p} did not parse: {e}"
+                return
+        elif q.is_file():
+            # Official clients ship only the binary index. Same reader the
+            # client's MapLibrary uses -- imported rather than copied, because
+            # this gap already existed in two places at once and duplicating
+            # it a third time is how it stays broken. It lives in COre so that
+            # sharing it does not make this module depend on `client/`, which
+            # is not extracted into COMod.
+            from dmap import read_gamemap_dat            # noqa: PLC0415
+            rows = read_gamemap_dat(q)
+            if rows is None:
+                self.reason = f"{q} did not parse"
+                return
+        else:
+            self.reason = f"{p} is missing, and so is {q}"
             return
         for r in rows:
             stem = Path(str(r.get("FileName", "")).replace("\\", "/")).stem.lower()
@@ -386,6 +438,9 @@ class PuzzleLibrary:
                 continue
             try:
                 self._doc_id[stem] = int(r["DocumentId"])
+                # ...and the other way round, which is the direction by_id
+                # actually needs. Many ids share one stem, never the reverse.
+                self._id_stem[int(r["DocumentId"])] = stem
             except (KeyError, TypeError, ValueError):
                 pass
 
@@ -430,14 +485,33 @@ class PuzzleLibrary:
                 out = json.loads(p.read_text("utf-8", errors="replace"))
             except Exception:                            # noqa: BLE001
                 out = {}
+        if not out:
+            # The pre-parsed .json is something this install ships; a
+            # community client ships only the raw .ani. Parse it directly --
+            # same content, INI-shaped:
+            #     [Puzzle72]  FrameAmount=1  Frame0=data/.../canyon072.dds
+            # Without this every tile resolves to "" and the ground renders
+            # completely blank, which is exactly how it failed.
+            a = self._root / "ani" / f"{stem}.ani"
+            if a.is_file():
+                out = _parse_ani(a)
         self._ani[stem] = out
         return out
 
     def by_id(self, map_id: int) -> Optional[PuzzleMap]:
-        for stem, doc in self._doc_id.items():
-            if doc == int(map_id):
-                return self.get(stem)
-        self.reason = f"map id {map_id} is not in GameMap.json"
+        # Search the index by ID, not by scanning a stem->id map.
+        #
+        # `_doc_id` is keyed by FILE STEM, and 40 stems are shared by several
+        # map ids because maps reuse art -- `newbie` is both 1010 and 1035,
+        # `forum` is four ids. Keyed that way the later row wins and every
+        # earlier id silently vanishes: 262 rows collapse to 180 entries, and
+        # by_id(1010) reported "not in GameMap.json" for a map that is plainly
+        # in it. Latent on any install; the binary index only made it visible.
+        want = int(map_id)
+        for stem, doc in self._id_stem.items():
+            if stem == want:
+                return self.get(doc)
+        self.reason = f"map id {map_id} is not in the map index"
         return None
 
     def get(self, name: str) -> Optional[PuzzleMap]:

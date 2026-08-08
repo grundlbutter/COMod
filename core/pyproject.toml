@@ -40,8 +40,8 @@ fast = ["numpy>=1.24"]
 
 [tool.setuptools]
 # The set is closed under its own imports: coassets needs coroot, safepath,
-# tqhash and wdf; dmap needs coroot; the rest are leaves that import only the
-# standard library. `tools/test_viewer.py::CoreBoundary` enforces that.
+# tqhash, wdf and tqdat; dmap needs coroot; the rest are leaves that import
+# only the standard library. `tools/test_viewer.py::CoreBoundary` enforces that.
 py-modules = [
     "coroot",     # install discovery: --root -> CO_ROOT -> saved config -> autodiscovery
     "safepath",   # confine an untrusted relative path to a trusted root
@@ -53,4 +53,12 @@ py-modules = [
     "tpd",        # NetDragon DatPkg .tpi/.tpd reader
     "coassets",   # the asset VFS that ties the above together
     "colibrary",  # per-server views over a COmmunity Library checkout
+    "collection", # the curated Collection inside a COmmunity Library
+    "wdb",        # ini/c3.wdb, the client's BDMG/RSDB resource database
+    "dbc",        # the compiled ini/*.dbc tables of official clients
+                  #   (RSDB id->path, SIMO simple objects)
+    "npcart",     # npc table -> 3DSimpleObj -> obj/texture tables: where an
+                  #   NPC's geometry, texture and motion each live
+    "tqdat",      # the TQ File Cipher and the encrypted ini/*.dat tables
+                  #   (itemtype.dat, Monster.dat)
 ]

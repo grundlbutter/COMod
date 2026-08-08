@@ -29,9 +29,19 @@
       and which takes a backup first.
     </p>
 
+    <label>What is this folder?</label>
+    <p class="mut small">
+      Each choice is a <b>parser plugin</b> — a module that knows how one
+      flavour of client stores its tables, ids and colours. The plugin
+      verifies the folder is its kind before anything is saved, and plugins
+      are discovered from <code>plugins/</code>, so a contributor can add
+      one for a patch level or private server without touching the app.
+    </p>
+    <div class="setup-kinds" id="kinds">loading parser plugins…</div>
+
     <label for="path">Install root</label>
     <input id="path" type="text" spellcheck="false"
-           placeholder="e.g. D:\Games\Classic Conquer 2.0">
+           placeholder="e.g. C:\Claude\ConquerAssets\Clients\6090">
     <div class="setup-actions">
       <button id="save" class="primary">Use this folder</button>
       <label class="chk"><input type="checkbox" id="scope-repo">

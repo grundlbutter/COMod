@@ -40,12 +40,37 @@ family whose ground is scenery rather than paint, and for debugging movement.
 
 SCALE
 -----
-`CELL` is a **chosen** number, not a recovered one. Character bodies are ~170
-units tall in C3 space (`docs/modding.md` 9); 100 units per cell makes a person
-about 1.7 cells tall, which reads correctly against a tile-based world. Nothing
-in the files states a cell's size in mesh units, and this module does not
-pretend otherwise. `ZSCALE` is likewise chosen: DMap elevation is an `i16` whose
-unit is unknown.
+`CELL` is **recovered**, as of `docs/map_scenery.md` 6.1. It used to be a
+chosen 100.0, and that was wrong by a factor of 2.21.
+
+Two things are solid. Characters are drawn at the size they were authored --
+`ini/AdditiveSize.json`'s per-appearance `scale` is a percentage and reads 100
+on 27 of its 30 rows -- and body `003000000`'s `v_body` chunk is 176.2 units
+tall. And a map cell is a 64 x 32 **pixel** diamond in the painted art, which
+`tools/puzzle.py` proves on 131 of 132 maps.
+
+What links them was NOT solid, and this is where an earlier version went
+wrong. `CPuzzleBlockX::Create(w, h, nx, ny)` builds the ground's vertices as
+`w*i/nx`, but `w` comes from the CALLER, and the caller is inside the packed
+exe. Reading `w` as the image's pixel width -- i.e. one world unit is one
+painted pixel, `CELL = 32*sqrt(2)` -- is an assumption, and
+`docs/ground_art.md` 6 always listed it as OPEN. Held against the real game it
+is wrong: it makes characters roughly 1.5x too big for the world.
+
+So the scale lives on the MAP, not on the character:
+
+    CELL = 64.0        the ground is drawn sqrt(2) larger than its pixels
+    FIGURE_SCALE = 1.0 characters at their authored size, as the engine does
+
+which puts a character at ~1.69 cell widths -- what the game looks like. The
+cost is that the painted art is magnified sqrt(2), so it is sampled above its
+native resolution.
+
+`ZSCALE` is **0**: characters are not lifted by terrain height at all. The
+DMap elevation is gameplay data -- it gates jumps and records which tile you
+stand on, and is never drawn -- while a platform's height is painted into the
+art, so the placement rule already puts a character on top of the step. See
+its own comment below.
 
 Read-only. Imports `client.gamemap` for the grid type so the client and the
 renderer cannot drift apart on what "walkable" means.
@@ -67,10 +92,40 @@ if str(_HERE) not in sys.path:
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-#: World units per map cell. Chosen, not recovered -- see the module docstring.
-CELL = 100.0
-#: World units per unit of DMap elevation. Chosen; the file's unit is unknown.
-ZSCALE = 12.0
+#: World units per map cell.
+#:
+#: 64.0, which draws the painted ground at **sqrt(2) times its native pixel
+#: size** and lets characters be drawn at the size they were authored
+#: (`FIGURE_SCALE` 1.0, which is what `ini/AdditiveSize.json` says the engine
+#: does). See the module docstring; the short version is that the previous
+#: 45.2548 = 32*sqrt(2) made one world unit one painted pixel, and that came
+#: from ASSUMING what `CPuzzleBlockX::Create` is passed for its block width --
+#: an assumption `docs/ground_art.md` 6 always listed as OPEN, because the
+#: caller is inside the packed exe. Held against the game, it makes characters
+#: about 1.5x too large; the map is drawn bigger than its pixels instead.
+CELL = 64.0
+#: World units per unit of DMap elevation: **0.0 -- characters are not
+#: lifted at all**, and that is a recovered conclusion rather than the last
+#: value in a sequence of guesses.
+#:
+#: The elevation `i16` is GAMEPLAY data, not a drawing offset. Every use of
+#: it on the server is either recording which tile you stand on
+#: (`set_elevation`, after a walk or a jump) or gating a jump
+#: (`sample_elevation`, the "too steep" rule -- `docs/jump.md` 2.3). Nothing
+#: positional, nothing rendered, nothing sent to a client for drawing.
+#:
+#: And the art does not need it. The ground draws FLAT because a platform's
+#: height is painted into the picture, and the placement rule lands a cell on
+#: its own painted surface -- `docs/ground_art.md` 3.2 measured 100% of
+#: walkable cells on painted art across several maps. So the top of Twin
+#: City's central square is already where a character standing there belongs;
+#: lifting it by the elevation counts the height twice, which is why 5.43,
+#: 1.0, 0.5 and 0.25 all read as too high in turn.
+#:
+#: Kept as a constant at zero rather than deleted, so the finding is visible
+#: at the point someone would reach for it, and so a map that genuinely needs
+#: a lift has somewhere to say so.
+ZSCALE = 0.0
 #: Half-width of the window drawn around the player, in cells. 24 gives a 49x49
 #: patch -- 9,604 vertices, comfortably inside the 65,535 a `Uint16` index
 #: buffer can address, which is what `gl.js` uses.

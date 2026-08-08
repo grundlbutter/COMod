@@ -56,10 +56,37 @@ from wdf import WdfArchive, detect_magic         # noqa: E402
 #: never extracted, never diffed as "assets" -- executable code.
 CODE_EXT = {".exe", ".dll", ".ocx", ".crm", ".sys"}
 #: directories under either root that are logs/scratch, not shipped content.
-SKIP_DIRS = {"log", "debug", "screenshot", "screenshots", "logs"}
-SKIP_EXT = {".log"}
+#: Directories that hold no shipped art.  `.sentry-native` is here for a
+#: measured reason: the crash reporter creates `<uuid>.run.lock` while the
+#: game runs and deletes it after, and one happened to exist during an
+#: import.  It became the canonical empty file (see `_alias_ok`), 28 of
+#: Zephyr's tables were aliased to it, and it was gone by the time anything
+#: tried to read them.  An alias target has to outlive the import.
+SKIP_DIRS = {"log", "debug", "screenshot", "screenshots", "logs",
+             ".sentry-native", "crashpad", "cache", "temp", "tmp"}
+SKIP_EXT = {".log", ".lock", ".tmp", ".pid", ".bak"}
 
 HASH = lambda b: hashlib.blake2b(b, digest_size=16).hexdigest()  # noqa: E731
+
+#: The hash every empty file has.
+EMPTY_HASH = HASH(b"")
+
+
+def _alias_ok(h: str, rel: str) -> bool:
+    """May these bytes stand in for another file's, by content?
+
+    **No, if there are none.** Content dedup says "the baseline already has
+    these bytes, point at its copy" -- which is sound for real content and
+    meaningless for an empty file: every empty file hashes identically, so
+    the first one scanned becomes the canonical answer for all of them. That
+    produced a filemap claiming `ini/miscmotion.ini` *is*
+    `.sentry-native/<uuid>.run.lock`. Both were zero bytes, so nothing was
+    lost -- but the provenance was nonsense, and when the transient file went
+    away the entry resolved to nothing at all.
+
+    An empty file is cheaper to store than to alias, so it is stored.
+    """
+    return h != EMPTY_HASH
 
 #: characters NTFS refuses in a component.  Two Zephyr entries carry literal
 #: '?' runs -- CJK characters flattened by whatever packed that client.
@@ -136,7 +163,9 @@ def catalog_baseline(root: Path, names: dict[int, str] | None = None) -> dict:
                 content.add(h)
                 name_hashes[e.hash] = h
                 nm = names.get(e.hash)
-                if nm is not None:
+                if not _alias_ok(h, nm or ""):
+                    pass                       # empty: never an alias target
+                elif nm is not None:
                     locator.setdefault(h, ["b", nm.lower()])
                 else:
                     locator.setdefault(h, ["w", arc_name, f"{e.hash:08x}"])
@@ -150,7 +179,9 @@ def catalog_baseline(root: Path, names: dict[int, str] | None = None) -> dict:
         loose[rel] = h
         # a loose path beats an archive-by-hash ref, but never replaces an
         # already-named archive path (both resolve; keep the first name).
-        if locator.get(h, ("w",))[0] == "w":
+        if not _alias_ok(h, rel):
+            pass                               # empty: never an alias target
+        elif locator.get(h, ("w",))[0] == "w":
             locator[h] = ["b", rel]
         else:
             locator.setdefault(h, ["b", rel])
@@ -219,7 +250,11 @@ def diff(root: Path, other: Path, repo: Path, extract_to: Path | None,
             continue
         h = HASH(data)
         key = name.replace("\\", "/").lower() if name else None
-        if h in base_content:
+        # `base_locator` deliberately has no entry for empty content, so an
+        # empty file falls through and is EXTRACTED rather than aliased. It
+        # costs nothing to store and the filemap then says what it is instead
+        # of pointing at an unrelated file that happened to be empty too.
+        if h in base_content and h in base_locator:
             counts["identical"] += 1
             if server and key:
                 filemap[key] = base_locator[h] + [source]
@@ -250,9 +285,15 @@ def diff(root: Path, other: Path, repo: Path, extract_to: Path | None,
                 extracted_content[h] = rel
                 rec["library"] = rel
             if server:
-                # unnamed entries are addressed by their library path itself
-                filemap[key or extracted_content[h]] = \
-                    ["l", extracted_content[h], source]
+                if key:
+                    filemap[key] = ["l", extracted_content[h], source]
+                elif extracted_content[h].startswith("garments-unnamed/"):
+                    # an unnamed entry extracted under its content hash is
+                    # addressed by that path; an unnamed entry whose bytes
+                    # duplicate a *named* file needs no entry at all -- the
+                    # named key already reaches the content.
+                    filemap[extracted_content[h]] = \
+                        ["l", extracted_content[h], source]
         records.append(rec)
 
     print(f"other client: {i} files total  ({time.time()-t0:.0f}s)", flush=True)

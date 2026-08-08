@@ -280,6 +280,149 @@ genuinely the right tool for diagnosing placement — but it is a debug view. Th
 locked camera also refuses to write itself into the asset viewer's stored
 orientation, so opening `coplay` once cannot silently re-aim `coviewer`.
 
+### 6.1 Character scale — the original never "chose a zoom"
+
+The question this answers: *how did the original client decide what size a
+character is drawn at on the map?* The answer is that *nothing decides it at
+runtime*. There is no zoom control and no scale constant to tune — the scale
+is a consequence of the units the art is authored in.
+
+**There is no zoom.** `graphic.dll` exports
+`CMyBitmap::GameCameraZoom(bool)` at `0x41440` — a *boolean*, i.e. one step
+in or out — and in this build it is **a stub that immediately returns**
+(`0x41440` falls straight through to `add rsp,0x38 / ret` at `0x4150C`).
+The camera is fixed. VERIFIED.
+
+**The world's unit is the painted image's pixel.** `docs/ground_art.md` §3.5
+already established (VERIFIED, RVAs cited) that `CPuzzleBlockX::Create`
+builds the ground's vertex positions in **the pixel units of the painted
+image** — `pos.x = w*i/nx` where `w` is the block's pixel width. The ground
+therefore *is* the world coordinate system, and one map cell is a 64 × 32
+**world-unit** diamond.
+
+**Characters are drawn in that space at 100 %.** `ini/AdditiveSize.json` (30
+rows, integrity-checked) carries a per-appearance `scale` — and it is a
+**percentage**: `100` on 27 of 30 rows, with `110` and `120` on a few large
+monsters. So the base transform is identity: **one character mesh unit is
+one map pixel.** `Role3D.dll`'s `LoadAdjustConfig` (`0x7000`) reads
+`ini/role3d.ini` (string at `.rdata 0x5E738`), which **is not present in
+this install** — so even the adjustment layer is at its defaults. VERIFIED
+for the tables; INFERRED that identity is the default `role3d.ini` would
+otherwise modify.
+
+**So the "zoom level" lives in the art.** The character meshes were authored
+at whatever size looks correct beside a 64 × 32 px tile, and the engine
+simply draws them 1:1. Measured on this install's own data, body appearance
+`003000000` has a render bounding box **183.5 units tall × 57.8 wide**, i.e.
+a character stands **183 map pixels** tall — just under three cell-widths —
+which is exactly the proportion seen in retail footage.
+
+#### What this corrects in our client
+
+`tools/terrain.py`'s `CELL = 100.0` world units per cell is one of the two
+"chosen, not recovered" constants (the other is `ZSCALE`). It is **wrong**,
+and the right value follows from the projection in §6: a one-cell step must
+land 32 px right and 16 px down, and with screen-right at `(1,1,0)/√2` that
+requires
+
+```
+CELL = 32 * sqrt(2) = 45.2548...        (not 100)
+```
+
+At `CELL = 100` a character is drawn **100 / (32√2) = 2.21×** too small
+against its own ground — which is exactly the discrepancy the retail video
+showed. Two equivalent fixes: set `CELL = 32√2` so world units are map
+pixels outright (preferred — it makes every other placement number
+literal), or keep `CELL = 100` and scale figures by 2.21. Verified live by
+scaling the figure by 2.21 in the running client: the character then stands
+about one cell wide and two-and-a-half cells tall on Twin City's paving,
+matching the footage. **Not yet applied** — it touches `terrain.py`,
+`gl.js`'s camera framing and the viewer tests together.
+
+### 6.2 The oblique tilt — how a 3D role stands on a 2D map
+
+§6 derived the camera and §6.1 the character's size. The remaining piece is
+the character's *orientation*, and the engine has an explicit control for it.
+
+**The oblique angle — VERIFIED, RVAs cited.** `graphic.dll` keeps a global
+`int` at `.data 0x25FC28`, read and written by
+`CMyBitmap::GetObliqueAngle()` (`0x4B160`) and
+`CMyBitmap::SetObliqueAngle(int)` (`0x4BCF0`) — each a two-instruction
+accessor, so the global *is* the setting. Two things pin its value:
+
+* the shipped `.data` initialiser is **`0xFFFFFFE2` = −30**, and
+* device init explicitly re-sets it: `mov [0x25FC28], 0xFFFFFFE2` at
+  `0x4B2E5`.
+
+**It is degrees, and it drives a rotation about X.** At `0x4BAEB` the angle
+is loaded, widened `cvtdq2pd`, multiplied by the double at `.rdata 0x1EAD48`
+— `0x3F91DF46A2529D39`, which is exactly **π/180** — narrowed back to float
+and passed to `D3DXMatrixRotationX` (the import thunk at `0x537FA`), whose
+result is then applied via `D3DXVec3TransformNormal` (`0x537C4`).
+
+**Every 3D object carries its own copy.** `Role3D.dll`'s `SyncObliqueAngle`
+(`0x70B0`) calls `GetObliqueAngle` and caches it in two globals, and the
+3D-object constructor (`sub_A630`) stores the current angle in the instance
+at **+0x10** — so a role is *created* with the tilt, and an individual object
+can deviate from the global.
+
+#### What it is: the camera pitch, in the other frame
+
+**−30 is our +30.** The engine does not use a pitched camera over a
+horizontal world. Its ground is drawn as **flat quads in painted-image pixel
+coordinates** (`CPuzzleBlockX`, §6.1) — i.e. effectively screen-aligned — so
+the isometric look comes entirely from the *art*, and a 3D role must be
+rotated to sit in that picture. The oblique angle is that rotation. Our
+renderer instead keeps a real horizontal ground plane and **pitches the
+camera** by `asin(½) = 30°`, which produces the identical image.
+
+The two are the same rotation expressed in different frames:
+
+| | engine | ours |
+|---|---|---|
+| ground | screen-aligned quads, in image px | horizontal plane, world units |
+| the 30° | rotates the **object** (`D3DXMatrixRotationX`, −30) | rotates the **camera** (pitch `asin(½)`) |
+| a standing figure | tilted back 30° into a flat scene | upright in a scene viewed 30° from above |
+| on screen | height × `cos 30° = 0.866`, seen from above | height × `cos 30° = 0.866`, seen from above |
+
+So the shipped **−30 is a VERIFIED, independent confirmation of §6's camera
+pitch**, which was derived from the art's 2:1 diamond alone. Two unrelated
+routes — the painted tile geometry and a constant in `.data` — give the same
+30°.
+
+#### The trap, which this project fell into
+
+Applying the oblique tilt *on top of* a pitched camera **double-counts it**.
+Measured live when we did exactly that: the figure's up axis came out
+perpendicular to the view direction (dot = −0.0000), its on-screen height
+rose to `1.0000` from `0.866`, and its "seen from above" component fell from
+`sin 30° = 0.5` to **zero** — a face-on billboard. You stop seeing the top of
+the head and shoulders at all, and the figure no longer sits in the picture.
+The retail look is the `0.866 / 0.5` pair, not `1.0 / 0.0`.
+
+Two independent checks agree the untilted figure is the correct one:
+
+* **The video** (§6.1). A character measures ~2.5 cell-widths tall in retail
+  footage, which is `183.5 · cos 30° / 64` — the *foreshortened* height. The
+  tilted figure would be 1.155× that.
+* **The geometry.** A camera 30° above the ground must show a standing figure
+  from 30° above. Zero is the signature of a bug, not of a design.
+
+**So `playerModel()` composes `T · facing · scale`, with no tilt term**, and
+the 30° comes from the camera alone. Map layers are likewise untilted:
+ground, scenery and covers are 2D art in the ground plane, and §5.1's 1:1
+pixel mapping already draws them exactly as authored.
+
+### 6.3 Lighting — there is none, on purpose
+
+World assets are drawn **flat**: the art is pre-shaded by the artists and the
+engine adds no lighting term of its own, which is why a character's shading
+never changes as it walks. The game view therefore runs `gl.js`'s `unlit`
+mode — texture × vertex colour and nothing else. `lit` (a hardcoded
+directional term, `0.42 + 0.58·max(dot(n,l),0)`) is an **asset-viewer**
+affordance for inspecting geometry and is wrong in the world: it invents a
+light the game does not have and fights the art's own baked shading.
+
 ## 7. Draw order
 
 ```

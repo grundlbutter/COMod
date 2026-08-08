@@ -130,7 +130,24 @@ class SuperFxDB:
         the most non-wildcard fields wins.
         """
         name = self.fx.lookup_action_effect(appearance, AURA_ACTION, shape=shape)
-        return "" if not name or name.lower() == "none" else name
+        if name and name.lower() != "none":
+            return name
+        # 6090 dropped the indirection. CCO ships 826 always-on rows of the
+        # form `999.999.410.009=410009` -- the effect is named after the
+        # appearance id, and the row exists only to say so. 6090 ships ZERO
+        # action-999 rows and instead defines the effect directly:
+        # `3DEffect.ini [410199]` is Rainbow Blade Super's aura, and no such
+        # section exists for 410195 or 410196. So the aura is declared by the
+        # existence of an effect bearing the appearance's own id.
+        #
+        # VERIFIED both ways on the 6090 base: 410009, 410099 and 410199 all
+        # resolve (every one a Super, ...9), and the Normal and Refined ids of
+        # the same family resolve to nothing. The author confirms a Super Rainbow
+        # Blade glows in the real client, which is what sent us looking.
+        ident = (appearance or "").strip()
+        if ident and self.fx.resolve(ident) is not None:
+            return ident
+        return ""
 
     def super_effect(self, appearance: str, slot: str = "r_weapon",
                      *, shape: str = "999") -> Optional[SuperEffect]:

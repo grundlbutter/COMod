@@ -38,7 +38,9 @@ import re
 import struct
 import sys
 import tempfile
+import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -71,6 +73,7 @@ except ImportError:                              # pragma: no cover
 HAVE_CLIENT = (PROJECT / "client" / "gamemap.py").is_file()
 HAVE_PLAY_UI = (HERE / "webui" / "play.js").is_file()
 HAVE_PACKMEASURE = (HERE / "packmeasure.py").is_file()
+HAVE_TILESET = (HERE / "tileset.py").is_file()
 
 
 def _thumbs_rendered(kind: str = "meshes") -> bool:
@@ -273,6 +276,18 @@ class DdsCorpus(unittest.TestCase):
 
     SAMPLES_PER_CLASS = 12
 
+    #: The classes the assertions below name by hand. Sampling may stop early,
+    #: but not before it has found these, or `test_format_classes_found` would
+    #: fail for a reason that has nothing to do with the decoder.
+    REQUIRED_FOURCC = {"DXT1", "DXT3"}
+
+    @classmethod
+    def _enough(cls) -> bool:
+        return (len(cls.buckets) >= 6
+                and cls.REQUIRED_FOURCC <= {k[0] for k in cls.buckets}
+                and all(len(v) >= cls.SAMPLES_PER_CLASS
+                        for v in cls.buckets.values()))
+
     @classmethod
     def setUpClass(cls):
         cls.buckets: dict[tuple, list[Path]] = {}
@@ -282,16 +297,25 @@ class DdsCorpus(unittest.TestCase):
                 continue
             for p in d.rglob("*.dds"):
                 try:
-                    hdr = dds.parse_header(p.open("rb").read(148))
+                    # `with`, because this reads every .dds in the install and
+                    # the leaked handles were the loudest thing in the suite:
+                    # 32,176 ResourceWarnings, 10MB of stderr, and a run that
+                    # looked hung rather than merely slow.
+                    with p.open("rb") as fh:
+                        hdr = dds.parse_header(fh.read(148))
                 except Exception:
                     continue
                 key = (hdr.fourcc or f"RGB{hdr.rgb_bits}", hdr.mipmaps > 0)
                 bucket = cls.buckets.setdefault(key, [])
                 if len(bucket) < cls.SAMPLES_PER_CLASS:
                     bucket.append(p)
-            if len(cls.buckets) >= 6 and all(
-                    len(v) >= cls.SAMPLES_PER_CLASS for v in cls.buckets.values()):
-                break
+                    # Tested here rather than once per directory: 12 samples
+                    # of each format are enough, and `c3/` alone holds 32,000
+                    # files that were all opened to find the first few dozen.
+                    if cls._enough():
+                        return
+            if cls._enough():
+                return
 
     def test_format_classes_found(self):
         """Guard against the corpus silently disappearing and the comparison
@@ -1075,6 +1099,25 @@ class Taxonomy(unittest.TestCase):
         self.assertEqual(ac.classify("c3/mesh/002135000.c3").category, "character")
         self.assertIn("appearance tables", ac.classify("c3/mesh/410000.c3").why)
 
+    def test_npc_table_membership_overrides_only_the_shared_buckets(self):
+        """c3/mesh/9990010.c3 is the Storekeeper's geometry -- NPC art that
+        happens to live in the shared bucket, which is why counting NPCs by
+        the c3/npc/ prefix alone undercounts them. But a monster-styled NPC
+        that borrows c3/monster/108/ does not pull the file out of Monsters:
+        the art is the monster's, the NPC merely wears it."""
+        member = {"c3/mesh/9990010.c3", "c3/texture/9990211.dds",
+                  "c3/monster/108/1.c3"}
+        ac = self.catalog.AssetCatalog(ROOT,
+                                       npc_membership=lambda p: p in member)
+        c = ac.classify("c3/mesh/9990010.c3")
+        self.assertEqual((c.category, c.subcategory), ("npc", "mesh"))
+        self.assertIn("NPC tables", c.why)
+        c = ac.classify("c3/texture/9990211.dds")
+        self.assertEqual((c.category, c.subcategory), ("npc", "texture"))
+        self.assertEqual(ac.classify("c3/monster/108/1.c3").category, "monster")
+        self.assertEqual(ac.classify("c3/mesh/002135000.c3").category,
+                         "character")
+
     def test_map_tiles_are_grouped_by_region(self):
         c = self.ac.classify("data/map/puzzle/woods/linn/linn111.dds")
         self.assertEqual(c.group, "woods")
@@ -1104,11 +1147,13 @@ class Taxonomy(unittest.TestCase):
         try:
             cat.wait_tables()
             ac = self.catalog.AssetCatalog(ROOT, table_membership=cat.references,
-                                           exists=cat.exists)
+                                           exists=cat.exists,
+                                           npc_membership=cat.npc_art_member)
             s = ac.summarise(cat.all_paths)
             total = sum(v["count"] for v in s.values())
             self.assertEqual(total, len(cat.all_paths), "every path must be counted")
-            for want in ("character", "weapon", "monster", "map", "ui", "effect"):
+            for want in ("character", "weapon", "monster", "map", "ui",
+                         "effect", "npc"):
                 self.assertGreater(s.get(want, {}).get("count", 0), 0, want)
             other = s.get("other", {}).get("count", 0)
             self.assertLess(other / total, 0.01,
@@ -2887,6 +2932,12 @@ class UnifiedEntries(unittest.TestCase):
                     (d / "manifest.json").write_text(json.dumps(shape))
                     idx = self.unify.UnifiedIndex.__new__(self.unify.UnifiedIndex)
                     idx._thumbs = None
+                    # `__init__` is bypassed on purpose -- this reads a
+                    # manifest and needs no install -- so every attribute
+                    # `thumbs()` touches has to be supplied by hand. Per-view
+                    # thumbnail directories (ac1dbd7) added this one, and the
+                    # test had been erroring on its absence ever since.
+                    idx._thumb_dir = d
                     got = self.unify.UnifiedIndex.thumbs(idx)
                     self.assertIn("c3/mesh/a.c3", got, shape)
                     self.assertTrue(Path(got["c3/mesh/a.c3"]["file"]).is_file())
@@ -5771,6 +5822,1999 @@ class PackMeasure(unittest.TestCase):
         self.assertIn("read_bytes", src, "it reads the file and nothing else")
 
 
+class Curation(unittest.TestCase):
+    """The Collection and the profile the viewer browses it through.
+
+    These are two files describing one thing, and they went out of sync the
+    only way they could: the index was written on every change and the
+    profile only when someone remembered to run `collect.py publish`. The
+    library then showed a Collection that no longer existed -- an entry
+    deleted weeks earlier still listed, three entries since kept absent.
+
+    So what is asserted here is the *coupling*, not either file: after any
+    mutation the published filemap must be exactly what the index says, with
+    nothing left over.  Needs no game install -- a Collection is a folder.
+    """
+
+    def setUp(self):
+        import collection as _c
+        self.mod = _c
+        self.dir = Path(tempfile.mkdtemp(prefix="cocol-"))
+        self.col = _c.Collection(self.dir)
+
+    def _keep(self, name, category="Weapons", parts=(), **kw):
+        return self.col.add(
+            category=category, name=name, mesh_bytes=b"C3\x00mesh-" + name.encode(),
+            mesh_name="0816.c3", skins=[("0816.dds", b"skin-" + name.encode())],
+            server="zephyr", source_mesh=f"c3/weapon/{name}.c3",
+            parts=parts, **kw)
+
+    def _published(self):
+        d = self.col.profile_dir
+        return (json.loads((d / "filemap.json").read_text("utf-8")),
+                json.loads((d / "profile.json").read_text("utf-8")))
+
+    def test_keeping_something_publishes_it_without_being_asked(self):
+        self.assertFalse(self.col.profile_dir.exists(), "nothing kept yet")
+        self._keep("katana")
+        filemap, prof = self._published()
+        self.assertEqual(prof["entries"], 1)
+        self.assertEqual(prof["files"], len(filemap))
+        self.assertEqual(prof["server"], self.mod.PROFILE_NAME)
+
+    def test_the_filemap_names_every_file_of_every_entry(self):
+        """Mesh, skin *and* parts. Publishing only mesh+skin left an entry's
+        motion files inside the library folder but outside its namespace:
+        collected, and unbrowsable."""
+        e = self._keep("katana", parts=[
+            ("motion", "100.c3", "c3/weapon/100.c3", b"MOTI-walk"),
+            ("effect", "aura.ini", "effect/aura.ini", b"[aura]"),
+        ])
+        filemap, _ = self._published()
+        want = {f"{self.mod.PROFILE_NAME}/{rel}".lower()
+                for rel in [e["mesh"], *e["skins"],
+                            *[p["file"] for p in e["parts"]]]}
+        self.assertEqual(set(filemap), want)
+
+    def test_every_published_path_points_at_a_file_that_is_there(self):
+        e = self._keep("katana", parts=[
+            ("motion", "100.c3", "c3/weapon/100.c3", b"MOTI-walk")])
+        filemap, _ = self._published()
+        for key, ref in filemap.items():
+            with self.subTest(path=key):
+                self.assertEqual(ref[0], "l", "collected bytes live in the library")
+                self.assertTrue((self.dir / ref[1]).is_file(), ref[1])
+                self.assertEqual(ref[2], e["category"], "the shelf is the group tag")
+
+    def test_removing_an_entry_removes_it_from_the_library(self):
+        """The bug in one assertion: a removed entry must not survive in the
+        profile, which is why the filemap is rewritten wholesale rather than
+        appended to."""
+        keep = self._keep("katana")
+        drop = self._keep("mace")
+        self.assertTrue(self.col.remove(drop["id"]))
+        filemap, prof = self._published()
+        self.assertEqual(prof["entries"], 1)
+        self.assertNotIn(f"{self.mod.PROFILE_NAME}/{drop['mesh']}".lower(), filemap)
+        self.assertIn(f"{self.mod.PROFILE_NAME}/{keep['mesh']}".lower(), filemap)
+
+    def test_a_reshelved_entry_is_published_on_its_new_shelf_only(self):
+        """Re-collecting into a different category moves the files; the
+        filemap keys are category-prefixed, so a stale key would resolve to a
+        path that no longer exists."""
+        self._keep("katana", category="Weapons")
+        moved = self._keep("katana", category="Headgear")
+        filemap, _ = self._published()
+        self.assertEqual(len(filemap), 2)                # mesh + skin, once
+        for key, ref in filemap.items():
+            with self.subTest(path=key):
+                self.assertTrue(key.startswith("collection/headgear/"))
+                self.assertTrue((self.dir / ref[1]).is_file())
+        self.assertEqual(moved["category"], "Headgear")
+
+    def test_publish_is_a_repair_command_that_changes_nothing_by_itself(self):
+        """`collect.py publish` still exists for a profile that was lost or a
+        folder edited by hand. Running it on a healthy Collection must be a
+        no-op, or "did publishing change something?" stops being answerable."""
+        self._keep("katana")
+        before, _ = self._published()
+        self.mod.Collection(self.dir).publish()
+        after, prof = self._published()
+        self.assertEqual(before, after)
+        self.assertIn("publishedAt", prof)
+
+    # -- replacing something with it ---------------------------------------
+    def _npc(self):
+        """A collected entry in the flat NPC layout -- skin away from the
+        mesh, actions named by code."""
+        return self.col.add(
+            category="NPCs", name="storekeeper",
+            mesh_bytes=b"C3\x00geom", mesh_name="999001100.c3",
+            skins=[("9990010.dds", b"skin")], server="",
+            source_mesh="c3/npc/999001100.c3",
+            source_texture="c3/texture/9990010.dds",
+            parts=[("motion", "999001101.c3", "c3/npc/999001101.c3", b"MOTI-a"),
+                   ("motion", "999001190.c3", "c3/npc/999001190.c3", b"MOTI-b")])
+
+    def test_a_part_is_filed_by_its_action_code_not_its_filename(self):
+        e = self._npc()
+        self.assertEqual(sorted(Path(p["file"]).name for p in e["parts"]),
+                         [f"{e['id']}__motion-101.c3",
+                          f"{e['id']}__motion-190.c3"])
+
+    def test_re_collecting_does_not_leave_the_old_files_behind(self):
+        """A re-collect that finds different parts writes them under new
+        names; the ones it no longer claims used to stay on disk with nothing
+        in the index pointing at them."""
+        self.col.add(category="NPCs", name="storekeeper",
+                     mesh_bytes=b"C3\x00geom", mesh_name="999001100.c3",
+                     server="", source_mesh="c3/npc/999001100.c3",
+                     parts=[("motion", "999001101.c3",
+                             "c3/npc/999001101.c3", b"MOTI-a")])
+        e = self.col.add(category="NPCs", name="storekeeper",
+                         mesh_bytes=b"C3\x00geom", mesh_name="999001100.c3",
+                         server="", source_mesh="c3/npc/999001100.c3",
+                         parts=[("motion", "999001190.c3",
+                                 "c3/npc/999001190.c3", b"MOTI-b")])
+        on_disk = {p.name for p in (self.col.root / "NPCs").iterdir()}
+        self.assertIn(f"{e['id']}__motion-190.c3", on_disk)
+        self.assertNotIn(f"{e['id']}__motion-101.c3", on_disk)
+        self.assertEqual(len(e["parts"]), 1)
+
+    def test_replacing_renames_the_actions_onto_the_target(self):
+        e = self._npc()
+        out = self.col.stage(e["id"], self.dir / "stage",
+                             swap_for="c3/npc/999002100.c3",
+                             skin_to="c3/texture/9990020.dds")
+        self.assertEqual(sorted(out["wrote"]), [
+            "c3/npc/999002100.c3",
+            "c3/npc/999002101.c3",
+            "c3/npc/999002190.c3",
+            "c3/texture/9990020.dds",
+        ])
+        for rel in out["wrote"]:
+            self.assertTrue((self.dir / "stage" / rel).is_file(), rel)
+
+    def test_replacing_can_leave_the_targets_skin_and_actions_alone(self):
+        """"Replace this model" and "replace this model, its skin and its
+        whole action set" are different edits, and only the second used to
+        be possible."""
+        e = self._npc()
+        out = self.col.stage(e["id"], self.dir / "stage",
+                             swap_for="c3/npc/999002100.c3",
+                             skin=False, roles=())
+        self.assertEqual(out["wrote"], ["c3/npc/999002100.c3"])
+        self.assertEqual(len(out["skipped"]), 3)      # skin + two actions
+
+    def test_a_skin_that_cannot_be_placed_says_so_and_takes_direction(self):
+        e = self._npc()
+        blind = self.col.stage(e["id"], self.dir / "a",
+                               swap_for="c3/npc/999002100.c3")
+        self.assertIn("skinSkipped", blind)
+        self.assertIn("c3/texture/9990010.dds", blind["skinSkipped"])
+        told = self.col.stage(e["id"], self.dir / "b",
+                              swap_for="c3/npc/999002100.c3",
+                              skin_to="c3/texture/9990020.dds")
+        self.assertNotIn("skinSkipped", told)
+        self.assertIn("c3/texture/9990020.dds", told["wrote"])
+
+    def test_a_part_never_overwrites_the_geometry_just_staged(self):
+        """In the per-action-mesh layout the target IS one of the action
+        files, so its own code resolves back onto it."""
+        e = self.col.add(
+            category="NPCs", name="sk", mesh_bytes=b"C3\x00geom",
+            mesh_name="999001100.c3", server="",
+            source_mesh="c3/npc/999001100.c3",
+            parts=[("motion", "999001100.c3", "c3/npc/999001100.c3", b"SELF")])
+        out = self.col.stage(e["id"], self.dir / "stage",
+                             swap_for="c3/npc/999002100.c3")
+        self.assertEqual(out["wrote"], ["c3/npc/999002100.c3"])
+        self.assertTrue(out["skipped"], "it must say what it left out")
+        self.assertEqual(
+            (self.dir / "stage/c3/npc/999002100.c3").read_bytes(), b"C3\x00geom")
+
+    def test_a_half_written_profile_is_never_visible(self):
+        """Written by replace, not by truncate: the viewer reads these files
+        while you collect, and a torn filemap is a view that fails to open
+        rather than one that is merely out of date."""
+        self._keep("katana")
+        leftovers = [p.name for p in self.col.profile_dir.iterdir()
+                     if p.suffix == ".tmp"]
+        self.assertEqual(leftovers, [])
+        src = (PROJECT / "core" / "collection.py").read_text("utf-8")
+        self.assertIn("os.replace", src)
+
+    # -- the two paths one entry has ---------------------------------------
+    #
+    # An entry is reachable as where it CAME FROM and as the copy that was
+    # KEPT, and the Collection card has to recognise both or the view you go
+    # to in order to look at what you kept is the one view that does not
+    # offer Replace for it. The card matches the second by rebuilding the
+    # logical path as `collection/<entry.mesh>`; these pin that arithmetic to
+    # what `publish` actually writes, since the card cannot ask.
+
+    def test_an_entry_is_browsable_at_collection_slash_its_mesh(self):
+        e = self._keep("katana", parts=[
+            ("motion", "100.c3", "c3/weapon/100.c3", b"MOTI-walk")])
+        filemap, _ = self._published()
+        want = f"{self.mod.PROFILE_NAME}/{e['mesh']}".lower()
+        self.assertIn(want, filemap,
+                      "the card rebuilds this path to recognise the entry")
+        self.assertNotEqual(want, (e["sourceMesh"] or "").lower(),
+                            "the two paths differ -- which is the whole bug")
+
+    def test_the_ui_and_the_library_agree_on_the_profile_name(self):
+        """`swap.js` hardcodes the profile name because a browser cannot
+        import Python. A rename here would silently stop the card matching,
+        and the symptom -- a missing button -- names nothing."""
+        js = (PROJECT / "tools" / "webui" / "swap.js").read_text("utf-8")
+        m = re.search(r"PROFILE_NAME\s*=\s*'([^']+)'", js)
+        self.assertIsNotNone(m, "swap.js must declare the profile name")
+        self.assertEqual(m.group(1), self.mod.PROFILE_NAME)
+
+    def test_every_kept_file_is_reachable_under_that_prefix(self):
+        """Not just the mesh: the skin and the action files are what Replace
+        chooses between, so they have to be in the namespace too."""
+        e = self._keep("katana", parts=[
+            ("motion", "100.c3", "c3/weapon/100.c3", b"MOTI-walk"),
+            ("motion", "110.c3", "c3/weapon/110.c3", b"MOTI-run")])
+        filemap, _ = self._published()
+        for rel in [e["mesh"], *e["skins"], *[p["file"] for p in e["parts"]]]:
+            with self.subTest(file=rel):
+                self.assertIn(f"{self.mod.PROFILE_NAME}/{rel}".lower(), filemap)
+
+
+class EmptyFileDedup(unittest.TestCase):
+    """Content dedup must not speak for files that have no content.
+
+    Every empty file hashes identically, so the first one scanned becomes the
+    canonical answer for all of them. An import caught a Sentry crash-reporter
+    lock -- `.sentry-native/<uuid>.run.lock`, created while the game runs and
+    deleted after -- and aliased 28 of Zephyr's tables to it, including
+    `ini/miscmotion.ini` and `ini/MountMotion.ini`. Both sides were zero bytes
+    so no content was lost, but the provenance was nonsense and the target was
+    gone by the time anything read it, so those 28 resolved to nothing.
+
+    Two rules, and this pins both: an empty file is never an alias target,
+    and a volatile file is never scanned in the first place.
+    """
+
+    def setUp(self):
+        import assetdiff
+        self.ad = assetdiff
+
+    def test_empty_content_is_never_an_alias_target(self):
+        self.assertFalse(self.ad._alias_ok(self.ad.EMPTY_HASH, "anything.ini"))
+
+    def test_real_content_still_dedups(self):
+        """The discount must not disable dedup -- 997 files were removed by it
+        on the last import and that saving has to survive."""
+        self.assertTrue(self.ad._alias_ok(self.ad.HASH(b"real bytes"), "a.dds"))
+
+    def test_the_locator_has_no_entry_for_empty_content(self):
+        """The property that makes an empty file get extracted rather than
+        aliased: with no locator entry, the identical-branch cannot fire."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "ini").mkdir()
+            (root / "ini" / "empty.ini").write_bytes(b"")
+            (root / "ini" / "real.ini").write_bytes(b"content")
+            cat = self.ad.catalog_baseline(root, {})
+            self.assertIn(self.ad.HASH(b"content"), cat["locator"])
+            self.assertNotIn(self.ad.EMPTY_HASH, cat["locator"],
+                             "an empty file must not become canonical")
+            self.assertIn(self.ad.EMPTY_HASH, cat["content"],
+                          "it is still known to exist -- just not aliasable")
+
+    def test_volatile_files_are_not_scanned(self):
+        """The alias target has to outlive the import. A lock file does not."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".sentry-native").mkdir()
+            (root / ".sentry-native" / "abc.run.lock").write_bytes(b"")
+            (root / "cache").mkdir()
+            (root / "cache" / "x.dds").write_bytes(b"cached")
+            (root / "keep.dds").write_bytes(b"kept")
+            found = {p.name for p in self.ad._walk_loose(root)}
+            self.assertEqual(found, {"keep.dds"})
+
+    def test_the_lock_extension_is_refused_anywhere(self):
+        self.assertIn(".lock", self.ad.SKIP_EXT)
+        self.assertIn(".sentry-native", self.ad.SKIP_DIRS)
+
+
+@unittest.skipUnless(HAVE_ROOT, "needs the game install")
+class MeshTexConfidence(unittest.TestCase):
+    """A rule that names three textures has not identified one.
+
+    `c3/npc/999001100.c3` is the standby motion of thirteen NPCs, and they do
+    not share a skin. `npc_table` therefore yields three textures -- all of
+    them genuinely stated by `npc.json` -- and the old `best()` returned
+    whichever sorted first, at the rule's full 0.95, as an authored fact. It
+    was the wrong one. Every swap built on it failed, and because the answer
+    named a real file that existed, the failures looked like plumbing.
+
+    The scoring is what is under test, not the pick: a shared asset has no
+    single texture, and the tool has to say so.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import meshtex
+        cls.meshtex = meshtex
+        cls.ix = meshtex.MeshTextureIndex(ROOT)
+
+    #: the mesh that started it
+    SHARED = "c3/npc/999001100.c3"
+
+    def test_a_shared_mesh_is_reported_as_ambiguous(self):
+        best = self.ix.best(self.SHARED)
+        self.assertTrue(best.ambiguous)
+        self.assertGreater(best.alternatives, 1)
+
+    def test_its_confidence_is_divided_by_what_it_could_not_tell_apart(self):
+        """Picking blind among n equally-authored candidates is right 1/n of
+        the time, so that is the number. 0.95 was a claim about a pick the
+        rule never made."""
+        best = self.ix.best(self.SHARED)
+        base = self.meshtex.METHODS[best.method][1]
+        self.assertAlmostEqual(best.confidence, base / best.alternatives,
+                               places=6)
+        self.assertLess(best.confidence, 0.5,
+                        "one of three is not a 0.95 answer")
+
+    def test_a_rule_that_identifies_one_texture_keeps_its_confidence(self):
+        """The discount must not punish rules that did their job -- most
+        meshes have a definite answer and it stays definite."""
+        definite = [m for m in ("c3/mesh/9990010.c3", self.SHARED)
+                    if not self.ix.best(m).ambiguous]
+        found = None
+        for m in self.ix.all_meshes()[:400]:
+            b = self.ix.best(m)
+            if b and b.kind == "authored" and not b.ambiguous:
+                found = b
+                break
+        self.assertIsNotNone(found, "expected some definite authored answers")
+        self.assertEqual(found.confidence,
+                         self.meshtex.METHODS[found.method][1])
+        self.assertEqual(found.alternatives, 1)
+
+    def test_the_ambiguity_is_visible_to_callers(self):
+        """`as_dict` feeds the viewer's panels; a caller that shows
+        confidence has to be able to show that it is one of several."""
+        d = self.ix.best(self.SHARED).as_dict()
+        self.assertIn("alternatives", d)
+        self.assertTrue(d["ambiguous"])
+
+    def test_the_definite_answer_for_an_npc_comes_from_npcart(self):
+        """meshtex cannot resolve a shared mesh and should not pretend to.
+        The entity does have one answer, and that is where to ask."""
+        import npcart
+        from coassets import AssetRoot
+        assets = AssetRoot(ROOT)
+        plan = npcart.Tables(assets.read).plan_for_mesh(self.SHARED)
+        self.assertEqual(plan.texture, "c3/texture/9990211.dds")
+        alts = {m.texture for m in self.ix.matches(self.SHARED)
+                if m.method == "npc_table"}
+        self.assertIn(plan.texture, alts,
+                      "the table answer is among the candidates -- the "
+                      "problem was only ever which one was chosen")
+
+
+@unittest.skipUnless(HAVE_ROOT, "needs the game install")
+class NpcArtTables(unittest.TestCase):
+    """Where an NPC's geometry, texture and motion each come from.
+
+    Found the hard way, in the running game. `npc.json` names `999001100`
+    and `c3/npc/999001100.c3` exists, so it reads like the whole model. It
+    is the **motion only**: the client takes geometry through
+    `simple_object -> Part0 -> 3dobj.ini` and the texture through
+    `Texture0 -> 3dtexture.ini`, into two other directories entirely.
+
+    The cost of not knowing that: replacing `c3/npc/999001100.c3` changed
+    the animation and nothing else, and writing 55-bone motion over a
+    30-bone body produced a T-posing NPC. The texture was inferred by
+    transposing the mesh id -- 9990010 for a mesh of 999001100 -- reported at
+    0.95 confidence, and is simply not the file the client loads.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import npcart
+        from coassets import AssetRoot
+        cls.npcart = npcart
+        cls.assets = AssetRoot(ROOT)
+        cls.tables = npcart.Tables(cls.assets.read)
+
+    def _exists(self, p):
+        return self.assets.locate(p) is not None
+
+    def test_the_storekeeper_resolves_the_way_the_game_does(self):
+        """The one case verified against the running client, end to end."""
+        plan = self.tables.plan_for_mesh("c3/npc/999001100.c3")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.name, "Storekeeper")
+        self.assertEqual(plan.geometry, "c3/mesh/9990010.c3")
+        self.assertEqual(plan.texture, "c3/texture/9990211.dds")
+        self.assertEqual(plan.motions, {
+            "standby": "c3/npc/999001100.c3",
+            "rest": "c3/npc/999001101.c3",
+            "blaze": "c3/npc/999001190.c3"})
+
+    def test_the_texture_is_not_the_transposed_mesh_id(self):
+        """The specific wrong answer that cost a whole session. It names a
+        real file, which is why it survived: 9990010.dds exists, and nothing
+        loads it for this NPC."""
+        plan = self.tables.plan_for_mesh("c3/npc/999001100.c3")
+        self.assertNotEqual(plan.texture, "c3/texture/9990010.dds")
+        self.assertTrue(self._exists("c3/texture/9990010.dds"),
+                        "it exists -- that is what made it convincing")
+
+    def test_geometry_and_motion_are_different_files(self):
+        """The distinction the whole bug rests on: the path named in
+        `npc.json` supplies motion, and the geometry is somewhere else."""
+        plan = self.tables.plan_for_mesh("c3/npc/999001100.c3")
+        self.assertNotIn(plan.geometry, plan.motions.values())
+
+    def test_every_npc_in_the_table_resolves(self):
+        """A resolver that is right about the asset it was debugged on is
+        worth very little. This is the claim that it describes the client.
+
+        CCO resolves whole. The 6090 table carries authored-dead rows --
+        rows naming no simple object, or one that no table defines -- so
+        the official claim is "everything except the enumerable dead"."""
+        r = self.npcart.audit(self.tables, self._exists)
+        if self.tables.profile.name == "cco":
+            self.assertEqual(r["unresolved"], 0,
+                             f"unresolved: {r['reasons']}")
+        else:
+            self.assertLessEqual(r["unresolved"], 10,
+                                 f"unresolved: {r['reasons']}")
+        self.assertGreater(r["resolved"], 400)
+
+    def test_resolved_art_is_on_disk_where_the_tables_say(self):
+        """Geometry and texture must exist, or the chain is describing
+        something other than this install. Motion is exempt: 34 looks are
+        referenced by `npc.json` and not shipped in this build, which is a
+        fact about the content rather than about the resolver."""
+        r = self.npcart.audit(self.tables, self._exists)
+        self.assertEqual(r["geometryMissingOnDisk"][1:], [],
+                         "at most the one known outlier")
+        self.assertEqual(r["textureMissingOnDisk"][1:], [])
+
+    def test_shared_art_is_reported_because_a_swap_hits_every_user(self):
+        """38 geometries and 47 textures serve more than one NPC here.
+        Replacing one changes all of them, which is a thing to be told
+        before it happens."""
+        r = self.npcart.audit(self.tables, self._exists)
+        self.assertTrue(r["sharedGeometry"])
+        self.assertTrue(r["sharedTexture"])
+
+    def test_skin_destination_prefers_the_tables_over_arithmetic(self):
+        import collection
+        got = collection.skin_destination(
+            "c3/npc/999001100.c3", self._exists, tables=self.tables)
+        self.assertEqual(got, "c3/texture/9990211.dds")
+        guess = collection.skin_destination("c3/npc/999001100.c3", self._exists)
+        self.assertEqual(guess, "c3/texture/9990010.dds",
+                         "the old answer, kept as the fallback it always was")
+
+
+@unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "3DSimpleObj.dbc").is_file(),
+                     "needs an official client with compiled .dbc tables")
+class OfficialDbcTables(unittest.TestCase):
+    """The 6090-era containers behind the same resolution chain.
+
+    Official clients ship the entity tables twice: the plaintext `.ini`
+    files stamped 2009, and compiled `.dbc` twins stamped 2015 that the
+    client actually reads. `core/dbc.py` reads the compiled set and
+    `npcart.PROFILE_OFFICIAL` declares it; these are the measured facts
+    that parsing rests on.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import dbc
+        import npcart
+        from coassets import AssetRoot
+        cls.dbc = dbc
+        cls.npcart = npcart
+        cls.assets = AssetRoot(ROOT)
+        cls.tables = npcart.Tables(cls.assets.read)
+
+    def test_the_install_detects_as_official(self):
+        self.assertEqual(self.tables.profile.name, "official")
+
+    def test_simo_walks_to_exactly_eof(self):
+        """Variable-length records leave no slack: a walk that does not end
+        on EOF misread a record shape, and `read_simo` raises rather than
+        tolerating it. Parsing at all is the assertion."""
+        simo = self.dbc.read_simo(self.assets.read("ini/3DSimpleObj.dbc"))
+        self.assertGreater(len(simo), 300)
+        # the Storekeeper's entry, the one case verified in the running game
+        self.assertEqual(simo[211], [(9990010, 9990211)])
+
+    def test_motion_ids_wrap_to_u32(self):
+        """`npc.ini` says StandByMotion=9990010100 -- ten digits of
+        decimal that do not fit a u32 -- and the motion table keys the row
+        by the id's low 32 bits. Unwrapped lookups miss every row. The row
+        resolves to the OLD nine-digit filename: the table is a renaming
+        shim over an archive namespace that never changed."""
+        mid = 9990010100
+        self.assertGreater(mid, 0xFFFFFFFF)
+        self.assertNotIn(mid, self.tables.motion_paths)
+        self.assertEqual(self.tables.motion_paths.get(mid & 0xFFFFFFFF),
+                         "c3/npc/999001100.c3")
+
+    def test_the_ini_twins_are_stale_decoys(self):
+        """`3dobj.ini` sits right there and parses fine; it is six years
+        older than `3DObj.dbc` and disagrees with it. A profile that
+        prefers the ini because it recognises the format reads 2009."""
+        stale = self.tables._path_table("ini/3dobj.ini")
+        live = self.tables.objects
+        self.assertTrue(stale, "the decoy exists and parses")
+        self.assertNotEqual(stale, live)
+        only_live = set(live) - set(stale)
+        self.assertGreater(len(only_live), 100,
+                           "the compiled table knows years of ids the "
+                           "plaintext one never heard of")
+
+    def test_monster_styled_npcs_derive_motion_from_geometry(self):
+        """The motions the table does not carry belong to monster-styled
+        NPCs, and live beside their geometry as `<dir>/<action>.c3` --
+        the last three digits of the motion id are the action."""
+        derived = [p for p in
+                   (self.tables.plan_for_npc(r) for r in self.tables.npcs)
+                   if p.geometry and p.motions
+                   and any(m.rsplit("/", 1)[0] == p.geometry.rsplit("/", 1)[0]
+                           for m in p.motions.values())]
+        self.assertGreater(len(derived), 50)
+        exists = lambda p: self.assets.locate(p) is not None
+        on_disk = [p for p in derived
+                   if all(exists(m) for m in p.motions.values())]
+        self.assertGreater(len(on_disk), 50,
+                           "derived motion paths name real files")
+
+
+class TqDatTables(unittest.TestCase):
+    """The TQ-cipher ``ini/*.dat`` tables of official clients.
+
+    CCO ships itemtype.json / monster.json in the open; official clients
+    ship the same data behind the TQ File Cipher (seed 9527).
+    `core/tqdat.py` opens those, and `load_items` / `load_monster_rows`
+    fall back to them, so both kinds of root serve the same row shape.
+    """
+
+    ITEM_DAT = ROOT / "ini" / "itemtype.dat"
+    MON_DAT = ROOT / "ini" / "Monster.dat"
+
+    def test_the_cipher_is_its_own_inverse(self):
+        import tqdat
+        blob = bytes(range(256)) * 5
+        self.assertEqual(tqdat.decrypt(tqdat.encrypt(blob)), blob)
+        self.assertNotEqual(tqdat.encrypt(blob), blob)
+
+    def test_a_wrong_seed_reads_as_noise_not_text(self):
+        """The guard that keeps a wrong seed (or an RSA file like
+        Server.dat) from parsing as garbage rows."""
+        import tqdat
+        text = b"111003 IronHelmet 21 0 15\r\n" * 40
+        good = tqdat.decrypt(tqdat.encrypt(text))
+        bad = tqdat.decrypt(tqdat.encrypt(text), seed=1234)
+        self.assertTrue(tqdat.looks_like_text(good))
+        self.assertFalse(tqdat.looks_like_text(bad))
+
+    @unittest.skipUnless(ITEM_DAT.is_file(), "this root ships no itemtype.dat")
+    def test_itemtype_rows_come_back_shaped_like_the_json(self):
+        """`load_items` on an official root serves the .dat as json-shaped
+        rows -- and re-encrypting the decryption reproduces the shipped
+        file byte for byte, which is what makes the cipher a fact rather
+        than a plausible reading."""
+        import tqdat
+        from coassets import load_items
+        raw = self.ITEM_DAT.read_bytes()
+        self.assertEqual(tqdat.encrypt(tqdat.decrypt(raw)), raw)
+        items = load_items(ROOT)
+        self.assertGreater(len(items), 5000)
+        named = sum(1 for i in items if i.get("name"))
+        self.assertGreater(named / len(items), 0.99)
+        for i in items[:200]:
+            self.assertIsInstance(i["id"], int)
+
+    @unittest.skipUnless(MON_DAT.is_file(), "this root ships no Monster.dat")
+    def test_monster_sections_resolve_by_type_id(self):
+        """Every section carries a TypeID, and the two sections that carry
+        a comma-list of them come back as one row per id."""
+        import tqdat
+        rows = tqdat.read_monster(self.MON_DAT)
+        self.assertGreater(len(rows), 300)
+        for r in rows:
+            self.assertIsInstance(r["type"], int, r["name"])
+            self.assertTrue(r["name"])
+
+
+@unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "3DSimpleObj.dbc").is_file(),
+                     "needs an official client with compiled .dbc tables")
+class ParserPlugins(unittest.TestCase):
+    """The plugin registry: discovery, declaration, detection.
+
+    Needs no install -- these are properties of the contract, and the
+    contract is what a contributor writes against.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import plugins
+        cls.plugins = plugins
+
+    def test_the_shipped_plugins_are_discovered(self):
+        names = {p.name for p in self.plugins.available()}
+        self.assertIn("patch6090", names)
+        self.assertIn("cco", names)
+
+    def test_every_plugin_declares_the_contract(self):
+        """A plugin is duck-typed, so the registry is the only thing that
+        checks it. Missing a hook must fail here, not at render time."""
+        for p in self.plugins.available():
+            self.assertTrue(p.name and p.name == p.name.lower(), p.name)
+            self.assertTrue(p.label, p.name)
+            for hook in ("confidence", "table_profile", "texture_for_mesh",
+                         "colourways", "monster_colourways",
+                         "flat_family_base", "entity_name_overrides",
+                         "import_plan", "default_colour",
+                         "colour_provenance"):
+                self.assertTrue(callable(getattr(p, hook, None)),
+                                f"{p.name} is missing {hook}")
+
+    def test_a_subclass_does_not_inherit_its_parents_evidence(self):
+        """patch5517 reuses 6090's monster colour sets and says so; it must
+        not also reuse 6090's claim to have *checked* them.
+
+        The viewer used to hard-code "verified colourway (default)" /
+        "authored" over whatever default_colour returned, for every plugin,
+        so an inherited set was rendered as a measurement. That is the
+        failure this project already paid a day for -- a guess believed
+        because of the confidence attached to it.
+        """
+        p90 = self.plugins.for_kind("patch6090")
+        p17 = self.plugins.for_kind("patch5517")
+        self.assertEqual(p90.colour_provenance()[1], "authored")
+        self.assertEqual(p17.colour_provenance()[1], "inferred")
+        self.assertIn("unverified", p17.colour_provenance()[0])
+        # ...over the same table, which is the point: reuse is fine.
+        self.assertEqual(p17.monster_colourways("103"),
+                         p90.monster_colourways("103"))
+
+    def test_the_default_provenance_is_weak(self):
+        """A colour set that resolves is worth using and is not thereby
+        measured, so the base class must not claim authorship."""
+        self.assertEqual(self.plugins.Plugin().colour_provenance()[1],
+                         "inferred")
+
+    def test_a_declared_kind_resolves_including_by_alias(self):
+        """Config written before the plugin rewrite says "official"; that
+        must keep resolving, or an existing install loses its parser."""
+        self.assertEqual(self.plugins.for_kind("patch6090").name, "patch6090")
+        self.assertEqual(self.plugins.for_kind("official").name, "patch6090")
+        self.assertIsNone(self.plugins.for_kind("nonesuch"))
+
+    def test_the_base_plugin_has_no_opinions(self):
+        """The default for every hook is "I do not know", which is what
+        makes a three-line plugin legitimate."""
+        g = self.plugins.GENERIC
+        self.assertEqual(g.confidence(Path("."), lambda p: True), 0.0)
+        self.assertIsNone(g.table_profile())
+        self.assertIsNone(g.texture_for_mesh("c3/mesh/1.c3", lambda p: True))
+        self.assertEqual(list(g.colourways("c3/texture/1.dds",
+                                           lambda p: True)), [])
+        self.assertIsNone(g.monster_colourways("103"))
+        self.assertEqual(g.entity_name_overrides(), ({}, set()))
+
+    def test_detection_tells_the_two_shipped_flavours_apart(self):
+        """Compiled .dbc means official; npc.json without them means CCO.
+        A folder with neither must fall to GENERIC rather than guess."""
+        official = {"ini/3DSimpleObj.dbc", "ini/3DObj.dbc", "ini/itemtype.dat"}
+        cco = {"ini/npc.json"}
+        self.assertEqual(
+            self.plugins.detect(Path("x"), lambda q: q in official).name,
+            "patch6090")
+        self.assertEqual(
+            self.plugins.detect(Path("x"), lambda q: q in cco).name, "cco")
+        self.assertEqual(
+            self.plugins.detect(Path("x"), lambda q: False).name,
+            self.plugins.GENERIC.name)
+
+    def test_format_differences_are_declared_by_the_plugin(self):
+        """Six ways 6090 differs in FORM, not content -- stale ini decoys,
+        a second motion reader that kept its own load, unpadded ids in the
+        compiled tables, four-wide action fields, u32-wrapped motion ids,
+        and socket tracks carrying scale. Every one failed SILENTLY, which
+        is why they belong somewhere a contributor will read rather than in
+        a commit message nobody greps."""
+        p = self.plugins.for_kind("patch6090")
+        q = p.table_quirks()
+        self.assertGreaterEqual(len(q), 6)
+        for key, text in q.items():
+            self.assertGreater(len(text), 80, f"{key} needs the detail")
+        self.assertEqual(
+            p.key_field_widths()["Action3DEffect.ini"]["action"], 4)
+        self.assertEqual(p.aura_convention(), "effect-named-for-id")
+        cco = self.plugins.for_kind("cco")
+        self.assertEqual(
+            cco.key_field_widths()["Action3DEffect.ini"]["action"], 3)
+        self.assertEqual(cco.aura_convention(), "table")
+        # the base contract stays opinion-free
+        self.assertEqual(self.plugins.GENERIC.table_quirks(), {})
+        self.assertEqual(self.plugins.GENERIC.aura_convention(), "both")
+
+    def test_sibling_patches_are_told_apart_by_version_dat(self):
+        """5517 and 6090 are the same parse family -- same .dbc set, same
+        TQ-cipher .dat tables, every reader works on both -- so the formats
+        cannot pick one. version.dat can: each official client stamps it with
+        its own patch number and nothing else. Without this the two plugins
+        are indistinguishable and the tie goes to dictionary order, which is
+        not evidence."""
+        p90 = self.plugins.for_kind("patch6090")
+        p55 = self.plugins.for_kind("patch5517")
+        self.assertIsNotNone(p55)
+        official = {"ini/3DSimpleObj.dbc", "ini/3DObj.dbc", "ini/itemtype.dat"}
+
+        import tempfile
+        for stamp, winner in (("6090", "patch6090"), ("5517", "patch5517")):
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "version.dat").write_bytes(stamp.encode())
+                best = self.plugins.detect(
+                    root, lambda q, r=root: q in official
+                    or (r / q).is_file())
+                self.assertEqual(best.name, winner, stamp)
+        # and a sibling patch never outbids the plugin that knows it
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "version.dat").write_bytes(b"5165")
+            c90 = p90.confidence(root, lambda q: q in official)
+            self.assertGreater(c90, 0.0, "still readable by the profile")
+            self.assertLess(c90, 0.9, "but not claimed as 6090")
+
+    def test_the_5517_plugin_inherits_the_6090_profile(self):
+        """The diff says it should: 26,098 of 5517's 26,766 files are
+        byte-identical to 6090 at the same path, nothing moved, nothing was
+        removed. So the readers, conventions and quirks carry over, and the
+        plugin only declares what 5517 does NOT have."""
+        p55 = self.plugins.for_kind("patch5517")
+        self.assertTrue(p55.prefers_compiled_tables())
+        self.assertEqual(p55.aura_convention(), "effect-named-for-id")
+        self.assertEqual(
+            p55.key_field_widths()["Action3DEffect.ini"]["action"], 4)
+        q = p55.table_quirks()
+        self.assertIn("no BodyMotionTrans.ini", q)
+        self.assertIn("stale ini decoys", q, "6090's quirks are inherited")
+
+    def test_the_6090_plugin_carries_the_scan_not_the_app(self):
+        """The verified sets, names and conventions must live in the
+        plugin: that is what a contributor copies to describe their own
+        client, and what stops the app hard-coding one client's habits."""
+        p = self.plugins.for_kind("patch6090")
+        self.assertEqual(p.monster_colourways("103"),
+                         ["c3/texture/103000000.dds",
+                          "c3/texture/303000000.dds",
+                          "c3/texture/503000000.dds",
+                          "c3/texture/703000000.dds"])
+        self.assertIsNone(p.monster_colourways("109"),
+                          "109 is unresolved and must stay unpinned")
+        pins, drops = p.entity_name_overrides()
+        self.assertEqual(pins[("monster", "133")], "Ganoderma")
+        self.assertIn(("monster", "109"), drops)
+        self.assertEqual(
+            p.texture_for_mesh("c3/npc/281/1.c3", lambda q: True),
+            ("c3/texture/9992810.dds", "npc texture family (999<dir>0)",
+             "inferred"))
+        self.assertEqual(p.default_colour("130"), "c3/texture/130000000.dds")
+
+
+class ArmedMotion(unittest.TestCase):
+    r"""**An armed character must play its ARMED motion, and every panel must
+    say which one.** This has now broken twice, silently both times, and it is
+    the regression this class exists to stop happening a third time.
+
+    THE ORIGINAL BUG
+    ----------------
+    `ini/3dmotion.ini` is keyed `<shape><weaponset><action>`, and a `410` swing
+    is a different motion from the unarmed one. CCO spells the pairing out --
+    259 rows for set 480 alone, each `1480100 = c3/0001/410/100.c3`. **6090 and
+    5517 ship none of those rows**, in either the stale ini or the compiled
+    `.dbc`, so an armed key misses.
+
+    It missed *quietly*: the lookup's own fallback chain ends at the unarmed
+    set `000` **and reports success**, so an armed character was posed
+    empty-handed with no error anywhere. `attach.WEAPON_MOTION_SET` recovers
+    TQ's own pairing from CCO's table and is applied before the fallback can
+    hide the miss.
+
+    THE SECOND BUG, WHICH IS WHY THIS IS A TEST AND NOT A COMMENT
+    -------------------------------------------------------------
+    The resolution was fixed; the *readout* was not. `api_figure` described the
+    pose it had just built with a hardcoded `000` weapon set:
+
+        f"{int(body_id[:3])}000{action_code}"
+
+    so a body correctly posed from `c3/0002/410/100.c3` reported key `2000100`
+    -- the unarmed motion -- while the ANIMATION panel beside it said `410`.
+    Two panels, same figure, disagreeing, and the wrong one was the one you
+    would read to check.
+
+    That readout is not decoration: the original bug was *found* by reading it
+    ("CCO's motion file is `c3/0001/410/100.c3` while 6090's is
+    `c3/0001/000/100.c3`"). A wrong answer there is worse than none, because it
+    is the instrument.
+
+    Third, the builder re-fetched the clip on an action change but not the
+    figure, so the pose key and the extent kept describing the action you had
+    navigated away from.
+    """
+
+    ALIASES = (("480", "410"), ("350", "560"), ("370", "500"), ("380", "741"))
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(PROJECT))
+        import attach
+        cls.attach = attach
+        cls.viewer_py = (HERE / "coviewer.py").read_text("utf-8")
+        cls.builder_js = (HERE / "webui" / "builder.js").read_text("utf-8")
+
+    def test_the_cco_recovered_aliases_are_intact(self):
+        """These four came out of CCO's own 3dmotion.ini, by taking the
+        dominant non-000 folder per weapon set. They cannot be re-derived from
+        6090 or 5517 -- neither ships the rows -- so if this table is lost it
+        is lost, and every armed character silently goes empty-handed."""
+        for wset, folder in self.ALIASES:
+            self.assertEqual(self.attach.motion_set_for(wset), folder, wset)
+        # An unaliased set maps to itself rather than to 000.
+        self.assertEqual(self.attach.motion_set_for("999"), "999")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_an_armed_key_resolves_to_the_armed_folder(self):
+        """The behaviour, not the table: the alias has to fire *before* the
+        lookup's fallback, or the fallback answers 000 and reports success."""
+        import anim
+        db = anim.AnimDB(ROOT)
+        unarmed, how = db.resolve("2", "000", "100")
+        self.assertTrue(unarmed and unarmed.endswith("/000/100.c3"), unarmed)
+        for wset, folder in self.ALIASES:
+            path, how = db.resolve("2", wset, "100")
+            self.assertTrue(path, f"weapon set {wset} resolved nothing")
+            self.assertIn(f"/{folder}/", path,
+                          f"weapon set {wset} should animate from {folder}, "
+                          f"got {path} ({how})")
+            self.assertNotIn("/000/", path,
+                             f"weapon set {wset} fell back to the unarmed "
+                             f"motion and would pose the character "
+                             f"empty-handed ({how})")
+
+    def test_the_pose_readout_reports_the_set_it_actually_used(self):
+        """The exact regression: a literal `000` in the key this panel
+        prints. It must interpolate the resolved set instead."""
+        # Booleans, not assertIn: a failed assertIn on a 250 KB source file
+        # prints the whole file and buries the one line that matters.
+        self.assertFalse(
+            'f"{int(body_id[:3])}000{action_code} "' in self.viewer_py,
+            "api_figure is hardcoding weapon set 000 into the pose readout "
+            "again -- an armed figure will report the unarmed motion key")
+        self.assertTrue(
+            "{int(body_id[:3])}{pose_set}{action_code}" in self.viewer_py,
+            "the pose readout no longer interpolates the resolved weapon set")
+        # And pose_set has to be the set actually resolved with, including
+        # the fallback case.
+        self.assertTrue("pose_set = wset" in self.viewer_py,
+                        "pose_set is not taken from the equipped weapon")
+        self.assertTrue('pose_set = "000"' in self.viewer_py,
+                        "the unarmed fallback no longer corrects pose_set, so "
+                        "a fallback would be reported as armed")
+
+    def test_changing_the_action_rebuilds_the_figure_not_just_the_clip(self):
+        """/api/figure is asked for a pose AT an action, so everything
+        derived from it -- the extent, the socket rows, the pose key -- is
+        stale until it is re-fetched."""
+        i = self.builder_js.find("B.anim.action = e.target.value;")
+        self.assertGreater(i, 0, "the action change handler moved")
+        handler = self.builder_js[i:i + 600]
+        self.assertIn("rebuild(", handler,
+                      "changing the action no longer rebuilds the figure, so "
+                      "the pose panel and the extent will describe the "
+                      "previous action")
+        self.assertIn("ensureAnim(", handler)
+
+
+class SocketCorrectionIsViewerOnly(unittest.TestCase):
+    r"""The one hook that makes the app disagree with the client on purpose.
+
+    `Patch6090` unit-scales the **female** `v_l_weapon` basis, because 5517 and
+    6090 ship it degenerate on body shapes 001/002 (rows to 0.012, flattening a
+    held weapon to a sliver) and clean on the male shapes. Four checks say the
+    engine does not repair it, so the real client very likely shows the squash.
+
+    **The project is building a compatible client**, so this correction must
+    never reach it. That is enforced structurally rather than promised: it is
+    applied in `coviewer` and nowhere else, and `attach.py` / `parts.py` --
+    which `client/` and any engine port read -- stay a faithful read. These
+    tests are the fence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(PROJECT))
+        import plugins
+        cls.plugins = plugins
+
+    def test_it_fires_on_female_bodies_and_only_on_the_left_weapon(self):
+        p = self.plugins.for_kind("patch6090")
+        for body in ("001131000", "002135000"):
+            hit = p.socket_correction("v_l_weapon", body)
+            self.assertIsNotNone(hit, f"{body} should be corrected")
+            self.assertEqual(hit[0], "reference-basis:cco")
+            self.assertTrue(hit[1].strip(), "a correction must say why")
+        for body in ("003133000", "004134000"):
+            self.assertIsNone(p.socket_correction("v_l_weapon", body),
+                              f"{body} is male and is not broken")
+        for sock in ("v_r_weapon", "v_armet", "v_mount"):
+            self.assertIsNone(p.socket_correction(sock, "002135000"), sock)
+
+    def test_5517_inherits_it_because_the_data_is_identical(self):
+        """The armed idle is the same bytes in both clients, so the same
+        correction applies. If 5517 ever stops inheriting it, that is a claim
+        the data no longer supports."""
+        a = self.plugins.for_kind("patch6090").socket_correction
+        b = self.plugins.for_kind("patch5517").socket_correction
+        self.assertEqual(a("v_l_weapon", "002135000"),
+                         b("v_l_weapon", "002135000"))
+
+    def test_the_base_plugin_corrects_nothing(self):
+        """"I have no complaint" is the default, as for every other hook."""
+        self.assertIsNone(
+            self.plugins.Plugin().socket_correction("v_l_weapon", "002135000"))
+
+    def test_the_correction_never_reaches_the_shared_read_path(self):
+        """**The fence.** `attach.py` and `parts.py` are what `client/` and any
+        engine port consume. If a correction ever appears in either, a
+        compatible-client rewrite silently inherits a deliberate deviation."""
+        for name in ("attach.py", "parts.py"):
+            src = (HERE / name).read_text("utf-8")
+            self.assertFalse("socket_correction" in src,
+                             f"{name} must not know about corrections -- it is "
+                             f"the faithful read the client rewrite depends on")
+            self.assertFalse("unit-rows" in src, name)
+
+    def test_the_viewer_states_every_correction_it_applies(self):
+        """A correction nobody can see is indistinguishable from a broken
+        reader -- and this project has already lost two sessions to a readout
+        that lied."""
+        py = (HERE / "coviewer.py").read_text("utf-8")
+        self.assertTrue("apply_socket_corrections" in py)
+        self.assertTrue('"socketCorrections": socket_corr' in py,
+                        "the figure payload must name corrected sockets")
+        js = (HERE / "webui" / "builder.js").read_text("utf-8")
+        self.assertTrue("socketCorrections" in js,
+                        "the attachment panel must state the correction")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_borrowed_orientation_is_exact_and_moves_nothing(self):
+        """`reference-basis` is only defensible because the two clients agree
+        on where the socket *is*. Assert that: CCO's translation for the
+        female left socket must equal this lineage's, at rest and mid-swing,
+        or borrowing the orientation would move the hand."""
+        import coviewer
+        import parts as partsmod
+        import attach
+        from coassets import AssetRoot
+        ref = coviewer._reference_root("cco")
+        if ref is None:
+            self.skipTest("no CCO install declared")
+        app = "002135000"
+        cat = partsmod.action_catalogue(ROOT)
+        mesh = cat.appearance_mesh("armor.ini", app) or cat.mesh_path(app)
+        if not mesh:
+            self.skipTest("body mesh not resolvable on this install")
+        raw = AssetRoot(ROOT).read(mesh)
+        for action, frame in (("100", 0), ("403", 12), ("403", 24)):
+            motion = partsmod.idle_motion(app, ROOT, "410", action)
+            if motion is None:
+                self.skipTest(f"action {action} not on this install")
+            here = partsmod.socket_anchors(raw, motion_set=motion,
+                                           frame=frame).get("v_l_weapon")
+            there = coviewer._reference_basis("cco", "v_l_weapon", app,
+                                              "410", action, frame)
+            if here is None or there is None:
+                self.skipTest("motion not resolvable on both installs")
+            for i in range(3):
+                self.assertAlmostEqual(
+                    here.matrix[12 + i], there[12 + i], places=4,
+                    msg=f"action {action} frame {frame}: the socket moves "
+                        f"between the clients, so its orientation cannot "
+                        f"simply be borrowed")
+
+    def test_an_undeclared_reference_falls_back_and_says_so(self):
+        """A correction that silently degrades is the half-truth this whole
+        area has already been bitten by."""
+        import coviewer
+        self.assertIsNone(coviewer._reference_root("nosuchclient"))
+        py = (HERE / "coviewer.py").read_text("utf-8")
+        self.assertTrue("FALLBACK" in py,
+                        "the fallback path must announce itself in the note")
+
+    def test_the_spec_the_rewrite_reads_warns_against_porting_it(self):
+        doc = (PROJECT / "docs" / "attachment.md").read_text("utf-8")
+        self.assertTrue("DO NOT PORT IT" in doc,
+                        "docs/attachment.md is what a client rewrite reads; "
+                        "the warning has to be in it")
+
+
+class PerBaseIndexes(unittest.TestCase):
+    """Derived indexes are namespaced by the install they were built from.
+
+    Needs no install: these are properties of the path algebra. The bug they
+    guard is not hypothetical -- `out/dll/rtti.md` shipped titled for one
+    client over a body describing another, because nothing recorded which
+    install an artefact came from and nothing checked.
+    """
+
+    def test_per_base_trees_are_rewritten_and_the_rest_are_not(self):
+        keyed = coroot.derived_rel("out/meshtex/coverage.json")
+        self.assertTrue(keyed.startswith(coroot.INDEX_ROOT + "/"), keyed)
+        self.assertTrue(keyed.endswith("/meshtex/coverage.json"), keyed)
+        # The archive name tables key on archive content, so they are shared
+        # by construction -- rewriting them would just duplicate 24,426 rows.
+        self.assertEqual(coroot.derived_rel("out/wdf/c3_names.json"),
+                         "out/wdf/c3_names.json")
+
+    def test_library_server_thumbs_stay_global(self):
+        """`out/thumbs/` is per-base but `out/thumbs/servers/<name>/` is not:
+        a COmmunity Library server view has nothing to do with whichever
+        install happens to be configured. The exception is checked first, so
+        the longer path wins."""
+        self.assertEqual(
+            coroot.derived_rel("out/thumbs/servers/zephyr/manifest.json"),
+            "out/thumbs/servers/zephyr/manifest.json")
+        self.assertNotEqual(coroot.derived_rel("out/thumbs/manifest.json"),
+                            "out/thumbs/manifest.json")
+
+    def test_two_installs_get_two_namespaces(self):
+        """The whole point. Same repo, same tool, different client -> a
+        different directory, so neither can read the other's answers."""
+        clients = Path(DEFAULT_ROOT).parent
+        roots = [clients / n for n in ("5517", "6090")]
+        if not all(r.is_dir() for r in roots):
+            self.skipTest("needs two sibling installs")
+        ids = [coroot.base_id(r) for r in roots]
+        self.assertEqual(len(set(ids)), 2, ids)
+        self.assertTrue(all(i and not i.endswith("-") for i in ids), ids)
+
+    def test_the_fingerprint_is_content_not_path(self):
+        """Keyed on what the install *contains*, so renaming or copying a
+        folder does not mint a second namespace for the same client."""
+        r = Path(DEFAULT_ROOT)
+        if not (r / "ini").is_dir():
+            self.skipTest("no install")
+        self.assertEqual(coroot.base_fingerprint(r), coroot.base_fingerprint(r))
+        self.assertTrue(coroot.base_fingerprint(r))
+        self.assertEqual(coroot.base_fingerprint(r / "nonesuch"), "")
+
+    def test_an_undeclared_root_is_never_guessed_a_kind(self):
+        """A declaration is the user's, and it would be baked into a
+        directory name. An unknown install says so rather than borrowing the
+        kind of whichever root the config happens to name."""
+        clients = Path(DEFAULT_ROOT).parent
+        stranger = clients / "5065"
+        if not stranger.is_dir():
+            self.skipTest("needs an undeclared sibling install")
+        if any(Path(p).resolve() == stranger.resolve()
+               for p in (coroot.read_settings().get(coroot.KINDS_KEY) or {})):
+            self.skipTest("5065 has been declared on this machine")
+        self.assertTrue(coroot.base_id(stranger).startswith("unknown-"))
+
+    def test_the_motion_catalogue_is_cached_per_root_not_per_process(self):
+        """`parts.action_catalogue` used to be one global built from whichever
+        install asked first, ignoring every later `root`. Invisible while one
+        client was ever configured; wrong the moment two are, and the viewer
+        now holds a catalogue per base so 6090 and 5517 can be compared.
+
+        It corrupted a real measurement before it was found: a script walking
+        CCO, 5517 and 6090 in one process got CCO's motions three times and
+        reported all three clean, hiding a degenerate track that is present in
+        two of them.
+        """
+        import parts as partsmod
+        clients = Path(DEFAULT_ROOT).parent
+        a, b = clients / "5517", clients / "6090"
+        if not (a.is_dir() and b.is_dir()):
+            self.skipTest("needs two sibling installs")
+        ca, cb = (partsmod.action_catalogue(a), partsmod.action_catalogue(b))
+        if ca is None or cb is None:
+            self.skipTest("attach.py not importable")
+        self.assertNotEqual(str(ca.root), str(cb.root))
+        self.assertEqual(str(Path(ca.root).resolve()), str(a.resolve()))
+        self.assertEqual(str(Path(cb.root).resolve()), str(b.resolve()))
+        # ...and asking again returns the same object, so it is still a cache.
+        self.assertIs(partsmod.action_catalogue(a), ca)
+
+    def test_a_missing_index_reads_as_build_me(self):
+        """Never a fallback to the unkeyed path: that is precisely how one
+        client's facts got served as another's."""
+        self.assertIsNone(coroot.find_derived("out/meshtex/no_such_file.json"))
+
+    def test_resolution_is_per_root_not_per_process(self):
+        """The viewer holds two catalogues at once to compare bases, so
+        "which index" cannot be a property of the process. If it were, the
+        second base would read the first's answers -- the exact failure the
+        key exists to stop, reintroduced one level up."""
+        clients = Path(DEFAULT_ROOT).parent
+        a, b = clients / "5517", clients / "6090"
+        if not (a.is_dir() and b.is_dir()):
+            self.skipTest("needs two sibling installs")
+        ra = coroot.derived_rel("out/meshtex/coverage.json", a)
+        rb = coroot.derived_rel("out/meshtex/coverage.json", b)
+        self.assertNotEqual(ra, rb)
+        self.assertIn(coroot.base_id(a), ra)
+        self.assertIn(coroot.base_id(b), rb)
+        # ...and the global-by-construction trees stay global for both.
+        self.assertEqual(coroot.derived_rel("out/wdf/c3_names.json", a),
+                         coroot.derived_rel("out/wdf/c3_names.json", b))
+
+    def test_two_unified_indexes_do_not_share_answers(self):
+        """The end-to-end version of the above, through the object the
+        viewer actually builds per catalogue."""
+        clients = Path(DEFAULT_ROOT).parent
+        a, b = clients / "5517", clients / "6090"
+        if not (a.is_dir() and b.is_dir()):
+            self.skipTest("needs two sibling installs")
+        import unify
+        ua = unify.UnifiedIndex(a, exists=lambda p: True)
+        ub = unify.UnifiedIndex(b, exists=lambda p: True)
+        if not (ua.mesh_matches and ub.mesh_matches):
+            self.skipTest("both bases need a built coverage index")
+        self.assertNotEqual(ua.source, ub.source)
+        self.assertNotEqual(len(ua.mesh_matches), len(ub.mesh_matches))
+        self.assertNotEqual(str(ua._thumb_dir), str(ub._thumb_dir))
+
+
+class NpcModelArtPins(unittest.TestCase):
+    """The model page's NPC/mount art, pinned to the author's verified scan.
+
+    Every answer here was eyeballed in the viewer against the 6090 base
+    (2026-08-05): 84 reported-broken NPC dirs resolved, the standby set's
+    prop-geometry regression reverted, seven mounts re-skinned. These pins
+    are what "the parser plugin keeps them as is" means -- a resolution
+    change that shifts any of them is a regression, not a refactor.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+        cls.cat.wait_tables()
+        cls.models = cls.cat.models
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cat.close()
+
+    def _model(self, key):
+        m = self.models.get(key)
+        self.assertIsNotNone(m, key)
+        return m
+
+    def test_npc_dirs_resolve_through_the_tables(self):
+        """281 was reported textureless; the tables said 9992810 all
+        along. Same family shape for every table-reached dir."""
+        for d, tex in (("281", "c3/texture/9992810.dds"),
+                       ("520", "c3/texture/9995200.dds"),
+                       ("523", "c3/texture/9995230.dds"),
+                       ("766", "c3/texture/9997660.dds")):
+            m = self._model(f"npc:{d}")
+            self.assertEqual(m.texture, tex, d)
+            self.assertEqual(m.texture_method, "npc tables", d)
+
+    def test_unreached_npc_dirs_fall_to_the_999_family(self):
+        """373 was reported mismatched: the generic guess crossed into the
+        monster namespace (373000000). The npc family wins."""
+        m = self._model("npc:373")
+        self.assertEqual(m.texture, "c3/texture/9993730.dds")
+        self.assertIn("999", m.texture_method)
+
+    def test_look_001_wears_the_storekeepers_real_body(self):
+        """The founding npcart lesson, now on the model page: the flat
+        files' embedded PHY is a copy; the body is simple_object -> 3DObj."""
+        m = self._model("npc_simple:001")
+        self.assertEqual(m.mesh, "c3/mesh/9990010.c3")
+        self.assertEqual(m.texture, "c3/texture/9990211.dds")
+
+    def test_the_short_stem_is_the_standby_looks_body(self):
+        """The author's second scan corrected the first: the 9-digit action
+        files of these looks carry 3-4 vertex shards, and the short-stem
+        sibling (999118.c3 / 9992640.c3) is the real body -- 1,181
+        vertices at person scale for 118. Skeleton layout in flat
+        clothing. Effect props and other non-c3/mesh plan geometry never
+        stand in (look 010's lesson)."""
+        for lk, stem in (("118", "999118"), ("256", "999256"),
+                         ("264", "9992640"), ("273", "9992730")):
+            m = self._model(f"npc_simple:{lk}")
+            self.assertEqual(m.mesh, f"c3/npc/{stem}.c3", lk)
+        m = self._model("npc_simple:010")
+        self.assertEqual(m.mesh, "c3/npc/999010100.c3")
+
+    def test_mounts_skin_from_their_own_directory(self):
+        """802/804/808/810/845/849/850 were dressed from the monster
+        family (802000000-style). A mount's colours live beside it."""
+        for d in ("802", "804", "808", "810", "845", "849", "850"):
+            m = self._model(f"mount:{d}")
+            self.assertEqual(m.texture, f"c3/mount/{d}/{d}0000.dds", d)
+        # 801 has an authored answer through the tables and keeps it
+        m = self._model("mount:801")
+        self.assertEqual(m.texture_method, "npc tables")
+
+    def test_monster_labels_carry_entity_names(self):
+        m = self._model("monster:103")
+        self.assertEqual(m.label, "ThunderApe (103)")
+
+    def test_monster_colourways_are_the_verified_sets(self):
+        """The author's eyeballed scan, not a digit probe: the leading-digit
+        guess pulled 203000000 (monster 203's own skin) into 103's strip
+        and crossed dirs everywhere. 206 really does wear 201's set."""
+        cases = {
+            "103": ["103000000", "303000000", "503000000", "703000000"],
+            "130": ["130000000", "230000000"],
+            "111": ["116000000"],
+            "206": ["206000000", "406000000", "606000000", "806000000"],
+            "209": ["209000000", "369000000"],
+        }
+        for d, stems in cases.items():
+            got = self.cat.monster_colourways(d, "")
+            self.assertEqual(got, [f"c3/texture/{s}.dds" for s in stems], d)
+
+    def test_every_pinned_monster_wears_its_default_colour(self):
+        """The first verified colourway is the default skin. meshtex had
+        109 dressed in 108's texture and four dirs in a non-default
+        colour."""
+        for m in self.models.models:
+            if m.kind != "monster":
+                continue
+            stems = self.cat.MONSTER_COLOURWAYS_6090.get(m.ident)
+            if not stems:
+                continue
+            self.assertEqual(m.texture, f"c3/texture/{stems[0]}.dds",
+                             m.ident)
+
+    def test_a_colourway_probe_asks_the_archive_not_the_name_table(self):
+        """c3/texture/109000000.dds is a real 16KB skin whose WDF name was
+        never recovered, so the path set has never heard of it while the
+        renderer loads it by hash. Probing names emptied 109's strip."""
+        self.assertFalse(self.cat.exists("c3/texture/109000000.dds"))
+        self.assertTrue(self.cat.assets.exists("c3/texture/109000000.dds"))
+        # 197's blue is the same case: real skin, unrecovered name, and the
+        # scan says it belongs. A name-based probe would drop it.
+        self.assertIn("c3/texture/797000000.dds",
+                      self.cat.monster_colourways("197", ""))
+
+    #: Kinds the author verified whole, by eye, on the 6090 base: every model
+    #: resolves a mesh and a texture that belong together. These are the
+    #: official parse profile's accepted output -- a change that leaves any
+    #: of these kinds with an unresolved model is a regression.
+    #: Effects are verified too, but their art is a particle scene built by
+    #: effects.py rather than a mesh+skin pair, so they carry no mesh of
+    #: their own and are checked separately below.
+    VERIFIED_WHOLE_KINDS = ("npc", "npc_simple", "ghost", "mount", "role")
+
+    def test_every_verified_kind_still_resolves_whole(self):
+        """NPCs, the standby set, ghosts, mounts, the character-select
+        roles and effects were each confirmed correct end to end. Effects
+        carry their art in their own scene rather than a mesh/texture pair,
+        so they are checked for resolvability, not for a texture."""
+        # 217 ships two motion-only files (999217100, 999217190) and no
+        # geometry or texture anywhere in the install -- the client has
+        # nothing to draw either. Absent content, not a resolution failure.
+        absent = {("npc_simple", "217")}
+        for kind in self.VERIFIED_WHOLE_KINDS:
+            models = [m for m in self.models.models if m.kind == kind]
+            self.assertTrue(models, kind)
+            for m in models:
+                if (kind, m.ident) in absent:
+                    self.assertFalse(m.mesh, f"{kind}:{m.ident} resolves now "
+                                             "-- update the absent set")
+                    continue
+                self.assertTrue(m.mesh, f"{kind}:{m.ident} has no mesh")
+                self.assertTrue(self.cat.assets.exists(m.mesh),
+                                f"{kind}:{m.ident} mesh {m.mesh} is absent")
+                self.assertTrue(m.texture, f"{kind}:{m.ident} has no texture")
+                self.assertTrue(self.cat.assets.exists(m.texture),
+                                f"{kind}:{m.ident} texture {m.texture} absent")
+
+    def test_the_effect_library_resolves_its_scenes(self):
+        """Effects are the sixth verified kind. They carry particle scenes
+        rather than a mesh and a skin, so the contract is that the library
+        is populated and a named effect builds a scene."""
+        effects = [m for m in self.models.models if m.kind == "effect"]
+        self.assertGreater(len(effects), 1000)
+        built = 0
+        for m in effects[:25]:
+            try:
+                if self.cat.effects.scene(m.ident).found:
+                    built += 1
+            except Exception:
+                pass
+        self.assertGreater(built, 12, "most sampled effects should build")
+
+    def test_a_static_preview_poses_the_body_and_the_socket_together(self):
+        """The headgear shift, pinned. attach.Catalogue kept its own load of
+        3dmotion.ini -- the 2009 decoy -- so idle_motion missed key 2000100,
+        every static preview drew the body unposed while taking its socket
+        from the mesh's embedded MOTI, and the hat sat (1.15, -2.47, 6.00)
+        from the head instead of (0.09, 0.40, 3.86). It came right the
+        moment an animation played, because playing one supplied the motion
+        the lookup had failed to find.
+
+        Two independent claims here: the idle resolves at all, and the
+        anchor it produces agrees with the body it is drawn against."""
+        import attach
+        cat = attach.Catalogue(ROOT)
+        self.assertEqual(cat.motion.get("2000100"), "c3/0002/000/100.c3")
+        self.assertIsNotNone(cat.idle_motion("002131090"),
+                             "the idle motion must resolve, or previews "
+                             "fall back to the embedded MOTI")
+        import parts as partsmod, coviewer as cv
+        body = "c3/mesh/002131090.c3"
+        raw = self.cat.assets.read(body)
+        action = partsmod.idle_motion("002131090", ROOT)
+        anc = partsmod.socket_anchors(raw, motion_set=action, frame=0)
+        m = anc["v_armet"].matrix
+        self.assertIsNotNone(m)
+        self.assertIn("idle action motion", anc["v_armet"].source)
+        scene = cv.c3_to_json(raw, body, motion_set=action, frame=0)
+        pts = []
+        for mesh in scene["meshes"]:
+            q = mesh["positions"]
+            pts += [(q[i], q[i + 1], q[i + 2]) for i in range(0, len(q), 3)
+                    if q[i + 2] > 150]
+        n = len(pts)
+        cx = sum(v[0] for v in pts) / n
+        cy = sum(v[1] for v in pts) / n
+        # The socket must sit within a couple of units of the head it is
+        # meant to be on, laterally. The bug was -2.9 in y.
+        self.assertLess(abs(m[12] - cx), 1.0, "lateral socket drift")
+        self.assertLess(abs(m[13] - cy), 1.0, "fore-aft socket drift")
+
+    def test_effect_keys_match_across_a_padding_change(self):
+        """CCO writes Action3DEffect's action field three wide, 6090 four
+        and zero-padded -- 999.100.135.999 against 999.0100.130.300, over
+        10,267 of 10,299 rows. A literal string compare misses every
+        non-wildcard row on 6090, which silenced every weapon and body
+        effect in the builder."""
+        import effects as fx
+        db = fx.EffectDB(ROOT, self.cat.assets)
+        self.assertEqual(fx.EffectDB._field_matches("0100", "100"), True)
+        self.assertEqual(fx.EffectDB._field_matches("100", "0100"), True)
+        self.assertEqual(fx.EffectDB._field_matches("0101", "100"), False)
+        # and the lookups it unblocks, on the real table
+        self.assertTrue(db.lookup_action_effect("410199", "401", shape="999"),
+                        "a weapon swing effect must resolve")
+        self.assertTrue(db.lookup_action_effect("130300", "100", shape="999"),
+                        "a body idle effect must resolve")
+
+    def test_the_super_aura_is_declared_by_an_effect_named_for_the_id(self):
+        """How 6090 says a weapon glows. CCO ships 826 always-on rows of
+        the form `999.999.410.009=410009` -- the effect is named after the
+        appearance id and the row exists only to point at it. 6090 ships
+        ZERO action-999 rows and declares the effect directly:
+        `3DEffect.ini [410199]` is Rainbow Blade Super's aura, and there is
+        no such section for 410195 or 410196.
+
+        The author confirmed the glow exists in the real client, which is the
+        only reason we kept looking after the table came up empty."""
+        import superfx
+        db = superfx.SuperFxDB(ROOT, self.cat.assets)
+        for ident in ("410199", "410099", "410009"):
+            self.assertEqual(db.effect_name(ident), ident,
+                             f"{ident} is a Super and must carry its aura")
+        for ident in ("410195", "410196", "410197", "410198"):
+            self.assertEqual(db.effect_name(ident), "",
+                             f"{ident} is not a Super and must not glow")
+        se = db.super_effect("410199", "l_weapon")
+        self.assertIsNotNone(se)
+        self.assertTrue(se.layers)
+
+    @unittest.expectedFailure
+    def test_socket_bases_cannot_flatten_a_weapon(self):
+        """OPEN BUG, asserted as expectedFailure so it cannot be forgotten.
+
+        A socket track's basis is neither unit nor orthogonal, and it varies
+        per dummy within one file: in c3/0002/000/100.c3 v_armet and
+        v_r_weapon are exact unit rotations while v_l_weapon's rows measure
+        (0.111, 0.149, 0.994), and at frame 24 of attack swing 3 that same
+        socket reads (0.999, 0.051, 0.056). One key per frame, so nothing
+        here is interpolation.
+
+        Three fixes were tried and all three were reverted, each trading one
+        artefact for another:
+
+          * Gram-Schmidt, longest axis first -- squared the basis but swung
+            an axis 43 degrees, holding weapons at impossible angles.
+          * per-row normalise, "short relative to its neighbours is noise"
+            -- discards two real directions at rest and invents a roll.
+          * per-row normalise against each axis's median across the motion
+            -- keeps directions and kills the flattening, but renders the
+            blade at full length, which is visibly too large.
+
+        The last one is the interesting failure: removing the scale gives a
+        120-unit sword and keeping it gives a 12-unit sliver, so the scale
+        is neither noise nor a pure size factor. Something in the chain
+        (world = Mbone x Msock x Mrole) is not what docs/attachment.md
+        describes, and the next step is reading Role3D's own composition
+        rather than fitting to screenshots -- which is what produced three
+        wrong answers in a row."""
+        import math
+        import parts as partsmod
+        raw = self.cat.assets.read("c3/mesh/002131090.c3")
+        act = partsmod.idle_motion("002131090", ROOT, "000", "403")
+        anc = partsmod.socket_anchors(raw, motion_set=act, frame=24)
+        m = anc["v_l_weapon"].matrix
+        lens = [math.sqrt(m[i] ** 2 + m[i + 1] ** 2 + m[i + 2] ** 2)
+                for i in (0, 4, 8)]
+        self.assertTrue(all(0.97 <= n <= 1.03 for n in lens),
+                        f"socket basis is not unit: {lens}")
+
+    def test_an_armed_body_plays_its_armed_motion(self):
+        """6090 ships none of CCO's per-(weapon set, action) alias rows, and
+        the lookup's fallback chain ends at the unarmed set 000 while
+        REPORTING SUCCESS -- so a club-wielding character was posed
+        empty-handed with no error raised anywhere. The set has to be
+        resolved before the fallback can hide the miss."""
+        import anim
+        db = anim.AnimDB(ROOT)
+        armed = db.clip("002131090", "100", weapon="480058")
+        self.assertIsNotNone(armed)
+        self.assertEqual(armed.path, "c3/0002/410/100.c3",
+                         "a club must animate from motion set 410")
+        bare = db.clip("002131090", "100")
+        self.assertEqual(bare.path, "c3/0002/000/100.c3",
+                         "and an empty hand must still use set 000")
+        bow = db.clip("002131090", "100", weapon="500019")
+        self.assertEqual(bow.path, "c3/0002/500/100.c3")
+
+    def test_the_right_weapon_socket_is_the_trustworthy_one(self):
+        """The finding that ended a four-round hunt. In the SAME motion file,
+        v_r_weapon and v_armet are bit-identical to CCO's (difference
+        0.00000) while v_l_weapon's basis was rewritten -- determinant 0.017
+        against CCO's clean rotation, and not a scaled version of it. So
+        right-hand placement is provably correct here and left-hand is not
+        recoverable by any normalisation."""
+        import math
+        import parts as partsmod
+        raw = self.cat.assets.read("c3/mesh/001131090.c3")
+        act = partsmod.idle_motion("001131090", ROOT, "480", "100")
+        self.assertIsNotNone(act, "the armed motion must resolve")
+        anc = partsmod.socket_anchors(raw, motion_set=act, frame=0)
+        for name, unit in (("v_r_weapon", True), ("v_armet", True),
+                           ("v_l_weapon", False)):
+            m = anc[name].matrix
+            lens = [math.sqrt(m[i] ** 2 + m[i + 1] ** 2 + m[i + 2] ** 2)
+                    for i in (0, 4, 8)]
+            near = all(0.97 <= n <= 1.03 for n in lens)
+            self.assertEqual(near, unit,
+                             f"{name} unit-ness changed: {lens}")
+
+    def test_no_payload_carries_a_token_javascript_cannot_parse(self):
+        """One NaN normal took down monsters 321, 322, 323 and 808: the
+        page's JSON.parse threw, so it kept the previous stage and read as
+        "no motion ships, no model displays" for models the server had
+        rendered fine. JSON has no NaN literal; the serialiser must not
+        emit one."""
+        import coviewer as cv
+        raw = cv._json_bytes({"a": float("nan"), "b": [float("inf"), 1.5],
+                              "c": {"d": float("-inf")}}).decode()
+        self.assertNotIn("NaN", raw)
+        self.assertNotIn("Infinity", raw)
+        self.assertEqual(json.loads(raw),
+                         {"a": 0.0, "b": [0.0, 1.5], "c": {"d": 0.0}})
+
+    def test_dropped_labels_do_not_claim_the_wrong_entity(self):
+        """109 was labelled a shopkeeper it does not resemble, and 141
+        BanditMessenger, whose art is monster 201's colourway. A numeric
+        label is the honest answer until the real name is known."""
+        for d in ("109", "301", "218"):
+            self.assertEqual(self._model(f"monster:{d}").label,
+                             f"Monster {d}", d)
+        for d, name in (("133", "Ganoderma"), ("134", "RareMeteorDove"),
+                        ("141", "Mimic"), ("209", "FireMonster")):
+            self.assertEqual(self._model(f"monster:{d}").label,
+                             f"{name} ({d})", d)
+
+
+class CrossLayoutSwap(unittest.TestCase):
+    """Swapping a model into a family that files its art differently.
+
+    The client ships two layouts and they do not mix:
+
+      per-action   PHY + MOTI in the SAME file, one per action. The flat NPC
+                   family (`c3/npc/999<look><action>.c3`) is this.
+      skeleton     one mesh file, and MOTI-only action files beside it.
+                   `c3/npc/001/1.c3` + `100.c3`/`101.c3` is this.
+
+    Staging the second into the first replaced files that each carry their
+    own geometry with files that carry none, so those actions lost their
+    model and the client animated whatever it still had. Reported as "the
+    animations changed but the mesh and texture did not" -- an exactly
+    correct description of a swap that cannot work in that shape.
+
+    Composing is what makes it expressible: the donor's mesh goes into every
+    action file, alongside that action's motion.
+    """
+
+    MAGIC = b"MAXFILE C3 00001"
+
+    def _c3(self, *chunks) -> bytes:
+        out = bytearray(self.MAGIC)
+        for tag, body in chunks:
+            out += tag + len(body).to_bytes(4, "little") + body
+        return bytes(out)
+
+    def setUp(self):
+        import collection
+        self.mod = collection
+        # A PHY4 body only has to be *carried*, not parsed, by compose.
+        self.mesh = self._c3((b"PHY4", b"GEOMETRY"), (b"MOTI", b"idle"))
+        self.action = self._c3((b"MOTI", b"walk-cycle"))
+
+    def test_layout_of_names_the_three_shapes(self):
+        self.assertEqual(self.mod.layout_of(self.mesh), "per-action")
+        self.assertEqual(self.mod.layout_of(self.action), "motion-only")
+        self.assertEqual(self.mod.layout_of(self._c3((b"PHY4", b"G"))), "mesh")
+
+    def test_composing_carries_the_mesh_and_the_action(self):
+        import coassets
+        out = self.mod.compose_action(self.mesh, self.action)
+        chunks = coassets.C3File(out, strict=False).chunks
+        self.assertEqual([c.tag for c in chunks], [b"PHY4", b"MOTI"],
+                         "per-action files are PHY then MOTI")
+        self.assertEqual(chunks[0].body, b"GEOMETRY", "the donor's mesh")
+        self.assertEqual(chunks[1].body, b"walk-cycle",
+                         "this action's motion, not the mesh's own idle")
+        self.assertEqual(self.mod.layout_of(out), "per-action")
+
+    def test_it_refuses_to_pair_chunks_it_would_have_to_guess_at(self):
+        """MOTI binds to PHY by ordinal, so unequal counts have no answer --
+        and silently pairing them would animate one submesh with another's
+        track, which looks like a subtle rigging bug rather than a bad
+        assumption."""
+        two_geom = self._c3((b"PHY4", b"A"), (b"PHY4", b"B"), (b"MOTI", b"m"))
+        with self.assertRaises(self.mod.LayoutError):
+            self.mod.compose_action(two_geom, self.action)
+        with self.assertRaises(self.mod.LayoutError):
+            self.mod.compose_action(self._c3((b"MOTI", b"m")), self.action)
+        with self.assertRaises(self.mod.LayoutError):
+            self.mod.compose_action(self.mesh, self._c3((b"PHY4", b"G")))
+
+    def test_staging_composes_only_where_the_target_needs_it(self):
+        """A skeleton-layout target wants the motion file as-is; composing
+        there would put geometry in a file the client expects not to have
+        any."""
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        col = self.mod.Collection(d)
+        e = col.add(category="NPCs", name="donor",
+                    mesh_bytes=self.mesh, mesh_name="1.c3",
+                    skins=[], server="z", source_mesh="c3/npc/001/1.c3",
+                    parts=[("motion", "101.c3", "c3/npc/001/101.c3",
+                            self.action)])
+
+        per_action = {"c3/npc/999001101.c3": self.mesh}       # carries geometry
+        skeleton = {"c3/npc/002/101.c3": self.action}         # motion only
+
+        r = col.stage(e["id"], d / "stage-flat",
+                      swap_for="c3/npc/999001100.c3",
+                      read_target=lambda p: per_action.get(p))
+        self.assertTrue(r.get("composed"), "the flat family needs composing")
+        out = (d / "stage-flat" / "c3/npc/999001101.c3").read_bytes()
+        self.assertEqual(self.mod.layout_of(out), "per-action")
+
+        r2 = col.stage(e["id"], d / "stage-dir",
+                       swap_for="c3/npc/002/1.c3",
+                       read_target=lambda p: skeleton.get(p))
+        self.assertFalse(r2.get("composed"),
+                         "a skeleton target takes the action file unchanged")
+        out2 = (d / "stage-dir" / "c3/npc/002/101.c3").read_bytes()
+        self.assertEqual(self.mod.layout_of(out2), "motion-only")
+
+
+class TwoInstalls(unittest.TestCase):
+    """Installing a mod into more than one client.
+
+    Backups and the manifest were single global paths under `mods/`, which
+    was survivable only while there was exactly one place to install to.
+    With two, installing to B overwrote A's manifest, and the `if not
+    b.exists()` guard meant B's originals were never backed up at all -- so
+    reverting B restored *A's* files into it. Uninstall made it worse by
+    ignoring the root the manifest recorded, because `--root` carried a
+    default and `args.root or man["root"]` therefore always took the default.
+
+    None of that needs a game install to demonstrate: an install root is a
+    directory that gets written to.
+    """
+
+    def setUp(self):
+        import comod
+        import errno as _errno
+        import shutil as _shutil
+        globals().setdefault("errno", _errno)
+        globals().setdefault("shutil", _shutil)
+        self.comod = comod
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self._orig = (comod.STAGE, comod.INSTALLS,
+                      comod.LEGACY_BACKUP, comod.LEGACY_MANIFEST)
+        comod.STAGE = base / "stage"
+        comod.INSTALLS = base / "installs"
+        comod.LEGACY_BACKUP = base / "backup"
+        comod.LEGACY_MANIFEST = base / "manifest.json"
+        self.a = base / "instA"
+        self.b = base / "instB"
+        for root, body in ((self.a, b"ORIGINAL-A"), (self.b, b"ORIGINAL-B")):
+            (root / "c3" / "npc").mkdir(parents=True)
+            (root / "c3" / "npc" / "1.c3").write_bytes(body)
+        (comod.STAGE / "c3" / "npc").mkdir(parents=True)
+        (comod.STAGE / "c3" / "npc" / "1.c3").write_bytes(b"MODDED")
+
+    def tearDown(self):
+        (self.comod.STAGE, self.comod.INSTALLS,
+         self.comod.LEGACY_BACKUP, self.comod.LEGACY_MANIFEST) = self._orig
+        self.tmp.cleanup()
+
+    def _run(self, *argv) -> int:
+        return self.comod.main(list(argv))
+
+    def _installed(self, root) -> bytes:
+        return (Path(root) / "c3" / "npc" / "1.c3").read_bytes()
+
+    def test_each_install_keeps_its_own_original(self):
+        """The load-bearing one. Both installs hold a *different* file at the
+        same logical path, which is the case a shared backup directory
+        silently collapses."""
+        self._run("--root", str(self.a), "install", "--yes")
+        self._run("--root", str(self.b), "install", "--yes")
+        got = {}
+        for root, name in ((self.a, "A"), (self.b, "B")):
+            p = self.comod.backup_dir(root) / "c3" / "npc" / "1.c3"
+            got[name] = p.read_bytes()
+        self.assertEqual(got, {"A": b"ORIGINAL-A", "B": b"ORIGINAL-B"})
+
+    def test_reverting_one_restores_that_one(self):
+        self._run("--root", str(self.a), "install", "--yes")
+        self._run("--root", str(self.b), "install", "--yes")
+        self.assertEqual(self._installed(self.a), b"MODDED")
+        self._run("--root", str(self.a), "uninstall", "--yes")
+        self.assertEqual(self._installed(self.a), b"ORIGINAL-A")
+        self.assertEqual(self._installed(self.b), b"MODDED",
+                         "reverting A must not touch B")
+        self._run("--root", str(self.b), "uninstall", "--yes")
+        self.assertEqual(self._installed(self.b), b"ORIGINAL-B")
+
+    def test_an_ambiguous_revert_refuses_rather_than_picking(self):
+        """With two installs on record and no `--root`, the old code reverted
+        against whichever install was conventional -- deleting files there
+        that were installed elsewhere."""
+        self._run("--root", str(self.a), "install", "--yes")
+        self._run("--root", str(self.b), "install", "--yes")
+        self.assertEqual(self._run("uninstall", "--yes"), 1)
+        self.assertEqual(self._installed(self.a), b"MODDED")
+        self.assertEqual(self._installed(self.b), b"MODDED")
+
+    def test_a_single_install_still_needs_no_ceremony(self):
+        self._run("--root", str(self.a), "install", "--yes")
+        self.assertEqual(self._run("uninstall", "--yes"), 0)
+        self.assertEqual(self._installed(self.a), b"ORIGINAL-A")
+
+    def test_installing_twice_without_reverting_is_refused(self):
+        """The second install's "originals" would be the first install's
+        files, and recording those as the originals makes the revert a lie."""
+        self._run("--root", str(self.a), "install", "--yes")
+        with self.assertRaises(SystemExit):
+            self._run("--root", str(self.a), "install", "--yes")
+
+    def test_a_pre_split_manifest_is_migrated_not_stranded(self):
+        """Upgrading with a live install must not lose the ability to revert
+        it -- the old layout recorded its root, so the slot is known."""
+        self.comod.LEGACY_BACKUP.joinpath("c3", "npc").mkdir(parents=True)
+        self.comod.LEGACY_BACKUP.joinpath(
+            "c3", "npc", "1.c3").write_bytes(b"ORIGINAL-A")
+        self.comod.LEGACY_MANIFEST.write_text(json.dumps({
+            "installed_utc": "2026-01-01T00:00:00+00:00",
+            "root": str(self.a),
+            "files": [{"logical": "c3/npc/1.c3", "displaced_loose": True}],
+        }), "utf-8")
+        (self.a / "c3" / "npc" / "1.c3").write_bytes(b"MODDED")
+        self.assertEqual(self._run("--root", str(self.a), "uninstall", "--yes"), 0)
+        self.assertEqual(self._installed(self.a), b"ORIGINAL-A")
+
+    # -- failing partway ----------------------------------------------------
+
+    def test_a_refused_install_says_so_before_writing_anything(self):
+        """`C:\\Program Files` is readable and not writable, and finding that
+        out from a PermissionError mid-loop leaves files installed with no
+        manifest -- installed, and unrevertable by the tool that put them
+        there. One probe up front instead."""
+        import builtins
+        real_open = builtins.open
+
+        def deny(path, mode="r", *a, **kw):
+            if "w" in mode and ".comod-write-test-" in str(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, mode, *a, **kw)
+
+        with unittest.mock.patch("pathlib.Path.write_bytes",
+                                 side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(SystemExit) as cm:
+                self._run("--root", str(self.a), "install", "--yes")
+        self.assertIn("Administrator", str(cm.exception))
+        self.assertEqual(self._installed(self.a), b"ORIGINAL-A")
+        self.assertFalse(self.comod.manifest_path(self.a).exists())
+
+    def test_a_failure_partway_rolls_back_rather_than_stranding(self):
+        """The state a mid-loop failure used to leave -- some files installed,
+        no manifest -- is the one `uninstall` cannot help with."""
+        (self.comod.STAGE / "c3" / "npc" / "2.c3").write_bytes(b"MODDED-2")
+        (self.a / "c3" / "npc" / "2.c3").write_bytes(b"ORIGINAL-A2")
+        real = shutil.copy2
+        calls = {"n": 0}
+
+        def flaky(src, dst, *a, **kw):
+            # Let the backups and the first install through, then fail once on
+            # a write into the install itself -- and only once, so the rollback
+            # that follows can actually run. That is the realistic shape: the
+            # blanket refusal (\\Program Files) is caught by the pre-flight
+            # probe before any write, so what reaches this path is a failure
+            # on one file -- the running game holding it open, a full disk --
+            # with the rest of the tree still writable.
+            if not calls.get("raised") and str(dst).startswith(str(self.a)):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    calls["raised"] = True
+                    raise OSError(errno.EACCES, "denied")
+            return real(src, dst, *a, **kw)
+
+        with unittest.mock.patch.object(shutil, "copy2", side_effect=flaky):
+            rc = self._run("--root", str(self.a), "install", "--yes")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._installed(self.a), b"ORIGINAL-A")
+        self.assertEqual((self.a / "c3" / "npc" / "2.c3").read_bytes(),
+                         b"ORIGINAL-A2")
+        self.assertFalse(self.comod.manifest_path(self.a).exists(),
+                         "a rolled-back install must leave no record")
+
+    def test_a_dry_run_leaves_no_slot_behind(self):
+        """An empty slot reads as "something is installed here" everywhere
+        that lists them."""
+        self._run("--root", str(self.a), "install", "--dry-run")
+        self.assertFalse(self.comod.install_dir(self.a).exists())
+
+    # -- resolving the target ----------------------------------------------
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_target_is_resolved_against_the_install_not_the_open_view(self):
+        """The bug this exists to stop.
+
+        A swap TARGET is a path in the install being modded. `_skin_target`
+        resolved it against whatever view was open -- and picking a collected
+        entry *requires* having the Collection open, where the target path
+        does not exist. So it returned nothing, `Collection.stage` fell back
+        to the DONOR's layout, and a Zephyr NPC (skin beside its mesh) staged
+        over the flat family put its skin at `c3/npc/999001100.dds`, which no
+        part of the client reads.
+
+        Checked with a view that is deliberately NOT the baseline, because
+        with the baseline open the bug is invisible.
+        """
+        import coviewer
+
+        base = coviewer.Catalog(ROOT)
+
+        class Empty:
+            """Stands in for any view the target is absent from."""
+            all_paths: list = []
+
+            def texture_for_mesh(self, p):
+                return None
+
+            def exists(self, p):
+                return False
+
+        class Stub(coviewer.Handler):
+            def __init__(self, active):
+                self.server = type("S", (), {
+                    "views": {"": base}, "game_root": ROOT,
+                    "view_lock": threading.Lock(), "catalog": active})()
+
+        target = "c3/npc/999001100.c3"
+        # Was `c3/texture/9990010.dds` when this was written -- the answer the
+        # resolver gave then, and the wrong one. The client loads 9990211,
+        # reached through the tables (`NpcArtTables`). The property under test
+        # is unchanged: resolution must use the INSTALL, not the open view.
+        want = "c3/texture/9990211.dds"
+        self.assertEqual(Stub(base)._skin_target(target), want,
+                         "baseline view: the case that already worked")
+        self.assertEqual(Stub(Empty())._skin_target(target), want,
+                         "a view without the target must still resolve it "
+                         "against the install")
+
+    # -- what counts as somewhere a mod can go -----------------------------
+
+    def test_a_datpkg_client_is_a_valid_target(self):
+        """`coroot.looks_like_root` demands c3.wdf, data.wdf and bin/64 --
+        which the community clients this project exists to support do not
+        have. Using it as the install gate refused the second client."""
+        z = Path(self.tmp.name) / "zephyr"
+        (z / "ini").mkdir(parents=True)
+        (z / "c3.tpi").write_bytes(b"x")
+        self.assertTrue(self.comod.moddable_install(z)["ok"])
+
+    def test_a_folder_that_is_not_a_client_is_refused(self):
+        plain = Path(self.tmp.name) / "documents"
+        plain.mkdir()
+        r = self.comod.moddable_install(plain)
+        self.assertFalse(r["ok"])
+        self.assertIn("ini/", r["missing"])
+
+
+class CollectedActions(unittest.TestCase):
+    """A collected model's action list.
+
+    The old client keeps a model's actions in `100.c3`/`101.c3` beside it.
+    The Collection cannot: one category folder holds every entry on that
+    shelf, so the second NPC you collect would overwrite the first one's
+    walk cycle.  `collection.py` prefixes each part with its entry instead.
+
+    The consequence, and the bug: a scanner that only recognised 3-digit
+    names found no actions at all for exactly the models whose motion files
+    had been collected deliberately, and the viewer fell back to a container's
+    own MOTI -- which for these is a two-frame bind pose.
+
+    Needs no install: the subject is a naming rule over a path listing.
+    """
+
+    #: One shelf, three entries, each with its own actions -- the arrangement
+    #: that makes "which of these belong to this model" a real question.
+    PATHS = [
+        "collection/npcs/zephyr-npc-001.c3",
+        "collection/npcs/zephyr-npc-001.dds",
+        "collection/npcs/zephyr-npc-001__motion-100.c3",
+        "collection/npcs/zephyr-npc-001__motion-101.c3",
+        "collection/npcs/zephyr-npc-001__motion-190.c3",
+        "collection/npcs/zephyr-npc-002.c3",
+        "collection/npcs/zephyr-npc-002__motion-100.c3",
+        "collection/npcs/zephyr-npc-003.c3",
+        "collection/npcs/zephyr-npc-003__effect-aura.c3",
+    ]
+
+    CLIENT_PATHS = [
+        "c3/npc/001/1.c3",
+        "c3/npc/001/100.c3",
+        "c3/npc/001/110.c3",
+        "c3/npc/001/2.c3",              # a second model, not an action
+    ]
+
+    #: The third layout: one flat directory, `999<look><action>`, plus the
+    #: stray `1.c3` that actually sits in `c3/npc/` and the family's own
+    #: base files, which carry no action code.
+    FLAT_PATHS = [
+        "c3/npc/1.c3",
+        "c3/npc/999001100.c3",
+        "c3/npc/999001101.c3",
+        "c3/npc/999001190.c3",
+        "c3/npc/999002100.c3",
+        "c3/npc/999002101.c3",
+        "c3/npc/9990110100.c3",         # a 4-digit look
+        "c3/npc/9990110190.c3",
+        "c3/npc/999118.c3",             # base file, no action
+    ]
+
+    def _actions(self, logical, paths):
+        import coviewer
+
+        class Stub(coviewer.Handler):
+            def __init__(self, rows):
+                self.server = type("S", (), {
+                    "catalog": type("C", (), {
+                        "list_under": staticmethod(
+                            lambda pre: [p for p in rows if p.startswith(pre)])
+                    })()})()
+
+        return Stub(paths)._sibling_actions(logical)
+
+    def test_a_collected_model_finds_the_motion_files_collected_with_it(self):
+        got = self._actions(self.PATHS[0], self.PATHS)
+        self.assertEqual([a["code"] for a in got], ["100", "101", "190"])
+        self.assertEqual(got[0]["path"],
+                         "collection/npcs/zephyr-npc-001__motion-100.c3")
+
+    def test_the_codes_still_carry_their_labels(self):
+        """The prefix is stripped down to the client's own action code, so
+        the list reads "100 — stand" rather than a filename."""
+        got = {a["code"]: a["label"] for a in self._actions(self.PATHS[0],
+                                                           self.PATHS)}
+        self.assertEqual(got["100"], "stand")
+        self.assertEqual(got["190"], "special")
+
+    def test_one_shelf_does_not_lend_its_neighbours_actions(self):
+        """The load-bearing one. The prefix is matched against *this* mesh's
+        stem, so a folder of six collected NPCs offers each its own three
+        actions rather than all eighteen."""
+        got = self._actions("collection/npcs/zephyr-npc-002.c3", self.PATHS)
+        self.assertEqual([a["path"] for a in got],
+                         ["collection/npcs/zephyr-npc-002__motion-100.c3"])
+
+    def test_a_collected_effect_is_not_offered_as_an_action(self):
+        """Parts are collected by role. Only `motion` binds over geometry;
+        an effect is a scene of its own and would not play here."""
+        self.assertEqual(self._actions("collection/npcs/zephyr-npc-003.c3",
+                                       self.PATHS), [])
+
+    def test_the_client_layout_still_works(self):
+        """The reason this is an added rule and not a replaced one: a staged
+        entry goes back to the client's names, and the baseline never left
+        them."""
+        got = self._actions("c3/npc/001/1.c3", self.CLIENT_PATHS)
+        self.assertEqual([a["code"] for a in got], ["100", "110", "2"])
+
+    def test_a_texture_is_never_an_action(self):
+        for row in self._actions(self.PATHS[0], self.PATHS):
+            self.assertTrue(row["path"].endswith(".c3"), row)
+
+    # -- the flat family ---------------------------------------------------
+    def test_the_flat_npc_family_finds_its_own_actions(self):
+        """`base-storekeeper-36` kept no animation at all. Its layout is one
+        flat directory keyed `999<look><action>`: nine digits is not "four or
+        fewer", so nothing matched, and the directory holds 127 files, so the
+        content-folder cap would have discarded anything that did."""
+        got = self._actions("c3/npc/999001100.c3", self.FLAT_PATHS)
+        self.assertEqual([a["code"] for a in got], ["101", "190"])
+        self.assertEqual(got[0]["label"], "stand (alt)")
+
+    def test_a_flat_look_does_not_answer_for_its_neighbours(self):
+        got = self._actions("c3/npc/999002100.c3", self.FLAT_PATHS)
+        self.assertEqual([a["path"] for a in got], ["c3/npc/999002101.c3"])
+
+    def test_a_four_digit_look_is_kept_apart_from_a_three_digit_one(self):
+        """`9990110100` is look 0110, not look 011 -- the prefixes are
+        compared whole, so the two families cannot borrow from each other."""
+        got = self._actions("c3/npc/9990110100.c3", self.FLAT_PATHS)
+        self.assertEqual([a["path"] for a in got], ["c3/npc/9990110190.c3"])
+
+    def test_the_stray_file_in_the_flat_directory_is_not_an_action(self):
+        """`c3/npc/1.c3` really is there. The short-numeric rule would offer
+        it as "action 1" of every NPC in the directory, so knowing the mesh's
+        layout has to switch that guess off rather than sit beside it."""
+        for row in self._actions("c3/npc/999001100.c3", self.FLAT_PATHS):
+            self.assertNotEqual(row["path"], "c3/npc/1.c3")
+
+    def test_a_base_file_with_no_action_code_is_not_read_as_one(self):
+        """`999118.c3` is geometry for look 118. Reading its last three
+        digits as an action would file it under look 999, which is the
+        family prefix, not a look."""
+        import collection as _c
+        self.assertFalse(_c._is_flat_action("999118"))
+        self.assertFalse(_c._is_flat_action("9990217"))
+        self.assertTrue(_c._is_flat_action("999001100"))
+
+    def test_an_action_takes_the_targets_name_when_the_name_carries_it(self):
+        """The swap's load-bearing rename. Staging look 001 over look 002
+        while its actions keep their own names writes `999001101.c3`, which
+        replaces the *donor's* walk cycle and leaves the target's alone --
+        the swap then plays the old animation, or none."""
+        import collection as _c
+        self.assertEqual(
+            _c.action_target_name("999002100", "101"), "999002101.c3")
+        # the per-look layout names the file after the code and nothing else
+        self.assertEqual(_c.action_target_name("1", "100"), "100.c3")
+
+
 class CoreBoundary(unittest.TestCase):
     """COre must stay extractable, which means it must not reach upwards.
 
@@ -5790,7 +7834,8 @@ class CoreBoundary(unittest.TestCase):
     #: The declared members. Kept here rather than globbed so that *adding* a
     #: module to COre is a deliberate act with a test change attached.
     MEMBERS = {"coroot", "safepath", "tqhash", "wdf", "dds", "c3phy",
-               "dmap", "tpd", "coassets", "colibrary"}
+               "dmap", "tpd", "coassets", "colibrary", "collection", "wdb",
+               "dbc", "npcart", "tqdat"}
 
     def test_the_directory_holds_exactly_the_declared_modules(self):
         on_disk = {p.stem for p in self.CORE.glob("*.py")}
@@ -5895,6 +7940,156 @@ class ConfinementIsActuallyWired(unittest.TestCase):
         self.assertIn("safepath", src)
         self.assertNotIn("target = root / logical", src,
                          "install/uninstall must go through safepath.confine")
+
+
+@unittest.skipUnless(HAVE_TILESET, "tools/tileset.py not present in this tree")
+class TileSetForTheClient(unittest.TestCase):
+    """`tools/tileset.py` -- the manifest + DXT bundle behind the page's
+    client-side ground compositing (`webui/tilebake.js`, docs/map_memory.md).
+
+    The contract under test: entry offsets are dense and ordered, every
+    payload size is the DXT arithmetic and nothing else, the slot grid
+    round-trips through its base64, and a tile that cannot be read is left
+    out rather than shipped short.
+    """
+
+    @staticmethod
+    def _dds(w, h, fourcc, fill):
+        """A minimal DDS: magic + 124-byte header + one DXT mip level."""
+        import struct as st
+        import tileset
+        hdr = bytearray(tileset.DDS_DATA_OFFSET)
+        hdr[0:4] = b"DDS "
+        st.pack_into("<I", hdr, 4, 124)
+        st.pack_into("<II", hdr, 12, h, w)                # height, then width
+        hdr[84:88] = fourcc.encode("ascii")
+        return bytes(hdr) + bytes([fill]) * tileset.dxt_payload_size(fourcc, w, h)
+
+    def _pm(self):
+        import puzzle
+        pm = _synthetic_puzzle(pul_w=3, pul_h=2)
+        # Slots: two distinct tiles, one EMPTY, one index with no art behind
+        # it (7), and tile 5 reused -- the dedup the whole design rides on.
+        pm.tiles = [5, puzzle.EMPTY, 9, 5, 7, 5]
+        pm.frames = {5: "data/t5.dds", 9: "data/t9.dds", 7: "data/gone.dds"}
+
+        class FakeAssets:
+            blobs = {"data/t5.dds": self._dds(256, 256, "DXT1", 0xAA),
+                     "data/t9.dds": self._dds(256, 256, "DXT3", 0xBB)}
+            def read(self, path):
+                return self.blobs[path]
+        pm.assets = FakeAssets()
+        return pm
+
+    def test_the_dxt_arithmetic(self):
+        import tileset
+        self.assertEqual(tileset.dxt_payload_size("DXT1", 256, 256), 32768)
+        self.assertEqual(tileset.dxt_payload_size("DXT3", 256, 256), 65536)
+        self.assertEqual(tileset.dxt_payload_size("DXT1", 128, 128), 8192)
+        # Non-multiples of 4 round UP to whole blocks.
+        self.assertEqual(tileset.dxt_payload_size("DXT1", 130, 2), 33 * 1 * 8)
+
+    def test_offsets_are_dense_payloads_are_the_arithmetic(self):
+        import tileset
+        manifest, bundle = tileset.build(self._pm())
+        # Tile 7's art is unreadable: left out, not shipped short.
+        self.assertEqual([e["i"] for e in manifest["entries"]], [5, 9])
+        e5, e9 = manifest["entries"]
+        self.assertEqual((e5["off"], e5["size"], e5["fmt"]), (0, 32768, "DXT1"))
+        self.assertEqual((e9["off"], e9["size"], e9["fmt"]), (32768, 65536, "DXT3"))
+        self.assertEqual(manifest["bytes"], len(bundle))
+        self.assertEqual(e9["off"] + e9["size"], len(bundle))
+        # The bundle is the payloads, headers stripped, in entry order.
+        self.assertEqual(bundle[:e5["size"]], bytes([0xAA]) * e5["size"])
+        self.assertEqual(bundle[e9["off"]:], bytes([0xBB]) * e9["size"])
+
+    def test_the_slot_grid_round_trips(self):
+        import base64
+        import struct as st
+        import tileset
+        pm = self._pm()
+        manifest, _ = tileset.build(pm)
+        raw = base64.b64decode(manifest["slots"])
+        slots = st.unpack(f"<{len(raw) // 2}H", raw)
+        self.assertEqual(list(slots), pm.tiles)
+        self.assertEqual(manifest["empty"], 0xFFFF)
+
+    def test_the_full_bundle_extends_the_ground_bundle_in_place(self):
+        import tileset
+        pm = self._pm()
+        v1, ground = tileset.build(pm)
+        manifest, bundle = tileset.build_full(pm)
+        # The ground bundle is the prefix, entries untouched.
+        self.assertEqual(bundle[:len(ground)], ground)
+        self.assertEqual(manifest["entries"], v1["entries"])
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["bytes"], len(bundle))
+
+    def test_sprite_payloads_are_dedup_d_and_offsets_stay_dense(self):
+        import tileset
+
+        class FakePlaced:
+            def __init__(self, ani, title, x, y, d):
+                self.ani, self.title = ani, title
+                self._xy, self._d = (x, y), d
+                self.frame_interval = 0
+            def depth(self): return self._d
+            def sprite_origin(self, pm): return self._xy
+
+        class FakeScenery:
+            # two covers sharing one sprite, one scene with its own
+            scenes = [FakePlaced("a.ani", "S", 10, 20, 1)]
+            covers = [FakePlaced("a.ani", "C", 30, 40, 2),
+                      FakePlaced("a.ani", "C", 50, 60, 3)]
+
+        class FakeSprites:
+            def frame_paths(self, ani, key):
+                return {"S": ["data/sc.dds"], "C": ["data/cv.dds"]}[key]
+
+        pm = self._pm()
+        pm.assets.blobs["data/sc.dds"] = self._dds(128, 64, "DXT3", 0xCC)
+        pm.assets.blobs["data/cv.dds"] = self._dds(64, 64, "DXT1", 0xDD)
+        manifest, bundle = tileset.build_full(pm, FakeScenery(), FakeSprites())
+        # Two distinct sprites, though three placements use them.
+        self.assertEqual(len(manifest["sprites"]), 2)
+        self.assertEqual(len(manifest["scenes"]), 1)
+        self.assertEqual(len(manifest["covers"]), 2)
+        # The two covers share entry index -- dedup by path.
+        c0, c1 = manifest["covers"]
+        self.assertEqual(c0["frames"], c1["frames"])
+        self.assertEqual((c0["x"], c0["y"]), (30, 40))
+        # Offsets are dense through ground + sprites and end at the bundle.
+        off = 0
+        for e in manifest["entries"] + manifest["sprites"]:
+            self.assertEqual(e["off"], off)
+            off += e["size"]
+        self.assertEqual(off, len(bundle))
+        # Every placement's frames point at real sprite entries.
+        ids = {e["i"] for e in manifest["sprites"]}
+        for p in manifest["scenes"] + manifest["covers"]:
+            self.assertTrue(set(p["frames"]) <= ids)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_a_real_city_map_builds_a_consistent_bundle(self):
+        import puzzle
+        import tileset
+        pm = puzzle.PuzzleLibrary().get("newplain")     # Twin City, the worst case
+        if pm is None:
+            self.skipTest("newplain has no placeable puzzle here")
+        manifest, bundle = tileset.build(pm)
+        self.assertTrue(manifest["consistent"])
+        self.assertEqual(manifest["bytes"], len(bundle))
+        off = 0
+        for e in manifest["entries"]:
+            self.assertEqual(e["off"], off, "offsets must be dense")
+            self.assertEqual(e["size"],
+                             tileset.dxt_payload_size(e["fmt"], e["w"], e["h"]))
+            off += e["size"]
+        # Every non-empty slot the client will look up resolves to an entry.
+        have = {e["i"] for e in manifest["entries"]}
+        used = {t for t in pm.tiles if t != puzzle.EMPTY}
+        self.assertEqual(used - have, set(),
+                         "a slot the client can see has no tile in the bundle")
 
 
 if __name__ == "__main__":

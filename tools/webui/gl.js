@@ -310,6 +310,12 @@ class Viewer {
     });
     window.addEventListener('mousemove', e => {
       if (!drag) return;
+      // `lockInput` takes the camera away from the mouse entirely -- no
+      // orbit, no pan, not even with Ctrl or the right button. The game view
+      // sets it because the camera belongs to the character, and a drag that
+      // silently slid the world was the thing to stop. The wheel is left
+      // alone: zoom is not movement.
+      if (this.lockInput) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       drag.x = e.clientX; drag.y = e.clientY;
       if (drag.btn === 2 || drag.shift || e.ctrlKey) {
@@ -331,7 +337,11 @@ class Viewer {
     c.addEventListener('wheel', e => {
       e.preventDefault();
       this.cam.dist *= Math.exp(e.deltaY * 0.0012);
-      this.cam.dist = Math.max(this.radius * 0.05, Math.min(this.radius * 40, this.cam.dist));
+      // zoomMin/zoomMax override the radius-derived clamp; the game view
+      // sets zoomMax to the whole map once its art is resident.
+      this.cam.dist = Math.max(this.zoomMin || this.radius * 0.05,
+                               Math.min(this.zoomMax || this.radius * 40,
+                                        this.cam.dist));
       this.draw();
       clearTimeout(this._wheelSave);
       this._wheelSave = setTimeout(() => this._saveCam(), 400);
@@ -976,6 +986,16 @@ class Viewer {
       gl.uniform1i(this.uni.uSolid, 0);
     }
 
+    // ---- world layers below the meshes --------------------------------
+    // An optional external pass (the tile ground, tools/webui/tilebake.js)
+    // draws in its own program; uniforms here are per-program state, so
+    // restoring the program is the whole hand-back.
+    if (this.hookGround) {
+      this.hookGround(mvp);
+      gl.useProgram(this.prog);
+      gl.activeTexture(gl.TEXTURE0);
+    }
+
     // ---- meshes -------------------------------------------------------
     const modeIdx = { unlit: 0, lit: 1, normals: 2, uv: 3 }[this.opts.shade] || 0;
     const alphaIdx = { blend: 0, test: 1, opaque: 2 }[this.opts.alpha] ?? 0;
@@ -1036,6 +1056,13 @@ class Viewer {
     if (overlayOn) {
       gl.depthFunc(gl.LEQUAL);
       gl.uniform1i(this.uni.uAlphaMode, alphaIdx);
+    }
+
+    // ---- world overlay above the meshes (COVER sprites) ---------------
+    if (this.hookOverlay) {
+      this.hookOverlay(mvp);
+      gl.useProgram(this.prog);
+      gl.activeTexture(gl.TEXTURE0);
     }
 
     if (this.opts.wire) {

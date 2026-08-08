@@ -29,10 +29,14 @@ version, all of it measured against this install rather than assumed:
     those 3,233 appearances, and no series is internally inconsistent.
     VERIFIED.
 
-  * Profession codes present in this build: 0, 11, 15, 21, 25, 40, 45, 143, 190.
-    No Ninja/Monk/Pirate codes exist here -- it really is the four classes plus
-    "any".  Read off item names and, decisively, weapon exclusivity: shields
-    (900xxx) are 21, bows (500xxx) are 40, backswords (421xxx) are 190.
+  * Profession codes are a fact about the *install*, not the game. CCO ships
+    0, 11, 15, 21, 25, 40, 45, 143, 190 -- four classes plus "any", no
+    Ninja/Monk/Pirate anywhere. The 6090 itemtype (24,270 rows, via the
+    decrypted .dat) adds 50 Ninja (katanas, scythes, Nobunaga claws), 60
+    Monk (prayer beads, Arhat/Nirvana frocks), 70 Pirate (InternPirateCoat
+    and up) and 80 DragonWarrior (nunchaku, hoods) -- each read off gear
+    vocabulary the way the original four were read off weapon exclusivity:
+    shields (900xxx) are 21, bows (500xxx) are 40, backswords (421xxx) 190.
 
 Nothing in this module writes anything or touches the game install.
 """
@@ -81,10 +85,15 @@ PROFESSION_CLASS: dict[int, str] = {
     11: "Trojan", 15: "Trojan",
     21: "Warrior", 25: "Warrior",
     40: "Archer", 45: "Archer",
+    50: "Ninja", 55: "Ninja",
+    60: "Monk", 65: "Monk",
+    70: "Pirate", 75: "Pirate",
+    80: "DragonWarrior", 85: "DragonWarrior",
     143: "Taoist", 190: "Taoist",
 }
 
-CLASS_ORDER = ["Warrior", "Trojan", "Taoist", "Archer", "any", "unknown"]
+CLASS_ORDER = ["Warrior", "Trojan", "Taoist", "Archer", "Ninja", "Monk",
+               "Pirate", "DragonWarrior", "any", "unknown"]
 GENDER_ORDER = ["female", "male", "other"]
 SIZE_ORDER = ["small", "large", "n/a"]
 
@@ -167,19 +176,23 @@ class BodyFacets:
     # ------------------------------------------------------------------
     def series_profession(self, series: str) -> Optional[int]:
         """The requiredProfession of a 3-digit armour series, or None when the
-        series has no items or its items disagree.
+        series has no items or its items disagree **at the class level**.
 
-        Returning None on disagreement rather than a majority vote is
+        Returning None on real disagreement rather than a majority vote is
         deliberate: a mixed series would mean the whole class axis is unsound
-        for it, and the user should see "unknown" rather than a guess.  As it
-        happens no series in this build is mixed.
+        for it, and the user should see "unknown" rather than a guess. But
+        tiers within one class are not disagreement -- CCO happened to keep
+        one code per series, while 6090 mixes 21 and 25 (both Warrior) in
+        series 131 -- so unanimity is judged on the class the codes map to,
+        and the lowest code stands in for the set.
         """
         c = self.series_prof.get(series)
         if not c:
             return None
-        if len(c) != 1:
+        classes = {PROFESSION_CLASS.get(p, "unknown") for p in c}
+        if len(classes) != 1:
             return None
-        return next(iter(c))
+        return min(c)
 
     def classify(self, ident: str) -> BodyRecord:
         r = BodyRecord(ident=ident)

@@ -1553,6 +1553,74 @@ is worse than no row.
 | **`npc_simple:217`** | Listed and withheld — see above. |
 | **`PTCL` / `PTC3` effects** | Unchanged from §4.5: 464 of 2,255 effects need particles for at least one layer and particles are still not decoded. Those layers draw nothing and the panel says so. |
 
+### Two lists, because one convention cannot reach everything
+
+The **Catalogue** list is discovered from the client's own directory layout —
+`c3/monster/<id>/`, `c3/npc/<id>/` and friends. That is what makes it a list of
+*models* rather than of files, and it is also its limit: art filed any other
+way is invisible to it. A recovered garment archive is. So is the Collection,
+where a kept model lives at `collection/<category>/<entry>.c3`.
+
+**By path** is the other list: every `.c3` under a prefix in the selected view,
+with clickable folders, opening as an ad-hoc mesh — the same route a `#mesh=`
+link takes, which is what puts geometry with no catalogue entry on the stage at
+all. An entry's own action files are filtered out of it; listing three
+collected NPCs alongside their eighteen motion files is a folder that reads as
+noise.
+
+The **Server** picker sits in the builder's header for the same reason it sits
+in the browser's. The active view is one process-wide choice shared by both
+pages, so this stage was always drawing from *some* namespace with no way to
+say which, and no way to reach the Collection's without going via the other
+page. Switching reloads: the model list, the appearance tables and every
+cached clip are derived from it.
+
+### Staging is on this page now
+
+The builder could collect and nothing else — no replace, no remove, no
+drawer. That is what "my mod staging is gone" describes from the page where
+you actually look at a model and decide it should stand in for another one;
+staging had only ever been built on the asset browser.
+
+Both pages now load `tools/webui/swap.js`: the **Replace** panel (target
+path, and tickboxes for whether the skin, the animations and the effects
+travel with it) and the **Mod staging** drawer, one implementation. Porting
+the drawer into `builder.js` instead would have made a second copy, and this
+project has already paid for that once — see `action_code` below.
+
+The panel asks where the skin goes only when that cannot be derived, because
+for most entries it can, and a field that is usually noise stops being read
+when it matters.
+
+### A collected model's actions, and the two-frame pose
+
+The client splits geometry from animation — `c3/npc/001/1.c3` is the model and
+`100.c3`/`101.c3`/`190.c3` beside it are MOTI-only action files binding over it
+by ordinal. **The Collection cannot keep those filenames.** One category folder
+holds every entry on that shelf, so the second NPC you collect would overwrite
+the first one's walk cycle; `collection.py` prefixes each part with the entry
+it belongs to (`zephyr-npc-001__motion-100.c3`).
+
+`_sibling_actions` therefore does not decide this at all: it asks
+`collection.action_code`, which is the same function `gather_parts` asks, so
+what the viewer offers to play is by construction what collecting would keep.
+Three layouts, and the rule had been written twice — once here and once
+there — which is exactly how one copy came to know about the Collection's
+naming while the other still did not. `docs/assets.md` §8 has the table.
+
+The match is anchored on *this* mesh's stem rather than merely stripping a
+prefix, so a folder of six collected NPCs offers each model its own three
+actions instead of all eighteen.
+
+What was left when it found none was the container's **own MOTI track**, and
+that is a bind pose: measured on a collected NPC, **2 frames against the 50,
+120 and 120 of its three real actions**. It plays, it just has nothing to show
+— which read as "animation is broken" rather than "the clips are in the ACTION
+list". So the option now says what it holds (`this file's own track (2 frames —
+a pose)`), and a mesh whose own track is a pose opens on its first real action.
+Once, and only when nothing was chosen: selecting the pose back deliberately
+has to stick.
+
 ### Keyboard, and links
 
 <kbd>M</kbd> switches mode. In model mode <kbd>↑</kbd><kbd>↓</kbd> walks the

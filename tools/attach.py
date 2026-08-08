@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -51,6 +52,28 @@ import effects as fx                                      # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, parse_ini   # noqa: E402
 
 Mat4 = tuple
+
+def socket_for(slot: str, plugin=None) -> Optional[str]:
+    r"""The socket a slot hangs off, asking the parser plugin first.
+
+    RE'd against patch 6090 (2026-08-05), and the reason this is a plugin
+    question rather than a constant: **`RolePart.ini` is not the art.** 6090
+    declares 8 parts and 7 dummies -- including `v_mount`, `v_misc`,
+    `v_l_shield` and `v_r_shield` -- while every one of its 3,001 body
+    meshes carries exactly `v_body`, `v_armet`, `v_l_weapon`, `v_r_weapon`
+    and nothing more. CCO declared 52 dummies including `v_head`, which 6090
+    drops entirely.
+
+    A plugin returning "" means "this client cannot attach that slot", which
+    is a different and more useful answer than falling through to the body
+    origin.
+    """
+    if plugin is not None:
+        hit = plugin.slot_socket(slot)
+        if hit is not None:
+            return hit or None
+    return SLOT_SOCKET.get(slot)
+
 
 #: `RolePart.ini [Config]` part name -> the `[Dumy]` socket it hangs off.
 #: INFERRED, but 7 of the 8 attachable parts have an exact `v_<part>` entry in
@@ -72,6 +95,152 @@ SLOT_SOCKET = {
     "pelvis":    "v_pelvis",
     "mount":     "v_mount",     # INVERTED: on the MOUNT mesh, not the body
 }
+
+#: Weapon set -> the body motion folder that holds it, recovered from the
+#: **official lineage's own authored data**: CCO's `3dmotion.ini` spells the
+#: pairing out one key at a time -- 259 rows for set 480 alone, each of the
+#: form `1480100 = c3/0001/410/100.c3` -- and the dominant non-`000` folder
+#: per set is unambiguous (480 -> 410, 350 -> 560, 370 -> 500, 380 -> 741).
+#:
+#: **6090 ships none of those rows** in either the stale ini or the compiled
+#: dbc, so a lookup for `<shape>480<action>` misses and falls through to the
+#: unarmed folder -- which posed every armed character empty-handed. The
+#: folders themselves all still ship (6090 keys 18 of them), so the mapping
+#: is what went missing, not the motions.
+#:
+#: RECOVERED, not inferred: this is TQ's pairing, read out of a client of
+#: the same lineage. Applied only when the aliased target actually exists.
+WEAPON_MOTION_SET = {
+    "350": "560",
+    "360": "410",
+    "370": "500",
+    "380": "741",
+    "410": "410",
+    "420": "410",
+    "421": "410",
+    "422": "410",
+    "430": "410",
+    "440": "410",
+    "450": "410",
+    "460": "410",
+    "480": "410",
+    "481": "410",
+    "490": "410",
+    "500": "500",
+    "510": "560",
+    "530": "560",
+    "540": "560",
+    "560": "560",
+    "561": "560",
+    "562": "560",
+    "580": "560",
+    "601": "601",
+    "611": "611",
+    "612": "611",
+    "613": "611",
+    "614": "611",
+    "615": "611",
+    "616": "611",
+    "617": "611",
+    "618": "611",
+    "619": "611",
+    "621": "611",
+    "622": "611",
+    "623": "611",
+    "624": "611",
+    "625": "611",
+    "626": "611",
+    "627": "611",
+    "628": "611",
+    "629": "611",
+    "631": "611",
+    "632": "611",
+    "633": "611",
+    "634": "611",
+    "635": "611",
+    "636": "611",
+    "637": "611",
+    "638": "611",
+    "639": "611",
+    "641": "611",
+    "642": "611",
+    "643": "611",
+    "644": "611",
+    "645": "611",
+    "646": "611",
+    "647": "611",
+    "648": "611",
+    "649": "611",
+    "651": "611",
+    "652": "611",
+    "653": "611",
+    "654": "611",
+    "655": "611",
+    "656": "611",
+    "657": "611",
+    "658": "611",
+    "659": "611",
+    "661": "611",
+    "662": "611",
+    "663": "611",
+    "664": "611",
+    "665": "611",
+    "666": "611",
+    "667": "611",
+    "668": "611",
+    "669": "611",
+    "671": "611",
+    "672": "612",
+    "673": "611",
+    "674": "611",
+    "675": "611",
+    "676": "611",
+    "677": "611",
+    "678": "611",
+    "679": "611",
+    "681": "611",
+    "682": "611",
+    "683": "611",
+    "684": "611",
+    "685": "611",
+    "686": "611",
+    "687": "611",
+    "688": "611",
+    "689": "611",
+    "691": "611",
+    "692": "611",
+    "693": "611",
+    "694": "611",
+    "695": "611",
+    "696": "611",
+    "697": "611",
+    "698": "611",
+    "699": "611",
+    "700": "741",
+    "735": "756",
+    "736": "741",
+    "741": "741",
+    "742": "741",
+    "743": "741",
+    "744": "741",
+    "745": "741",
+    "746": "741",
+    "748": "741",
+    "749": "741",
+    "751": "756",
+    "753": "756",
+    "754": "756",
+    "756": "756",
+    "757": "756",
+    "758": "756",
+}
+
+
+def motion_set_for(weapon_type: str) -> str:
+    """The motion folder a weapon set is animated from, or the set itself."""
+    ws = (weapon_type or "").strip()
+    return WEAPON_MOTION_SET.get(ws, ws)
+
 
 #: Sockets a body may not carry; fall back to these in order.
 SOCKET_FALLBACK = {
@@ -373,21 +542,54 @@ class Catalogue:
         self.assets = AssetRoot(root)
         self.root = self.assets.root
         self.obj: dict[str, str] = {}
-        p = self.root / "ini" / "3dobj.ini"
-        if p.is_file():
-            for line in p.read_text("latin-1", errors="replace").splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    self.obj[k.strip()] = v.strip().replace("\\", "/")
+        self._load_flat("3dobj.ini", self.obj)
         self.motion: dict[str, str] = {}
-        p = self.root / "ini" / "3dmotion.ini"
-        if p.is_file():
-            for line in p.read_text("latin-1", errors="replace").splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    self.motion[k.strip()] = v.strip().replace("\\", "/")
+        self._load_flat("3dmotion.ini", self.motion)
         self._tables: dict[str, dict] = {}
         self._cache: dict[str, PartMesh] = {}
+
+    def _load_flat(self, ini_name: str, into: dict) -> None:
+        r"""A flat `key=value` table, **preferring the compiled twin**.
+
+        This is the stale-decoy trap in its second hiding place. Official
+        6090-era clients ship `3dmotion.ini` and `3dobj.ini` stamped 2009
+        beside `.dbc` twins stamped 2015, and the client reads the twins.
+        `tools/anim.py` was taught this; this Catalogue kept its own
+        independent load and was not, so `idle_motion` looked up key
+        `2000100` in a table that has not carried it for years, got None,
+        and every static preview fell back to the mesh's embedded MOTI --
+        while the body itself drew unposed. Two different spaces, and a
+        headgear offset of (1.1, -2.9, 2.1) that vanished the moment an
+        animation played, because playing one supplied the motion the
+        lookup had failed to find.
+
+        The dbc keys are rebuilt from each row's path, not its integer id,
+        for the reason `anim.MotionIndex` documents: the ini key space
+        strips the shape's leading zeros and `int()` cannot round-trip it.
+        """
+        p = self.root / "ini" / ini_name
+        if p.is_file():
+            for line in p.read_text("latin-1", errors="replace").splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    into[k.strip()] = v.strip().replace("\\", "/")
+        twin = p.with_suffix(".dbc")
+        if not twin.is_file():
+            return
+        try:
+            import dbc as dbcmod
+            rows = dbcmod.Rsdb.parse(twin.read_bytes()).paths
+        except Exception:                                 # pragma: no cover
+            return
+        pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
+        for rid, val in rows.items():
+            val = val.replace("\\", "/")
+            m = pat.match(val)
+            if m:
+                into[str(int(m.group(1))) + m.group(2) +
+                     m.group(3).zfill(3)] = val
+            else:
+                into[str(rid)] = val
 
     def table(self, ini: str) -> dict:
         if ini not in self._tables:
@@ -430,8 +632,15 @@ class Catalogue:
         """
         if len(body_appearance) < 3:
             return None
-        key = f"{int(body_appearance[:3])}{weapon_type}{action}"
-        path = self.motion.get(key)
+        shape = int(body_appearance[:3])
+        path = self.motion.get(f"{shape}{weapon_type}{action}")
+        if not path:
+            # 6090 dropped the per-(set, action) alias rows CCO ships, so an
+            # armed key misses and the caller would silently get the unarmed
+            # idle. Map the set to its motion folder and try that.
+            alias = motion_set_for(weapon_type)
+            if alias != weapon_type:
+                path = self.motion.get(f"{shape}{alias}{action}")
         return self.load(path) if path else None
 
 
@@ -461,7 +670,13 @@ class Figure:
            "shield": "shield.ini", "pelvis": "pelvis.ini"}
 
     def __init__(self, cat: Catalogue, body: str, frame: int = 0,
-                 use_action_motion: bool = False, weapon_type: str = "000"):
+                 use_action_motion: bool = False, weapon_type: str = "000",
+                 plugin=None):
+        #: The parser plugin, so `equip` asks `socket_for` rather than the
+        #: raw `SLOT_SOCKET` default. Without it a plugin's "" -- "this
+        #: client cannot attach that slot" -- is silently ignored and the
+        #: part is hung off a socket the bodies do not carry.
+        self.plugin = plugin
         self.cat = cat
         self.frame = frame
         self.body_appearance = body
@@ -492,7 +707,7 @@ class Figure:
         part = self.cat.load(logical)
         if part is None:
             return None
-        dumy = SLOT_SOCKET.get(slot)
+        dumy = socket_for(slot, self.plugin)
         src = "none"
         S: Optional[Mat4] = IDENTITY
         if dumy:

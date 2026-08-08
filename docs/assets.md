@@ -454,19 +454,71 @@ py -3 tools/coviewer.py --library "D:\COmmunity Library" --server zephyr
 py -3 tools/comod.py   --library "D:\COmmunity Library" --server zephyr show 900119
 ```
 
-The viewer also switches at runtime: pass `--library` once (it is remembered
-in the per-user config) and a **Server** selector appears in the header —
-baseline install or any catalogued profile; the Files pane gains an
-**Origin** filter (everything / this server only / shared with baseline).
-`GET /api/servers` lists views, `POST /api/server` switches; catalogues are
-built lazily and cached per view, and the texture cache is kept per view so
-the same path never shows another server's bytes.
+The viewer needs no flag at all: on start it looks for a library in the
+obvious places (`discover_libraries`, bounded — a few parents, one level
+deep) and adopts one if exactly one is found, saying so in the log. The
+header's **Asset library** button opens a chooser that lists what was
+discovered as one-click buttons, with pasting a path as the fallback;
+`GET /api/library` reports it, `POST /api/setlibrary` sets or clears it
+(validated by contents: `servers/<name>/filemap.json` must exist) and
+remembers it in the per-user config. `--library DIR` still works and is
+remembered the same way.
+
+A **Server** selector then sits in the header — baseline install or any
+catalogued profile. `GET /api/servers` lists views, `POST /api/server`
+switches; catalogues are built lazily and cached per view, and the texture
+cache is kept per view so the same path never shows another server's bytes.
+
+**Server tags.** Every asset a server does *not* share with the baseline
+carries that server's tag ("Zephyr", from `profile.json`'s `tag` or the
+title-cased directory name). It is derived from the filemap on catalogue
+build, never stored per file — 100k rows in the tag store would be a copy of
+the filemap that can go stale. The tag shows on file rows and on appearance
+rows (an appearance is tagged when the art it resolves to is), appears in
+the tag vocabulary with its count, and filters like any hand-written tag:
+`/api/files?tag=Zephyr`, the Appearances tag chip, and the Files pane's
+**Origin** filter, whose options are named after the server ("Zephyr only").
+`untagged` still means "not labelled by you" — a server tag does not make a
+row count as tagged.
 
 `tools/colibrary.py materialize NAME --to DIR` writes a server's combined
 tree (every logical path, bytes pulled from library or baseline) as plain
 files. The destination is guarded: never under Program Files (the baseline
 install is a read-only source), never inside the baseline root or the
 library repo.
+**Deep dedup.** `tools/deepdedup.py` goes below bytes: it decodes every
+texture to RGBA (mip 0) and every mesh to geometry (positions + UV0 + faces +
+placement matrix, normals excluded since PHY /PHY4 generate them) on both
+sides and removes library files whose *decoded* content matches the baseline
+— re-encodes and PHY-variant repacks. Zephyr result: 92,233 library files vs
+77,958 baseline assets → 997 removed (21 textures, 978 meshes), filemap
+entries rewritten to kind `"e"` (serves the baseline's visually identical
+bytes, not counted as server-unique). Only 3 files in the library fail to
+decode: two effects with garbage after their last valid chunk (the viewer now
+parses those leniently, like the engine) and one truncated garment mesh.
+
+**Old-client conventions, synthesized.** Clients that ship no armor.ini
+resolve bodies as `c3/<type>/<look>/<action>.c3` + `c3/texture/<look><var>.dds`,
+and mounts as `c3/mount/<look>/<look><var>00.*`; 3-digit `.c3` files in look
+directories are MOTI-only motion (the viewer says so and names the model).
+`colibrary.py rebuild-tables <server>` derives real PartIni tables from those
+conventions into the profile snapshot (Zephyr: 2,229 body + 160 mount
+appearances), which is what makes the character builder work for such
+clients. Map support materializes the server's `map/` + `ani/*.ani` into
+`out/viewer/serverviews/<name>/` (old `.7z` DMaps decompressed — same v1004
+format inside) and converts the binary `ini/GameMap.dat` registry
+(`u32 count; {u32 id, u32 len, path, u32 gridSize}` — verified to EOF) to
+GameMap.json, so the MapEditor and Maps tab list and open the server's own
+maps (Zephyr: 313 of 360 fully drawable).
+
+**Per-library thumbnails.** `thumbs.py --library DIR --server NAME` renders a
+server view's own assets into `out/thumbs/servers/<name>/` (own manifest;
+meshes paired via the server's tables, then same-stem, then same-dir; MOTI-only
+action files listed as unmatched). The viewer's Health & thumbnails panel
+targets the *active* view: with a server selected it shows that library's
+cache state and generates into it; the base install's renders are never
+reused for a server (same path, different bytes).
+
 ### 6.1 Using a DatPkg client as a WDF wordlist
 
 `wdf_recover.py --tpi <client-dir-or-.tpi>` mines those ~130k plaintext paths.
@@ -506,3 +558,286 @@ hash against 14 k targets makes blind enumeration birthday-limited. The extracte
 payloads keep their content-hash filenames; `apply_recovered_names.py` (dry-run
 by default) is ready to rename any that a future signal *does* resolve, but as of
 this pass it renames nothing — the honest result is 0, not a table of guesses.
+
+---
+
+## 7. Community `garments*.wdf` — pairing without names
+
+The five `garments*.wdf` a private server adds to an old client are **not
+TQ-packed archives**, and that is why the earlier name-recovery effort
+returned zero. Two verified facts:
+
+* A genuine WDF index is sorted strictly ascending by name-hash (shipped
+  `c3.wdf`: all 10,238 entries). **Every `garments*.wdf` index is unsorted**,
+  so nothing binary-searches it — the client scans.
+* The name-hash field matches no path under any transformation tried:
+  every plaintext path in this client's own `ini/c3.wdb` (72,626 names,
+  6,682 of them under `garments/`) and `c3.tpi` (53,609), under `tq_hash`,
+  `str2id`, `crc32` and `adler32`, with and without package prefixes,
+  slashes flipped, case folded. Zero hits in all combinations.
+
+The hash *function* is not the problem: Zephyr's `TqPackageWdf.dll` contains
+all six of the constants `core/tqhash.py` was recovered from
+(`0x9BE74448`, `0x66F42C48`, `0x267B0B11` and the three seeds), so the
+algorithm is identical — these archives were simply written by someone
+else's packer, keyed on something that is not a path we can observe.
+
+**What survives is the authoring order.** The packer wrote each model
+immediately followed by its skin, so payloads in offset order run
+`M T M T …` — 1,634 adjacent mesh/texture pairs in `garments4.wdf` alone.
+`tools/garmentpair.py` groups on that and reports what it cannot explain:
+
+| archive | entries | paired | multiskin | orphan | explained |
+|---|---|---|---|---|---|
+| `garments.wdf`  | 5,253 | 1,967 | 5 | 503 | 90.4 % |
+| `garments1.wdf` | 2,341 | 958 | 1 | 318 | 86.3 % |
+| `garments2.wdf` | 1,943 | 784 | 2 | 279 | 85.4 % |
+| `garments3.wdf` | 2,493 | 1,000 | 3 | 381 | 84.6 % |
+| `garments4.wdf` | 2,021 | 816 | 2 | 151 | 92.5 % |
+
+Two independent checks that the rule is real rather than convenient:
+
+1. **Ground truth.** Applied blind to `c3.tpd`, whose names *are* known, the
+   same rule picks the correct texture for 367 of 417 meshes (88 %); every
+   mismatch is in `c3/effect/flash`, an alphabetically-ordered region where
+   adjacency is coincidence rather than authorship.
+2. **Rendered.** `tools/garmentrender.py` renders a pair straight out of the
+   archive through `tools/thumbs.py`'s renderer. The results are coherent
+   textured weapons and effect auras (`out/zephyr/g4_contact*.png`); a wrong
+   pairing renders as garbled UV noise, which none of them do.
+
+`garments4.wdf` is mostly weapons and particle effects rather than clothing —
+several groups are `PTC3`/`CCFL` particle chunks with no drawable geometry,
+reported as such rather than rendered blank.
+
+### 7.1 Extracting them
+
+`tools/garmentextract.py` writes the verified groups into the library, one
+folder per source archive, `<library>/<Server>/<Archive>/`:
+
+| archive | folder | models | of which particle-only |
+|---|---|---|---|
+| `garments.wdf`  | `Zephyr/Garments`  | 897 | 259 |
+| `garments1.wdf` | `Zephyr/Garments1` | 410 | 111 |
+| `garments2.wdf` | `Zephyr/Garments2` | 323 | 105 |
+| `garments3.wdf` | `Zephyr/Garments3` | 370 | 126 |
+| `garments4.wdf` | `Zephyr/Garments4` | 299 | 102 |
+
+2,299 models / 7,877 files, one group rejected. Model and skin are written
+with the **same stem** (`0042.c3` + `0042.dds`), which is exactly what the
+viewer's same-stem pairing rule wants, and a model that recurs with a new
+skin folds it in as `0042_s1.dds` rather than being dropped as a duplicate —
+those repeats are the archive's colourways, 2,053 of them. Each folder keeps
+a `manifest.json` recording every check per group.
+
+`--emit-filemap` registers them in the server profile, so they carry the
+server tag **and** a per-archive tag (`Garments4`) that appears in the tag
+vocabulary — one archive can be browsed on its own.
+
+
+---
+
+## 8. The curated Collection
+
+The library holds everything an imported client shipped. The **Collection**
+is the subset that has been *chosen* -- `core/collection.py`, driven by
+`tools/collect.py` and the viewer's Collection card.
+
+    <library>/Collection/collection.json   the index
+    <library>/Collection/Weapons/          one folder per category
+        zephyr-frost-katana.c3             the mesh
+        zephyr-frost-katana.dds            its skin (same stem: the viewer
+        zephyr-frost-katana.json           pairs them for free)
+
+Categories are the game's own vocabulary rather than a models/textures split,
+because the question being asked is "what can go in this slot": Characters,
+Garments, Weapons, Shields, Headgear, Mounts, NPCs, Monsters, Effects, Maps,
+UI, Other.
+
+Three properties make it a repository rather than a folder of copies:
+
+* **Self-contained pairs.** Collecting copies the mesh *and* the skin
+  currently resolved for it, so an entry survives the archive it came from.
+* **Provenance.** Every entry records the server, the source paths, content
+  hashes and when it was collected; a per-entry `.json` sits beside the files
+  so a folder is self-describing even away from the index.
+* **Usable as a swap.** `collect.py stage <id> --swap-for <logical>` writes
+  the entry into `mods/stage/` under the path it replaces -- and the skin
+  follows the *target*, not the source, or the game would draw the old
+  texture on the new geometry. `comod.py install` remains the only thing
+  that touches the game, with its own backups and revert.
+
+The Collection appears in the viewer's Server menu as a profile of its own
+(`<library>/servers/collection/`), so it gets the same folder tree,
+thumbnails, tags and model viewer as any imported client -- the category
+becomes its tag.
+
+That profile is **derived from the index and rewritten on every change**, by
+`Collection.save`. It used to be written only by `collect.py publish`, which
+made the library show the Collection as of the last time someone ran that
+command: entries removed weeks earlier still listed, entries since kept
+absent entirely. Two details follow from fixing it that way:
+
+* The filemap is rewritten **wholesale**, never appended to, so a removed
+  entry leaves the library by construction rather than by remembering to
+  delete it. It also names an entry's **motion and effect files**, which the
+  first version omitted -- they were collected into the library folder but
+  left outside its namespace, so they could not be browsed.
+* The viewer caches one built catalogue per server for the life of the
+  process, and the Collection is the one view it also *writes*. So a change
+  drops that cached catalogue, and rebuilds it in place when it is the view
+  you are looking at (`coviewer.py::_refresh_collection_view`). Without that
+  the profile was correct on disk and stale on screen until a restart.
+
+`collect.py publish` still exists, now as a repair command: reach for it when
+the profile was lost, or when the Collection folder was edited by hand.
+
+### Which files are a model's actions — one rule, three layouts
+
+`collection.action_code` answers this for everything that asks: what the
+viewer offers to play, and what collecting keeps, are the same question and
+were being answered by two separate copies of the rule. One of them learned
+about the Collection's naming and the other did not.
+
+| layout | example | actions | anchored |
+|---|---|---|---|
+| one directory per look | `c3/npc/013/1.c3` | `100.c3`, `110.c3` beside it | no |
+| the flat family | `c3/npc/999001100.c3` | `999001101.c3`, `999001190.c3` | yes |
+| collected | `collection/npcs/zephyr-npc-001.c3` | `…__motion-100.c3` | yes |
+
+**Anchored** means the match is tied to this model's own name, and it decides
+two things. `MAX_ACTIONS` — the cap that stops a directory of hundreds of
+4-digit models being read as one model's action set — applies only to the
+unanchored layout, because only it can make that mistake. And the
+"MOTI *without* geometry" test, which is what a motion-only file looks like,
+applies only there too: the flat family is per-action **meshes**, every file
+`PHY` + `MOTI`, so requiring no geometry rejected every action it had.
+
+That is the whole of the `base-storekeeper-36` report — collected with no
+animation. Nine digits is not "four or fewer", `c3/npc/` holds 127 files so
+the cap would have discarded anything that survived, and each of its action
+files carries geometry so the motion test would have rejected the rest.
+
+Knowing the layout also has to switch the guess off rather than sit beside
+it: `c3/npc/1.c3` really exists, and the short-numeric rule offered it as
+"action 1" of every NPC in the directory.
+
+### Confidence, and the 26% that never had a single answer
+
+`meshtex` scores each pairing rule, and the score was a claim about the
+*rule* rather than about the answer. A rule that names three textures for one
+mesh has not identified it — but each candidate was reported at the rule's
+full confidence, and `best()` returned whichever sorted first.
+
+Measured over this install: **1,290 of 4,964 meshes (26%)** had an
+ambiguous authored best presented as a definite one.
+
+| rule | meshes it could not disambiguate |
+|---|---|
+| `appearance_table` | 728 |
+| `motion_appearance` | 338 |
+| `effect_table` | 204 |
+| `npc_table` | 13 |
+| `simpleobj_table` | 7 |
+
+`matches` now divides the confidence by the number of distinct textures the
+rule produced — picking blind among *n* is right 1/n of the time — and sets
+`Match.alternatives`, so `ambiguous` is visible to callers. The kind stays
+`authored`: the table really does say all three, and the ambiguity is a fact
+about shared art rather than a failure to read it.
+
+**Why it mattered.** `c3/npc/999001100.c3` is the standby motion of thirteen
+NPCs, with two different skins between them. `npc_table` yielded three
+textures at 0.95 each and `best()` chose `9990010` — a real file that
+nothing loads for the Storekeeper, which uses `9990211`. Every swap built on
+it failed while looking like a plumbing problem, because the answer existed
+and carried a high score.
+
+**Where one answer is genuinely needed, resolve the entity, not the mesh.** A
+shared mesh has no texture of its own; the NPC does. That is what
+`core/npcart.py` is for.
+
+### An NPC is assembled from three tables — VERIFIED in the running game
+
+`npc.json` names `999001100`, and `c3/npc/999001100.c3` exists, so it reads
+like the whole model. **It is the motion and nothing else.** The client
+assembles a Storekeeper from three separate lookups:
+
+```
+ini/npc.json          type 1 "Storekeeper"
+                        simple_object   211
+                        standby_motion  999001100    ← motion
+                        rest_motion     999001101
+                        blaze_motion    999001190
+ini/3DSimpleObj.ini   [ObjIDType211]
+                        Part0    = 9990010           ← geometry
+                        Texture0 = 9990211           ← texture
+ini/3dobj.ini         9990010 → c3/mesh/9990010.c3
+ini/3dtexture.ini     9990211 → c3/texture/9990211.dds
+```
+
+`core/npcart.py` walks that chain. **437 of 437 NPCs resolve**; geometry and
+texture exist on disk for all but one outlier row (type 10999, which points
+at `c3/npc/999/1.tga`). 34 looks are referenced and not shipped in this
+build, so 165 NPCs have no motion files — a fact about the content, not the
+resolver. 38 geometries and 47 textures serve more than one NPC, so a swap
+is told when it will change others.
+
+**How this was found, because the manner matters.** `meshtex` inferred the
+texture by transposing the mesh id — `999001100` → `c3/texture/9990010.dds`
+— and reported it as an **authored** pairing at **0.95**. It names a real
+file, which is what made it survive scrutiny; nothing loads it for this NPC.
+Every swap built on it failed, and the confidence score is what stopped the
+inference being questioned. Two experiments settled it: replacing that one
+texture changed nothing, tinting all 70 in `c3/texture/999*` turned every NPC
+red. That bracketed the answer to "right namespace, wrong file" and sent us
+to the tables.
+
+The same mistake, in geometry, produced the T-pose. The Storekeeper's own
+skeleton is **30 PHY bones**; the donor's is **54**. Writing 55-bone motion
+into `c3/npc/999001*.c3` while the client kept drawing its own 30-bone body
+from `c3/mesh/` is a rig disagreeing with itself. **Resolve all three roles
+together or none of them are right.**
+
+`skin_destination` and `Catalog.texture_for_mesh` now ask the tables before
+any inference, and `Collection.stage` takes an `art_plan` so each role is
+written where the client reads it.
+
+### Replacing something with a collected entry
+
+`Collection.stage` writes an entry into `mods/stage/` under the path it
+replaces. Three things make that more than a file copy:
+
+* **The skin follows the target.** Staging a model over `c3/npc/002/1.c3`
+  while its skin lands back at `c3/npc/001/1.dds` leaves the game drawing
+  002's texture on 001's geometry.
+
+  Where the skin does not sit beside its mesh — the flat family keeps
+  textures in `c3/texture/` — there is nothing for `Collection.stage` to
+  derive, and `skin_to` says where. **That destination is no longer typed.**
+  `coviewer._skin_target` asks where the *target's own* texture lives, which
+  is the path the client actually reads; the resolver answers first, and for
+  the flat family a second pass reaches it from the filename. Measured over
+  this install: of 41 looks, **36 ship `c3/texture/999<look>0.dds` and the
+  rest ship `c3/texture/999<look>.dds`**. Two forms, so both are tried — and
+  only a path that **exists** is returned, because a derived name that is
+  not on disk is a guess about where the client looks, and a texture written
+  to a guessed path is read by nothing. Look 002 resolves to
+  `c3/texture/999002.dds`; `c3/texture/9990020.dds` does not exist.
+* **The actions take the target's name.** In the flat family the filename
+  carries the look as well as the action, so staging look 001 over look 002
+  with the actions keeping their own names replaces the *donor's* walk cycle
+  and leaves the target's untouched — the swap then plays the old animation,
+  or none. `action_target_name` maps the code onto the target's spelling.
+  Where no code can be derived the part is skipped and said so, because the
+  fallback of writing the donor's filename into the target's directory
+  overwrites a third model.
+* **`skin` and `roles` choose what travels.** Everything by default, because
+  a model swapped without its animation is a statue; but "new geometry, the
+  target's own colours and actions" is a real edit and used to require
+  staging by hand.
+
+The UI for this is `tools/webui/swap.js`, loaded by **both** pages — the
+asset browser had a `prompt()` that asked for a path and then wrote whatever
+the entry had, and the builder, which is where you are when you decide one
+model should replace another, had no staging at all.

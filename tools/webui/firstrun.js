@@ -100,7 +100,45 @@
   }
 
   // ------------------------------------------------------------ thumbnails
+  //
+  // With a community server selected, generation targets that library's own
+  // cache (out/thumbs/servers/<name>/) -- a much simpler card, because the
+  // install-corpus estimates do not apply to an arbitrary library.
+  function serverThumbPrompt(rep) {
+    const th = rep.thumbnails || {};
+    const box = mk('div');
+    box.appendChild(mk('h3', null,
+      `Thumbnails — “${rep.activeServer}” library`));
+    if (th.status === 'generated') {
+      box.appendChild(mk('p', null,
+        `This library's cache holds ${(th.meshes || 0).toLocaleString()} ` +
+        `mesh and ${(th.textures || 0).toLocaleString()} texture ` +
+        `thumbnails. Re-running only renders what changed.`));
+    } else {
+      box.appendChild(mk('p', null,
+        'No thumbnails have been generated for this library yet. ' +
+        'Generation renders the library’s own meshes and textures ' +
+        '(paired through the server’s tables and conventions) into ' +
+        'its own cache — the base install’s thumbnails are ' +
+        'never reused for it, because the same path can be different art.'));
+    }
+    const row = mk('div', 'setup-actions');
+    const goM = mk('button', 'primary', 'Generate meshes');
+    goM.addEventListener('click', () => start('meshes'));
+    const goA = mk('button', 'primary', 'Generate meshes + textures');
+    goA.addEventListener('click', () => start('all'));
+    row.appendChild(goM);
+    row.appendChild(goA);
+    box.appendChild(row);
+    box.appendChild(mk('p', 'mut small',
+      'Resumable and cancellable, like the base run. Switch the Server ' +
+      'menu back to base to generate for the install instead. CLI: ' +
+      `py -3 tools/thumbs.py --library <dir> --server ${rep.activeServer} --all --textures`));
+    return box;
+  }
+
   function thumbPrompt(rep) {
+    if (rep.activeServer) return serverThumbPrompt(rep);
     const th = rep.thumbnails || {};
     const plan = th.plan || {};
     const box = mk('div');
@@ -193,7 +231,9 @@
   function thumbRunning(run) {
     const box = mk('div');
     const p = run.progress || {};
-    box.appendChild(mk('h3', null, 'Generating thumbnails'));
+    box.appendChild(mk('h3', null, run.server
+      ? `Generating thumbnails — “${run.server}” library`
+      : 'Generating thumbnails'));
     const frac = p.total ? p.done / p.total : 0;
     const track = mk('div', 'progress-track');
     const fill = mk('div', 'progress-fill');
@@ -265,7 +305,8 @@
       if (!poll) poll = setInterval(refresh, 1500);
     } else {
       if (poll) { clearInterval(poll); poll = null; }
-      if (th.status === 'none' || th.status === 'meshes-only') {
+      if (rep.activeServer || th.status === 'none'
+          || th.status === 'meshes-only') {
         card.appendChild(thumbPrompt(rep));
       } else {
         card.appendChild(mk('h3', null, 'Thumbnails'));

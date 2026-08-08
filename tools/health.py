@@ -295,14 +295,20 @@ def check_derived() -> dict:
 
     An artefact counts as present when `coroot.find_derived` can read it --
     from this checkout, or from the primary checkout when this is a linked
-    git worktree.  Inherited artefacts are reported as such."""
+    git worktree.  Inherited artefacts are reported as such.
+
+    "Inherited" means *another checkout*, so the comparison has to be against
+    the same keyed path `find_derived` resolved (`coroot.derived_rel`), not
+    the plain literal.  Against the literal, every per-base artefact reads as
+    inherited the moment indexes are keyed -- which is exactly how this
+    printed on the first run after the change."""
     artefacts = []
     for rel, argv, cost, why in DERIVED:
         p = coroot.find_derived(rel)
         found = p is not None and p.is_file()
         artefacts.append({
             "path": rel, "exists": found,
-            "inherited": found and not (REPO / rel).is_file(),
+            "inherited": found and not (REPO / coroot.derived_rel(rel)).is_file(),
             "bytes": p.stat().st_size if found else 0,
             "command": "py -3 " + " ".join(argv), "cost": cost, "why": why,
         })
@@ -382,16 +388,22 @@ def human_duration(seconds: int) -> str:
     return f"{m:.0f} min" if m < 90 else f"{m / 60:.1f} h"
 
 
-def thumbnail_state() -> dict:
-    """What `out/thumbs/` currently holds, and what filling it would cost.
+def thumbnail_state(server: str = "") -> dict:
+    """What the thumbnail cache currently holds, and what filling it would
+    cost.  With ``server``, reports that library view's own cache
+    (out/thumbs/servers/<name>/) instead of the install's.
 
     Everything factual comes from `tools/thumbs.py` (its output directory and
     manifest); this function only reads and describes.
     """
     import thumbs                                   # noqa: PLC0415
 
-    out_dir = thumbs.OUT_DIR
-    manifest = thumbs.MANIFEST
+    if server:
+        out_dir = thumbs.REPO / "out" / "thumbs" / "servers" / server
+        manifest = out_dir / "manifest.json"
+    else:
+        out_dir = thumbs.OUT_DIR
+        manifest = thumbs.MANIFEST
     state: dict = {
         "dir": str(out_dir),
         "exists": out_dir.is_dir(),
@@ -411,6 +423,14 @@ def thumbnail_state() -> dict:
             })
         except (OSError, ValueError) as e:
             state["error"] = f"manifest unreadable: {e}"
+
+    if server:
+        state["server"] = server
+        # a library's corpus size is not the install's; report presence
+        # rather than pretending to know the denominator.
+        state["status"] = ("none" if not (state["meshes"] or state["textures"])
+                           else "generated")
+        return state
 
     want_m = THUMB_FACTS["meshes"]["count"]
     want_t = THUMB_FACTS["textures"]["count"]

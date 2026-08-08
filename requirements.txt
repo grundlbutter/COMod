@@ -1,30 +1,44 @@
-# Python dependencies for the COMod toolkit.
+# Python dependencies for the Conquer Online RE / modding toolkit.
 #
 #     pip install -r requirements.txt
 #
 # That is the whole list. Everything else in this repository is Python
-# standard library: the WDF reader, the C3 mesh parser, the DDS/BC decoder
-# and the viewer's HTTP server are all stdlib-only by design.
+# standard library: the WDF reader, the C3 mesh parser, the DDS/BC decoder,
+# the PE parser, the x86 disassembler, the HTTP servers and the packet
+# decoders are all stdlib-only by design.
 #
-# Verified by parsing every .py under core/, tools/, tests/ and blender/
-# for imports and subtracting the standard library: PIL and numpy are the
-# only two names left.
+# Verified by parsing every .py under tools/, capture/, tests/ and blender/
+# for imports and subtracting the standard library: PIL, numpy and capstone
+# are the only three names left, and capstone is imported by exactly one
+# script, which nothing else imports (see the bottom of this file).
 #
-# No browser driver, no C compiler, no 7-Zip, no node. The thumbnail
-# renderer is a software rasteriser written in numpy; nothing here shells
-# out to anything you have to install.
+# No browser driver, no Npcap, no C compiler, no 7-Zip, no node. The
+# thumbnail renderer is a software rasteriser written in numpy; nothing here
+# shells out to anything you have to install.
 
 # REQUIRED.
 #   Every texture the Asset Viewer displays is decoded by core/dds.py (pure
 #   python) and then re-encoded to PNG by Pillow. Pillow also writes the .dds
 #   files produced by the mod-staging flow, and reads the handful of assets in
-#   a typical install that are a JPEG or BMP wearing a .dds extension.
+#   this install that are a JPEG or BMP wearing a .dds extension.
 #   Tested with 12.3.0.
 pillow>=10.0
 
 # STRONGLY RECOMMENDED, and required for thumbnails.
 #   Optional for browsing: core/dds.py has a pure-python fallback for every
 #   path, it is just slower. NOT optional for tools/thumbs.py, which is a
-#   numpy software rasteriser.
+#   numpy software rasteriser, nor for the memory-scanning helpers in
+#   capture/pktfeed.py.
 #   Tested with 2.5.1.
 numpy>=1.24
+
+# OPTIONAL, and only for tools/x86_verify.py.
+#   tools/x86.py is a hand-written decoder and stays stdlib-only -- nothing
+#   that reads a binary at runtime imports capstone, so leaving this
+#   uninstalled costs you nothing but the ability to re-run the check.
+#   x86_verify.py sweeps a whole PE through both decoders and reports where
+#   they disagree; that is how the 32-bit mode was proven rather than
+#   asserted. Install it before changing x86.py's tables, and re-run it after.
+#       pip install capstone
+#   Tested with 5.0.7.
+# capstone>=5.0

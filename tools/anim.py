@@ -33,6 +33,7 @@ import argparse
 import collections
 import copy
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -379,6 +380,31 @@ class MotionIndex:
                     self.duplicate_rows += 1
                     self.conflicting_rows += (self.raw[k] != v)
                 self.raw[k] = v
+        # Official 6090-era clients keep that ini as a 2009 stale decoy and
+        # ship the live table as 3dmotion.dbc (core/dbc.py). Overlay it so
+        # the live rows win: reading only the ini is what left every 6090
+        # body in a T-pose. The dbc's integer ids do NOT reproduce the ini
+        # key strings (the 7-digit player form strips the shape's leading
+        # zeros, which int() cannot round-trip), so the key is rebuilt from
+        # the row's PATH -- c3/<shape>/<ws>/<action>.c3 spells all three
+        # fields. Rows that are not that layout (chained "-N" stems, the
+        # flat NPC family) are left to the ini and to npcart, which resolve
+        # them by other means.
+        pdbc = self.root / "ini" / "3dmotion.dbc"
+        if pdbc.is_file():
+            import dbc as dbcmod
+            pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
+            for mv in dbcmod.Rsdb.parse(pdbc.read_bytes()).paths.values():
+                mv = mv.replace("\\", "/")
+                m = pat.match(mv)
+                if not m:
+                    continue
+                k = str(int(m.group(1))) + m.group(2) + m.group(3).zfill(3)
+                self.row_count += 1
+                if k in self.raw:
+                    self.duplicate_rows += 1
+                    self.conflicting_rows += (self.raw[k] != mv)
+                self.raw[k] = mv
         self.keys: list[MotionKey] = [self._split(k, v) for k, v in self.raw.items()]
         self.by_shape: dict[str, set[str]] = {}
         self.by_shape_ws: dict[tuple[str, str], set[str]] = {}
@@ -772,6 +798,30 @@ class AnimDB:
     # -- resolution --------------------------------------------------------
     def resolve(self, shape: str, weaponset: str, action: str,
                 distance: Optional[int] = None) -> tuple[Optional[str], str]:
+        """The motion for one (shape, weapon set, action).
+
+        The weapon set has to be resolved BEFORE `lookup`, not after: lookup's
+        own fallback chain ends at the unarmed set 000 and reports success, so
+        an armed key that misses comes back looking answered while posing the
+        character empty-handed. That is what left a club-wielding body in the
+        idle stance -- 6090 ships none of CCO's per-(set, action) alias rows,
+        so `2480100` simply is not there while `2410100` is.
+        """
+        exact = self.index.key(shape, weaponset, action, distance)
+        if exact in self.index.raw:
+            return self.index.lookup(shape, weaponset, action, distance)
+        try:
+            import attach as attachmod
+            alias = attachmod.motion_set_for(weaponset)
+        except Exception:                                 # pragma: no cover
+            alias = weaponset
+        if alias != weaponset:
+            akey = self.index.key(shape, alias, action, distance)
+            if akey in self.index.raw:
+                path, how = self.index.lookup(shape, alias, action, distance)
+                if path:
+                    return path, (f"{how} (weapon set {weaponset} animates "
+                                  f"from set {alias})")
         return self.index.lookup(shape, weaponset, action, distance)
 
     def clip(self, body_appearance: str, action: str, *, weapon: str = "",

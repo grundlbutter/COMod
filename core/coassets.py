@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import coroot                       # noqa: E402
 import safepath                     # noqa: E402
+import tqdat                        # noqa: E402
 from tqhash import tq_hash          # noqa: E402
 from wdf import WdfArchive          # noqa: E402
 
@@ -101,6 +102,19 @@ class PartIni:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.name = self.path.name
+        # Official 6090-era clients ship every appearance table twice: this
+        # ini, stamped 2008-09 and never updated, and a compiled `.dbc` twin
+        # (magic MESH) the client actually reads -- armet's stale ini is
+        # missing 1,441 of the dbc's 2,609 rows. Prefer the twin when it
+        # parses; the ini remains the format everywhere it is all there is.
+        self.source = self.name
+        dbc_twin = self.path.with_suffix(".dbc")
+        if dbc_twin.is_file():
+            try:
+                self._load_mesh_dbc(dbc_twin)
+                return
+            except Exception:
+                pass
         self.sections = parse_ini(self.path)
         self.appearances: dict[str, Appearance] = {}
         for ident, kv in self.sections.items():
@@ -121,6 +135,43 @@ class PartIni:
                     fourth_tex=kv.get(f"FourthTex{i}", "0"),
                     material=kv.get(f"Material{i}", "default"),
                 ))
+            self.appearances[ident] = app
+
+    def _load_mesh_dbc(self, twin: Path) -> None:
+        """Appearances out of the compiled MESH twin (`dbc.read_mesh`).
+
+        Idents are `str(id)` -- the dbc stores section numbers as ints,
+        which is also the 6090 inis' own unpadded spelling; `get` bridges
+        the zero-padded CCO form. Multi-part appearances arrive as repeated
+        ids on consecutive rows, in part order.
+        """
+        import dbc
+        rows = dbc.read_mesh(twin.read_bytes())
+        self.source = twin.name
+        self.sections = {}
+        self.appearances = {}
+        # CCO spells body-typed sections nine wide ([002000000]) and every
+        # consumer's bodyType arithmetic slices that form; the dbc stores the
+        # same numbers as ints. Restore the width for the tables that carry
+        # a body-type prefix -- weapon idents are six wide in both worlds
+        # and must not be padded.
+        pad9 = self.path.stem.lower() in (
+            "armor", "armet", "head", "pelvis", "misc",
+            "mix_armor", "mix_armet", "mix_head", "mix_pelvis")
+        for rid, parts in rows.items():
+            ident = str(rid).zfill(9) if pad9 and rid < 10 ** 9 else str(rid)
+            app = Appearance(ident=ident, source_ini=self.name)
+
+            def w(n: int) -> str:
+                return str(n).zfill(9) if pad9 and 0 < n < 10 ** 9 else str(n)
+
+            for i, r in enumerate(parts):
+                app.parts.append(PartRef(
+                    index=i, mesh=w(r["mesh"]), texture=w(r["texture"]),
+                    mix_tex=w(r["mixtex"]) if r["mixtex"] else "0"))
+            app.raw = {"Part": str(len(parts)),
+                       "Asb0": str(parts[0]["asb"]),
+                       "Adb0": str(parts[0]["adb"])} if parts else {}
             self.appearances[ident] = app
 
     def get(self, ident: str) -> Optional[Appearance]:
@@ -191,24 +242,37 @@ class C3File:
     most mesh modding actually needs.
     """
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, strict: bool = True):
+        """``strict=False`` reproduces the engine's tolerance: it walks
+        chunks until one does not fit and quietly stops there.  A handful of
+        community-client files carry trailing garbage after their last valid
+        chunk; the game draws them, so a viewer should too.  Writers must
+        stay strict -- re-packing a leniently-parsed file would silently drop
+        the tail."""
         if not data.startswith(C3_MAGIC):
             raise ValueError(f"not a C3 file (magic {data[:16]!r})")
         self.magic = data[:16]
         self.chunks: list[C3Chunk] = []
+        self.truncated_at: Optional[int] = None
         off = 16
         while off + 8 <= len(data):
             tag = bytes(data[off:off + 4])
             (size,) = struct.unpack_from("<I", data, off + 4)
             if off + 8 + size > len(data):
-                raise ValueError(
-                    f"chunk {tag!r} at {off} claims {size} bytes, only "
-                    f"{len(data) - off - 8} remain"
-                )
+                if strict:
+                    raise ValueError(
+                        f"chunk {tag!r} at {off} claims {size} bytes, only "
+                        f"{len(data) - off - 8} remain"
+                    )
+                self.truncated_at = off
+                return
             self.chunks.append(C3Chunk(tag, bytes(data[off + 8:off + 8 + size]), off))
             off += 8 + size
         if off != len(data):
-            raise ValueError(f"trailing bytes: stopped at {off}, file is {len(data)}")
+            if strict:
+                raise ValueError(
+                    f"trailing bytes: stopped at {off}, file is {len(data)}")
+            self.truncated_at = off
 
     @classmethod
     def load(cls, path: Path) -> "C3File":
@@ -724,6 +788,11 @@ class AssetRoot:
     def resolve_asset(self, asset_id: str, kind: str = "texture") -> Optional[Located]:
         if not asset_id or asset_id == "0":
             return None
+        # A reference that is already a path (synthesised tables for old
+        # clients name their meshes by full path -- bare IDs never contain a
+        # slash) resolves directly, no directory probing.
+        if "/" in asset_id or "\\" in asset_id:
+            return self.locate(asset_id)
         dirs = self.TEX_DIRS if kind == "texture" else self.MESH_DIRS
         ext = ".dds" if kind == "texture" else ".c3"
         ids = []
@@ -780,9 +849,27 @@ class AssetRoot:
 # ---------------------------------------------------------------------------
 
 def load_items(root: Path = DEFAULT_ROOT) -> list[dict]:
-    """ini/itemtype.json -- 11142 items, id + name + stats. Plain JSON."""
+    """The item table: id + name + stats, one dict per item.
+
+    CCO ships it as plain JSON (ini/itemtype.json, 11142 items). Official
+    clients carry the same data only as a TQ-cipher-encrypted
+    ini/itemtype.dat (24,270 items in 6090), which ``tqdat`` decrypts and
+    parses into rows keyed the same way, so both roots serve the same shape.
+    Item names are labels over the appearance tables, not structure, so an
+    install with neither table -- or a .dat some other seed encrypted --
+    yields no rows rather than an exception. The character builder then
+    offers every option unnamed instead of refusing to open.
+    """
     p = Path(root) / "ini" / "itemtype.json"
-    return json.loads(p.read_text("utf-8", errors="replace"))
+    if p.is_file():
+        return json.loads(p.read_text("utf-8", errors="replace"))
+    p = Path(root) / "ini" / "itemtype.dat"
+    if p.is_file():
+        try:
+            return tqdat.read_itemtype(p)
+        except ValueError:
+            return []
+    return []
 
 
 def find_items(name_substr: str, root: Path = DEFAULT_ROOT) -> list[dict]:

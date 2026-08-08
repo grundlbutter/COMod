@@ -97,11 +97,27 @@ import c3phy                                                    # noqa: E402
 import dds                                                      # noqa: E402
 import effects as fx                                            # noqa: E402
 import attach                                                   # noqa: E402
+import coroot                                                   # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot                    # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-OUT_DIR = REPO / "out" / "thumbs"
-COVERAGE = REPO / "out" / "meshtex" / "coverage.json"
+OUT_DIR = coroot.derived_path("out/thumbs")
+
+#: (library, server) when rendering a COmmunity Library server view instead
+#: of the install; set once by main(), read by the worker initializer.
+_LIB_SRV: tuple[str, str] = ("", "")
+
+
+def _apply_output(server: str) -> None:
+    """Per-server output tree: out/thumbs/servers/<name>/ with its own
+    manifest, so a community client's renders never mix with the base
+    install's (same logical path, different bytes)."""
+    global OUT_DIR, MANIFEST, MESH_MANIFEST
+    base = coroot.derived_path("out/thumbs")
+    OUT_DIR = (base / "servers" / server) if server else base
+    MANIFEST = OUT_DIR / "manifest.json"
+    MESH_MANIFEST = OUT_DIR / "manifest_meshes.json"
+COVERAGE = coroot.derived_path("out/meshtex/coverage.json")
 
 #: Bump when a change alters pixels.  It is part of every cache key, so a bump
 #: makes `--resume` re-render everything instead of silently mixing versions.
@@ -724,6 +740,89 @@ def texture_universe() -> list[str]:
         return sorted(mi.textures)
 
 
+def server_worklist(view) -> tuple[list["Job"], list[str]]:
+    """Mesh work list for a COmmunity Library server view.
+
+    `tools/meshtex.py` indexes the *install*, so a server view pairs its own
+    way, strongest evidence first: the server's appearance tables (including
+    the tables `colibrary` synthesizes from old-client conventions), then a
+    same-stem texture beside the mesh, then any same-directory texture.
+    Motion-only action files (MOTI, no PHY) have nothing to render and land
+    in `unmatched` -- listed, not silently dropped.
+    """
+    fm = view.filemap
+    meshes = sorted(k for k in fm if k.endswith(".c3"))
+    texset = {k for k in fm if k.endswith(".dds")}
+    paired: dict[str, tuple[str, str, float]] = {}
+    from coassets import AssetRoot as _AR
+    all_tables = list(view.part_tables().items())
+    try:
+        # baseline tables as a second source (unbound call bypasses the
+        # ServerView override); a pairing only sticks if both halves
+        # resolve in the view, so this cannot invent art the server lacks.
+        all_tables += [(f"base:{k}", v)
+                       for k, v in _AR.part_tables(view).items()]
+    except Exception:
+        pass
+    for part, ini in all_tables:
+        for app in ini:
+            for pr in app.parts:
+                mloc = view.resolve_asset(pr.mesh, "mesh")
+                tloc = view.resolve_asset(pr.texture, "texture")
+                if mloc and tloc:
+                    paired.setdefault(
+                        mloc.logical,
+                        (tloc.logical, f"table:{ini.name}", 1.0))
+    by_dir: dict[str, list[str]] = {}
+    for t in sorted(texset):
+        by_dir.setdefault(t.rsplit("/", 1)[0], []).append(t)
+    by_stem: dict[str, str] = {}
+    for t in sorted(texset):
+        tstem = t.rsplit("/", 1)[-1][:-4]
+        if tstem.isdigit() and len(tstem) < 5:
+            continue
+        by_stem.setdefault(tstem, t)
+    for m in meshes:
+        if m in paired:
+            continue
+        stem = m[:-3]
+        if stem + ".dds" in texset:
+            paired[m] = (stem + ".dds", "same-stem", 0.9)
+            continue
+        mstem = m.rsplit("/", 1)[-1][:-3]
+        hit = None if (mstem.isdigit() and len(mstem) < 5)             else by_stem.get(mstem)
+        if hit:
+            paired[m] = (hit, "stem-anywhere", 0.7)
+            continue
+        sibs = by_dir.get(m.rsplit("/", 1)[0])
+        if sibs:
+            paired[m] = (sibs[0], "same-dir", 0.5)
+    jobs, unmatched = [], []
+    for m in meshes:
+        hit = paired.get(m)
+        if hit is None:
+            unmatched.append(m)
+            continue
+        # a container with no PHY chunk is motion data, not a model
+        try:
+            from coassets import C3File
+            from c3phy import VARIANTS
+            c3 = C3File(view.read(m), strict=False)
+            if not any(ch.tag in VARIANTS for ch in c3.chunks):
+                unmatched.append(m)
+                continue
+        except Exception:
+            unmatched.append(m)
+            continue
+        jobs.append(Job(m, "mesh", hit[0], hit[1], hit[2], "server", ""))
+    jobs.sort(key=lambda j: (j.texture or "", j.logical))
+    return jobs, unmatched
+
+
+def server_texture_universe(view) -> list[str]:
+    return sorted(k for k in view.filemap if k.endswith(".dds"))
+
+
 # ===========================================================================
 # worker
 # ===========================================================================
@@ -731,8 +830,14 @@ def texture_universe() -> list[str]:
 _W: dict = {}
 
 
-def _init_worker(root: str, opts: dict) -> None:
-    _W["assets"] = AssetRoot(root)
+def _init_worker(root: str, opts: dict, library: str = "",
+                 server: str = "") -> None:
+    if server:
+        _apply_output(server)
+        from colibrary import ServerView
+        _W["assets"] = ServerView(library, server, root)
+    else:
+        _W["assets"] = AssetRoot(root)
     _W["opts"] = opts
     _W["tex_cache"] = {}
 
@@ -998,14 +1103,14 @@ def run(jobs: list[Job], opts: dict, root: str, jobs_n: int,
             OUT_DIR).as_posix()
 
     if jobs_n <= 1:
-        _init_worker(root, opts)
+        _init_worker(root, opts, *_LIB_SRV)
         for i, j in enumerate(jobs, 1):
             absorb(render_job(j))
             _progress(label, i, total, t0, tally)
     else:
         ctx = mp.get_context("spawn")
         with ctx.Pool(jobs_n, initializer=_init_worker,
-                      initargs=(root, opts)) as pool:
+                      initargs=(root, opts, *_LIB_SRV)) as pool:
             for i, r in enumerate(pool.imap(render_job, jobs, chunksize=8), 1):
                 absorb(r)
                 _progress(label, i, total, t0, tally)
@@ -1184,6 +1289,12 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=str(DEFAULT_ROOT))
+    ap.add_argument("--library", default="",
+                    help="COmmunity Library root (with --server)")
+    ap.add_argument("--server", default="",
+                    help="render a library server view's assets instead of "
+                         "the install; output goes to out/thumbs/servers/"
+                         "<name>/ with its own manifest")
     ap.add_argument("--all", action="store_true",
                     help="render every mesh with a matched texture")
     ap.add_argument("--textures", action="store_true",
@@ -1224,6 +1335,17 @@ def main(argv: list[str]) -> int:
     opts = {"size": a.size, "ss": a.ss, "shade": a.shade, "frame": a.frame,
             "bg": bg, "tex_size": a.tex_size,
             "tex_quantize": not a.tex_truecolor}
+
+    if a.server and not a.library:
+        ap.error("--server needs --library")
+    global _LIB_SRV
+    _LIB_SRV = (a.library, a.server)
+    if a.server:
+        _apply_output(a.server)
+    view = None
+    if a.server:
+        from colibrary import ServerView
+        view = ServerView(a.library, a.server, a.root)
 
     if a.selftest:
         return selftest(a.root)
@@ -1270,7 +1392,8 @@ def main(argv: list[str]) -> int:
     mesh_jobs: list[Job] = []
     unmatched: list[str] = []
     if a.all:
-        mesh_jobs, unmatched = load_worklist()
+        mesh_jobs, unmatched = (server_worklist(view) if view
+                                else load_worklist())
         for j in mesh_jobs:
             j.old_key = (entries.get(j.logical) or {}).get("key", "")
         if a.limit:
@@ -1280,9 +1403,10 @@ def main(argv: list[str]) -> int:
     if a.textures:
         used = {j.texture for j in mesh_jobs if j.texture}
         if not used:
-            wl, _ = load_worklist()
+            wl, _ = server_worklist(view) if view else load_worklist()
             used = {j.texture for j in wl if j.texture}
-        for t in texture_universe():
+        for t in (server_texture_universe(view) if view
+                  else texture_universe()):
             if a.only_unmatched_textures and t in used:
                 continue
             tex_jobs.append(Job(t, "texture",

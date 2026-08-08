@@ -15,9 +15,16 @@
     <button id="mode-model" class="modebtn" role="tab" aria-selected="false"
             title="Monsters, NPCs, ghosts, mounts, roles and effects — one model, one action list (M)">Models</button>
   </div>
+  <label id="path-label" class="hidden"
+         title="What this stage is drawing from — an installed client, or a server in your COmmunity Library. The parser plugin follows the path, so the tables, id conventions and socket map all change with it. Your loadout, action and frame are kept across the switch, which is how you tell a regression in this tool from a difference between the clients.">
+    Path
+    <select id="path-select"></select>
+  </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
   <button id="btn-collapse-all" class="ghost" title="Collapse / expand every panel on the right (C)">Collapse panels</button>
+  <button id="btn-mods" class="ghost"
+          title="What is staged to replace an asset, and the install that applies it. Nothing reaches the game until you press Install.">Mod staging</button>
   <button id="btn-share" class="ghost" title="A link that restores this exact character">Copy link</button>
   <button id="btn-reset-all" class="ghost" title="Back to the starting character">Reset</button>
   <a class="navlink" href="/" title="The asset browser — your character is kept">Browse assets →</a>
@@ -50,8 +57,19 @@
       <b>Models</b>
       <span class="mut small">pick one, then an action</span>
     </div>
+    <!-- The catalogue is discovered by the client's own directory
+         convention (c3/monster/<id>/, c3/npc/<id>/), so a namespace that
+         does not use it -- a recovered garment archive, the Collection --
+         has models the catalogue cannot see. "By path" lists meshes under
+         a prefix in whatever view is selected, which is the only route to
+         those. -->
+    <div id="model-source" class="facet-axis"></div>
     <input id="model-search" type="search" placeholder="search monsters, NPCs, effects…" autocomplete="off">
+    <input id="model-path" class="hidden" type="search" autocomplete="off"
+           placeholder="path prefix, e.g. collection/npcs/"
+           title="Only meshes whose logical path starts with this. Leave empty for every mesh in the view.">
     <div id="model-kinds" class="facet-axis"></div>
+    <div id="model-crumbs" class="facet-axis hidden"></div>
     <div id="model-list" class="list" tabindex="0"></div>
     <div id="model-count" class="small mut"></div>
   </aside>
@@ -110,6 +128,18 @@
     <section class="card hidden" id="card-monster" data-card="monster">
       <h2><button class="cardtoggle" aria-expanded="true">▾</button>monster.json properties</h2>
       <div class="cardbody" id="monster-body"></div>
+    </section>
+
+    <section class="card" id="card-collect" data-card="collect">
+      <h2>Collection</h2>
+      <div class="cardbody">
+        <p class="small mut" style="margin:0 0 8px">
+          Keep this asset in the library&#39;s curated Collection &mdash; filed by
+          category, viewable, and stageable over an existing asset as a swap.
+          Its motion files come along with it.
+        </p>
+        <div id="collect-body"></div>
+      </div>
     </section>
 
     <section class="card" id="card-look" data-card="look">
@@ -192,12 +222,54 @@
   </div>
 </div>
 
+<!-- ------------------------------------------------ mod drawer
+     Same markup and the same swap.js behind it as the asset browser: this
+     page is where you decide one model should replace another, so it is
+     where staging has to be reachable. -->
+<div id="drawer" class="hidden">
+  <div class="drawer-inner">
+    <div class="drawer-head">
+      <h2>Mod staging</h2>
+      <button id="drawer-close" class="ghost">close</button>
+    </div>
+    <p class="mut small">
+      Staged files live in <code id="stage-dir"></code>. Nothing touches the game
+      install until you press <b>Install</b>, which runs
+      <code>comod.py install --yes</code> &mdash; the same path as the CLI, with its
+      backups and its <code>uninstall</code> revert.
+    </p>
+    <div id="stage-list"></div>
+    <!-- Which install to write to. There is usually more than one Conquer on a
+         machine -- a baseline, a community client, a copy kept for comparison --
+         and "install" silently meaning whichever one the viewer happens to be
+         browsing is a guess made on the user's behalf about a folder that gets
+         written to. Backups and the revert manifest are kept per install root,
+         so each one can be reverted on its own. -->
+    <label class="small mut" style="display:block;margin-top:8px">
+      Install into
+      <select id="install-select" style="max-width:100%"></select>
+    </label>
+    <input id="install-path" type="text" autocomplete="off"
+           style="width:100%;margin-top:4px"
+           placeholder="or paste the path to another game install">
+    <div id="install-note" class="small mut" style="margin-top:4px"></div>
+    <div class="row">
+      <button id="btn-dry" class="ghost">Install (dry run)</button>
+      <button id="btn-install" class="danger">Install for real</button>
+      <button id="btn-uninstall" class="ghost">Uninstall / revert</button>
+    </div>
+    <pre id="mod-output" class="out"></pre>
+  </div>
+</div>
+
 <div id="toast" class="hidden"></div>
 
 <script src="/ui/fx.js"></script>
 <script src="/ui/gl.js"></script>
 <script src="/ui/cards.js"></script>
+<script src="/ui/swap.js"></script>
 <script src="/ui/builder.js"></script>
+<script src="/ui/basepicker.js"></script>
 <script src="/ui/pageshot.js"></script>
 </body>
 </html>

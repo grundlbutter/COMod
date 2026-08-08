@@ -316,6 +316,56 @@ def parse(path: str | Path, want_cells: bool = True, verify: bool = True) -> DMa
 # rendering
 # ---------------------------------------------------------------------------
 
+def read_gamemap_dat(path: str | Path) -> list[dict] | None:
+    """`ini/GameMap.dat` -> rows shaped like `ini/GameMap.json`.
+
+    Every OFFICIAL client ships this and none of them ship the .json, which is
+    the community client's form. It is NOT TQ-ciphered -- despite the .dat
+    extension it is a plain little-endian table:
+
+        u32  record count
+        per record:
+            u32  DocumentId
+            u32  length of the path
+            char[length]      e.g. "map/map/newbie.7z"   (no NUL)
+            u32  PuzzleGridSize    256 or 128
+
+    Verified on 5517: 262 declared, 262 parsed, consuming exactly 8131 of 8131
+    bytes, and the 256/128 split matches what docs/cell_recovered.md read out
+    of the engine. A short or trailing-garbage file returns None rather than a
+    partial index, because a half-read map table is worse than none.
+
+    It lives in COre because both readers of the map index need it and neither
+    can import the other: `client/gamemap.py` is the game client's MapLibrary
+    and `tools/puzzle.py` is the viewer's PuzzleLibrary. It was briefly in the
+    former with the latter importing it, which quietly made the viewer's map
+    stack depend on the client package -- and that dependency does not survive
+    an extraction, so COMod shipped a MapEditor that could not open a map.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 4:
+        return None
+    (count,) = struct.unpack_from("<I", raw, 0)
+    off = 4
+    rows: list[dict] = []
+    try:
+        for _ in range(count):
+            (doc_id,) = struct.unpack_from("<I", raw, off); off += 4
+            (n,) = struct.unpack_from("<I", raw, off); off += 4
+            name = raw[off:off + n].decode("latin-1"); off += n
+            (puzzle,) = struct.unpack_from("<I", raw, off); off += 4
+            rows.append({"DocumentId": doc_id, "FileName": name,
+                         "PuzzleGridSize": puzzle})
+    except (struct.error, UnicodeDecodeError):
+        return None
+    if off != len(raw):
+        return None
+    return rows
+
+
 def _png(width: int, height: int, gray: bytes) -> bytes:
     """Minimal 8-bit greyscale PNG encoder (stdlib only)."""
     import zlib

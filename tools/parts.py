@@ -299,20 +299,33 @@ def _flip(p):
 
 #: Cache for `ini/3dmotion.ini`, which is 6.9 MB / 229,481 rows -- parsing it
 #: per request would dominate an equip round trip.
-_ACTION_CAT = None
+#:
+#: **Keyed by root.** It used to be a single global built from whichever
+#: install asked first, and every later call ignored its own `root` argument.
+#: That was invisible while one client was ever configured and wrong the
+#: moment two were: the viewer holds a catalogue per base so 6090 and 5517
+#: can be compared, and after a switch the figure was posed from the previous
+#: client's motion tables. It also silently corrupted a measurement in this
+#: session -- a script that walked CCO, 5517 and 6090 in one process got
+#: CCO's motions three times and reported all three clean.
+_ACTION_CATS: dict = {}
 
 
 def action_catalogue(root: Path = DEFAULT_ROOT):
-    """`attach.Catalogue`, built once. None when attach.py is not importable."""
-    global _ACTION_CAT
+    """`attach.Catalogue` for `root`, built once per root. None when
+    attach.py is not importable."""
     if attachmod is None:
         return None
-    if _ACTION_CAT is None:
+    try:
+        key = str(Path(root).resolve())
+    except OSError:                                       # pragma: no cover
+        key = str(root)
+    if key not in _ACTION_CATS:
         try:
-            _ACTION_CAT = attachmod.Catalogue(root)
+            _ACTION_CATS[key] = attachmod.Catalogue(root)
         except Exception:                                 # pragma: no cover
             return None
-    return _ACTION_CAT
+    return _ACTION_CATS[key]
 
 
 def idle_motion(body_appearance: str, root: Path = DEFAULT_ROOT,
@@ -344,6 +357,34 @@ def idle_motion(body_appearance: str, root: Path = DEFAULT_ROOT,
         return cat.idle_motion(body_appearance, weapon_type, action)
     except Exception:                                     # pragma: no cover
         return None
+
+
+def _orthonormal(mat):
+    r"""**Not used. Kept as the record of a fix that was worse than the bug.**
+
+    Weapons flatten partway through some swings: `v_l_weapon` in attack
+    swing 3 has row lengths (0.999, 0.051, 0.056) at frame 24 where frame 0
+    has (0.967, 0.969, 0.994). Dividing the scale out of the basis fixed
+    that frame and broke every resting pose, because **the socket scale is
+    load-bearing**: at idle frame 0 the same socket's rows measure (0.111,
+    0.149, 0.994), and that 10x shrink on two axes is what sizes a 188-unit
+    sword down into a hand. Removing it produced a blade longer than the
+    character, and the Gram-Schmidt -- which rebuilt axes longest-first --
+    also swung one axis 43 degrees off where the file put it.
+
+    So scale stays. What is still wrong is narrower than "the basis is not a
+    rotation": *some frames' scales are wildly out of line with the same
+    socket's other frames*. The measured fix, not yet implemented, is to
+    keep every axis DIRECTION exactly as stored and replace an outlier
+    axis LENGTH with the median that axis holds across the motion -- 0.051
+    at frame 24 against a median near 0.15. That needs a per-(mesh, socket,
+    motion) pass rather than the single-frame evaluation here, which is why
+    it is written down instead of guessed at.
+
+    The rows are nearly orthogonal as stored (dot products 0.003, 0.024,
+    0.102), so whatever the engine does, it is not fighting a skewed basis.
+    """
+    return mat
 
 
 def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None) -> dict[str, Anchor]:

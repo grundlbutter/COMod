@@ -462,6 +462,63 @@ def components(walk: bytes, width: int, height: int) -> list[int]:
 # art
 # ---------------------------------------------------------------------------
 
+
+def parse_ani_ini(path) -> dict:
+    """A classic `.ani` -> the same {key: [frame, ...]} shape as the JSON.
+
+    OFFICIAL clients ship `ani/MapScene.ani` in TQ's ini form; only the
+    community build ships `ani/MapScene.json`. Reading just the JSON left the
+    parser returning an empty dict on every official root, so every sprite
+    lookup missed and `frames()` came back [] -- including all of the p-arena
+    bridge pieces the .msk fallback exists for.
+
+    This is the same split as monster.json/Monster.dat and
+    GameMap.json/GameMap.dat: the community form is the exception, not the rule.
+
+        [bridge06.tga]
+        FrameAmount=1
+        Frame0=data/map/mapobj/plain/plain/bridge06.msk
+
+    Frames are ordered by their INDEX, not by the order they appear, because
+    nothing guarantees the file lists Frame0 before Frame1. `FrameAmount` is
+    deliberately ignored -- what is actually present wins over what the file
+    claims, so a truncated section yields the frames it really has.
+    """
+    try:
+        text = Path(path).read_text("latin-1", errors="replace")
+    except OSError:
+        return {}
+    out: dict[str, list[str]] = {}
+    cur: Optional[list[tuple[int, str]]] = None
+    frames: dict[str, list[tuple[int, str]]] = {}
+    key = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("//", ";", "#")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            key = line[1:-1].strip()
+            cur = frames.setdefault(key, [])
+            continue
+        if cur is None or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if not k.lower().startswith("frame") or k.lower() == "frameamount":
+            continue
+        try:
+            idx = int(k[5:])
+        except ValueError:
+            continue
+        v = v.strip()
+        if v:
+            cur.append((idx, v))
+    for k, pairs in frames.items():
+        if pairs:
+            out[k] = [v for _, v in sorted(pairs)]
+    return out
+
+
 class SpriteCache:
     """`.ani` key -> decoded RGBA frames, cached. Reads through an AssetRoot so
     the art is found whether it is loose or inside data.wdf."""
@@ -497,11 +554,14 @@ class SpriteCache:
         out: dict = {}
         if self._root is not None:
             p = self._root / "ani" / f"{stem}.json"
+            q = self._root / "ani" / f"{stem}.ani"
             if p.is_file():
                 try:
                     out = json.loads(p.read_text("utf-8", errors="replace"))
                 except Exception:                           # noqa: BLE001
                     out = {}
+            elif q.is_file():
+                out = parse_ani_ini(q)
         self._ani[stem] = out
         return out
 

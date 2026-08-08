@@ -18,17 +18,28 @@ Resolution order (first hit wins, and every answer records *how* it was found):
     5. failure       ``RootNotFound``, carrying the full list of what was tried
 
 A candidate is only accepted if it *contains the files that must exist* --
-``c3.wdf``, ``data.wdf``, ``ini/`` and ``bin/64/``.  A path is never trusted
-because it looks right.
+``c3.wdf``, ``data.wdf`` and ``ini/`` (see `REQUIRED`, and the note there
+about the ``bin/64/`` entry that used to be in it and refused every client
+but one).  A path is never trusted because it looks right.
 
 Nothing here writes to the game install.  The only file this module ever
 writes is its own config, and only when something explicitly asks it to.
 
-One repo-side question is also answered here: where a derived artefact
-(``out/...``, gitignored, built from the install) can be *read* from.
-``find_derived`` looks in this checkout first, then -- in a linked ``git
-worktree`` -- in the primary checkout, so a fresh worktree inherits the
-``out/`` tree it cannot have yet instead of silently starting without it.
+Two repo-side questions are also answered here, both about derived artefacts
+(``out/...``, gitignored, built from the install):
+
+*Where can one be read from?*  ``find_derived`` looks in this checkout first,
+then -- in a linked ``git worktree`` -- in the primary checkout, so a fresh
+worktree inherits the ``out/`` tree it cannot have yet instead of silently
+starting without it.
+
+*Which install does one belong to?*  A derived index is only valid for the
+client it was built from, and this machine holds eight.  ``base_id`` names
+that client and ``find_derived`` resolves per-base trees (`PER_BASE`) inside
+``out/indexes/<base-id>/``, so pointing the tools at another install cannot
+serve the previous one's facts.  Nothing recorded this before, and it showed:
+``out/dll/rtti.md`` is still titled for one client over a body describing
+another.
 
 CLI::
 
@@ -57,6 +68,8 @@ __all__ = [
     "missing_parts", "looks_like_root", "describe_root",
     "user_config_path", "repo_config_path", "config_root", "save_root",
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
+    "PER_BASE", "GLOBAL_EXCEPTIONS", "INDEX_ROOT", "base_fingerprint",
+    "base_id", "derived_rel", "derived_path", "declare_kind", "KINDS_KEY",
     "iter_candidates", "discover", "search_report",
     "find", "resolve", "game_root", "default_root", "bin_dir",
     "add_root_argument", "root_from_args", "invalidate_cache",
@@ -70,13 +83,23 @@ ENV_VAR = "CO_ROOT"
 CONVENTIONAL_ROOT = r"C:\Program Files\Classic Conquer 2.0"
 
 #: What a real install must contain.  ``(relative path, kind)`` where kind is
-#: "file" or "dir".  These four are what every tool in the repo actually opens:
-#: the two WDF archives, the ini/ game database, and the 64-bit binaries.
+#: "file" or "dir".
+#:
+#: **`bin/64/` used to be here and was wrong.** It was described as "what
+#: every tool in the repo actually opens", and nothing opens it -- a grep for
+#: it across every `.py` finds only this table and its own error message. It
+#: is an artefact of the one install this project started from: measured over
+#: the official lineage, *none* of 5017, 5065, 5165, 5517 or 6090 has it, and
+#: neither does Zephyr. So it rejected every client except the one it was
+#: written from, which is the third gate this project has had tuned to that
+#: install and the third to refuse a legitimate client.
+#:
+#: What is left is what a client genuinely cannot work without and what the
+#: tools genuinely read: the asset archives and the ini/ database.
 REQUIRED: tuple[tuple[str, str], ...] = (
     ("c3.wdf", "file"),
     ("data.wdf", "file"),
     ("ini", "dir"),
-    ("bin/64", "dir"),
 )
 
 #: Directory names an install has been seen under, or plausibly could be.
@@ -413,7 +436,234 @@ def _find_primary_checkout() -> Optional[Path]:
     return primary
 
 
-def find_derived(rel: str) -> Optional[Path]:
+#: Derived trees that are **built from one install and valid only for it**.
+#: A path under any of these is rewritten into ``out/indexes/<base-id>/...``
+#: so two clients cannot share an answer.
+#:
+#: Everything not listed stays where it is, and each omission is a claim:
+#:
+#: * ``out/wdf/`` -- hash-to-name maps.  The key *is* the archive content, so
+#:   an entry recovered from one client cannot be served for another unless
+#:   the archives are the same file, which across the official lineage they
+#:   are (identical md5 in all five).
+#: * ``out/offsets_cache.json`` -- already refuses a foreign cache; it keys on
+#:   the sha256 of the module bytes.  This is the pattern, not the exception.
+#: * ``out/opcodes.json`` -- protocol, not assets.
+#: * ``out/health.json``, ``out/client/``, ``out/recon/``, ``out/sessions/``,
+#:   ``out/clientdiff/`` -- reports and captures, named for what they describe.
+#: * ``out/dll/`` -- **not keyed, and it should be.** It currently holds a mix:
+#:   `rtti.*` from the classic DLLs beside `imports/metadata/functions` built
+#:   from a CCO 2.0 install that no longer exists on any machine here, so a
+#:   migration would have to label data it cannot regenerate or verify.
+#:   Left alone deliberately rather than half-moved.  See
+#:   ``docs/handoff_5517_base_prep.md``.
+#: ``out/thumbs/servers/<name>/`` is exempt and stays global: those are
+#: COmmunity Library server views, which have nothing to do with whichever
+#: install happens to be configured.  They were already namespaced by hand --
+#: the ad-hoc version of this key.
+PER_BASE: tuple[str, ...] = (
+    "out/meshtex/", "out/artcrawl/", "out/thumbs/", "out/effects/",
+    "out/skins/", "out/browse/", "out/c3/", "out/ini/",
+)
+
+#: Checked before `PER_BASE`, so a longer path can opt back out.
+GLOBAL_EXCEPTIONS: tuple[str, ...] = (
+    "out/thumbs/servers/",
+)
+
+#: Where keyed artefacts live.
+INDEX_ROOT = "out/indexes"
+
+
+def base_fingerprint(root=None) -> str:
+    """A short content hash of the install's table layer, or ``""``.
+
+    **What it is:** sha256 over every file directly in ``ini/``, in
+    name order, contents included -- 250 files and 37 MB at 6090, about
+    50 ms.  Cheap enough to ask for on demand and decisive enough to
+    separate clients that no other cheap test can: all five official patch
+    clients ship byte-identical ``c3.wdf`` and ``data.wdf``, so the archives
+    discriminate nothing, and ``version.dat`` is absent from private-server
+    repacks.  The table layer is what a parser plugin is *about*, and it is
+    where the clients actually differ (91 of 176 shared ``ini/`` files differ
+    between 5517 and 6090).
+
+    **What it is not:** proof of identity.  It reads only the top level of
+    ``ini/``, so two installs differing solely in loose art or in a
+    subdirectory hash the same.  That is the right trade for choosing an
+    index namespace -- the cost of a collision is a shared index between two
+    installs whose tables agree exactly, and the cost of hashing the loose
+    layer instead would be minutes per call.
+    """
+    try:
+        d = Path(root) if root is not None else game_root()
+    except Exception:
+        return ""
+    ini = Path(d) / "ini"
+    if not ini.is_dir():
+        return ""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        files = sorted((p for p in ini.iterdir() if p.is_file()),
+                       key=lambda p: p.name.lower())
+        for p in files:
+            h.update(p.name.lower().encode("utf-8"))
+            h.update(p.read_bytes())
+    except OSError:
+        return ""
+    return h.hexdigest()[:12]
+
+
+def base_id(root=None) -> str:
+    """The namespace a derived artefact belongs to: ``<kind>-<fingerprint>``.
+
+    The kind half is the declared ``game_kind`` -- the user's own statement
+    of what this folder is -- so the directory name is readable
+    (``patch5517-113d8413ee90``) rather than opaque.  The fingerprint half is
+    what makes it *correct*: a declaration can be stale or absent, and a
+    repack of 6090 declares itself 6090 while shipping different tables.
+
+    **Re-declaring a folder deliberately changes the namespace**, even though
+    the bytes did not move.  An index is what a *plugin* concluded *about* an
+    install, so a different parse profile is a different index -- declaring a
+    6090 repack "myserver" instead of "patch6090" must not keep serving
+    answers derived under the other one's conventions.  The rebuild is the
+    point, not a cost.
+
+    Store the plugin's canonical ``name`` here, not an alias: ``for_kind``
+    accepts both and they would key two directories from one install.  The
+    setup page already writes ``plug.name``.
+
+    A missing directory means "build me", never "borrow another base's
+    answers".  Falls back to ``unknown-<fingerprint>`` with no declaration,
+    and to ``unkeyed`` when even the fingerprint fails -- which keeps a
+    broken install from silently sharing whatever was built last.
+    """
+    fp = base_fingerprint(root)
+    if not fp:
+        return "unkeyed"
+    return f"{_declared_kind(root)}-{fp}"
+
+
+#: Settings key: ``{absolute root: plugin name}``, every folder the user has
+#: ever declared.  ``game_kind`` alone cannot answer for more than one
+#: install, and this machine has eight.
+KINDS_KEY = "kinds"
+
+
+def declare_kind(root, kind: str) -> Path:
+    """Remember that ``root`` is a ``kind`` of client.  Returns the file written.
+
+    Writes both the single ``game_kind`` (what the app reads for the *current*
+    install) and an entry in `KINDS_KEY`, so the declaration survives pointing
+    the tools somewhere else and back.  Without the map, switching roots with
+    ``CO_ROOT`` or ``--root`` drops to ``unknown`` and silently opens a second,
+    empty index namespace for a client you already declared.
+    """
+    doc = read_settings()
+    kinds = dict(doc.get(KINDS_KEY) or {})
+    try:
+        kinds[str(Path(root).resolve())] = str(kind)
+    except OSError:
+        kinds[str(root)] = str(kind)
+    return write_settings(game_kind=str(kind), **{KINDS_KEY: kinds})
+
+
+def kind_for_root(root=None) -> str:
+    """The plugin name the user declared for ``root``, or ``""``.
+
+    Ask this rather than reading ``game_kind`` directly.  ``game_kind`` is a
+    single value and this machine has eight installs, so it answers for
+    whichever root the config names and for no other: resolve a different one
+    and it hands back a plugin for a client you are not looking at.  That is
+    not theoretical -- running the suite with ``CO_ROOT`` pointed at 6090
+    while the config named 5517 loaded the 5517 plugin against 6090's assets,
+    and the only reason it surfaced was a provenance label changing.
+    """
+    kind = _declared_kind(root)
+    return "" if kind == "unknown" else kind
+
+
+def _declared_kind(root=None) -> str:
+    """What the user said this root is, or ``unknown``.
+
+    The per-root map (`KINDS_KEY`) answers first, because it is the only
+    record that can be about more than one install.  ``game_kind`` is the
+    fallback and is only evidence for the root it was saved beside: resolve a
+    different one -- via ``CO_ROOT``, ``--root``, or an explicit argument --
+    and it describes some other folder, so using it would file one client's
+    index under another's name.
+
+    Never guesses.  Detection is the app's job and the user's declaration
+    outranks it; a wrong name here would be baked into a directory.
+    """
+    doc = read_settings()
+    try:
+        here = Path(Path(root) if root is not None else game_root()).resolve()
+    except Exception:
+        return "unknown"
+
+    def clean(k: str) -> str:
+        k = str(k).strip().lower()
+        return "".join(c if c.isalnum() or c in "-_" else "-" for c in k)
+
+    for path, kind in (doc.get(KINDS_KEY) or {}).items():
+        try:
+            if Path(str(path)).resolve() == here and str(kind).strip():
+                return clean(kind)
+        except OSError:
+            continue
+    kind = str(doc.get("game_kind", "")).strip()
+    declared_for = doc.get("game_root")
+    if not kind or not declared_for:
+        return "unknown"
+    try:
+        if Path(str(declared_for)).resolve() != here:
+            return "unknown"
+    except OSError:
+        return "unknown"
+    return clean(kind)
+
+
+def derived_rel(rel: str, root=None) -> str:
+    """Rewrite a derived path into its per-base namespace, if it has one.
+
+    ``out/meshtex/coverage.json`` -> ``out/indexes/<base-id>/meshtex/coverage.json``
+    ``out/wdf/c3_names.json``     -> unchanged
+
+    Callers keep writing the plain literal they always wrote; this is the one
+    place that knows which trees are per-install.
+
+    ``root`` names *which* install to resolve for, and defaults to the
+    configured one.  It matters whenever a process holds more than one
+    catalogue at a time -- the viewer serving 6090 and 5517 side by side is
+    the case this exists for.  Without it the answer would be per-process,
+    and the second base would silently read the first's index, which is the
+    whole failure this key was built to stop.
+    """
+    r = str(rel).replace("\\", "/")
+    for pref in GLOBAL_EXCEPTIONS:
+        if r == pref.rstrip("/") or r.startswith(pref):
+            return r
+    for pref in PER_BASE:
+        if r == pref.rstrip("/") or r.startswith(pref):
+            return f"{INDEX_ROOT}/{base_id(root)}/{r[len('out/'):]}"
+    return r
+
+
+def derived_path(rel: str, root=None) -> Path:
+    """Where a **writer** should put ``rel``, in this checkout, keyed.
+
+    Never falls back to another checkout: everything that builds an artefact
+    builds it here.  Creates no directories -- the caller decides when.
+    """
+    repo = _repo_dir()
+    base = repo if repo is not None else Path.cwd()
+    return base / derived_rel(rel, root)
+
+
+def find_derived(rel: str, root=None) -> Optional[Path]:
     """Locate a derived artefact (an ``out/...`` path) for **reading**.
 
     This checkout first; failing that, the primary checkout when running in
@@ -422,7 +672,16 @@ def find_derived(rel: str) -> Optional[Path]:
     on with less (``meshtex.scan_meshes`` is the cautionary tale).  Never
     used for writing: everything that builds an artefact writes into its own
     checkout.
+
+    Per-base trees (`PER_BASE`) resolve inside ``out/indexes/<base-id>/``, so
+    switching installs cannot serve one client's facts as another's -- the
+    failure that cost four visible bugs in the 6090 rebase.  **There is no
+    fallback to the unkeyed path**: a missing index must read as "build me".
+
+    Pass ``root`` when the caller knows which install it is asking about;
+    anything holding two catalogues at once must.
     """
+    rel = derived_rel(rel, root)
     repo = _repo_dir()
     if repo is not None and (repo / rel).exists():
         return repo / rel

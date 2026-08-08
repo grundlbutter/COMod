@@ -68,6 +68,22 @@ REPO = Path(__file__).resolve().parent.parent
 #: shipped data file and "inferred" when it is a naming convention measured
 #: from the corpus.
 #:
+#: **The confidence below is the rule's, for a mesh the rule identifies.**
+#: When a rule names several textures for one mesh it has not identified it,
+#: and `matches` divides the confidence by how many it named -- picking blind
+#: among n is right 1/n of the time.  1,290 of 4,964 meshes here are in that
+#: position, so this is the normal case rather than an edge one, and the
+#: figures below are ceilings.
+#:
+#: That mattered: `c3/npc/999001100.c3` is the standby motion of thirteen
+#: NPCs with two different skins between them, `npc_table` returned three
+#: textures, and `best()` handed back whichever sorted first at the full
+#: 0.95.  It was the wrong one, and everything built on it failed while
+#: looking like a plumbing problem.  A shared asset has no single texture,
+#: and the honest answer is a low confidence with `alternatives` set -- not
+#: a confident pick.  Where one answer is actually needed, resolve the
+#: *entity* instead: `core/npcart.py` does it for NPCs.
+#:
 #: Candidates are ranked **by kind first** -- every authored match outranks
 #: every inferred one -- and by ``confidence`` within a kind.  For the
 #: inferred rules ``confidence`` is literally the top-1 precision measured by
@@ -123,11 +139,20 @@ class Match:
     confidence: float
     kind: str
     detail: str = ""
+    #: How many distinct textures the SAME rule produced for this mesh.
+    #: 1 is a definite answer; more means the rule cannot tell them apart
+    #: and `confidence` has been divided accordingly -- see `matches`.
+    alternatives: int = 1
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.alternatives > 1
 
     def as_dict(self) -> dict:
         return {"texture": self.texture, "method": self.method,
                 "confidence": self.confidence, "kind": self.kind,
-                "detail": self.detail}
+                "detail": self.detail, "alternatives": self.alternatives,
+                "ambiguous": self.ambiguous}
 
 
 # ---------------------------------------------------------------------------
@@ -730,10 +755,30 @@ class MeshTextureIndex:
             kind, conf, _ = METHODS[method]
             if kind == "inferred" and not include_inferred:
                 return
+            pairs = list(pairs)
+            # **A rule that names several textures for one mesh has not
+            # identified one.** `c3/npc/999001100.c3` is the standby motion of
+            # thirteen NPCs -- Storekeeper, GuildConductor1..4, RuoDie and the
+            # rest -- and they do not share a skin, so `npc_table` yields
+            # three. Reporting each at the rule's full 0.95 and letting
+            # `best()` take whichever sorted first presented an arbitrary pick
+            # as an authored fact, and the pick was wrong: the Storekeeper
+            # uses 9990211 and this returned 9990010.
+            #
+            # Picking blind among n equally-authored candidates is right 1/n
+            # of the time, so that is the confidence. The rule is still
+            # `authored` -- the *table* said this, and the ambiguity is real
+            # rather than a failure to read it -- but a caller ranking by
+            # confidence now sees the difference between "the table says X"
+            # and "the table says one of these three".
+            distinct = {t for t, _ in pairs}
+            n = max(1, len(distinct))
+            eff = conf / n
             for tex, detail in pairs:
                 cur = found.get(tex)
-                if cur is None or rank(kind, conf) < rank(cur.kind, cur.confidence):
-                    found[tex] = Match(tex, method, conf, kind, detail)
+                if cur is None or rank(kind, eff) < rank(cur.kind, cur.confidence):
+                    found[tex] = Match(tex, method, eff, kind, detail,
+                                       alternatives=n)
 
         emit("effect_table", self._effect.get(mesh, ()))
         emit("simpleobj_table", self._simple.get(mesh, ()))
@@ -759,7 +804,7 @@ class MeshTextureIndex:
         return m[0] if m else None
 
     # -- mesh census (cached) ----------------------------------------------
-    CACHE = REPO / "out" / "meshtex" / "mesh_index.json"
+    CACHE = coroot.derived_path("out/meshtex/mesh_index.json")
 
     def _cache_covers(self, idx: dict) -> bool:
         """Does a cached census cover the current universe?
@@ -1076,7 +1121,7 @@ def _main(argv: list[str]) -> int:
     with MeshTextureIndex() as idx:
         if "--precision" in flags:
             p = measure_precision(idx)
-            out = REPO / "out" / "meshtex"
+            out = coroot.derived_path("out/meshtex")
             out.mkdir(parents=True, exist_ok=True)
             (out / "precision.json").write_text(json.dumps(p, indent=1), "utf-8")
             print(f"{'rule':<18}{'fires':>8}{'scored':>8}{'top-1':>8}{'any':>8}{'conf':>7}")
@@ -1097,7 +1142,7 @@ def _main(argv: list[str]) -> int:
                   file=sys.stderr)
             idx._load_mesh_index()
             rep = build_coverage(idx, verify="--verify" in flags)
-            out = REPO / "out" / "meshtex"
+            out = coroot.derived_path("out/meshtex")
             out.mkdir(parents=True, exist_ok=True)
             (out / "coverage.json").write_text(json.dumps(rep, indent=1), "utf-8")
             s = rep["summary"]

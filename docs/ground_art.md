@@ -336,7 +336,9 @@ per window; `?scale=2` quarters it.
 * `map/PuzzleSave/*.pux` (`TqTerrain\0`), used by 4 maps.
 * Whether the engine draws the puzzle at one block per tile or one per map, and
   what subdivision it asks for — `CPuzzleBlockX::Create`'s arguments come from
-  the packed exe.
+  the packed exe. **Narrowed by `docs/map_memory.md`**: the create warns above
+  80×80 subdivisions, the draw path is ordinary sprite batching, and the
+  memory question (whole tile set resident per map) is answered there.
 * The `rollSpeedX/Y` scrolling backdrops.
 * ~~Scene / cover / effect layer placement~~ — **done for scene and cover**:
   `docs/map_scenery.md`. `effect` and `sound` remain.

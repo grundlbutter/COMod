@@ -115,6 +115,12 @@ c3/mesh/<id>.c3        geometry
 c3/texture/<id>.dds    skin
 ```
 
+(Official clients ship the first link as `ini/itemtype.dat` — the same rows
+behind the TQ File Cipher — and their monster table as `ini/Monster.dat`.
+`core/tqdat.py` reads both, VERIFIED by re-encrypting the decryption back to
+the shipped bytes, and `load_items` / `load_monster_rows` fall back to them,
+so the chain starts the same way on either kind of root.)
+
 **VERIFIED**: `RolePart.ini` `[Config]` lists 13 parts, each naming a mesh table
 and a motion table. Sections in those tables are appearance IDs; `Part=N` gives
 N sub-parts; each has `Mesh<i>` and `Texture<i>`.
@@ -428,8 +434,42 @@ py -3 tools/comod.py install --dry-run
 ```
 
 Staging lives in `mods/stage/`, mirroring the install layout. `install` requires
-`--yes`, backs up any loose file it displaces into `mods/backup/`, and records
-`mods/manifest.json` so `uninstall` reverts exactly what was added.
+`--yes` and backs up any loose file it displaces, so `uninstall` reverts exactly
+what was added.
+
+### One slot per install, because there is rarely one install
+
+`comod.py installs` prints the stage tree and every client something has been
+installed to. **Backups and the manifest are keyed by install root** —
+`mods/installs/<slug>/` — rather than the single `mods/backup/` +
+`mods/manifest.json` they used to share. That was survivable while there was
+one place to install to. With two it was not:
+
+* installing to B overwrote A's manifest, so A could no longer be reverted;
+* `if not b.exists()` meant B's originals were **never backed up**, because A's
+  file was already sitting at that path in the shared backup tree — so
+  reverting B restored *A's* files into B;
+* `uninstall` never read the root the manifest recorded. `--root` carried a
+  default, so `args.root or man["root"]` always took the default and reverted
+  against whichever install was conventional.
+
+Now: an ambiguous `uninstall` lists the candidates and refuses rather than
+picking, a single install still needs no `--root`, installing twice without
+reverting is refused (the second install's "originals" would be the first
+install's files), and a pre-split manifest is migrated into its own slot on
+first use rather than stranded.
+
+### What counts as somewhere a mod can go
+
+Not `coroot.looks_like_root`. That answers whether the **viewer** can browse a
+baseline and demands `c3.wdf`, `data.wdf`, `ini/` and `bin/64/` — which the
+community clients this project exists to support do not have. Zephyr ships
+`c3.tpi`/`c3.tpd` and no `bin/64/`, so that gate refused to install into it.
+
+`comod.moddable_install` asks the weaker question the mechanism actually
+needs, since a swap is only a loose file read before the archive: the `ini/`
+tables, and somewhere art lives (`c3.wdf`, `c3.tpi`, `c3.tpd` or `c3/`).
+`C:\Windows` fails on the first.
 
 Visual discovery:
 

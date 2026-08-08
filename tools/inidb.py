@@ -345,8 +345,7 @@ def main() -> int:
 
     p = sub.add_parser("schemas")
     p.add_argument("-o", "--out", type=Path,
-                   default=Path(__file__).resolve().parents[1]
-                   / "out" / "ini" / "schemas.json")
+                   default=coroot.derived_path("out/ini/schemas.json"))
     p.set_defaults(func=cmd_schemas)
 
     p = sub.add_parser("show")

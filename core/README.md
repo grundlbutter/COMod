@@ -1,9 +1,21 @@
 # COre
 
-The shared foundation under the COMod tools: install discovery, path safety,
-and the Conquer Online asset and map formats. It is vendored into this
-repository as `core/` so that a clone runs with no extra install step; it is
-kept deliberately separable so it can also stand alone.
+The shared foundation under **COMod** (modding tools), **COmpanion**
+(quality-of-life tools) and **VibeCo** (the open client). Install discovery,
+path safety, and the Conquer Online asset and map formats.
+
+**Not the place to start.** If you arrived here first, you probably want
+VibeCo — the open client and the protocol work. COre is the layer underneath,
+and on its own it does nothing you can look at.
+
+## Why this exists
+
+`coroot` is imported by 34 files, `coassets` by 21, `c3phy` by 18 — spread
+across all three of the other projects. A three-way split does not divide that
+code; every side needs it. So it gets its own home rather than being copied
+three times and drifting.
+
+See `docs/repo_split.md` in the main tree for the full reasoning.
 
 ## What is in it
 
@@ -16,6 +28,7 @@ kept deliberately separable so it can also stand alone.
 | `dds` | DDS / BC texture decoding. Uses numpy if present, correct without it. |
 | `c3phy` | C3 / PHY mesh parsing. |
 | `dmap` | `.DMap` map grids, passability and row checksums. |
+| `tqdat` | The TQ File Cipher and the encrypted `ini/*.dat` tables official clients ship (itemtype.dat, Monster.dat). |
 | `coassets` | The asset VFS — loose file, then overlay, then archive, in the order the game itself resolves them. |
 
 Standard library only. `numpy` is an optional speed-up, never a requirement.
@@ -23,18 +36,18 @@ Standard library only. `numpy` is an optional speed-up, never a requirement.
 ## Two properties that are enforced, not just intended
 
 **The set is closed under its own imports.** `coassets` needs `coroot`,
-`safepath`, `tqhash` and `wdf`; `dmap` needs `coroot`; everything else imports
-only the standard library. Nothing here reaches up into `tools/`.
-`tools/test_viewer.py::CoreBoundary` fails if that changes — which is the
-property that keeps COre extractable, and exactly the property that rots
-silently without a test.
+`safepath`, `tqhash`, `wdf` and `tqdat`; `dmap` needs `coroot`; everything else imports
+only the standard library. Nothing here reaches up into `tools/`, `client/` or
+`capture/`. `tools/test_viewer.py::CoreBoundary` fails if that changes — which is
+the property that makes COre extractable at all, and exactly the property that
+rots silently without a test.
 
 **The install is read-only.** Nothing in COre writes to a game directory.
-`tools/comod.py` is the only writer in the whole project.
+`comod.py`, which lives in COMod, is the only writer in the whole project.
 
 ## Using it
 
-From a checkout, the way this tree does:
+From a checkout, the way the current tree does:
 
 ```python
 import sys
@@ -45,6 +58,18 @@ import coroot
 root = coroot.resolve().path
 ```
 
-The import spelling is always the flat module name — `import coroot`, not
-`from cocore import coroot`. `pyproject.toml` explains why, and what that
-costs.
+Once split into its own repository, as a pinned dependency:
+
+```
+co-core @ git+https://github.com/<owner>/COre@v0.1.0
+```
+
+Either way the import spelling is the same — `import coroot`, not
+`from cocore import coroot`. `pyproject.toml` explains why, and what that costs.
+
+## Status
+
+Currently a **directory in the combined repository**, with its packaging and its
+boundary test already in place, so extraction is a `git filter-repo --path core/`
+away rather than a refactor. See `docs/repo_split.md` §5 for the order the rest
+of the split should happen in.

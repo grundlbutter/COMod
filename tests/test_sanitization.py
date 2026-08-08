@@ -188,6 +188,57 @@ INSTALL_PATH_ALLOWED = {"core/coroot.py",
                         "docs/sanitization.md",
                         "docs/repo_split.md"}
 
+# ---------------------------------------------------------------------------
+# Decompiled source material.
+#
+# The 6090 client shipped with its asserts intact, so `tools/asserts.py` can
+# recover the source path, line number and the *text of the failing condition*
+# for ~5,300 sites. Those condition fragments are literal text from TQ
+# Digital's proprietary source. Under the project's "ship an engine, never the
+# data" rule they sit on the same side of the line as the game assets: they may
+# live in this private tree, and must not reach COre / VibeCo / COMod.
+#
+# This is a different category from the personal data above -- it is not a leak
+# about the author, it is someone else's copyrighted text -- but it wants the
+# same treatment, so it reuses the same machinery.
+#
+# The identifiers are stored **as hashes**, for the same reason the personal
+# ones are: a check that carries a copy of the thing it exists to contain has
+# not contained it. Only Hungarian-notation parameter names distinctive enough
+# to have come from an assert are listed. Class names and .cpp filenames are
+# deliberately excluded -- they collide with this project's own long-standing
+# vocabulary (`RolePart.ini` is a real game data file), and a filename is not
+# source text.
+# ---------------------------------------------------------------------------
+
+BANNED_SOURCE = {
+    "10abcc50f3f16c93fa8c61fb4f456064",
+    "135c3545fd422c4aef79eabe659e1243",
+    "147fb2c46121a572aa1680132f8261bd",
+    "326d0e268630850298381bb31bf3724d",
+    "697d81a98308d6fe746ea1a910e61b88",
+    "9745841f2dfd4f229747e8b7443a3cd4",
+    "b3b366a1cdbdb3f7c50daa29d4ab5752",
+}
+
+#: The vendor source trees the asserts name. Matched literally rather than
+#: hashed: these are *paths*, and naming a filename is not reproducing a file.
+#: They remain a reliable marker that a file carries assert-derived material,
+#: which is what makes them worth gating on.
+VENDOR_TREE_RE = re.compile(r"c3engine_official|cq2clientcn", re.IGNORECASE)
+
+#: Files allowed to carry it, because recording the finding is what they are
+#: for. **Everything in this set is private-tree-only** and must not survive an
+#: extraction -- see docs/repo_split.md §3. Adding a path here is a decision
+#: that the file can never be published, so add deliberately.
+DECOMPILED_ALLOWED = {"docs/sockets_6090.md",
+                      "docs/handoff_socket_basis.md",
+                      "docs/dll_analysis.md",
+                      "docs/STATUS.md",
+                      "tests/test_sanitization.py",
+                      "docs/sanitization.md",
+                      "docs/repo_split.md"}
+
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 #: Squashed identifiers span at most this many consecutive alphanumeric runs
@@ -296,6 +347,24 @@ def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None) -> list[s
     if rel not in INSTALL_PATH_ALLOWED and INSTALL_PATH_RE.search(text):
         bad.append("hardcoded game install path -- resolve it through "
                    "core/coroot.py instead")
+
+    # Decompiled source material.  Unlike everything above, a finding here is
+    # not necessarily a bug in the file -- it may be a correct note that simply
+    # cannot be published.  The message says so, because "delete this" is the
+    # wrong fix about half the time.
+    if rel not in DECOMPILED_ALLOWED:
+        if VENDOR_TREE_RE.search(text):
+            bad.append("names a vendor source tree recovered from the client's "
+                       "compiled-in asserts -- private-tree-only material. "
+                       "Either drop it, or add this path to DECOMPILED_ALLOWED "
+                       "and accept that the file can never be extracted")
+        for t in set(toks):
+            if h(t) in BANNED_SOURCE:
+                bad.append("an identifier recovered from the client's own "
+                           "asserts is present -- that is literal text from "
+                           "TQ's source, and belongs only in co-client-re "
+                           "(not naming it here)")
+                break
     return bad
 
 

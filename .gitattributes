@@ -1,4 +1,17 @@
-* text=auto
-*.cmd text eol=crlf
+# Keep LF in the tree. Something in the local environment rewrites Python
+# sources to CRLF on save, which silently breaks byte-level edits and shows up
+# as phantom whole-file diffs.
+* text=auto eol=lf
+
+# Binary, never touched.
 *.png binary
-*.zip binary
+*.dds binary
+*.wdf binary
+*.c3  binary
+*.dll binary
+*.exe binary
+
+# Windows-only launchers genuinely want CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

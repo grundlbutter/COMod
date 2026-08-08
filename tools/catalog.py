@@ -12,7 +12,13 @@ first:
 
   1. **Appearance-table membership.** If `armor.ini` names a mesh or texture,
      that asset *is* character body art -- the game says so. Same for
-     `weapon.ini`, `armet.ini`, `mount.ini`. This is the only evidence that
+     `weapon.ini`, `armet.ini`, `mount.ini`. The NPC chain (npc table ->
+     simple object -> obj/texture tables, `core/npcart.py`) is the same kind
+     of evidence and files an NPC's geometry and skin under NPCs even though
+     they live in the shared `c3/mesh/` and `c3/texture/` buckets. It only
+     overrides those generic buckets: a monster-styled NPC that borrows
+     `c3/monster/108/` does not pull the file out of Monsters -- the art is
+     the monster's, the NPC merely wears it. This is the only evidence that
      comes from the client's own data rather than from us.
   2. **Directory layout.** `c3/monster/...`, `data/map/puzzle/<region>/...`,
      `c3/0001..0004/...`. Verified against the real tree; every rule below
@@ -237,6 +243,12 @@ RULES: list[Rule] = [
          "a top-level config or binary file"),
 ]
 
+#: The shared buckets whose rules already promise that table evidence
+#: overrides them. NPC-table membership reclassifies a path only when its
+#: rule is one of these (or none matched) -- specific family folders like
+#: `c3/monster/` keep their art even when an NPC references it.
+GENERIC_SHARED = {"c3/mesh/", "c3/texture/", "c3/"}
+
 #: Appearance tables -> the category their meshes and textures belong to.
 #: This is the strongest evidence there is: it comes from the client's own ini.
 TABLE_CATEGORY: dict[str, tuple[str, str]] = {
@@ -270,11 +282,13 @@ class AssetCatalog:
     def __init__(self, root: Path = DEFAULT_ROOT,
                  table_membership: Optional[Callable[[str], list]] = None,
                  exists: Optional[Callable[[str], bool]] = None,
-                 list_under: Optional[Callable[[str], list]] = None):
+                 list_under: Optional[Callable[[str], list]] = None,
+                 npc_membership: Optional[Callable[[str], bool]] = None):
         self.root = Path(root)
         self._tables = table_membership or (lambda p: [])
         self._exists = exists or (lambda p: (self.root / p).is_file())
         self._list_under = list_under or (lambda prefix: [])
+        self._npc = npc_membership or (lambda p: False)
         self._cache: dict[str, Classification] = {}
         self._weapon_motion: Optional[dict[str, str]] = None
         self._linkage: Optional[dict] = None
@@ -310,20 +324,30 @@ class AssetCatalog:
                         f"referenced by {t} in the appearance tables",
                         group=self._group_for(p, cat))
 
-        # (2) directory layout
-        for rule in RULES:
-            if rule.match(p):
-                sub = rule.subcategory
-                # A folder that holds both geometry and skins (c3/monster,
-                # c3/effect, ...) splits by role. Rules that already name a
-                # specific bucket -- weather, firework, face -- keep it.
-                if sub == "mesh" and role == "texture":
-                    sub = "texture"
-                seg = p.split("/")
-                grp = seg[rule.group_from] if 0 <= rule.group_from < len(seg) else ""
-                return Classification(rule.category, sub, role, rule.why, grp)
+        rule = next((r for r in RULES if r.match(p)), None)
 
-        # (3) nothing matched -- say so out loud
+        # (2) the NPC chain is table evidence too, but it only overrides the
+        #     generic shared buckets -- see GENERIC_SHARED.
+        if ((rule is None or rule.pattern in GENERIC_SHARED)
+                and self._npc(p)):
+            return Classification(
+                "npc", "texture" if role == "texture" else "mesh", role,
+                "referenced by the NPC tables "
+                "(npc -> simple object -> obj/texture)")
+
+        # (3) directory layout
+        if rule is not None:
+            sub = rule.subcategory
+            # A folder that holds both geometry and skins (c3/monster,
+            # c3/effect, ...) splits by role. Rules that already name a
+            # specific bucket -- weather, firework, face -- keep it.
+            if sub == "mesh" and role == "texture":
+                sub = "texture"
+            seg = p.split("/")
+            grp = seg[rule.group_from] if 0 <= rule.group_from < len(seg) else ""
+            return Classification(rule.category, sub, role, rule.why, grp)
+
+        # (4) nothing matched -- say so out loud
         return Classification("other", "other", role, "no rule matched")
 
     @staticmethod

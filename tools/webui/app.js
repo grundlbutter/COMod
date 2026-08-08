@@ -78,26 +78,82 @@ window.state = state;
 // catalogued in the COmmunity Library. Switching swaps the whole catalogue on
 // the server side -- namespace, appearance tables, provenance -- then reloads
 // the page, because every pane caches derived state.
+function serverOptionLabel(s) {
+  return s.name + (s.clientVersion ? ` (v${s.clientVersion})` : '') +
+    (s.files ? ` — ${s.files.toLocaleString()} files` : '');
+}
+
+/** Re-read /api/servers and re-label the picker in place.
+ *
+ *  The Collection is the one profile this page can *change*, so its
+ *  "N files" is the one label that goes stale while you look at it. The
+ *  listener stays bound because the options are relabelled rather than
+ *  rebuilt; a profile that did not exist at load -- the Collection
+ *  publishes itself the first time you keep something -- is appended. */
+async function refreshServerLabels() {
+  const sel = $('#server-select');
+  if (!sel) return;
+  let doc;
+  try { doc = await api('/api/servers'); } catch (e) { return; }
+  const pending = new Map((doc.servers || []).map(s => [s.name, s]));
+  if (!sel.options.length && pending.size) {
+    // The picker starts empty when the library had no profiles at load.
+    // Keeping the first entry means "the baseline install" everywhere.
+    const b = el('option', null, 'base — ' + (doc.base || 'install'));
+    b.value = '';
+    sel.appendChild(b);
+    sel.value = doc.current || '';
+  }
+  for (const o of sel.options) {
+    if (!o.value) continue;
+    const s = pending.get(o.value);
+    if (s) { o.textContent = serverOptionLabel(s); pending.delete(o.value); }
+  }
+  for (const s of pending.values()) {
+    const o = el('option', null, serverOptionLabel(s));
+    o.value = s.name;
+    sel.appendChild(o);
+  }
+  if (sel.options.length > 1) $('#server-label').classList.remove('hidden');
+}
+
 async function initServerPicker(st) {
   let doc;
   try { doc = await api('/api/servers'); } catch (e) { return; }
   const sel = $('#server-select');
   const label = $('#server-label');
-  if (!doc.servers || !doc.servers.length) { label.classList.add('hidden'); return; }
+  // The two dropdowns were merged into one (`basepicker.js`), so this markup
+  // is gone. Leave rather than throw on the missing label -- the path list
+  // includes library servers now.
+  if (!sel || !label) return;
+  if (!doc.servers || !doc.servers.length) {
+    label.classList.add('hidden');
+    $('#origin-label').classList.add('hidden');
+    return;
+  }
   sel.innerHTML = '';
   const b = el('option', null, 'base — ' + (doc.base || 'install'));
   b.value = '';
   sel.appendChild(b);
   for (const s of doc.servers) {
-    const o = el('option', null,
-      s.name + (s.clientVersion ? ` (v${s.clientVersion})` : '') +
-      (s.files ? ` — ${s.files.toLocaleString()} files` : ''));
+    const o = el('option', null, serverOptionLabel(s));
     o.value = s.name;
     sel.appendChild(o);
   }
   sel.value = doc.current || '';
   $('#origin-label').classList.toggle('hidden', !doc.current);
   label.classList.remove('hidden');
+  // Name the filter after the server, so "unique to this client" reads as
+  // "Zephyr only" rather than as jargon about where bytes are stored.
+  const tag = (st && st.serverTag) || '';
+  if (tag) {
+    const opts = $('#source-select').options;
+    opts[1].textContent = `${tag} only (unique to this server)`;
+    opts[2].textContent = `shared with the base install`;
+    $('#origin-label').title =
+      `${tag} only = assets this server does not share with your base ` +
+      `install — the ones tagged ${tag}.`;
+  }
   sel.addEventListener('change', async () => {
     const name = sel.value;
     sel.disabled = true;
@@ -116,9 +172,131 @@ async function initServerPicker(st) {
   });
 }
 
+/** "Open in the model viewer" for whatever mesh is on screen.
+ *
+ *  The prose link beside it goes to the builder's *character* side, which
+ *  starts from a body; that is why following it loses the thing you were
+ *  looking at. This carries the actual mesh (and the texture already
+ *  resolved for it) so the model stage opens on the same asset.
+ */
+function renderModelViewerLink() {
+  const host = $('#model-open');
+  if (!host) return;
+  host.innerHTML = '';
+  const mesh = state.meshPath;
+  if (!mesh) {
+    host.appendChild(el('div', 'mut small',
+      'Select a mesh to open it in the model viewer.'));
+    return;
+  }
+  const p = new URLSearchParams({ mesh });
+  if (state.texPath) p.set('tex', state.texPath);
+  const a = el('a', 'navlink-inline', '→ Open this mesh in the model viewer');
+  a.href = '/builder#' + p.toString();
+  a.title = 'Same geometry and skin, on the builder\u2019s model stage: ' +
+            'zoom, camera and lighting, without needing a catalogue entry.';
+  host.appendChild(a);
+  const what = el('div', 'mut small');
+  what.textContent = mesh.split('/').pop() +
+    (state.texPath ? ' · ' + state.texPath.split('/').pop() : ' · untextured');
+  host.appendChild(what);
+}
+
+// ------------------------------------------------------------ asset library
+//
+// Choosing the library is a folder question, and a browser cannot hand a page
+// a real folder path. So: discover the likely ones server-side and offer them
+// as one-click buttons, with pasting a path as the fallback rather than the
+// only option.
+function initLibraryPanel() {
+  const host = $('#libdrawer');
+  const out = $('#lib-output');
+  const open = () => host.classList.remove('hidden');
+  const close = () => host.classList.add('hidden');
+
+  async function refresh() {
+    let doc;
+    try { doc = await api('/api/library'); }
+    catch (e) { out.textContent = 'could not read the library: ' + e.message; return; }
+    const cur = $('#lib-current');
+    cur.innerHTML = '';
+    if (doc.library && doc.library.ok) {
+      const names = doc.library.servers.map(s => `${s.tag} (${s.name})`).join(', ');
+      cur.appendChild(el('div', null, 'Using: '));
+      cur.appendChild(el('code', null, doc.library.path));
+      cur.appendChild(el('div', 'mut small',
+        `${doc.library.servers.length} server profile(s): ${names}`));
+      $('#lib-path').value = doc.library.path;
+    } else if (doc.library) {
+      cur.appendChild(el('div', 'mut',
+        `Not usable: ${doc.library.path} — ${doc.library.why}`));
+    } else {
+      cur.appendChild(el('div', 'mut', 'No library chosen yet.'));
+    }
+
+    const found = $('#lib-found');
+    found.innerHTML = '';
+    if (doc.candidates && doc.candidates.length) {
+      found.appendChild(el('div', 'mut small', 'Found on this machine:'));
+      for (const c of doc.candidates) {
+        const b = el('button', 'ghost');
+        b.style.display = 'block';
+        b.style.marginTop = '4px';
+        b.textContent = `${c.path}  —  ` +
+          c.servers.map(s => s.tag).join(', ');
+        b.addEventListener('click', () => save(c.path));
+        found.appendChild(b);
+      }
+    }
+  }
+
+  async function save(path) {
+    out.textContent = 'saving…';
+    try {
+      const r = await api('/api/setlibrary', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }) });
+      out.textContent = path
+        ? `library set to ${r.library.path} — reloading…`
+        : 'library forgotten — reloading…';
+      setTimeout(() => location.reload(), 500);
+    } catch (e) {
+      out.textContent = 'failed: ' + e.message;
+    }
+  }
+
+  $('#btn-library').addEventListener('click', async () => {
+    if (!host.classList.contains('hidden')) { close(); return; }
+    open();
+    out.textContent = '';
+    await refresh();
+  });
+  $('#libdrawer-close').addEventListener('click', close);
+  $('#lib-save').addEventListener('click', () => save($('#lib-path').value.trim()));
+  $('#lib-clear').addEventListener('click', () => save(''));
+}
+
 // ------------------------------------------------------------------ helpers
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  // A bare "NetworkError" says the request never completed and nothing about
+  // why. Name the request and the two things that actually cause it, so the
+  // toast is a lead rather than a dead end.
+  let r;
+  try {
+    try {
+      r = await fetch(path, opts);
+    } catch (first) {
+      // A connection that died in the pool fails this attempt and nothing after it.
+      // Chrome retries a POST like that for us; Firefox does not.
+      r = await fetch(path, opts);
+    }
+  } catch (e) {
+    const how = (opts && opts.method) || 'GET';
+    throw new Error(
+      `${how} ${path} never reached the viewer (${e.message}). Either it is `
+      + `no longer running at ${location.origin}, or something is blocking `
+      + `${how} requests to localhost. Use "Test connection" to tell which.`);
+  }
   const ct = r.headers.get('content-type') || '';
   if (!ct.includes('json')) {
     if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -230,6 +408,7 @@ async function boot() {
   const st = await api('/api/status');
   state.status = st;
   await initServerPicker(st);
+  initLibraryPanel();
   $('#statusline').textContent =
     (st.server ? `server: ${st.server} · ` : '') +
     `${st.root} · ${st.looseFiles.toLocaleString()} loose files · ` +
@@ -245,7 +424,11 @@ async function boot() {
     o.value = t.name;
     sel.appendChild(o);
   }
-  sel.value = tables.find(t => t.name === 'body') ? 'body' : (tables[0] && tables[0].name);
+  // Prefer 'body', but never land on an empty table: a community client
+  // may ship no armor.ini at all, and an empty pane reads as a broken one.
+  const filled = tables.filter(t => t.count > 0);
+  const body = filled.find(t => t.name === 'body');
+  sel.value = (body || filled[0] || tables[0] || {}).name || '';
   state.table = sel.value;
   await refreshVocabulary();
   const hadLoadout = restoreLoadout();
@@ -254,24 +437,426 @@ async function boot() {
   await loadCategories();          // Categories is the default landing pane
   await fillDirs('', 'c3/mesh');
   if (hadLoadout) { setViewMode('character'); renderFigure(); }
+  // The Collection card must say something before anything is selected --
+  // an empty card reads as a broken one.
+  renderCollect();
+
+  // #file=<logical> opens straight onto one asset. This is the return leg of
+  // the model-viewer round trip, and it makes any asset linkable.
+  const fromUrl = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const wanted = fromUrl.get('file');
+  if (wanted) {
+    const tab = document.querySelector('.tab[data-mode="files"]');
+    if (tab) tab.click();
+    const search = $('#file-search');
+    if (search) {
+      search.value = wanted;
+      await loadFiles();
+    }
+    await selectFile(wanted);
+  }
 }
 
 /** Repopulate the directory dropdown for an extension filter. */
+// ------------------------------------------------------------- collection
+//
+// The library holds everything a client shipped; the Collection is what you
+// have chosen to keep. Collecting copies the mesh AND the skin currently
+// resolved for it, so an entry is a self-contained pair rather than a
+// pointer into an archive that may not be there later.
+let collectionMeta = null;
+
+let collectFor = null;
+
+async function renderCollect({ force = false } = {}) {
+  const host = $('#collect-body');
+  if (!host) return;
+  const mesh = state.meshPath;
+  // Rebuilding the card throws away whatever is half-typed in the
+  // name box. A late texture load calls this, so a name typed while
+  // the skin was still decoding was being silently reverted to the
+  // prefill. Leave the card alone unless the subject changed.
+  if (!force && collectFor === (mesh || '') && host.querySelector('input')) {
+    return;
+  }
+  collectFor = mesh || '';
+  host.innerHTML = '';
+  if (!collectionMeta) {
+    try { collectionMeta = await api('/api/keep'); }
+    catch (e) { host.appendChild(el('div', 'mut small', 'unavailable')); return; }
+  }
+  if (!collectionMeta.library) {
+    host.appendChild(el('div', 'mut small',
+      'Choose a COmmunity Library first (the "Asset library" button).'));
+    return;
+  }
+  const total = Object.values(collectionMeta.counts || {})
+    .reduce((a, b) => a + b, 0);
+  const summary = el('div', 'mut small', `${total} collected`);
+  host.appendChild(summary);
+
+  if (!mesh) {
+    host.appendChild(el('div', 'mut small',
+      'Select a mesh to collect it.'));
+    return;
+  }
+  // Matched by the path it came from OR by the Collection's own copy: this
+  // page can browse the `collection` view too, and there the entry is at
+  // collection/<category>/<id>.c3. See Swap.entryFor.
+  const hit = Swap.entryFor(collectionMeta.entries, mesh);
+  const existing = hit && hit.entry;
+  if (hit && hit.isCopy) { renderCollectedCopy(host, existing); return; }
+
+  const row = el('div');
+  row.style.marginTop = '6px';
+  const catSel = el('select');
+  for (const c of Object.keys(collectionMeta.categories || {})) {
+    const o = el('option', null, c);
+    o.value = c;
+    catSel.appendChild(o);
+  }
+  catSel.value = existing ? existing.category : guessCategory(mesh);
+  catSel.title = (collectionMeta.categories || {})[catSel.value] || '';
+  catSel.addEventListener('change', () => {
+    catSel.title = (collectionMeta.categories || {})[catSel.value] || '';
+  });
+  const nameIn = el('input');
+  nameIn.type = 'text';
+  nameIn.placeholder = 'name (optional)';
+  nameIn.value = existing ? existing.name : '';
+  nameIn.style.width = '100%';
+  nameIn.style.marginTop = '4px';
+
+  const go = el('button', 'primary', existing ? 'Update entry' : 'Collect');
+  go.style.marginTop = '6px';
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    try {
+      const r = await api('/api/keep/add', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: mesh, texture: state.texPath || '',
+                               category: catSel.value,
+                               name: nameIn.value.trim() }) });
+      collectionMeta = null;
+      toast(`collected as ${r.entry.id}`);
+      renderCollect({ force: true });
+      // What you keep joins the library immediately: the profile is
+      // republished server-side, so the picker's count is re-read here.
+      refreshServerLabels();
+      afterCollectionChanged(r);
+    } catch (e) {
+      toast('collect failed: ' + e.message, 5000);
+      go.disabled = false;
+    }
+  });
+
+  row.appendChild(catSel);
+  row.appendChild(nameIn);
+  row.appendChild(go);
+  const diag = el('button', 'ghost tiny', 'Test connection');
+  diag.style.marginLeft = '6px';
+  diag.title = 'Checks whether this page can reach the viewer, and '
+             + 'whether POSTs specifically are blocked.';
+  diag.addEventListener('click', () => diagnoseCollect(host));
+  row.appendChild(diag);
+  host.appendChild(row);
+
+  if (existing) {
+    const info = el('div', 'mut small');
+    info.style.marginTop = '6px';
+    const np = (existing.parts || []).length;
+    info.textContent = `already collected as ${existing.id}` +
+      (existing.skins && existing.skins.length ? ' with skin' : ', no skin') +
+      (np ? `, ${np} motion/effect file(s)` : '');
+    host.appendChild(info);
+
+    // A prompt() asked for a path and then wrote everything the entry had,
+    // with no say in it -- and no way to place a skin that does not sit
+    // beside its mesh, which it then told you to do yourself.
+    const panel = el('div', 'swap-panel');
+    panel.style.marginTop = '8px';
+    const stage = el('button', 'ghost tiny', 'Replace an asset with this…');
+    stage.title = 'Write this entry into mods/stage/ over the asset it '
+                + 'replaces, choosing what travels with it. Nothing touches '
+                + 'the game until you install.';
+    stage.addEventListener('click', () => {
+      if (panel.childElementCount) { panel.innerHTML = ''; return; }
+      Swap.replacePanel(panel, existing, { defaultTarget: existing.swapFor || mesh });
+    });
+    host.appendChild(stage);
+
+    const drop = el('button', 'ghost tiny', 'Remove');
+    drop.style.marginLeft = '6px';
+    drop.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/keep/remove', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: existing.id }) });
+        collectionMeta = null;
+        toast('removed from the collection');
+        renderCollect({ force: true });
+        refreshServerLabels();
+        afterCollectionChanged(r);
+      } catch (e) { toast('remove failed: ' + e.message, 5000); }
+    });
+    host.appendChild(drop);
+    host.appendChild(panel);
+  }
+}
+
+/** The card when the selected file IS a Collection entry's own copy.
+ *
+ *  Browsing the `collection` view to find what you kept is the obvious way
+ *  to go and use it. What must not be offered here is Collect: posting this
+ *  path would file a second entry whose source is the first entry's copy.
+ */
+function renderCollectedCopy(host, entry) {
+  host.innerHTML = '';
+  host.appendChild(el('div', 'mut small',
+    `In the Collection as ${entry.id} — ${entry.category}.`));
+  const nMotion = (entry.parts || []).filter(p => p.role === 'motion').length;
+  const nOther = (entry.parts || []).length - nMotion;
+  host.appendChild(el('div', 'mut small',
+    (entry.skins && entry.skins.length ? 'skin kept' : 'no skin')
+    + (nMotion ? ` · ${nMotion} animation file(s)` : ' · no animations')
+    + (nOther ? ` · ${nOther} effect/sound file(s)` : '')));
+
+  const panel = el('div', 'swap-panel');
+  panel.style.marginTop = '8px';
+  const stage = el('button', 'ghost tiny', 'Replace an asset with this…');
+  stage.title = 'Write this entry into mods/stage/ over the asset it '
+              + 'replaces, choosing what travels with it. Nothing touches '
+              + 'the game until you install.';
+  stage.addEventListener('click', () => {
+    if (panel.childElementCount) { panel.innerHTML = ''; return; }
+    Swap.replacePanel(panel, entry,
+                      { defaultTarget: entry.swapFor || entry.sourceMesh });
+  });
+  host.appendChild(stage);
+
+  const drop = el('button', 'ghost tiny', 'Remove');
+  drop.style.marginLeft = '6px';
+  drop.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/keep/remove', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: entry.id }) });
+      collectionMeta = null;
+      toast('removed from the collection');
+      renderCollect({ force: true });
+      refreshServerLabels();
+      afterCollectionChanged(r);
+    } catch (e) { toast('remove failed: ' + e.message, 5000); }
+  });
+  host.appendChild(drop);
+  host.appendChild(panel);
+
+  if (entry.sourceMesh) {
+    const from = el('div', 'mut small');
+    from.style.marginTop = '6px';
+    from.textContent = 'collected from '
+      + (entry.server ? entry.server + ':' : '') + entry.sourceMesh;
+    host.appendChild(from);
+  }
+}
+
+/** The Collection changed; if you are *looking* at it, show the change.
+ *
+ *  The server rebuilds its catalogue and says so with `view.rebuilt`. Every
+ *  pane on this page -- folder tree, extension filter, model list, the row
+ *  list itself -- was derived from the namespace as it was when the page
+ *  loaded, so a reload is what makes them agree. Only when the Collection is
+ *  the active view: collecting *into* it from another client changes nothing
+ *  on screen. */
+function afterCollectionChanged(r) {
+  if (!r || !r.view || !r.view.rebuilt) return;
+  toast('the Collection changed — reloading the view…', 1500);
+  setTimeout(() => location.reload(), 700);
+}
+
+/** A first guess at the shelf, from where the asset lives. Always editable:
+ *  the path is evidence, not a verdict. */
+function guessCategory(p) {
+  const k = (p || '').toLowerCase();
+  if (k.includes('/monster/')) return 'Monsters';
+  if (k.includes('/npc/')) return 'NPCs';
+  if (k.includes('/mount/')) return 'Mounts';
+  if (k.includes('/weapon')) return 'Weapons';
+  if (k.includes('/shield')) return 'Shields';
+  if (k.includes('/armet') || k.includes('/hair')) return 'Headgear';
+  if (k.includes('garment')) return 'Garments';
+  if (k.includes('/effect/')) return 'Effects';
+  if (k.startsWith('data/map') || k.includes('/map/')) return 'Maps';
+  if (k.startsWith('data/interface') || k.includes('icon')) return 'UI';
+  if (/^c3\/\d{4}\//.test(k)) return 'Characters';
+  return 'Other';
+}
+
+
+/** Say which layer failed, because "NetworkError" alone does not.
+ *  GET works but POST does not => something is refusing non-GET requests to
+ *  loopback (security software, an extension), not the feature. */
+const UI_BUILD = 'ui-2026-08-04-e-name';
+
+async function diagnoseCollect(host) {
+  const out = el('div', 'mut small');
+  out.style.marginTop = '6px';
+  out.style.whiteSpace = 'pre-wrap';
+  out.textContent = 'checking…';
+  host.appendChild(out);
+  const lines = [];
+  try {
+    await api('/api/keep');
+    lines.push('GET  /api/collection: ok');
+  } catch (e) { lines.push('GET  /api/collection: ' + e.message); }
+  try {
+    const r = await api('/api/ping', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    lines.push('POST /api/ping: ok (origin ' + (r.origin || 'none') + ')');
+  } catch (e) {
+    lines.push('POST /api/ping: ' + e.message);
+    lines.push('→ If GET works and POST does not, something between this '
+             + 'page and the viewer is refusing POSTs to localhost — a '
+             + 'browser extension or security software that filters local '
+             + 'traffic. The viewer itself is answering.');
+  }
+  lines.push('page origin: ' + location.origin);
+  lines.push('ui build: ' + UI_BUILD);
+  // Exercise the real endpoint, not just a no-op POST: a
+  // failing Collect and a failing request look identical
+  // from the outside, and they are not the same problem.
+  const subject = (typeof state !== 'undefined' && state.meshPath)
+    || (typeof B !== 'undefined' && B.adhoc && B.adhoc.mesh) || '';
+  if (subject) {
+    try {
+      const d = await api('/api/keep/add', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: subject, dryRun: true,
+                               category: 'Other' }) });
+      lines.push('POST /api/keep/add (dry run): ok — '
+                 + d.parts + ' part(s), ' + d.skins + ' skin(s)');
+    } catch (e) {
+      lines.push('POST /api/keep/add (dry run): ' + e.message);
+    }
+  } else {
+    lines.push('POST /api/collect: not tried (nothing selected)');
+  }
+  out.textContent = lines.join('\n');
+}
+
+// ------------------------------------------------------------ folder tree
+//
+// The picker used to be a flat <select> holding the 500 largest folders of
+// 5,386, ordered by file count -- so a folder was findable only if it was
+// big, and its place in the hierarchy was invisible. The tree is the shape
+// the paths already have: alphabetical at every level, open by default,
+// each folder collapsible.
+const DIR_CLOSED_KEY = 'coviewer.dirsClosed';
+/** Folders the user has closed. Empty by default: fully open on first run. */
+let dirClosed = new Set();
+try {
+  dirClosed = new Set(JSON.parse(localStorage.getItem(DIR_CLOSED_KEY) || '[]'));
+} catch (e) { /* ignore */ }
+
+function saveDirClosed() {
+  try {
+    localStorage.setItem(DIR_CLOSED_KEY, JSON.stringify([...dirClosed]));
+  } catch (e) { /* ignore */ }
+}
+
+/** Flat ["a/b", count] rows -> nested nodes, with subtree totals. */
+function buildDirTree(rows) {
+  const root = { name: '', path: '', own: 0, total: 0, kids: new Map() };
+  for (const r of rows) {
+    const parts = (r.dir || '').split('/').filter(Boolean);
+    let node = root;
+    root.total += r.count;
+    let acc = '';
+    for (const seg of parts) {
+      acc = acc ? acc + '/' + seg : seg;
+      let kid = node.kids.get(seg);
+      if (!kid) {
+        kid = { name: seg, path: acc, own: 0, total: 0, kids: new Map() };
+        node.kids.set(seg, kid);
+      }
+      kid.total += r.count;
+      node = kid;
+    }
+    node.own += r.count;
+  }
+  return root;
+}
+
+function renderDirTree(root) {
+  const host = $('#dir-tree');
+  host.innerHTML = '';
+
+  const frag = document.createDocumentFragment();
+  const allRow = el('div', 'dirrow' + (state.dir === '' ? ' on' : ''));
+  allRow.appendChild(el('span', 'dirtwist leaf', ''));
+  allRow.appendChild(el('span', 'dirname', 'all folders'));
+  allRow.appendChild(el('span', 'dircount', String(root.total)));
+  allRow.addEventListener('click', () => selectDir(''));
+  frag.appendChild(allRow);
+
+  const walk = (node, into) => {
+    const kids = [...node.kids.values()]
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const k of kids) {
+      const wrap = el('div', 'dirnode' + (dirClosed.has(k.path) ? ' closed' : ''));
+      const row = el('div', 'dirrow' + (state.dir === k.path ? ' on' : ''));
+      const hasKids = k.kids.size > 0;
+      const tw = el('span', 'dirtwist' + (hasKids ? '' : ' leaf'),
+                    hasKids ? (dirClosed.has(k.path) ? '\u25B6' : '\u25BC') : '');
+      if (hasKids) {
+        tw.addEventListener('click', ev => {
+          ev.stopPropagation();
+          if (dirClosed.has(k.path)) dirClosed.delete(k.path);
+          else dirClosed.add(k.path);
+          saveDirClosed();
+          wrap.classList.toggle('closed');
+          tw.textContent = dirClosed.has(k.path) ? '\u25B6' : '\u25BC';
+        });
+      }
+      row.appendChild(tw);
+      row.appendChild(el('span', 'dirname', k.name));
+      row.appendChild(el('span', 'dircount', String(k.total)));
+      row.title = k.path + '  —  ' + k.total + ' file(s) in this folder and below';
+      row.addEventListener('click', () => selectDir(k.path));
+      wrap.appendChild(row);
+      if (hasKids) {
+        const box = el('div', 'dirkids');
+        walk(k, box);
+        wrap.appendChild(box);
+      }
+      into.appendChild(wrap);
+    }
+  };
+  walk(root, frag);
+  host.appendChild(frag);
+}
+
+function selectDir(path) {
+  state.dir = path;
+  for (const r of document.querySelectorAll('#dir-tree .dirrow')) {
+    r.classList.remove('on');
+  }
+  renderDirTree(state.dirTree);
+  loadFiles();
+}
+
 async function fillDirs(ext, prefer) {
   const dirs = await api('/api/dirs?ext=' + encodeURIComponent(ext || ''));
-  const dsel = $('#dir-select');
-  const prev = dsel.value;
-  dsel.innerHTML = '';
-  const all = el('option', null, '(all directories)');
-  all.value = '__all__';
-  dsel.appendChild(all);
-  for (const d of dirs.slice(0, 500)) {
-    const o = el('option', null, `${d.dir || '(root)'} — ${d.count}`);
-    o.value = d.dir;
-    dsel.appendChild(o);
+  state.dirTree = buildDirTree(dirs);
+  if (state.dir === undefined) state.dir = '';
+  // keep the current folder if it still exists under this extension filter
+  if (state.dir && !dirs.some(d => d.dir === state.dir)) {
+    if (prefer && dirs.some(d => d.dir === prefer)) state.dir = prefer;
+    else state.dir = '';
+  } else if (!state.dir && prefer && dirs.some(d => d.dir === prefer)) {
+    state.dir = prefer;
   }
-  const want = [prev, prefer].find(v => v && [...dsel.options].some(o => o.value === v));
-  dsel.value = want || (dirs[0] ? dirs[0].dir : '__all__');
+  renderDirTree(state.dirTree);
 }
 
 function bindControls() {
@@ -328,8 +913,23 @@ function bindControls() {
                         'Cancel for raw JSON (re-importable).') ? 'csv' : 'json';
     window.open('/api/tags/export?format=' + fmt, '_blank');
   });
-  $('#dir-select').addEventListener('change', loadFiles);
   $('#source-select').addEventListener('change', loadFiles);
+  $('#dir-expand').addEventListener('click', () => {
+    dirClosed.clear();
+    saveDirClosed();
+    renderDirTree(state.dirTree);
+  });
+  $('#dir-collapse').addEventListener('click', () => {
+    const mark = node => {
+      for (const k of node.kids.values()) {
+        if (k.kids.size) dirClosed.add(k.path);
+        mark(k);
+      }
+    };
+    if (state.dirTree) mark(state.dirTree);
+    saveDirClosed();
+    renderDirTree(state.dirTree);
+  });
   $('#ext-select').addEventListener('change', async () => {
     const ext = $('#ext-select').value;
     await fillDirs(ext, ext === '.c3' ? 'c3/mesh' : 'c3/texture');
@@ -377,22 +977,17 @@ function bindControls() {
     rerender();
   });
 
-  $('#btn-mods').addEventListener('click', openDrawer);
-  $('#drawer-close').addEventListener('click', () => $('#drawer').classList.add('hidden'));
-  $('#drawer').addEventListener('click', e => {
-    if (e.target.id === 'drawer') $('#drawer').classList.add('hidden');
+  // The drawer, its table and the install buttons live in swap.js, which the
+  // builder loads too -- that page had no staging at all, and porting this
+  // would have made a second copy to keep in step.
+  Swap.configure({
+    api, toast,
+    onChange: async () => {
+      if (state.texPath) showProvenance(state.texPath);
+      try { state.status = await api('/api/status'); } catch (e) { /* ignore */ }
+    },
   });
-  $('#btn-dry').addEventListener('click', () => runMod('/api/install?dry=1'));
-  $('#btn-install').addEventListener('click', () => {
-    if (!confirm('This writes the staged files into the game install.\n\n' +
-                 'comod.py backs up anything it displaces and records a manifest, ' +
-                 'so "Uninstall / revert" can undo it.\n\nProceed?')) return;
-    runMod('/api/install?dry=0');
-  });
-  $('#btn-uninstall').addEventListener('click', () => {
-    if (!confirm('Revert the last install, restoring displaced originals?')) return;
-    runMod('/api/uninstall?dry=0');
-  });
+  Swap.initDrawer();
 }
 
 function debounce(fn, ms) {
@@ -836,6 +1431,31 @@ async function showRelated({ id = '', table = '', path = '' } = {}) {
     const box = el('div', 'relgroup');
     box.appendChild(el('h3', null, g.title));
     if (g.note) box.appendChild(el('div', 'note', g.note));
+    if (g.noThumbs) {
+      // Motion tracks and effect scenes have nothing to picture. Listing
+      // them by name and kind is the honest presentation -- a placeholder
+      // tile would imply a render that does not exist.
+      const ul = el('ul', 'components');
+      for (const it of g.items) {
+        const li = el('li');
+        const txt = el('div', 'ctext');
+        txt.appendChild(el('b', null, it.label));
+        const meta = el('span', 'flags');
+        meta.appendChild(el('span', 'role', it.kind));
+        if (it.note) meta.appendChild(el('span', 'mut', it.note));
+        if (it.source) meta.appendChild(el('span', 'mut', it.source));
+        txt.appendChild(meta);
+        if (it.detail) txt.appendChild(el('div', 'note', it.detail));
+        li.appendChild(txt);
+        li.title = it.path;
+        li.style.cursor = 'pointer';
+        li.addEventListener('click', () => selectFile(it.path));
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+      b.appendChild(box);
+      continue;
+    }
     if (g.components) {
       // The entry taken apart again. The left-hand list merges a mesh and its
       // skins into one row; here each half is its own line you can open. The
@@ -1203,6 +1823,7 @@ function equippedSlots() {
 function renderLoadout() {
   const b = $('#loadout-body');
   b.innerHTML = '';
+  renderModelViewerLink();
   const m = state.partManifest;
   $('#mode-pill').textContent =
     (viewer && viewer.viewMode === 'character') ? 'character view' : 'asset view';
@@ -1769,12 +2390,18 @@ async function bulkTag() {
   }
 }
 
+/** Monotonic guard: clicking through folders issues overlapping requests,
+ *  and without this the slower one lands last and shows the wrong folder's
+ *  files under the right folder's highlight. */
+let fileLoadSeq = 0;
+
 async function loadFiles() {
+  const seq = ++fileLoadSeq;
   const list = $('#file-list');
   list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
-  const dir = $('#dir-select').value || '';
+  const dir = state.dir || '';
   const p = new URLSearchParams({
-    dir: dir === '__all__' ? '' : dir,
+    dir,
     ext: $('#ext-select').value || '',
     q: $('#file-search').value.trim(),
     limit: '300',
@@ -1782,6 +2409,7 @@ async function loadFiles() {
   const origin = $('#source-select').value;
   if (origin) p.set('source', origin);
   const data = await api('/api/files?' + p.toString());
+  if (seq !== fileLoadSeq) return;      // a newer folder click won
   state.files = data.rows;
   list.innerHTML = '';
   const items = [];
@@ -1931,6 +2559,13 @@ async function loadMesh(meshPath, texPath, { guessTexture = false } = {}) {
   state.meshData = data;
   if (guessTexture && data.guessedTexture) texPath = data.guessedTexture;
 
+  // A motion-only container has nothing to draw; the server names the model
+  // it animates, so say that instead of leaving the viewport blank.
+  if (!data.meshes.length && data.note) {
+    clearViewport(data.note);
+    return data;
+  }
+
   const defs = data.meshes.map(m => ({ meta: m, textureKey: texPath ? 'main' : null }));
   viewer.setMeshes(defs);
 
@@ -1938,6 +2573,8 @@ async function loadMesh(meshPath, texPath, { guessTexture = false } = {}) {
 
   $('#gl-msg').classList.add('hidden');
   $('#gl-stats').textContent = viewer.stats;
+  renderModelViewerLink();
+  renderCollect();
 
   // The C3Key alpha track's own last keyframe is the useful range. C3Phy+0x190
   // ("frameCount") is 0/1/2 on meshes whose alpha keys run out to frame 70, so
@@ -1968,6 +2605,7 @@ async function applyTexture(texPath, previewToken) {
       if (!stillCurrent(tk)) return resolve(false);
       viewer.setTexture('main', img);
       viewer.draw();
+      renderModelViewerLink();
       resolve(true);
     };
     img.onerror = () => { resolve(false); };
@@ -2336,58 +2974,12 @@ function showError(m) {
 }
 
 // ------------------------------------------------------------------ mod drawer
-async function openDrawer() {
-  $('#drawer').classList.remove('hidden');
-  await refreshStage();
-}
-
-async function refreshStage() {
-  const data = await api('/api/stage');
-  const host = $('#stage-list');
-  host.innerHTML = '';
-  if (!data.rows.length) {
-    host.appendChild(el('p', 'mut', 'Nothing staged yet. Pick a texture, load a ' +
-      'replacement image, then press "Stage this swap".'));
-    return;
-  }
-  const t = el('table', 'stage');
-  t.innerHTML = '<tr><th>status<th>logical path<th>orig<th>new<th>from<th></tr>';
-  for (const r of data.rows) {
-    const tr = el('tr');
-    const st = el('td');
-    st.appendChild(el('span', 'badge ' + (r.status === 'MODIFIED' ? 'stage' :
-                                          r.status === 'NEW' ? 'loose' : 'arc'), r.status));
-    tr.appendChild(st);
-    tr.appendChild(el('td', null, r.logical));
-    tr.appendChild(el('td', null, r.oldBytes ? r.oldBytes.toLocaleString() : '—'));
-    tr.appendChild(el('td', null, r.newBytes.toLocaleString()));
-    tr.appendChild(el('td', null, r.originalSource || '—'));
-    const act = el('td');
-    const rm = el('button', 'ghost', 'unstage');
-    rm.addEventListener('click', async () => {
-      await api('/api/unstage?path=' + encodeURIComponent(r.logical), { method: 'POST' });
-      await refreshStage();
-      if (state.texPath) showProvenance(state.texPath);
-    });
-    act.appendChild(rm);
-    tr.appendChild(act);
-    t.appendChild(tr);
-  }
-  host.appendChild(t);
-}
-
-async function runMod(url) {
-  const out = $('#mod-output');
-  out.textContent = 'running…';
-  try {
-    const r = await api(url, { method: 'POST' });
-    out.textContent = `$ ${r.cmd}\n\n${r.stdout}${r.stderr ? '\n' + r.stderr : ''}` +
-                      `\n[exit ${r.returncode}]`;
-  } catch (e) { out.textContent = 'failed: ' + e.message; }
-  await refreshStage();
-  const st = await api('/api/status');
-  state.status = st;
-}
+//
+// The drawer, the staged-file table and the install buttons are swap.js's,
+// shared with the builder. They used to live here, which is why the builder
+// -- the page you are actually on when you decide a model should replace
+// another -- had no staging at all.
+const openDrawer = () => Swap.openDrawer();
 
 boot().catch(e => {
   document.getElementById('statusline').textContent = 'startup failed: ' + e.message;

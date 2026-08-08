@@ -73,10 +73,10 @@ from coassets import DEFAULT_ROOT                        # noqa: E402
 import coroot                                            # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-COVERAGE = REPO / "out" / "meshtex" / "coverage.json"
+COVERAGE = coroot.derived_path("out/meshtex/coverage.json")
 
 #: Where task #21's batch renderer puts its output.
-THUMB_DIR = REPO / "out" / "thumbs"
+THUMB_DIR = coroot.derived_path("out/thumbs")
 #: `manifest_meshes.json` is the 3.5 MB mesh-only slice of the 23 MB
 #: `manifest.json`, same schema. The mesh slice is loaded eagerly because every
 #: list row wants it; the full one only when a *texture* thumbnail is asked for.
@@ -105,15 +105,27 @@ class UnifiedIndex:
 
     def __init__(self, root: Path = DEFAULT_ROOT,
                  exists: Optional[Callable[[str], bool]] = None,
-                 coverage: Optional[Path] = None):
+                 coverage: Optional[Path] = None,
+                 thumb_dir: Optional[Path] = None):
         self.root = Path(root)
+        #: where thumbnail manifests live; a server view passes its own
+        #: out/thumbs/servers/<name>/ so the base install's renders (same
+        #: logical path, different bytes) are never shown for it.
+        #:
+        #: The default keys to **this index's root**, not to the process's
+        #: configured install: two catalogues are live at once whenever the
+        #: viewer compares one base against another, and "same logical path,
+        #: different bytes" is as true between 6090 and 5517 as it is for a
+        #: library server.
+        self._thumb_dir = (Path(thumb_dir) if thumb_dir
+                           else coroot.derived_path("out/thumbs", self.root))
         self._exists = exists or (lambda p: True)
         self.mesh_matches: dict[str, list[dict]] = {}
         self.source = ""
         self.error = ""
         # a linked worktree reads the primary checkout's coverage.json
         self._load(coverage
-                   or coroot.find_derived("out/meshtex/coverage.json")
+                   or coroot.find_derived("out/meshtex/coverage.json", self.root)
                    or COVERAGE)
 
         #: texture -> [(mesh, match)] over every *owning* pairing
@@ -174,6 +186,39 @@ class UnifiedIndex:
         return p.endswith(".dds") and p in self.primary_owner
 
     # -- the collapse ------------------------------------------------------
+    def add_pairs(self, pairs: dict[str, str], method: str = "same-stem",
+                  confidence: float = 0.9) -> int:
+        """Teach the index mesh->texture pairs it could not know about.
+
+        `coverage.json` describes the *install*.  A community archive
+        recovered by write order (docs/assets.md section 7) has its own
+        pairs, and without them every model and its skin stay two rows.
+        Existing matches win; the owner maps are rebuilt so `collapse`
+        folds the new pairs too.
+        """
+        added = 0
+        for mesh, tex in pairs.items():
+            if mesh in self.mesh_matches:
+                continue
+            self.mesh_matches[mesh] = [{"texture": tex, "method": method,
+                                        "confidence": confidence,
+                                        "kind": "authored"}]
+            added += 1
+        if not added:
+            return 0
+        self.texture_owners = {}
+        for mesh, matches in self.mesh_matches.items():
+            for i, m in enumerate(matches):
+                if m.get("kind") == "authored" or i == 0:
+                    self.texture_owners.setdefault(
+                        m["texture"], []).append((mesh, m))
+        self.primary_owner = {}
+        for tex, owners in self.texture_owners.items():
+            best = max(owners, key=lambda om: (om[1].get("kind") == "authored",
+                                               om[1].get("confidence", 0.0)))
+            self.primary_owner[tex] = best[0]
+        return added
+
     def collapse(self, paths: Iterable[str]) -> list[dict]:
         """One row per asset.
 
@@ -328,18 +373,21 @@ class UnifiedIndex:
         if self._thumbs is None:
             self._thumbs = {}
             for name in THUMB_MANIFEST_NAMES:
-                p = THUMB_DIR / name
+                p = self._thumb_dir / name
                 if p.is_file():
                     self._thumbs = self._read_manifest(p)
                     break
             else:
                 # nothing local: a linked worktree inherits the primary
-                # checkout's render, same name priority
-                for name in THUMB_MANIFEST_NAMES:
-                    p = coroot.find_derived("out/thumbs/" + name)
-                    if p is not None and p.is_file():
-                        self._thumbs = self._read_manifest(p)
-                        break
+                # checkout's render, same name priority.  Never for a
+                # server-specific dir -- another checkout's *base* renders
+                # would be the wrong bytes.
+                if self._thumb_dir == THUMB_DIR:
+                    for name in THUMB_MANIFEST_NAMES:
+                        p = coroot.find_derived("out/thumbs/" + name)
+                        if p is not None and p.is_file():
+                            self._thumbs = self._read_manifest(p)
+                            break
         return self._thumbs
 
     _tex_thumbs: Optional[dict] = None

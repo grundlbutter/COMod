@@ -26,10 +26,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
+import coroot                                                 # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, DMap, dds_info  # noqa: E402
 
 PROJECT = Path(__file__).resolve().parent.parent
-OUT = PROJECT / "out" / "browse"
+OUT = coroot.derived_path("out/browse")
 
 
 def _pil():

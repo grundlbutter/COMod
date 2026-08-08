@@ -98,6 +98,18 @@ def _refuse_destination(dest: Path, base_root: Path, library: Path) -> None:
             sys.exit(f"refusing to materialize at {d}: {why}")
 
 
+def cmd_rebuild_tables(args) -> int:
+    lib = _library(args)
+    view = ServerView(lib, args.name, args.root)
+    wrote = view.write_synthesized_tables()
+    for w in wrote:
+        print(f"wrote {w}")
+    if not wrote:
+        print("nothing to synthesize (real tables present, or no "
+              "recognisable convention)")
+    return 0
+
+
 def cmd_materialize(args) -> int:
     lib = _library(args)
     dest = Path(args.to)
@@ -141,6 +153,12 @@ def main(argv=None) -> int:
     p = sub.add_parser("show", help="print one profile")
     p.add_argument("name")
     p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("rebuild-tables",
+                       help="derive missing linkage tables (old-client body "
+                            "convention -> armor.ini) into the profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rebuild_tables)
 
     p = sub.add_parser("materialize",
                        help="write a server's combined asset tree as plain "
