@@ -30,7 +30,18 @@ import coroot                                                 # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, DMap, dds_info  # noqa: E402
 
 PROJECT = Path(__file__).resolve().parent.parent
-OUT = coroot.derived_path("out/browse")
+
+
+def out_dir(root=None) -> Path:
+    """Where a browse of ``root`` belongs, resolved per invocation.
+
+    `out/browse/` is a per-base tree, so the answer depends on which install
+    is being browsed and cannot be a module constant: one resolved at import
+    names whichever install was configured *then*, and `--root <other client>`
+    would write its pages into the configured client's namespace. Same shape
+    as C21, and the same fix `artcrawl.out_dir_for` already uses. C55.
+    """
+    return coroot.derived_path("out/browse", root)
 
 
 def _pil():
@@ -105,7 +116,8 @@ def _page(title: str, subtitle: str, body: str, search: bool = True) -> str:
 
 
 def cmd_textures(args) -> int:
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = out_dir(args.root)
+    out.mkdir(parents=True, exist_ok=True)
     with AssetRoot(args.root) as R:
         targets: list[tuple[str, str]] = []   # (label, logical)
 
@@ -161,7 +173,7 @@ def cmd_textures(args) -> int:
             sub += f" &middot; {skipped} skipped (unreadable)"
         page = _page("CO texture browser", sub, f"<div class=grid>{''.join(cards)}</div>")
         name = args.table or args.dir.replace("/", "_")
-        dest = OUT / f"textures_{name}.html"
+        dest = out / f"textures_{name}.html"
         dest.write_text(page, "utf-8")
         print(f"wrote {dest}  ({len(cards)} thumbnails)")
     return 0
@@ -184,7 +196,8 @@ def _list_dir(R: AssetRoot, d: str) -> list[str]:
 
 
 def cmd_maps(args) -> int:
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = out_dir(args.root)
+    out.mkdir(parents=True, exist_ok=True)
     root = Path(args.root)
     rows = []
     for p in sorted((root / "map" / "map").glob("*.[Dd][Mm]ap")):
@@ -204,7 +217,7 @@ def cmd_maps(args) -> int:
             f"<td>{m.layer_count}</td><td>{html.escape(m.puzzle_path)}</td></tr>")
     body = ("<table><tr><th>file<th>ver<th>size<th>walkable<th>layers<th>puzzle</tr>"
             + "".join(rows) + "</table>")
-    dest = OUT / "maps.html"
+    dest = out / "maps.html"
     dest.write_text(_page("CO map index", f"{len(rows)} maps in map/map/", body), "utf-8")
     print(f"wrote {dest}  ({len(rows)} maps)")
     return 0

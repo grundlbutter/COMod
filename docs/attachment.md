@@ -37,8 +37,25 @@ out of `py -3 tools/attach.py --validate`.
 >   read — return the shipped value unchanged. Verified: `parts.socket_anchors`
 >   still reports rows `(0.208, 0.974, 0.293)` for the socket where the viewer
 >   serves CCO's orientation, and neither file nor `client/` mentions the hook.
-> * Without a declared CCO install it degrades to unit-scaling the rows and
->   says so in the note, rather than silently doing less than it claims.
+> * The reference is read **per body shape, not per appearance**. Armour ids
+>   are client-specific — 6090's `001139040` "Abyss Coat" has no counterpart in
+>   CCO — but the basis comes from the shape's motion track, not the armour, so
+>   the borrow reads CCO's canonical body for the same shape. MEASURED: CCO's
+>   `001131000`, `001139000`, `001135000` and `001000000` return the *same*
+>   `v_l_weapon` matrix on every printed digit. Requiring an exact id match was
+>   a real bug — it made the borrow unreachable for most bodies and silently
+>   degraded the viewer to `unit-rows`.
+> * A borrow is refused unless the reference resolves the **same clip at the
+>   same length**. `Motion.matrix` clamps an out-of-range frame to the last
+>   key, so a length mismatch would borrow the reference's final pose and look
+>   plausible. Action 130 is the live case (20 frames here, 25 in CCO) and
+>   resampling is refuted by the control socket: under proportional mapping
+>   CCO's `v_r_weapon` — otherwise identical to ours to `0.000000` — diverges
+>   by 0.97 and the left socket's translation by 44.7 units. Two different
+>   animations, not one resampled.
+> * Without a declared CCO install, without a body of that shape there, or on
+>   a clip that does not line up, it degrades to unit-scaling the rows and says
+>   so in the note, rather than silently doing less than it claims.
 > * Every corrected socket is named in the `/api/figure` payload and stated on
 >   screen, so it cannot be mistaken for client behaviour.
 >

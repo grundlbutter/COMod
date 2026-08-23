@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import DEFAULT_ROOT, AssetRoot          # noqa: E402
+import coroot                                        # noqa: E402
 
 try:                                                   # task #13 owns this
     import effects as effectsmod                       # noqa: E402
@@ -287,12 +288,19 @@ class EffectPlayer:
         except Exception as exc:                           # pragma: no cover
             return EffectScene(name, False, f"resolve failed: {exc}")
         if eff is None:
+            # Name the file that was actually consulted, not the one the
+            # plaintext lineage happens to use: on 5517/6090 that is
+            # `3DEffect.dbc`, and "not a section of ini/3DEffect.ini" would
+            # send the reader to a file the client ignores (C47).
+            src = getattr(db.sources.get("3DEffect"), "path", None)
+            where = f"ini/{src.name}" if src is not None else "ini/3DEffect.ini"
             return EffectScene(name, False,
-                               f"{name!r} is not a section of ini/3DEffect.ini")
+                               f"{name!r} is not defined in {where}")
 
         layers = []
         playable_parts = 0
         particle_parts = 0
+        undecoded_parts = 0
         max_eff_frames = 0
         max_frames = 0
         for lay in eff.layers:
@@ -314,10 +322,13 @@ class EffectPlayer:
                         continue
                     if j["kind"] == "particle":
                         particle_parts += 1
-                    else:
-                        playable_parts += 1
-                        max_eff_frames = max(max_eff_frames, j.get("effectiveFrames") or 0)
-                        max_frames = max(max_frames, j.get("frameCount") or 0)
+                        if not j.get("decoded"):
+                            undecoded_parts += 1
+                            parts.append(j)
+                            continue
+                    playable_parts += 1
+                    max_eff_frames = max(max_eff_frames, j.get("effectiveFrames") or 0)
+                    max_frames = max(max_frames, j.get("frameCount") or 0)
                     parts.append(j)
             layers.append({
                 "index": lay.index,
@@ -359,6 +370,10 @@ class EffectPlayer:
             "durationMs": duration,
             "playableParts": playable_parts,
             "particleParts": particle_parts,
+            # Non-zero means this build met a chunk it cannot play. It stays a
+            # separate number from `particleParts` on purpose: particles are no
+            # longer a gap, so counting them as one would misreport the scene.
+            "undecodedParts": undecoded_parts,
             "layers": layers,
             "timingNote": (
                 "Length comes from the alpha envelope, not from the declared "
@@ -369,10 +384,75 @@ class EffectPlayer:
 
     def _part_json(self, p) -> Optional[dict]:
         if p.kind == effectsmod.PART_PARTICLE:
-            return {"kind": "particle", "name": p.name, "rawSize": p.raw_size,
-                    "note": "PTCL/PTC3 particle systems are not decoded "
-                            "(docs/effects.md §6.6) — this layer is skipped, "
-                            "not faked."}
+            q = p.particle
+            if q is None:
+                return {"kind": "particle", "name": p.name,
+                        "rawSize": p.raw_size, "decoded": False,
+                        "frameCount": 0, "effectiveFrames": 0,
+                        "note": "this particle chunk did not decode -- the "
+                                "layer is skipped, not faked."}
+            # The simulation is baked: one solved particle set per frame, so
+            # there is nothing to integrate. Positions go to render space with
+            # the project-wide (x, y, -z); the per-frame matrix goes through
+            # `render_matrix` like every other C3 matrix.
+            frames = []
+            for f in q.frames:
+                if not f.count:
+                    frames.append({"n": 0})
+                    continue
+                pos = []
+                for (x, y, z) in f.positions:
+                    pos += [round(x, 4), round(y, 4), round(-z, 4)]
+                frames.append({
+                    "n": f.count,
+                    "p": pos,
+                    "c": [round(v, 5) for v in f.cells],
+                    "s": [round(v, 4) for v in f.sizes],
+                    "m": [round(v, 5) for v in render_matrix(list(f.matrix))],
+                })
+            out = {
+                "kind": "particle",
+                "name": p.name,                    # the chunk tag
+                "objectName": q.name,
+                "generation": q.generation,
+                "rawSize": p.raw_size,
+                "decoded": True,
+                "frameCount": q.frame_count,
+                "effectiveFrames": q.effective_frames,
+                "atlas": q.tex_grid,               # an atlas x atlas flipbook
+                "maxParticles": q.max_particles,
+                "peakParticles": q.peak_particles,
+                "vertsPerParticle": effectsmod.PTCL_VERTS_PER_PARTICLE,
+                "frames": frames,
+                "note": "Baked simulation: frames[i] is the solved particle "
+                        "set for frame i (docs/effects.md §6.6). Draw one "
+                        "camera-facing quad of half-size s per particle, UV "
+                        "cell (floor(c*atlas^2) % atlas, // atlas).",
+            }
+            if q.envelope is not None:
+                e = q.envelope
+                out["envelope"] = {
+                    "billboard": e.billboard,
+                    "worldSpace": e.world_space,
+                    "alpha": list(e.alpha),
+                    "fadeFrames": list(e.fade_frames),
+                    "particleAlpha": list(e.particle_alpha),
+                    "particleLife": list(e.particle_life),
+                    "roll": list(e.roll),
+                }
+                out["systemAlpha"] = [round(q.system_alpha(i), 5)
+                                      for i in range(q.frame_count)]
+            if q.stretch is not None:
+                out["stretch"] = q.stretch
+            # Same key and same shape a PHY part's geometry uses, so the
+            # viewer's camera fit does not need to know which kind it got.
+            # Without it a pure-particle effect has no bounds at all and the
+            # view keeps whatever the last model left it at -- a 12-unit burst
+            # in a frame sized for a 400-unit aura is an invisible dot.
+            b = particle_bounds(out)
+            if b is not None:
+                out["bboxRender"] = [b["min"], b["max"]]
+            return out
         if p.kind == effectsmod.PART_SHAPE:
             if p.shape is None:
                 return None
@@ -501,7 +581,9 @@ class EffectPlayer:
 # playback -- the reference implementation of docs/effects.md §8
 # ---------------------------------------------------------------------------
 #
-# `tools/webui/fx.js` is a line-for-line mirror of the four functions below.
+# `tools/webui/fx.js` is a line-for-line mirror of the functions below --
+# `frame_at`, `sample_part`, `motion_matrix`, `ribbon_advance`, and (further
+# down) `particle_scale` / `particle_frame` / `particle_quads`.
 # They live here as well as there so the algorithm is covered by
 # `tools/test_viewer.py` against real assets rather than only by looking at the
 # viewport, which is exactly the "looks subtly off" failure mode this project
@@ -685,6 +767,188 @@ def _xform(glm, p):
 
 
 # ---------------------------------------------------------------------------
+# particles -- docs/effects.md 6.6 "Rendering, in the same form as 8"
+# ---------------------------------------------------------------------------
+#
+# The simulation is BAKED. `frames[i]` is the solved particle set for frame i,
+# so there is no integrator here and there is not supposed to be one: this
+# turns one already-solved frame into camera-facing quads and nothing else.
+#
+# What the engine does, and what each line below is:
+#
+#     M      = frame.matrix x world              premultiply, then transform
+#     p      = M * frame.position[i]             D3DXVec3TransformCoordArray
+#     s      = frame.size[i] * scale_of(M)       half-extent
+#     c      = int(frame.cellPhase[i] * N*N)     N = the atlas side, `texGrid`
+#     uv0    = (c % N / N, c // N / N)           cell size 1/N
+#
+# The one thing this file decides that graphic.dll does not hand over is WHICH
+# PLANE the quad lies in. `Ptcl_Draw` subtracts the half-extent from the quad's
+# x and y (0x60808) after the position array has been transformed, which is the
+# ordinary billboard idiom -- the caller is expected to have supplied a world
+# matrix whose x/y already face the camera. Our viewport has no such caller, so
+# `particle_quads` takes the camera's right/up explicitly and the *caller*
+# decides. gl.js takes them out of the view matrix it is already building, the
+# way `screenToGround` re-derives its basis from the render path rather than
+# borrowing `_basis()` -- the two differ in sign on X and that bug looks like
+# a mirrored world, not like a crash.
+
+_SQRT3 = 3.0 ** 0.5
+
+
+def particle_scale(glm) -> float:
+    """`Ptcl_Draw`'s size multiplier (RVA 0x1EC968).
+
+    The length of the matrix's transformed ``(1,1,1)`` direction times
+    ``1/sqrt(3)`` -- i.e. 1.0 for a rotation, and the uniform factor for a
+    uniform scale. Translation is deliberately not included: this is a
+    direction, not a point.
+
+    >>> round(particle_scale(GL_IDENTITY), 6)
+    1.0
+    """
+    x = glm[0] + glm[4] + glm[8]
+    y = glm[1] + glm[5] + glm[9]
+    z = glm[2] + glm[6] + glm[10]
+    return ((x * x + y * y + z * z) ** 0.5) / _SQRT3
+
+
+def particle_frame(part: dict, frame: int) -> Optional[dict]:
+    """The solved set for `frame`, or None when nothing is alive.
+
+    `Ptcl_SetFrame` / `Ptcl_NextFrame` are ``frame % frameCount`` (RVA 0x61570
+    / 0x613B0), the same clock discipline as `Phy_NextFrame`, and `Ptcl_Draw`
+    returns immediately on ``count == 0`` (RVA 0x605CF) -- 47 % of patch5517's
+    particle frames are empty, so the empty case is the common one.
+    """
+    frames = (part or {}).get("frames") or []
+    if not frames:
+        return None
+    f = frames[int(frame) % len(frames)]
+    return f if f.get("n") else None
+
+
+#: Corner offsets of a billboard quad as (right, up) multiples, and the (u, v)
+#: corner of the atlas cell each one takes, in the two-triangle order the quad
+#: is emitted in. V grows downward -- the viewer sets no UNPACK_FLIP_Y_WEBGL and
+#: D3D's V axis runs top-down (gl.js header), so the cell's row index counts
+#: from the top exactly as the PHY ChangeTex channel's does (docs/effects.md
+#: 6.4). Screen-up is therefore the SMALL v.
+_QUAD = (
+    (-1.0,  1.0, 0.0, 0.0),
+    (-1.0, -1.0, 0.0, 1.0),
+    ( 1.0,  1.0, 1.0, 0.0),
+    ( 1.0,  1.0, 1.0, 0.0),
+    (-1.0, -1.0, 0.0, 1.0),
+    ( 1.0, -1.0, 1.0, 1.0),
+)
+
+#: Vertices this module emits per particle. NOT `PTCL_VERTS_PER_PARTICLE` (4):
+#: the engine draws a strip off a 4-vertex quad, we draw a triangle list, so
+#: the two numbers describe different buffers and are not each other's bug.
+QUAD_VERTS_PER_PARTICLE = 6
+
+
+def particle_quads(part: dict, frame: int, world, right, up) -> dict:
+    """One frame of a baked particle system as camera-facing quads.
+
+    `world` is the effect's world matrix (column-major GL, the same one the
+    PHY parts ride). `right` and `up` are the camera basis in world space.
+    Returns flat arrays ready for a vertex buffer::
+
+        {"n": particles, "pos": [x,y,z ...], "uv": [u,v ...], "alpha": float}
+
+    with ``6 * n`` vertices in each. Returns ``n = 0`` for an empty frame.
+
+    NOT APPLIED, and named rather than faked:
+
+    * the PTC3 **per-particle** alpha envelope (`particleAlpha` /
+      `particleLife`, RVA 0x5FCD3). It runs on a particle's *normalised life*,
+      and a baked frame carries no life and no birth frame, so the input does
+      not exist in this descriptor. 1,057 of patch5517's 2,211 PTC3 parts
+      would be unaffected anyway (peak 1.0), but 1,154 would not.
+    * `worldSpace` (+0x34, non-zero "skips the position transform") -- 165 of
+      those 2,211 parts. One clause of prose is not enough to branch the
+      transform on, and a wrong branch here puts a whole effect somewhere else
+      in the world, which is the loudest failure available.
+    * `billboard` (+0x30) and `roll` (+0x3C) -- 337 parts carry a non-zero
+      billboard byte and 333 a non-zero roll. Both are unread here.
+
+    The **system** alpha envelope (`systemAlpha`, RVA 0x5F5BA) IS applied, and
+    on patch5517 it is inert on all 2,211 PTC3 parts: every one declares
+    ``alpha = (1,1,1)`` with ``fadeFrame = (0, 0xFFFFFFFF)``. Applying it is
+    therefore correct and invisible on this base, which is worth saying out
+    loud so nobody reads a flat glow as proof the envelope works.
+    """
+    f = particle_frame(part, frame)
+    out = {"n": 0, "pos": [], "uv": [], "alpha": 1.0}
+    if f is None:
+        return out
+    fm = f.get("m") or GL_IDENTITY
+    m = mat_mul_gl(list(world), list(fm))
+    scale = particle_scale(m)
+    n = int(max(1, part.get("atlas") or 1))
+    cell = 1.0 / n
+    last = n * n - 1
+    sa = part.get("systemAlpha") or []
+    if sa:
+        out["alpha"] = float(sa[min(int(frame), len(sa) - 1)])
+
+    count = int(f["n"])
+    pos = f.get("p") or []
+    cells = f.get("c") or []
+    sizes = f.get("s") or []
+    vpos: list = []
+    vuv: list = []
+    for i in range(count):
+        px, py, pz = _xform(m, pos[i * 3:i * 3 + 3])
+        s = float(sizes[i]) * scale
+        # int() truncates exactly as `Particle.cell` does; the clamp is for a
+        # phase of exactly 1.0, which would index one cell past the atlas.
+        c = min(int(float(cells[i]) * n * n), last)
+        u0, v0 = (c % n) * cell, (c // n) * cell
+        for (dr, du, cu, cv) in _QUAD:
+            vpos.append(px + right[0] * dr * s + up[0] * du * s)
+            vpos.append(py + right[1] * dr * s + up[1] * du * s)
+            vpos.append(pz + right[2] * dr * s + up[2] * du * s)
+            vuv.append(u0 + cu * cell)
+            vuv.append(v0 + cv * cell)
+    out["n"] = count
+    out["pos"] = vpos
+    out["uv"] = vuv
+    return out
+
+
+def particle_bounds(part: dict) -> Optional[dict]:
+    """The axis-aligned box every particle of every frame sits in, half-extent
+    included, in the part's own (untransformed) space.
+
+    A pure-particle effect has no `PHY` geometry, so the viewer's camera fit
+    had nothing to frame on and a burst 12 units across came up as an
+    invisible dot in a view last used for a 400-unit aura. Returns None when
+    the system never has a live particle.
+    """
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    seen = False
+    for f in (part or {}).get("frames") or []:
+        if not f.get("n"):
+            continue
+        m = f.get("m") or GL_IDENTITY
+        scale = particle_scale(list(m))
+        pos = f.get("p") or []
+        sizes = f.get("s") or []
+        for i in range(int(f["n"])):
+            p = _xform(list(m), pos[i * 3:i * 3 + 3])
+            s = float(sizes[i]) * scale
+            seen = True
+            for k in range(3):
+                lo[k] = min(lo[k], p[k] - s)
+                hi[k] = max(hi[k], p[k] + s)
+    return {"min": lo, "max": hi} if seen else None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -740,13 +1004,18 @@ def _cli(argv) -> int:
                     print(f"     shape {p['name']:<10} line {p['line']}  "
                           f"segments {p['segments']} -> {p['maxPairs']} pairs  "
                           f"smot {p['frameCount']}")
+                elif p["kind"] == "particle" and p.get("decoded"):
+                    print(f"     ptcl  {p['name']:<10} gen {p['generation']}  "
+                          f"frames {p['frameCount']}  peak {p['peakParticles']}"
+                          f"/{p['maxParticles']}  atlas "
+                          f"{p['atlas']}x{p['atlas']}")
                 else:
                     print(f"     {p['kind']} {p['name']} ({p['rawSize']} bytes, not decoded)")
         return 0
 
     if a.coverage:
         names = pl.names()
-        ok = playable = particles = 0
+        ok = playable = particles = undecoded = 0
         for n in names:
             sc = pl.scene(n)
             if not sc.found:
@@ -756,10 +1025,14 @@ def _cli(argv) -> int:
                 playable += 1
             if sc.payload["particleParts"]:
                 particles += 1
+            if sc.payload.get("undecodedParts"):
+                undecoded += 1
+        print(f"base                {coroot.base_id(pl.root)}")
         print(f"effect names        {len(names)}")
         print(f"  resolve           {ok}")
-        print(f"  playable geometry {playable}")
-        print(f"  needing particles {particles}")
+        print(f"  playable parts    {playable}   (geometry and particles)")
+        print(f"  using particles   {particles}")
+        print(f"  undecoded chunks  {undecoded}")
         return 0
 
     ap.print_help()

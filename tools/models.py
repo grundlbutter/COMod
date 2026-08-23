@@ -52,17 +52,25 @@ docs/attachment.md §3), which is why the same code path serves both.
 
 WHAT NAMES A MODEL
 ------------------
-* **Monsters: nothing does.**  `ini/monster.json`'s `type` is a sequential
-  index 1..374 and its `bodyType` is `0` on every one of the 374 rows, so there
-  is no join column to the art at all -- the server picks the appearance at
-  spawn.  This module therefore browses monsters **by mesh directory** and lets
-  the user *optionally* attach a `monster.json` row to borrow its render
-  properties.  That pairing is the user's assertion, never presented as one the
-  data makes.  See `MONSTER_LINK_NOTE`.
-* **NPCs: `ini/npc.json` does.**  `standby_motion` is a literal `3dmotion.ini`
-  key and **435 of its 437 rows resolve to a file that ships**, which is a far
-  better link than `simple_object` -> `3DSimpleObj.ini` (only 100 of 437 of
-  those meshes are on disk).  Both are used; the motion path wins.
+* **Monsters: nothing does.**  The monster table's `bodyType` is `0` on every
+  row of **every** client -- CCO's 374, and 431 / 439 / 586 / 762 / 1010 on
+  5017 / 5065 / 5165 / 5517 / 6090 -- so there is no join column to the art at
+  all and the server picks the appearance at spawn.  This module therefore
+  browses monsters **by mesh directory** and lets the user *optionally* attach
+  a monster row to borrow its render properties.  That pairing is the user's
+  assertion, never presented as one the data makes.  See `MONSTER_LINK_NOTE`.
+* **NPCs: the NPC table does.**  `standby_motion` is a literal `3dmotion.ini`
+  key and **435 of CCO's 437 rows resolve to a file that ships**, which is a
+  far better link than `simple_object` -> `3DSimpleObj.ini` (only 100 of 437
+  of those meshes are on disk).  Both are used; the motion path wins.
+
+  **WHICH FILE, though, is per client, and so is how its ids are spelled.**
+  CCO ships `ini/monster.json` and `ini/npc.json`; no official client ships
+  either, and all five ship `ini/Monster.dat` and `ini/npc.ini` instead.
+  `load_monster_rows` and `_npc_name_rows` pick, and the second also has to
+  re-key: 5517 spells Storekeeper's standby motion `9990010100` where CCO
+  spells it `999001100`.  `docs/CORRECTIONS.md`
+  `C-2026-08-09-comod-json-official-sweep`.
 * **Roles: `ini/3DsimpleRole.ini` does** -- `Role0`..`Role7`, each naming a
   `3DStandByMotion` and a `3DBlazeMotion` that resolve to `c3/mesh/9998xx0.C3`.
 
@@ -120,9 +128,11 @@ KINDS: dict[str, tuple[str, str, str]] = {
                 "one directory per creature under c3/monster/, one file per "
                 "action"),
     "npc": ("NPCs", "NPC",
-            "c3/npc/<id>/ — a directory per NPC, named by ini/npc.json"),
+            "c3/npc/<id>/ — a directory per NPC, named by the client's NPC "
+            "table (ini/npc.json on CCO, ini/npc.ini on every official "
+            "client)"),
     "npc_simple": ("NPCs (standby set)", "NPC",
-                   "the flat c3/npc/999<type><action>.c3 files ini/npc.json "
+                   "the flat c3/npc/999<type><action>.c3 files the NPC table "
                    "names through standby_motion / rest_motion / blaze_motion"),
     "ghost": ("Ghosts", "ghost",
               "c3/ghost/098 and 099 — shapes 98 and 99 in 3dmotion.ini"),
@@ -147,20 +157,24 @@ KIND_TREE = {"monster": "c3/monster/", "npc": "c3/npc/",
 
 
 MONSTER_LINK_NOTE = (
-    "ini/monster.json carries NO link to the art. Its `type` is a sequential "
-    "index 1–374 and `bodyType` is 0 on all 374 rows, so nothing in the "
-    "shipped data says which mesh directory a monster uses — the server picks "
-    "the appearance when it spawns the creature. Monsters are therefore "
-    "browsed by mesh directory. Attaching a monster.json row is YOUR pairing, "
-    "not one the data asserts; it is worth doing because that row does carry "
-    "real render properties (zoomPercent 60–350 above all).")
+    "The monster table carries NO link to the art. `bodyType` is 0 on every "
+    "row of every client measured — CCO's 374 and all 431/439/586/762/1010 "
+    "of 5017/5065/5165/5517/6090 — so nothing in the shipped data says which "
+    "mesh directory a monster uses; the server picks the appearance when it "
+    "spawns the creature. Monsters are therefore browsed by mesh directory. "
+    "Attaching a monster row is YOUR pairing, not one the data asserts; it is "
+    "worth doing because that row does carry real render properties "
+    "(zoomPercent 60–350 above all). The table is ini/monster.json on CCO and "
+    "the encrypted ini/Monster.dat on every official client, and `type` is a "
+    "sequential 1–374 index only in CCO's — the .dat's TypeIDs are the "
+    "server's own ids and are neither sequential nor dense.")
 
 ZOOM_NOTE = (
-    "zoomPercent is the one monster.json field that visibly changes the "
-    "render: it runs 60 to 350 across the 374 rows, so a creature drawn at "
-    "100% can be nearly four times too small. It is applied as a uniform "
-    "scale on the model matrix. VERIFIED as a field; that it is a percentage "
-    "of the authored size is INFERRED from its range and its name.")
+    "zoomPercent is the one monster-table field that visibly changes the "
+    "render: it runs 60 to 350, so a creature drawn at 100% can be nearly "
+    "four times too small. It is applied as a uniform scale on the model "
+    "matrix. VERIFIED as a field; that it is a percentage of the authored "
+    "size is INFERRED from its range and its name.")
 
 LAYOUT_NOTE = (
     "A monster is not one mesh with a motion track per action — it is one "
@@ -444,8 +458,24 @@ class ModelCatalogue:
                  entity_names: Optional[dict] = None,
                  entity_textures: Optional[dict] = None,
                  flat_npc_art: Optional[dict] = None,
-                 plugin=None):
+                 plugin=None, table_profile=None):
         self.root = Path(root)
+        #: The `npcart.Profile` the CALLER already resolved, or None to let
+        #: `npcart` probe.
+        #:
+        #: **THE FIFTH CALL SITE.** `docs/handoff_zephyr_planning.md` §1 ruled
+        #: the plugin registry is keyed on a root with "four call sites and no
+        #: fifth"; this is the fifth, and it is reachable with a
+        #: `colibrary.ServerView` -- `coviewer` builds this with
+        #: `read=self.read`, which delegates to the view. Left probing, it
+        #: called `npcart.Tables(read)` with no profile at all, so
+        #: `detect_profile` answered from the COMPOSED view and therefore from
+        #: the **baseline**. `docs/CORRECTIONS.md`
+        #: C-2026-08-09-plugin-c-serverview-profile.
+        #:
+        #: This one names NPC models in the viewer's own UI, so getting it
+        #: wrong shows up as labels rather than as an error.
+        self._table_profile = table_profile
         self.paths: set[str] = {p.replace("\\", "/").lower()
                                 for p in (paths or [])}
         self._exists = exists or (lambda p: p.lower() in self.paths)
@@ -475,6 +505,15 @@ class ModelCatalogue:
         #: is labelled as the guess it is.
         self.plugin = plugin
         self._geom_cache: dict[str, bool] = {}
+        #: Which NPC container actually answered -- `ini/npc.json` (community)
+        #: or `ini/npc.ini` (every official client). Recorded rather than
+        #: assumed so a label can name its source instead of implying one.
+        self._npc_table_source: str = ""
+        #: What the NPC-name join actually did: the table it read, the rows it
+        #: found and how many resolved to a motion path. A join that yields
+        #: nothing looks exactly like a client with no NPCs, so the numbers
+        #: are kept rather than the outcome.
+        self.npc_name_join: dict = {"source": "", "rows": 0, "resolved": 0}
 
         self.index = motion_index
         if self.index is None and animmod is not None:
@@ -851,7 +890,12 @@ class ModelCatalogue:
         if not p.is_file():
             return {}                                     # pragma: no cover
         try:
-            raw = parse_ini(p)
+            # STALE-INI: 3DSimpleObj.dbc (SIMO) shadows this from 5517 on.
+            # Declared explicitly rather than left to the bare `except` below,
+            # which would swallow the gate's error and return {} -- turning a
+            # refusal into an empty table, which is the failure mode the gate
+            # exists to prevent.
+            raw = parse_ini(p, allow_stale=True)
         except Exception:                                 # pragma: no cover
             return {}
         out = {}
@@ -866,31 +910,87 @@ class ModelCatalogue:
         v = self.index.raw.get(str(key))
         return v.replace("\\", "/") if v else None
 
-    def _attach_npc_names(self) -> None:
-        r"""`ini/npc.json` -> the family its `standby_motion` lands in.
+    def _npc_name_rows(self) -> list[tuple[str, str]]:
+        r"""``(name, standby motion path)`` for every NPC this install names.
 
-        This is the real NPC art link and it is worth stating why it is
-        preferred: 435 of 437 rows resolve to a motion file that ships,
-        against 100 of 437 for `simple_object` -> `3DSimpleObj.ini` -> a mesh
-        on disk.  Both are recorded; the motion path is what picks the family.
+        `npcart.Tables` picks the container -- `ini/npc.json` on CCO,
+        `ini/npc.ini` on all five official clients -- normalises both to the
+        same row keys, and **resolves the motion id itself**.  Both halves
+        matter and the second is the one that bit:
+
+        * `ini/npc.json` is the community client's pre-parsed table and NO
+          official client ships it.  Reading only the JSON returned early
+          here, so 1,123 named rows on 5517 were never looked at.
+        * Reading `npc.ini` and then looking its motion id up the way the
+          JSON's is looked up **still resolves nothing**, and silently.  CCO
+          spells `standby_motion` as `999001100` and its motion *is* the file
+          stem; 5517 spells the same NPC `9990010100` and its
+          `ini/3dmotion.ini` keys that as `0999001100`.  Joining raw gives
+          **0 of 1,123** -- the key-width rule (`docs/CORRECTIONS.md` §2),
+          which reports "the table does not have it" with total confidence.
+          `npcart._motion_path` already holds the client's own rule for this
+          (`mid & 0xFFFFFFFF`, then a geometry-derived stem), so it is called
+          rather than re-derived.
+
+        ``self.npc_name_join`` records the source, the row count and how many
+        resolved, and a table that yields **zero** paths says so on stderr:
+        the whole failure mode here is a join returning nothing while looking
+        exactly like a client that names no NPCs.
         """
-        p = self.root / "ini" / "npc.json"
-        if not p.is_file():
-            return                                        # pragma: no cover
+        self._npc_table_source = ""
+        self.npc_name_join = {"source": "", "rows": 0, "resolved": 0}
+        read = self._read
+        if read is None:                                  # pragma: no cover
+            def read(logical: str) -> bytes:
+                return (self.root / logical).read_bytes()
         try:
-            rows = json.loads(p.read_text("utf-8", errors="replace"))
+            import npcart                                 # noqa: PLC0415
+            # Use the profile the caller resolved. `read` may be a
+            # `ServerView`'s, whose composed fallback answers every probe from
+            # the BASELINE -- so probing here asks the wrong client. See
+            # `self._table_profile` and `assetdiff.table_profile_for`.
+            t = npcart.Tables(read, self._table_profile)
         except Exception:                                 # pragma: no cover
-            return
-        by_dir = {m.directory: m for m in self.models if m.kind == "npc"}
-        by_grp = {m.ident: m for m in self.models if m.kind == "npc_simple"}
+            return []
+        self._npc_table_source = t.profile.npc_table
+        rows = [r for r in t.npcs if isinstance(r, dict)]
+        out: list[tuple[str, str]] = []
         for r in rows:
             name = _spaced(str(r.get("name", "")))
             if not name or name.upper() == "UNKNOWN":
                 continue
             path = self._motion_value(str(r.get("standby_motion", "")))
             if not path:
-                continue
-            path = path.lower()
+                try:
+                    path = t.plan_for_npc(r).motions.get("standby") or ""
+                except Exception:                         # pragma: no cover
+                    path = ""
+            if path:
+                out.append((name, path.replace("\\", "/").lower()))
+        self.npc_name_join = {"source": t.profile.npc_table,
+                              "rows": len(rows), "resolved": len(out)}
+        if rows and not out:
+            print(f"models: {t.profile.npc_table} has {len(rows)} rows and "
+                  f"NONE of their standby motions resolved to a path -- NPC "
+                  f"models will carry numeric labels. This is a lookup "
+                  f"failure, not an empty table.", file=sys.stderr)
+        return out
+
+    def _attach_npc_names(self) -> None:
+        r"""The NPC table -> the family its `standby_motion` lands in.
+
+        This is the real NPC art link and it is worth stating why it is
+        preferred: 435 of 437 rows resolve to a motion file that ships,
+        against 100 of 437 for `simple_object` -> `3DSimpleObj.ini` -> a mesh
+        on disk.  Both are recorded; the motion path is what picks the family.
+
+        Which container answers, and how its ids are keyed, is
+        `_npc_name_rows`' problem -- see it for the two ways this silently
+        returned nothing on every official client.
+        """
+        by_dir = {m.directory: m for m in self.models if m.kind == "npc"}
+        by_grp = {m.ident: m for m in self.models if m.kind == "npc_simple"}
+        for name, path in self._npc_name_rows():
             m = None
             rest = path[len("c3/npc/"):] if path.startswith("c3/npc/") else ""
             if rest and "/" in rest:
@@ -907,8 +1007,9 @@ class ModelCatalogue:
             if m.kind in ("npc", "npc_simple") and m.names:
                 m.label = m.names[0] if len(m.names) == 1 else \
                     f"{m.names[0]} +{len(m.names) - 1}"
+                src = self._npc_table_source or "npc.json"
                 m.detail = (m.detail + " · " if m.detail else "") + \
-                    f"{len(m.names)} npc.json row" + \
+                    f"{len(m.names)} {src.rsplit('/', 1)[-1]} row" + \
                     ("s" if len(m.names) != 1 else "")
 
     def _build_effect_models(self) -> None:
@@ -999,7 +1100,8 @@ class ModelCatalogue:
 
     # -- audit -------------------------------------------------------------
     def audit(self) -> dict:
-        out: dict = {"kinds": {}, "monsterRows": len(self.monsters)}
+        out: dict = {"kinds": {}, "monsterRows": len(self.monsters),
+                     "npcNameJoin": dict(self.npc_name_join)}
         for k in KIND_ORDER:
             ms = [m for m in self.models if m.kind == k]
             if not ms:

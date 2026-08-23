@@ -8,7 +8,8 @@ WDF pair the Classic Conquer 2.0 client uses.  Unlike WDF, the index stores
 **plaintext file paths**, and every payload is a raw zlib stream.
 
 Layout (VERIFIED empirically against both Zephyr archive pairs -- 53,609 and
-76,923 entries respectively; every offset/size cross-checked for contiguity):
+76,923 entries respectively -- and both 7878 pairs, 59,964 and 86,149; every
+offset/size cross-checked for contiguity):
 
   .tpi (index)
     offset 0x00  char[16]  magic  = "NetDragonDatPkg\\0"
@@ -18,24 +19,65 @@ Layout (VERIFIED empirically against both Zephyr archive pairs -- 53,609 and
     offset 0x1C  u32       3
     offset 0x20  u32       indexOffset = 0x30 (where entries start)
     offset 0x24  u32       fileCount
-    offset 0x28  u32       ~index byte length (off-by-one from measured; unused)
-    offset 0x2C  u32       0
+    offset 0x28  u32       ~index byte length -- APPROXIMATE, do not seek by it:
+                           exact on 7878, but 9 and 1 bytes short on Zephyr's
+                           two pairs.  The record walk is the reliable measure.
+    offset 0x2C  u32       freeCount -- number of 8-byte free-list records that
+                           follow the entries.  0 in every full archive; 3 in
+                           7878's `c31.tpi`.
     offset 0x30  ...       fileCount variable-length entries, back to back
+    then         ...       freeCount records of {u32 size, u32 offset}
 
-  index entry (little-endian):
+  index entry (little-endian) -- THE TAIL LENGTH DEPENDS ON `flag`:
     u8   nameLen
     char name[nameLen]     forward-slash path, e.g. "data/arrow.dds" -- no NUL
-    u16  flag              always 1 in both shipped pairs (zlib-compressed)
-    u32  uncompressedSize
-    u32  compressedSize
-    u32  compressedSize    (exact duplicate; "allocated size", always == above)
-    u32  uncompressedSize  (exact duplicate)
-    u32  offset            absolute byte offset of the payload in the .tpd
+    u16  flag              0 = empty file, 1 = one zlib stream, 2 = chunked
+
+    flag 1 -- 22-byte tail, one zlib stream:
+      u32  uncompressedSize
+      u32  compressedSize
+      u32  compressedSize     of the first chunk == the whole file, so equal
+      u32  uncompressedSize   of the first chunk == the whole file, so equal
+      u32  offset             absolute byte offset of the payload in the .tpd
+
+    flag 2 -- the same 22-byte tail, then (chunkCount - 1) chunk descriptors:
+      u32  compressedSize     } one per chunk after the first, in order
+      u32  uncompressedSize   }
+      u32  offset             }
+      chunkCount = ceil(uncompressedSize / firstChunkUncompressedSize); the
+      chunk size is 2 MiB.  Each chunk is its own zlib stream; concatenating
+      the inflated chunks gives the file.
+
+    flag 0 -- 10-byte tail, and this one is load-bearing:
+      u32  uncompressedSize (0)
+      u32  compressedSize   (0)
+      An empty file has NO offset field, because there is no payload to point
+      at.  The record is 12 bytes shorter than every other record.
 
   .tpd (data)
     Same 0x20-byte magic+version header, then zlib streams (78 DA) laid out
     contiguously: offset[i] + compressedSize[i] == offset[i+1] for every i,
-    first payload at 0x20.
+    first payload at 0x20.  Chunks of one file are contiguous too.
+
+WHY THIS DOCSTRING WAS WRONG BEFORE, AND THE SHAPE OF THE BUG
+-------------------------------------------------------------
+This file used to describe the 3rd and 4th u32 as "exact duplicate; always ==
+above", and raised `layout assumption broken` when they were not.  That was a
+true statement about the Zephyr archives it was verified against, written down
+as a property of the *format* -- so the first client that used the fields for
+what they are (a chunk table) read as a corrupt archive.  Cf. `wdf.py`'s
+ascending-by-nameHash claim and `inidb`'s Win32-parity claim: same shape, both
+harmless until a new client arrived.  See docs/CORRECTIONS.md
+C-2026-08-10-parser-tpd-grammar.
+
+The expensive half is `flag 0`.  It is rare -- 4 entries in 7878's c3.tpi, 1 in
+its data.tpi -- but a walk that assumes the 22-byte tail over-reads an empty
+record by 12 bytes and every subsequent entry is then read at the wrong offset.
+The corruption therefore surfaces thousands of entries later as drifting
+garbage, nowhere near the record that caused it, which is why naive attempts to
+fix this read like a chunk-size problem.  `_parse_index` guards against that
+class directly: it refuses an unknown flag at the entry that carries it, and
+`read_index` checks that the walk consumed the index exactly.
 
 Usage:
     python core/tpd.py index   <archive.tpi> [-o out.json]
@@ -69,19 +111,38 @@ HEADER_SIZE = 0x30          # .tpi; the .tpd header is the first 0x20 bytes
 @dataclass(frozen=True)
 class TpdEntry:
     name: str               # forward-slash relative path, as stored
-    flag: int               # 1 = zlib (the only value ever observed)
-    uncompressed: int
-    compressed: int
-    offset: int             # into the .tpd
+    flag: int               # 0 = empty, 1 = one zlib stream, 2 = chunked
+    uncompressed: int       # whole file, summed over chunks
+    compressed: int         # whole file, summed over chunks
+    offset: int             # into the .tpd; first chunk's, 0 for an empty file
+    # (compressed, uncompressed, offset) per chunk, in order.  One entry for
+    # flag 1, several for flag 2, and empty for flag 0 -- an empty file has no
+    # payload, so there is nothing to point at.
+    chunks: tuple[tuple[int, int, int], ...] = ()
+
+    @property
+    def size(self) -> int:
+        """The inflated size, under the name `WdfEntry` uses for it.
+
+        `coassets.Located` and everything downstream read `.size` off an
+        archive entry; spelling it here lets a TPD entry travel the same code
+        path as a WDF one instead of needing a wrapper at the boundary."""
+        return self.uncompressed
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "flag": self.flag,
-                "uncompressed": self.uncompressed,
-                "compressed": self.compressed, "offset": self.offset}
+        d = {"name": self.name, "flag": self.flag,
+             "uncompressed": self.uncompressed,
+             "compressed": self.compressed, "offset": self.offset}
+        if len(self.chunks) > 1:      # keep single-chunk output as it was
+            d["chunks"] = [list(c) for c in self.chunks]
+        return d
 
 
 class TpdFormatError(ValueError):
     pass
+
+
+CHUNK_SIZE = 2097152        # 2 MiB; the unit flag-2 files are split into
 
 
 def _parse_index(blob: bytes, source: str) -> list[TpdEntry]:
@@ -95,18 +156,81 @@ def _parse_index(blob: bytes, source: str) -> list[TpdEntry]:
         pos += 1
         name = blob[pos:pos + name_len].decode("latin-1")
         pos += name_len
-        flag, unc, comp, comp2, unc2, off = struct.unpack_from("<HIIIII", blob, pos)
-        pos += 22
-        if comp != comp2 or unc != unc2:
+        (flag,) = struct.unpack_from("<H", blob, pos)
+        pos += 2
+
+        if flag == 0:
+            # Empty file: a 10-byte tail with no offset field.  Reading the
+            # 22-byte tail here would over-read by 12 and desynchronise every
+            # entry after this one.
+            unc, comp = struct.unpack_from("<II", blob, pos)
+            pos += 8
+            if unc or comp:
+                raise TpdFormatError(
+                    f"{source} entry {i} ({name!r}): flag 0 means an empty "
+                    f"file but sizes are {unc}/{comp}")
+            entries.append(TpdEntry(name, flag, 0, 0, 0, ()))
+            continue
+
+        if flag not in (1, 2):
+            # Refuse here rather than guess a tail length -- a wrong guess
+            # corrupts every subsequent entry and reports the damage far from
+            # this record.
             raise TpdFormatError(
-                f"{source} entry {i} ({name!r}): size fields disagree "
-                f"({unc}/{unc2}, {comp}/{comp2}) -- layout assumption broken")
-        entries.append(TpdEntry(name, flag, unc, comp, off))
-    return entries
+                f"{source} entry {i} ({name!r}): unknown flag {flag}; "
+                f"tail length is unknown, refusing to guess")
+
+        unc, comp, comp2, unc2, off = struct.unpack_from("<IIIII", blob, pos)
+        pos += 20
+        chunks = [(comp2, unc2, off)]
+        if flag == 2:
+            if not unc2:
+                raise TpdFormatError(
+                    f"{source} entry {i} ({name!r}): chunked but first chunk "
+                    f"is 0 bytes; cannot derive the chunk count")
+            n_chunks = -(-unc // unc2)
+            for _ in range(n_chunks - 1):
+                chunks.append(struct.unpack_from("<III", blob, pos))
+                pos += 12
+
+        if sum(c[0] for c in chunks) != comp or sum(c[1] for c in chunks) != unc:
+            raise TpdFormatError(
+                f"{source} entry {i} ({name!r}): chunk sizes sum to "
+                f"{sum(c[0] for c in chunks)}/{sum(c[1] for c in chunks)}, "
+                f"header says {comp}/{unc}")
+        entries.append(TpdEntry(name, flag, unc, comp, off, tuple(chunks)))
+
+    # Patch-overlay archives carry a free list after the entries: `free_count`
+    # records of {u32 size, u32 offset} naming space in the .tpd that no entry
+    # references any more, because a patch replaced a file in place and
+    # orphaned its old payload.  VERIFIED on 7878's c31.tpi: the three records
+    # are exactly the three gaps left in the .tpd by the 82 entries' coverage.
+    (free_count,) = struct.unpack_from("<I", blob, 0x2C)
+    free: list[tuple[int, int]] = []
+    for _ in range(free_count):
+        size, off = struct.unpack_from("<II", blob, pos)
+        pos += 8
+        free.append((size, off))
+
+    if pos != len(blob):
+        # A variable-length walk that ends anywhere but the end of the index
+        # has mis-read a tail somewhere; the count alone would not catch it.
+        raise TpdFormatError(
+            f"{source}: consumed {pos} of {len(blob)} index bytes after "
+            f"{count} entries and {free_count} free-list records -- a record "
+            f"tail was mis-read")
+    return entries, free
 
 
 def read_index(tpi_path: Path | str) -> list[TpdEntry]:
     """Parse a .tpi index alone; the .tpd data file need not exist."""
+    p = Path(tpi_path)
+    return _parse_index(p.read_bytes(), str(p))[0]
+
+
+def read_index_and_free(tpi_path: Path | str
+                        ) -> tuple[list[TpdEntry], list[tuple[int, int]]]:
+    """As `read_index`, plus the free list of (size, offset) in the .tpd."""
     p = Path(tpi_path)
     return _parse_index(p.read_bytes(), str(p))
 
@@ -120,7 +244,8 @@ class TpdArchive:
             self.tpi, self.tpd = p.with_suffix(".tpi"), p
         else:
             self.tpi, self.tpd = p, p.with_suffix(".tpd")
-        self.entries = _parse_index(self.tpi.read_bytes(), str(self.tpi))
+        self.entries, self.free = _parse_index(self.tpi.read_bytes(),
+                                               str(self.tpi))
         self._by_name = {e.name.lower(): e for e in self.entries}
         self._fh = open(self.tpd, "rb")
         head = self._fh.read(16)
@@ -139,19 +264,33 @@ class TpdArchive:
 
     # -- reads -------------------------------------------------------------
     def read_compressed(self, e: TpdEntry) -> bytes:
-        self._fh.seek(e.offset)
-        return self._fh.read(e.compressed)
+        """The stored bytes, chunks concatenated in order."""
+        out = []
+        for c_comp, _c_unc, c_off in e.chunks:
+            self._fh.seek(c_off)
+            out.append(self._fh.read(c_comp))
+        return b"".join(out)
 
     def read(self, e: TpdEntry) -> bytes:
-        raw = self.read_compressed(e)
-        if e.flag != 1:
-            return raw
-        out = zlib.decompress(raw)
-        if len(out) != e.uncompressed:
+        if e.flag == 0:                 # empty file, no payload
+            return b""
+        if e.flag != 1 and e.flag != 2:
+            return self.read_compressed(e)
+        out = []
+        for c_comp, c_unc, c_off in e.chunks:
+            self._fh.seek(c_off)
+            part = zlib.decompress(self._fh.read(c_comp))
+            if len(part) != c_unc:
+                raise TpdFormatError(
+                    f"{e.name}: chunk at {c_off} inflated to {len(part)} "
+                    f"bytes, index says {c_unc}")
+            out.append(part)
+        data = b"".join(out)
+        if len(data) != e.uncompressed:
             raise TpdFormatError(
-                f"{e.name}: decompressed to {len(out)} bytes, "
+                f"{e.name}: decompressed to {len(data)} bytes, "
                 f"index says {e.uncompressed}")
-        return out
+        return data
 
     def read_by_name(self, name: str) -> bytes:
         e = self._by_name.get(name.replace("\\", "/").lower())

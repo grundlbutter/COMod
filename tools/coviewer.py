@@ -40,6 +40,7 @@ import mimetypes
 import os
 import re
 import secrets
+import struct
 import subprocess
 import sys
 import threading
@@ -66,6 +67,7 @@ import mapindex                                          # noqa: E402
 import mapedit as mapedit_mod                            # noqa: E402
 import models as models_mod                              # noqa: E402
 import parts as partsmod                                 # noqa: E402
+import tileset                                           # noqa: E402
 import effectplay                                        # noqa: E402
 import unify                                             # noqa: E402
 
@@ -78,7 +80,9 @@ except Exception:                                        # pragma: no cover
 from tagstore import TagStore, TagError, normalise as norm_tag   # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, C3File, parse_ini   # noqa: E402
 from tqhash import tq_hash                               # noqa: E402
-import coroot                                            # noqa: E402
+import coroot
+import cosettings
+import provenance                                            # noqa: E402
 import health                                            # noqa: E402
 import safepath                                          # noqa: E402
 
@@ -126,10 +130,34 @@ def _unit_rows(m):
 #: `mode` from `Plugin.socket_correction` -> the transform that applies it.
 _SOCKET_CORRECTIONS = {"unit-rows": _unit_rows}
 
-#: (root, appearance, weapon set, action) -> (mesh bytes, motion) for a
-#: reference client, so a per-frame borrow costs one parse rather than one
-#: parse per frame.
+#: (root, appearance, weapon set, action) -> (mesh bytes, motion, body used)
+#: for a reference client, so a per-frame borrow costs one parse rather than
+#: one parse per frame.
 _REF_MOTION_CACHE: dict = {}
+
+#: Fallback body appearance per shape when the reference client does not ship
+#: the appearance being viewed. Taken from `attach.Catalogue.BODIES` -- the
+#: canonical one-per-shape body the attachment code already uses -- so the two
+#: cannot drift; the literal is only the degraded case where `attach` did not
+#: import, and an empty map means "no reference", never a guessed body.
+_REF_SHAPE_BODIES = dict(getattr(attach, "Catalogue", None).BODIES) \
+    if getattr(attach, "Catalogue", None) is not None else \
+    {"001": "001131000", "002": "002135000",
+     "003": "003133000", "004": "004134000"}
+
+
+def _frame_counts(motion) -> tuple:
+    """The distinct MOTI frame counts in a motion file, sorted.
+
+    One number in practice -- every chunk of an action shares the clip's
+    length -- but read as a set so a file that disagrees with itself cannot
+    silently compare equal to one that does not.
+    """
+    try:
+        return tuple(sorted({c.motion.frame_count for c in motion.chunks
+                             if c.motion is not None}))
+    except Exception:                                    # pragma: no cover
+        return ()
 
 
 def _reference_root(kind: str):
@@ -146,7 +174,40 @@ def _reference_root(kind: str):
     return None
 
 
-def _reference_basis(kind, socket, body_appearance, weapon_set, action, frame):
+def _reference_body(cat, body_appearance):
+    """`(mesh logical, appearance used)` in the reference client, else `(None, None)`.
+
+    THE APPEARANCE DOES NOT HAVE TO EXIST THERE, AND THAT IS THE WHOLE POINT.
+    An armour appearance is client-specific -- 6090's `001139040` ("Abyss
+    Coat") has no counterpart in CCO, whose shape-001 series-139 ids are
+    `001139290 … 001139990` -- but the socket basis being borrowed is not a
+    property of the armour. It comes from the MOTI track of the per-shape
+    motion file (`c3/0001/410/100.c3`); the mesh only supplies the PHY chunk
+    whose *ordinal* selects that track. MEASURED on CCO, shape 001, weapon set
+    480, action 100 frame 0: `001131000`, `001139000`, `001135000` and
+    `001000000` return v_l_weapon and v_r_weapon matrices that are **identical
+    to all printed digits**. So any body of the right shape is the same answer.
+
+    Demanding the exact id was the live bug: it made the borrow unreachable for
+    every appearance the reference client does not ship, which is most of them,
+    and the viewer degraded to `unit-rows` -- full-size weapon, wrong
+    direction, which is exactly what was reported on screen.
+
+    Exact match is still preferred when it exists, so nothing about the
+    already-verified cases changes.
+    """
+    for app in (body_appearance,
+                _REF_SHAPE_BODIES.get(str(body_appearance or "")[:3])):
+        if not app:
+            continue
+        mesh = cat.appearance_mesh("armor.ini", app) or cat.mesh_path(app)
+        if mesh:
+            return mesh, app
+    return None, None
+
+
+def _reference_basis(kind, socket, body_appearance, weapon_set, action, frame,
+                     local_motion=None):
     """The same socket's 3x3 from a reference client, or None.
 
     Exact rather than approximate, for a measured reason: the socket's
@@ -156,9 +217,28 @@ def _reference_basis(kind, socket, body_appearance, weapon_set, action, frame):
     the 3x3 and keeping our own translation restores the authored orientation
     without moving the hand.
 
-    None whenever anything fails to line up: no such install declared, the
-    motion absent, or the frame counts differing (CCO's action 130 is 25
-    frames against this lineage's 20). The caller then falls back and says so.
+    Returns `(3x3-bearing matrix, reference appearance)`, or None whenever
+    anything fails to line up: no such install declared, no body of that shape
+    there, the motion absent, or the two clients' clips not being the same clip
+    (see `local_motion`). The caller then falls back and says so.
+
+    **`local_motion` is the guard, and it did not exist before.** The docstring
+    used to claim frame counts were checked; nothing checked them, and
+    `Motion.matrix` clamps out-of-range frames to the last key rather than
+    failing -- so a mismatch would have borrowed the reference's final pose for
+    every frame past its end and looked plausible. Pass this client's own
+    motion and the borrow is refused unless the reference resolves the **same
+    logical clip** with the **same frame count**.
+
+    WHY REFUSE RATHER THAN RESAMPLE. The one mismatch in this pairing is action
+    130 (CCO 25 frames, this lineage 20), and proportional frame mapping is
+    refuted by the control socket: map `f -> round(f * 24/19)` and CCO's
+    `v_r_weapon` -- which is byte-identical to ours on every action that *does*
+    line up -- diverges from ours by up to **0.97** in the 3x3, with the left
+    socket's translation off by **44.7** units. They are two different
+    animations, not one resampled. (Action 130 is also not degenerate on this
+    lineage: its shortest v_l_weapon row is 1.000, so there is nothing there to
+    borrow for anyway.)
     """
     root = _reference_root(kind)
     if root is None:
@@ -168,29 +248,35 @@ def _reference_basis(kind, socket, body_appearance, weapon_set, action, frame):
     if hit is None:
         try:
             cat = partsmod.action_catalogue(root)
-            mesh = (cat.appearance_mesh("armor.ini", body_appearance)
-                    or cat.mesh_path(body_appearance))
-            motion = partsmod.idle_motion(body_appearance, root,
-                                          weapon_set, action)
-            hit = ((AssetRoot(root).read(mesh), motion)
+            mesh, used = _reference_body(cat, body_appearance)
+            motion = (partsmod.idle_motion(used, root, weapon_set, action)
+                      if used else None)
+            hit = ((AssetRoot(root).read(mesh), motion, used)
                    if (mesh is not None and motion is not None)
-                   else (None, None))
+                   else (None, None, None))
         except Exception:
-            hit = (None, None)
+            hit = (None, None, None)
         _REF_MOTION_CACHE[key] = hit
-    raw, motion = hit
+    raw, motion, used = hit
     if raw is None or motion is None:
         return None
+    if local_motion is not None:
+        if getattr(local_motion, "logical", None) != getattr(motion, "logical",
+                                                             None):
+            return None
+        if _frame_counts(local_motion) != _frame_counts(motion):
+            return None
     try:
         a = partsmod.socket_anchors(raw, motion_set=motion,
                                     frame=frame).get(socket)
     except Exception:                                    # pragma: no cover
         return None
-    return a.matrix if (a and a.matrix) else None
+    return (a.matrix, used) if (a and a.matrix) else None
 
 
 def apply_socket_corrections(anchors, plugin, body_appearance, *,
-                             weapon_set="000", action="100", frame=0):
+                             weapon_set="000", action="100", frame=0,
+                             local_motion=None):
     """Repair sockets the plugin declares broken. Returns `(anchors, notes)`.
 
     **This is the only place a correction is applied, and that is the point.**
@@ -202,6 +288,11 @@ def apply_socket_corrections(anchors, plugin, body_appearance, *,
     `notes` is `{socket: note}` and travels in the payload, because a
     correction the user cannot see is indistinguishable from a reader that is
     simply wrong.
+
+    `local_motion` is this client's own motion `.c3` for the pose being drawn.
+    Pass it: it is what lets a `reference-basis` borrow prove the other client
+    resolved the *same clip at the same length* before trusting it. Omitted,
+    the borrow is unguarded -- see `_reference_basis`.
     """
     notes: dict = {}
     if plugin is None or not anchors:
@@ -217,17 +308,32 @@ def apply_socket_corrections(anchors, plugin, body_appearance, *,
         if not getattr(anchor, "matrix", None):
             continue
         if mode.startswith("reference-basis:"):
-            ref = _reference_basis(mode.split(":", 1)[1], name,
-                                   body_appearance, weapon_set, action, frame)
+            kind = mode.split(":", 1)[1]
+            ref = _reference_basis(kind, name, body_appearance, weapon_set,
+                                   action, frame, local_motion=local_motion)
             if ref is not None:
+                basis, used = ref
                 # The reference's orientation, our own translation. Those two
                 # already agree to 0.0000, so this moves nothing -- it only
                 # restores the 3x3 the shipped track lost.
                 m = list(anchor.matrix)
                 for r in (0, 4, 8):
-                    m[r], m[r + 1], m[r + 2] = ref[r], ref[r + 1], ref[r + 2]
+                    m[r:r + 3] = basis[r:r + 3]
                 anchor.matrix = tuple(m)
                 notes[name] = note
+                if used and used != body_appearance:
+                    # Say whose body it came from. The armour is client-
+                    # specific and the basis is not, so the reference read a
+                    # different appearance of the same shape on purpose --
+                    # but "borrowed from CCO" and "borrowed from CCO's
+                    # 001131000" are different claims and only one is true.
+                    notes[name] += (
+                        f"  [The reference client ({kind}) does not ship "
+                        f"appearance {body_appearance}; the basis is read from "
+                        f"its {used}, the canonical body of the same shape. "
+                        f"The basis is a property of the shape's motion track, "
+                        f"not of the armour -- every {body_appearance[:3]} body "
+                        f"in that client returns the same matrix.]")
                 continue
             # No reference available, or it did not line up. Fall back to the
             # shape-preserving repair and say which one happened -- "corrected"
@@ -235,7 +341,8 @@ def apply_socket_corrections(anchors, plugin, body_appearance, *,
             # project two sessions.
             anchor.matrix = _unit_rows(anchor.matrix)
             notes[name] = (note + "  [FALLBACK: the reference client is not "
-                           "available or its track does not line up, so only "
+                           "available, ships no body of this shape, or "
+                           "resolves a different clip for this action, so only "
                            "the collapse is repaired -- the orientation is "
                            "still the one this client ships.]")
             continue
@@ -308,10 +415,27 @@ SOCKET_NAMES = {
 }
 
 
+#: The install currently being served.  Set once, from the Catalog, so the
+#: socket test reads the [Dumy] list of the client on screen instead of
+#: attach's environment-derived default.  It stays a module value because
+#: `mesh_to_json` is eleven call sites deep and a wrong answer here is silent:
+#: a short [Dumy] list does not fail, it just stops hiding attachment points,
+#: and the model grows textured boxes with nothing reporting a fault.
+ACTIVE_ROOT = None
+
+
+def set_active_root(root) -> None:
+    """Point the socket test at the install being drawn."""
+    global ACTIVE_ROOT
+    ACTIVE_ROOT = Path(root) if root is not None else None
+
+
 def is_socket_chunk(name: str) -> bool:
     """True when a PHY chunk is an attachment point rather than geometry."""
     if attach is not None:
         try:
+            if ACTIVE_ROOT is not None:
+                return attach.is_socket_name(name, ACTIVE_ROOT)
             return attach.is_socket_name(name)
         except Exception:                                # pragma: no cover
             pass
@@ -488,9 +612,159 @@ class ThumbRunner:
         }
 
 
+#: The progress line `tools/meshtex.py` already writes while it scans the `.c3`
+#: containers ("  scan 3500/6390").  Parsed rather than re-implemented, for the
+#: same reason as the thumbnail one above: the numbers shown in the browser are
+#: literally the builder's own.
+_INDEX_PROGRESS_RE = re.compile(r"^\s*scan\s+(\d+)\s*/\s*(\d+)\s*$")
+
+
+class IndexRunner:
+    r"""Runs `tools/meshtex.py --coverage` in a child process, on request only.
+
+    The same three rules as `ThumbRunner`, for the same reasons, because this
+    is the same kind of job -- a one-off derived-data build that a first-time
+    user should be *offered* rather than subjected to:
+
+    * **Nothing starts by itself.**  This is the offered, permanent build. The
+      viewer will also build the relation live, in-process, when a page asks
+      for it (`Catalog.unified_now`) -- but that answer dies with the process,
+      and it is 32-56 s **every time the client is opened**. This one writes
+      `out/indexes/<base-id>/meshtex/coverage.json` once and the next open is
+      1.6 s.  MEASURED: 6090, which has one, loads it in 1.6 s; 7878, which
+      did not, built live in 32.3 s.
+    * **The UI does not block on it.**  Separate process, polled progress,
+      page can be closed and reopened.
+    * **It is resumable** -- in the only sense this job has one. `meshtex`
+      caches its `.c3` container census in `mesh_index.json`, so an
+      interrupted run re-does the matching (seconds) rather than the scan
+      (most of the time). It is NOT incremental the way `thumbs.py --resume`
+      is, and that difference is stated rather than papered over: cancelling
+      halfway leaves nothing behind but the scan cache.
+
+    **Per base, not per process.**  The argv carries `--root`, so the artefact
+    lands in the base's own namespace (`coroot.base_id`) and switching clients
+    cannot serve one client's relation as another's.
+    """
+
+    def __init__(self, project: Path, root: Path):
+        self.project = project
+        self.root = Path(root)
+        self.lock = threading.Lock()
+        self.proc: Optional[subprocess.Popen] = None
+        self.started: float = 0.0
+        self.finished: float = 0.0
+        self.returncode: Optional[int] = None
+        self.cancelled = False
+        self.progress: dict = {"label": "scan", "done": 0, "total": 0}
+        self.tail: list[str] = []
+
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self) -> dict:
+        with self.lock:
+            if self.running():
+                return {"started": False, "reason": "already running",
+                        **self.status()}
+            argv = [sys.executable, str(HERE / "meshtex.py"),
+                    "--root", str(self.root), "--coverage"]
+            creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
+                if os.name == "nt" else 0
+            self.proc = subprocess.Popen(
+                argv, cwd=str(self.project), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                errors="replace", creationflags=creation)
+            self.started = time.time()
+            self.finished = 0.0
+            self.returncode = None
+            self.cancelled = False
+            self.progress = {"label": "scan", "done": 0, "total": 0}
+            self.tail = []
+            threading.Thread(target=self._pump, daemon=True).start()
+            _log(f"asset index: started {' '.join(argv[1:])}")
+            return {"started": True, "cmd": " ".join(argv), **self.status()}
+
+    def cancel(self) -> dict:
+        with self.lock:
+            if not self.running():
+                return {"cancelled": False, "reason": "not running",
+                        **self.status()}
+            self.cancelled = True
+            pid = self.proc.pid                    # type: ignore[union-attr]
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           capture_output=True)
+        else:                                       # pragma: no cover
+            self.proc.terminate()                   # type: ignore[union-attr]
+        _log("asset index: cancelled")
+        return {"cancelled": True, **self.status()}
+
+    def _pump(self) -> None:
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                m = _INDEX_PROGRESS_RE.match(line)
+                if m:
+                    self.progress = {"label": "scan", "done": int(m.group(1)),
+                                     "total": int(m.group(2))}
+                else:
+                    self.tail.append(line)
+                    del self.tail[:-40]
+        except Exception as e:                       # pragma: no cover
+            self.tail.append(f"(reader stopped: {e})")
+        self.returncode = proc.wait()
+        self.finished = time.time()
+        _log(f"asset index: finished, exit {self.returncode}")
+
+    def status(self) -> dict:
+        elapsed = ((self.finished or time.time()) - self.started
+                   if self.started else 0.0)
+        return {
+            "running": self.running(),
+            "elapsedSeconds": round(elapsed, 1),
+            "returncode": self.returncode,
+            "cancelled": self.cancelled,
+            "progress": self.progress,
+            "tail": self.tail[-12:],
+            "root": str(self.root),
+            # `meshtex.py --coverage` only emits a counted "scan i/total" line
+            # when it has to rebuild its container census; with the census
+            # cached it prints phase lines and then the summary, so `progress`
+            # stays 0/0 for the whole run. Rather than show a bar that never
+            # moves, the card falls back to the builder's own last line. The
+            # honest readout is "here is what it is doing", not a fake
+            # percentage. (The in-process live build, which is the one a user
+            # actually waits on mid-switch, does have a real count -- see
+            # `Catalog.unified_status`.)
+            "phase": self.tail[-1] if self.tail else "",
+        }
+
+
 # ---------------------------------------------------------------------------
 # catalogue
 # ---------------------------------------------------------------------------
+
+#: Order the path picker's groups appear in, and the sort that keeps each one
+#: CONTIGUOUS. `basepicker.js` opens a new `<optgroup>` whenever `kind`
+#: changes, so a kind appearing twice in the payload renders as two groups
+#: under the same heading. That is not hypothetical: declared installs sort by
+#: plugin name and `cco` -- a `server` since it is a private server's client --
+#: sorts before every `patch*`, which put "Private server clients" both above
+#: and below the official block. Ordering belongs here, with the payload; the
+#: renderer stays a renderer.
+BASE_GROUP_ORDER = {"install": 0, "server": 1, "collection": 2, "other": 3}
+
+
+def base_group_key(entry: dict):
+    """Sort key for `/api/bases` entries: group first, then label."""
+    return (BASE_GROUP_ORDER.get(entry.get("kind"), 9),
+            str(entry.get("label", "")).lower())
+
 
 @dataclass
 class Provenance:
@@ -527,6 +801,8 @@ class Catalog:
 
     def __init__(self, root: Path, server_view=None):
         self.root = Path(root)
+        # The socket test is keyed on the served install, never on CO_ROOT.
+        set_active_root(self.root)
         #: a colibrary.ServerView when browsing an imported community client;
         #: the namespace and the appearance tables then come from that
         #: client's profile instead of the install.
@@ -553,10 +829,54 @@ class Catalog:
             self._scan_loose()
 
         # archive entry lookup: logical path -> (archive, entry)
-        self.arc_by_hash = {}
+        #
+        # Keyed by `tq_hash` because that is what the two consumers below ask
+        # with. **A WDF entry carries `.hash` and a DatPkg entry does not** --
+        # the latter is keyed by plaintext path, so it never needed one, and
+        # reading `e.hash` unconditionally is what made `Catalog(7878)` raise
+        # `AttributeError` before the archive layer was even consulted.
+        #
+        # For a DatPkg archive the key is computed from the name, which is
+        # EXACT: the index stores the real path, where WDF stores only the
+        # hash and 331 of the official archive's 24,757 names were never
+        # recovered. Same key, better provenance.
+        # A CONTAINER THAT STORES THE NAME IS ASKED FOR THE NAME.
+        #
+        # This used to hash every entry up front and then build `archived` by
+        # walking the RECOVERED WDF NAME TABLE and looking each hash up. On a
+        # WDF root that is the only thing possible -- the container stores a
+        # hash and nothing else. **On a DatPkg root it is both slow and
+        # lossy**, and the two are the same mistake seen from either end.
+        # MEASURED on 7878 (146,196 entries across four DatPkg pairs):
+        #
+        #     hashing every entry             3,414 ms of pure-python tq_hash
+        #     names that survived the round trip   13,003 of 146,196
+        #
+        # The 133,193 that did not survive are not missing from the archive --
+        # they are missing from `names`, which is a table recovered for WDF
+        # clients. So `Catalog.exists` answered False for them, and that is
+        # why 7878's whole appearance chain measured zero while the assets sat
+        # right there (`C-2026-08-13-claude-vibeco-content`).
+        #
+        # A DatPkg entry carries its real path. Taking it directly is exact,
+        # free, and complete.
+        self.arc_by_name: dict[str, tuple] = {}
+        self._unnamed: list = []                 # (archive, entry) needing a hash
         for aname, arc in self.assets._archives.items():
             for e in arc.entries:
-                self.arc_by_hash.setdefault(e.hash, (aname, e))
+                nm = getattr(e, "name", None)
+                if nm:
+                    self.arc_by_name.setdefault(
+                        nm.lower().replace("\\", "/"), (aname, e))
+                else:
+                    self._unnamed.append((aname, e))
+        #: Hash index, built on demand. `provenance()` is a per-file
+        #: diagnostic and asks by name first, so a DatPkg root never pays for
+        #: this at all; a WDF root pays 4.2 ms (25,013 entries) the first time
+        #: something asks. It stays a public attribute because
+        #: `tests/test_gamemap_registry.py` reads it to prove entries were
+        #: indexed, and that assertion should keep meaning what it means.
+        self._arc_by_hash: Optional[dict] = None
 
         self.archived: dict[str, str] = {}       # logical -> archive name
         if self.server_view is not None:
@@ -565,10 +885,16 @@ class Catalog:
             for key, ref in self.server_view.filemap.items():
                 self.archived[key] = _labels.get(ref[0], "baseline")
         else:
-            for h, nm in self.names.items():
-                hit = self.arc_by_hash.get(h)
-                if hit:
-                    self.archived[nm.lower()] = hit[0]
+            # Names the container states, then names only the table knows.
+            # Both, because neither source is complete: a DatPkg root has no
+            # recovered table and a WDF root has no stated names.
+            for nm, (aname, _e) in self.arc_by_name.items():
+                self.archived[nm] = aname
+            if self._unnamed:
+                for h, nm in self.names.items():
+                    hit = self.arc_by_hash.get(h)
+                    if hit:
+                        self.archived.setdefault(nm.lower(), hit[0])
 
         self.all_paths: list[str] = sorted(set(self.loose) | set(self.archived))
         self._path_set = set(self.all_paths)
@@ -659,9 +985,44 @@ class Catalog:
         self._builder_lock = threading.Lock()
 
         # mesh <-> texture, so the file lists show one row per asset instead of
-        # one per file. Cheap when out/meshtex/coverage.json exists.
+        # one per file. Cheap when out/meshtex/coverage.json exists -- 1.6 s on
+        # 6090, which HAS one. Without one it is built live from meshtex, and
+        # that is 32-56 s on 7878 (37,856 meshes). MEASURED, both.
+        #
+        # THE BUILD DOES NOT RUN UNDER THE LOCK. It used to, and the lock was
+        # never the interesting half: what actually made the viewer look dead
+        # after switching to 7878 was that `unified` is a *blocking* property,
+        # so the first list request of the new client sat for the whole build
+        # and the page had nothing to say about it. MEASURED before this
+        # change, cold 7878: /api/files 56.2 s, /api/catfiles 54.3 s,
+        # /api/models 56.4 s -- while /api/status stayed at 74 ms and
+        # /api/tables at 46 ms, because those never touch this index. The
+        # server was responsive throughout; the *page* was not, and nothing
+        # told the user why.
+        #
+        # So: one build, on a background thread, started by whoever asks
+        # first. `unified` still blocks (its callers cache what they derive
+        # and must not cache a narrower answer); `unified_now` does not, and
+        # returns a legitimately-empty index plus a progress readout so the
+        # lists render immediately and say what is missing and why.
         self._unified: Optional[unify.UnifiedIndex] = None
+        #: served by `unified_now` until the real one lands. Built with
+        #: `build=False`, so it is empty *by construction* rather than
+        #: half-filled -- a partially populated index would answer some
+        #: questions wrongly instead of answering none.
+        self._unified_pending: Optional[unify.UnifiedIndex] = None
+        #: guards this state ONLY. Never held across the build.
         self._unified_lock = threading.Lock()
+        self._unified_done = threading.Event()
+        self._unified_thread: Optional[threading.Thread] = None
+        self._unified_started: float = 0.0
+        self._unified_finished: float = 0.0
+        self._unified_progress: dict = {"done": 0, "total": 0}
+        self._unified_error: str = ""
+        #: memoised, because both are sha256-over-37-MB behind the scenes.
+        self._base_id: Optional[str] = None
+        self._prebuilt: Optional[bool] = None
+        self._prebuilt_at: float = 0.0
 
         # The non-character model families (tools/models.py): monsters, NPCs,
         # ghosts, the mount family, the character-select roles, effects. Lazy
@@ -721,33 +1082,180 @@ class Catalog:
                                                       assets=self.assets)
             return self._mapedit
 
+    def _thumb_dir_for_view(self) -> Optional[Path]:
+        return (PROJECT / "out" / "thumbs" / "servers" / self.server_view.server
+                if self.server_view is not None else None)
+
+    def _build_unified(self) -> None:
+        """The whole index build, on a worker thread, holding nothing.
+
+        Only the *publication* at the end takes the lock, so a reader asking
+        `unified_now` mid-build waits on a set lookup, not on 56 seconds of
+        meshtex.
+        """
+        t0 = time.time()
+        try:
+            def tick(done: int, total: int) -> None:
+                self._unified_progress = {"done": done, "total": total}
+
+            u = unify.UnifiedIndex(self.root, exists=self.exists,
+                                   thumb_dir=self._thumb_dir_for_view(),
+                                   progress=tick)
+            if self.server_view is not None:
+                # recovered-archive pairs: model and skin share a stem
+                pairs = {}
+                for q in self.all_paths:
+                    if q.endswith(".c3") and (q[:-3] + ".dds") in self._path_set:
+                        pairs[q] = q[:-3] + ".dds"
+                n_add = u.add_pairs(pairs)
+                if n_add:
+                    _log(f"unified index: +{n_add} same-stem pairs "
+                         f"from the {self.server_view.server} library")
+            _log(f"unified index: {u.source}"
+                 f"{' — ' + u.error if u.error else ''}"
+                 f"  ({time.time() - t0:.1f}s)")
+            n = len(u.thumbs())
+            if n:
+                _log(f"thumbnail manifest: {n} entries from out/thumbs/")
+        except Exception as e:                            # pragma: no cover
+            # A failed build must not leave every future reader blocked on an
+            # Event that will never be set. Publish an empty index and say so.
+            self._unified_error = f"{type(e).__name__}: {e}"
+            _log(f"unified index FAILED: {self._unified_error}")
+            u = unify.UnifiedIndex(self.root, exists=self.exists,
+                                   thumb_dir=self._thumb_dir_for_view(),
+                                   build=False)
+        with self._unified_lock:
+            self._unified = u
+            self._unified_finished = time.time()
+        self._unified_done.set()
+
+    def _start_unified(self) -> None:
+        """Ensure exactly one build is running or finished. Cheap and idempotent."""
+        with self._unified_lock:
+            if self._unified is not None or self._unified_thread is not None:
+                return
+            self._unified_started = time.time()
+            self._unified_pending = unify.UnifiedIndex(
+                self.root, exists=self.exists,
+                thumb_dir=self._thumb_dir_for_view(), build=False)
+            self._unified_thread = threading.Thread(
+                target=self._build_unified, daemon=True,
+                name="unified-index")
+            self._unified_thread.start()
+
     @property
     def unified(self) -> unify.UnifiedIndex:
         """The mesh<->texture relation (tools/meshtex.py's answers) plus the
-        rule that collapses a related pair into one list row."""
-        with self._unified_lock:
-            if self._unified is None:
-                tdir = (PROJECT / "out" / "thumbs" / "servers"
-                        / self.server_view.server
-                        if self.server_view is not None else None)
-                self._unified = unify.UnifiedIndex(self.root, exists=self.exists,
-                                                   thumb_dir=tdir)
-                if self.server_view is not None:
-                    # recovered-archive pairs: model and skin share a stem
-                    pairs = {}
-                    for q in self.all_paths:
-                        if q.endswith(".c3") and (q[:-3] + ".dds") in self._path_set:
-                            pairs[q] = q[:-3] + ".dds"
-                    n_add = self._unified.add_pairs(pairs)
-                    if n_add:
-                        _log(f"unified index: +{n_add} same-stem pairs "
-                             f"from the {self.server_view.server} library")
-                _log(f"unified index: {self._unified.source}"
-                     f"{' — ' + self._unified.error if self._unified.error else ''}")
-                n = len(self._unified.thumbs())
-                if n:
-                    _log(f"thumbnail manifest: {n} entries from out/thumbs/")
-            return self._unified
+        rule that collapses a related pair into one list row.
+
+        **Blocks until the index is real.** Keep using this wherever a wrong
+        answer would be *kept*: `models` builds a whole catalogue out of it
+        and caches that, and a catalogue built against an empty index would
+        report every model geometry-free and skinless for the life of the
+        process. A silently narrower answer is the failure shape this project
+        has paid for most often; waiting is the cheaper of the two.
+
+        Presentation endpoints want `unified_now` instead.
+        """
+        self._start_unified()
+        self._unified_done.wait()
+        assert self._unified is not None
+        return self._unified
+
+    def unified_now(self) -> unify.UnifiedIndex:
+        """The index if it is built, else an empty one -- **never blocks.**
+
+        Starts the build on first call, exactly as touching `unified` always
+        has, so nothing new begins on its own: this is the same trigger, minus
+        the wait. Until it lands, callers get `available == False`, which is a
+        state every consumer already handles (it is what an install with no
+        meshtex answers looks like) -- lists simply show one row per file.
+
+        Pair it with `unified_status()` so the page can say *why* the rows are
+        not collapsed yet. An index that is quietly missing and an index that
+        is three seconds from arriving must not look the same.
+        """
+        self._start_unified()
+        u = self._unified
+        if u is not None:
+            return u
+        assert self._unified_pending is not None
+        return self._unified_pending
+
+    def unified_status(self) -> dict:
+        """What to tell someone waiting: state, progress, and where it came from.
+
+        `state` is one of:
+          * ``"cold"``     -- nothing has asked for it yet, so nothing is running
+          * ``"building"`` -- a background build is in flight; `progress` moves
+          * ``"ready"``    -- `unified` is real
+          * ``"failed"``   -- the build raised; `error` says what
+        """
+        u = self._unified
+        if u is not None:
+            state = "failed" if self._unified_error else "ready"
+        elif self._unified_thread is not None:
+            state = "building"
+        else:
+            state = "cold"
+        p = dict(self._unified_progress)
+        el = ((self._unified_finished or time.time()) - self._unified_started
+              if self._unified_started else 0.0)
+        return {
+            "state": state,
+            "available": bool(u is not None and u.available),
+            "source": u.source if u is not None else "",
+            "error": self._unified_error or (u.error if u is not None else ""),
+            "meshes": len(u.mesh_matches) if u is not None else 0,
+            "elapsedSeconds": round(el, 1),
+            "progress": p,
+            # Whether a prebuilt coverage.json exists for THIS base. False is
+            # the whole reason a switch is slow, and it is the thing the
+            # health screen offers to fix.
+            "prebuilt": self.prebuilt_index(),
+            "baseId": self.base_id_safe(),
+        }
+
+    def base_id_safe(self) -> str:
+        """This install's index namespace, computed **once**.
+
+        `coroot.base_id` is a sha256 over the whole top level of `ini/` -- 37
+        MB and ~50 ms on 6090, and it does not cache. That is the right shape
+        for a CLI tool asking once; it is the wrong shape for a status
+        endpoint a page polls, and calling it per request is how `/api/status`
+        went from 4 ms to 404 ms the first time this state was published.
+        MEASURED. A Catalog's root never changes, so neither can its answer.
+        """
+        if self._base_id is None:
+            try:
+                self._base_id = coroot.base_id(self.root)
+            except Exception:                             # pragma: no cover
+                self._base_id = "unkeyed"
+        return self._base_id
+
+    #: How long `prebuilt_index` trusts its last look at the disk.
+    PREBUILT_TTL = 10.0
+
+    def prebuilt_index(self) -> bool:
+        """Is there a saved `coverage.json` for this base?
+
+        Cached for `PREBUILT_TTL` seconds rather than answered per call, for
+        the reason above: the lookup goes through `base_id`. Time-limited
+        rather than invalidated by hand, because the file can appear from
+        outside this process (`meshtex.py --coverage` on a command line, or
+        the offered `IndexRunner` child) and a cache nobody remembers to
+        invalidate is a cache that lies.
+        """
+        now = time.time()
+        if self._prebuilt is None or now - self._prebuilt_at > self.PREBUILT_TTL:
+            try:
+                self._prebuilt = coroot.find_derived(
+                    "out/meshtex/coverage.json", self.root) is not None
+            except Exception:                             # pragma: no cover
+                self._prebuilt = False
+            self._prebuilt_at = now
+        return self._prebuilt
 
     @property
     def models(self) -> models_mod.ModelCatalogue:
@@ -785,7 +1293,18 @@ class Catalog:
                     effect_names=self.effects.names,
                     entity_names=self._entity_name_map(),
                     entity_textures=npc_tex, flat_npc_art=flat_art,
-                    plugin=self.plugin)
+                    plugin=self.plugin,
+                    # THE FIFTH CALL SITE. `read=self.read` above delegates to
+                    # `self.assets`, which is a `ServerView` when browsing an
+                    # imported community client -- so leaving `models.py` to
+                    # probe made it resolve the profile from the BASELINE, the
+                    # same defect the other four had.
+                    # `docs/CORRECTIONS.md`
+                    # C-2026-08-09-plugin-c-serverview-profile. Handed the
+                    # profile this Catalog already resolved, so there is one
+                    # answer per catalogue rather than two that can disagree.
+                    table_profile=(self.npc_tables.profile
+                                   if self.npc_tables is not None else None))
                 # A pinned monster wears its default skin -- the first of
                 # its verified colourways. meshtex had 109 in 108's clothes
                 # and four dirs in a non-default colour; the pin decides,
@@ -819,11 +1338,71 @@ class Catalog:
         if cached == "unset":
             try:
                 import npcart
-                cached = npcart.Tables(self.read)
+                # ASK THE CLIENT BEING SHOWN, do not let the tables guess and
+                # do not ask the baseline. `detect_profile` probes which
+                # container shape exists, which is a fair question and a
+                # different one from "which client is this": it cannot see
+                # `version.dat` or the user's declaration, and a declaration
+                # outranks a heuristic. But `self.plugin` resolves from
+                # `self.root`, and when this Catalog holds a `server_view` that
+                # root is the **baseline** -- so the community client whose
+                # assets are on screen was never asked. See
+                # `assetdiff.table_profile_for`, which is the single definition
+                # of that rule, and `docs/CORRECTIONS.md`
+                # C-2026-08-09-plugin-c-serverview-profile.
+                #
+                # STABLE, NOT CORRECT. This makes the answer independent of
+                # which baseline the user configured; it does NOT show the
+                # chosen profile is the right one for a community client, which
+                # is UNMEASURED and someone else's question. MEASURED on
+                # 21f2501, zephyr, 5165/plaintext vs 6090/official: 646 of
+                # 2,785 rows differ (23.2%; 639 of 2,747 npc_types) --
+                # superseding the register's 25-of-400 file-order sample -- and
+                # **0** of them conflict. Every difference is one-sided.
+                from assetdiff import table_profile_for   # noqa: PLC0415
+                # `plugin=self.plugin` rather than letting it re-derive: this
+                # Catalog's plugin was detected with `exists=self.assets.exists`
+                # (archives included), and `plugin_for` cannot reach that. On a
+                # declared install the two agree; on an undeclared one,
+                # re-deriving would downgrade to the loose layer.
+                prof, rep = table_profile_for(self.assets, self.root,
+                                              resolve=False,
+                                              plugin=self.plugin)
+                cached = npcart.Tables(self.read, prof)
+                if self.server_view is not None:
+                    # The count a pin could not resolve has to reach a user,
+                    # not just a docstring: a fallback is not a fix unless the
+                    # miss is audible.
+                    #
+                    # `tables=cached` rather than letting the report build its
+                    # own: the counts must describe the object that actually
+                    # answers, not a parallel one. A report about something
+                    # other than what answered is this change's own subject
+                    # matter in miniature.
+                    try:
+                        rep = self.server_view.table_profile_report(
+                            tables=cached)
+                        _log(self.server_view.table_profile_note(
+                            tables=cached))
+                    except Exception:                    # pragma: no cover
+                        pass
+                self._npc_profile_report = rep
             except Exception:                            # pragma: no cover
                 cached = None
             self._npc_tables = cached
         return cached
+
+    def npc_profile_report(self) -> dict:
+        """What answered the "which npc tables" question, for `/api/status`.
+
+        Built as a side effect of `npc_tables`, so asking forces the tables --
+        which is right: a report about a profile that was never resolved would
+        be a second silent answer. Empty only if the tables could not be built
+        at all, and empty then says so rather than implying a default.
+        """
+        self.npc_tables                                   # noqa: B018
+        return getattr(self, "_npc_profile_report", None) or {
+            "profile": None, "how": "npc tables unavailable"}
 
     def npc_art_member(self, p: str) -> bool:
         """Whether the NPC tables reference this path -- geometry, skin,
@@ -870,6 +1449,14 @@ class Catalog:
                 plan = None
             if plan is not None and plan.texture:
                 return plan.texture
+        # BLOCKING on purpose, unlike the list endpoints. This answers "which
+        # skin does this mesh wear", and the fallbacks below it (c3tex, then
+        # naming conventions) are independent resolvers that can disagree with
+        # the index. Serving whichever one happened to be reachable would make
+        # the same mesh show different skins depending on when it was opened,
+        # and the viewer caches decoded textures -- so the inconsistency would
+        # outlive the build that caused it. Slow and one answer beats fast and
+        # two. Nothing polls this.
         u = self.unified
         if u is not None and getattr(u, "available", False):
             try:
@@ -1117,6 +1704,9 @@ class Catalog:
         out: dict = {}
         try:
             raw = json.loads(_read_derived("out/artcrawl/entities.json", self.root))
+            # `unwrap` returns an unstamped document unchanged, so a crawl
+            # built before the provenance migration still reads.
+            raw = provenance.unwrap(raw)[1]
             ents = raw.get("entities", raw) if isinstance(raw, dict) else raw
             pat = re.compile(r"c3/monster/([^/]+)/", re.I)
             for e in ents:
@@ -1141,6 +1731,9 @@ class Catalog:
         ents = []
         try:
             raw = json.loads(_read_derived("out/artcrawl/entities.json", self.root))
+            # `unwrap` returns an unstamped document unchanged, so a crawl
+            # built before the provenance migration still reads.
+            raw = provenance.unwrap(raw)[1]
             ents = raw.get("entities", raw) if isinstance(raw, dict) else raw
         except Exception:
             return {}
@@ -1202,6 +1795,30 @@ class Catalog:
     MESH_DIRS = ("mesh", "weapon", "body", "hair", "mount", "npc", "monster")
     TEX_DIRS = ("texture", "weapon", "body", "hair", "mount", "npc", "monster")
 
+    @property
+    def arc_by_hash(self) -> dict:
+        """`tq_hash(logical) -> (archive, entry)`, built the first time it is
+        asked for.
+
+        Eager, this cost **3,414 ms on 7878** -- 146,196 pure-python `tq_hash`
+        calls over DatPkg entries that already carry their path. Nothing on the
+        startup path needs it: `archived` is now built from the stated names,
+        and `provenance()` asks `arc_by_name` first. It stays public and
+        complete because a hash lookup is still the only way to answer for a
+        WDF entry, and because a caller reading it to prove entries were
+        indexed should keep getting that answer.
+        """
+        if self._arc_by_hash is None:
+            index: dict = {}
+            for aname, arc in self.assets._archives.items():
+                for e in arc.entries:
+                    h = getattr(e, "hash", None)
+                    if h is None:
+                        h = tq_hash(e.name)
+                    index.setdefault(h, (aname, e))
+            self._arc_by_hash = index
+        return self._arc_by_hash
+
     def resolve_id(self, asset_id: str, kind: str = "texture") -> Optional[str]:
         if not asset_id or asset_id == "0":
             return None
@@ -1248,7 +1865,11 @@ class Catalog:
                 pv.size = loc.size
             return pv
 
-        arc_hit = self.arc_by_hash.get(h)
+        # By name first: a container that stores the path can answer without a
+        # hash, and on a DatPkg root that keeps the 146,196-entry hash index
+        # from ever being built.
+        arc_hit = self.arc_by_name.get(key) or (
+            self.arc_by_hash.get(h) if self._unnamed else None)
         real = self.root / key
         if key in self.loose and real.is_file():
             pv.exists = True
@@ -1366,11 +1987,14 @@ def mesh_to_json(m: "c3phy.PhyMesh", index: int, motion=None, frame: int = 0) ->
       puts headgear at the wrong angle.  It is deliberately NOT applied when a
       mesh is viewed on its own, because asset view shows a mesh as authored.
     """
-    import copy
-    mm = copy.deepcopy(m)
-    matrix_identity = (len(mm.matrix) == 16 and
-                       all(abs(a - b) < 1e-6 for a, b in zip(mm.matrix, _IDENT)))
-    c3phy.apply_matrix_to(mm)
+    # `apply_matrix_copy`, not `deepcopy` + `apply_matrix_to`: the two produce
+    # bit-identical output and the copy is 8x cheaper. This function is the
+    # hot inner loop of /api/mesh, /api/figure, /api/anim and /api/modelanim
+    # (the animation routes call it once per frame), and cProfile put
+    # `copy.deepcopy` at 67% of the figure path. See c3phy.apply_matrix_copy.
+    matrix_identity = (len(m.matrix) == 16 and
+                       all(abs(a - b) < 1e-6 for a, b in zip(m.matrix, _IDENT)))
+    mm = c3phy.apply_matrix_copy(m)
     motion_applied = False
     if motion is not None and mm.vertices and attach is not None:
         try:
@@ -1587,6 +2211,11 @@ class ViewerServer(ThreadingHTTPServer):
         self.tags = TagStore(TAGS_FILE)
         #: None until an install is known -- the setup page runs without one.
         self.thumbs = ThumbRunner(PROJECT, root) if root else None
+        #: The offered mesh<->texture index build, per base. Rebound when the
+        #: active base changes, because the artefact is per base: one runner
+        #: held over a switch would offer to index the client you just left.
+        self.indexer: Optional[IndexRunner] = (
+            IndexRunner(PROJECT, root) if root else None)
         #: Per-run CSRF token. New on every start, held only in memory, never
         #: written to disk -- a token in a file is a token that outlives the
         #: run it authorised. See `Handler._csrf_reason`.
@@ -1803,6 +2432,7 @@ class Handler(BaseHTTPRequestHandler):
             handler = {
                 "/api/preview": self.post_preview,
                 "/api/stage": self.post_stage,
+                "/api/swap/stage": self.post_swap_stage,
                 "/api/unstage": self.post_unstage,
                 "/api/install": self.post_install,
                 "/api/uninstall": self.post_uninstall,
@@ -1812,6 +2442,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/base": self.post_base,
                 "/api/setlibrary": self.post_setlibrary,
                 "/api/ping": self.post_ping,
+                "/api/settings": self.post_settings,
                 # "/collect" is the Google Analytics Measurement Protocol
                 # path, and ad/tracker blockers ship rules that match it by
                 # name. A local tool asking to keep an asset was being
@@ -1821,6 +2452,7 @@ class Handler(BaseHTTPRequestHandler):
                 # filter list. The old paths stay as aliases so an
                 # already-open page keeps working.
                 "/api/keep/add": self.post_collect,
+                "/api/keep/map": self.post_collect_map,
                 "/api/keep/remove": self.post_uncollect,
                 "/api/keep/stage": self.post_collect_stage,
                 "/api/collect": self.post_collect,
@@ -1828,6 +2460,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/collect/stage": self.post_collect_stage,
                 "/api/setroot": self.post_setroot,
                 "/api/thumbs/start": self.post_thumbs_start,
+                "/api/index/start": self.post_index_start,
+                "/api/index/cancel": self.post_index_cancel,
                 "/api/thumbs/cancel": self.post_thumbs_cancel,
                 "/api/thumbs/decision": self.post_thumbs_decision,
                 "/api/mapedit/passability": self.post_mapedit_passability,
@@ -1863,15 +2497,26 @@ class Handler(BaseHTTPRequestHandler):
         # browser's three-pane layout is built around a 3D viewport.
         if path in ("/mapedit", "/mapedit/", "/mapedit.html"):
             return self._static("mapedit.html")
+        # ...and so is Settings. The owner's word for it was "window", and a
+        # column of prose does not belong in a layout built around a 3D
+        # viewport.
+        if path in ("/settings", "/settings/", "/settings.html"):
+            return self._static("settings.html")
+        # ...and so is the swap page: two model viewers side by side need the
+        # window, and the flow it replaces was a text field in a drawer.
+        if path in ("/swap", "/swap/", "/swap.html"):
+            return self._static("swap.html")
         if path.startswith("/ui/"):
             return self._static(path[4:])
 
         routes = {
             "/api/status": self.api_status,
+            "/api/settings": self.api_settings,
             "/api/servers": self.api_servers,
             "/api/bases": self.api_bases,
             "/api/library": self.api_library,
             "/api/keep": self.api_collection,
+            "/api/keep/map": self.api_map_closure,
             "/api/collection": self.api_collection,
             "/api/tables": self.api_tables,
             "/api/appearances": self.api_appearances,
@@ -1881,10 +2526,23 @@ class Handler(BaseHTTPRequestHandler):
             "/api/provenance": self.api_provenance,
             "/api/mesh": self.api_mesh,
             "/api/texture": self.api_texture,
+            "/api/texbundle": self.api_texbundle,
             "/api/rawinfo": self.api_rawinfo,
             "/api/stage": self.api_stage_list,
             "/api/installs": self.api_installs,
             "/api/skintarget": self.api_skintarget,
+            "/api/swap/writable": self.api_swap_writable,
+            "/api/swap/record": self.api_swap_record,
+            "/api/swap/library": self.api_swap_library,
+            "/api/swap/targets": self.api_swap_targets,
+            "/api/swap/npcset": self.api_swap_npcset,
+            "/api/swap/instructions": self.api_swap_instructions,
+            "/api/swap/libmesh": self.api_swap_libmesh,
+            "/api/swap/libtex": self.api_swap_libtex,
+            "/api/swap/kinds": self.api_swap_kinds,
+            "/api/swap/browse": self.api_swap_browse,
+            "/api/swap/parts": self.api_swap_parts,
+            "/api/swap/plan": self.api_swap_plan,
             "/api/diff": self.api_diff,
             "/api/bodyfacets": self.api_bodyfacets,
             "/api/categories": self.api_categories,
@@ -1894,6 +2552,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/mapedit/maps": self.api_mapedit_maps,
             "/api/mapedit/map": self.api_mapedit_map,
             "/api/mapedit/tile": self.api_mapedit_tile,
+            "/api/mapedit/puzzle": self.api_mapedit_puzzle,
+            "/api/mapedit/tileset": self.api_mapedit_tileset,
             "/api/mapedit/pick": self.api_mapedit_pick,
             "/api/mapedit/editable": self.api_mapedit_editable,
             "/api/related": self.api_related,
@@ -1920,6 +2580,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tags/export": self.api_tags_export,
             "/api/health": self.api_health,
             "/api/thumbs/status": self.api_thumbs_status,
+            "/api/index/status": self.api_index_status,
             "/api/token": self.api_token,
             "/api/plugins": self.api_plugins,
         }
@@ -2008,11 +2669,25 @@ class Handler(BaseHTTPRequestHandler):
             "recoveredNames": len(c.names),
             "knownPaths": len(c.all_paths),
             "tablesReady": c._tables_ready.is_set(),
+            # The mesh<->texture index: whether this base has a prebuilt one,
+            # and if not, how far the live build has got. Served here because
+            # /api/status is the one call the page makes that never touches
+            # the index -- so it can still answer while the index is building.
+            "unifiedIndex": c.unified_status(),
             "tables": sorted(c.tables.keys()),
             "numpy": dds.HAVE_NUMPY,
             "stageDir": str(STAGE),
             "stagedCount": len(_staged_files()),
             "installed": (PROJECT / "mods" / "manifest.json").is_file(),
+            # WHICH PARSE PROFILE ANSWERED, and what it could not resolve.
+            # Pinning a community client's profile removes the baseline
+            # variance BY FIAT, which trades a wrong-and-unstable answer for a
+            # NARROWER one -- and a silent narrower answer is the failure shape
+            # this project has recorded most often. A user seeing 2,019 NPCs
+            # must be able to tell "a stable answer with a named cost" from
+            # "all of them". `docs/CORRECTIONS.md`
+            # C-2026-08-09-plugin-c-serverview-profile.
+            "npcProfile": c.npc_profile_report(),
         })
 
     # -- API: comparison bases -----------------------------------------------
@@ -2038,6 +2713,11 @@ class Handler(BaseHTTPRequestHandler):
             out.append({
                 "name": plug.name if plug else str(kind),
                 "label": plug.label if plug else str(kind),
+                # "official" | "server" | "unknown" -- the plugin's own claim
+                # about what it is. A kind with no plugin cannot claim
+                # anything, so it stays unknown rather than inheriting one.
+                "origin": getattr(plug, "origin", "unknown") if plug
+                          else "unknown",
                 "root": str(p),
                 # Whether this base can answer at all yet. A base with no
                 # index is not broken, it is unbuilt -- and saying which is
@@ -2067,15 +2747,33 @@ class Handler(BaseHTTPRequestHandler):
         that. Picking a path is the only decision.
 
         Each entry carries `id` (what to POST back), `kind` (`install` or
-        `library`), and enough to say what it is. Switching keeps the model,
+        `server`), and enough to say what it is. Switching keeps the model,
         action and frame, which is what makes "regression, or difference
         between clients?" answerable at all.
+
+        **`kind` is `server`, not `library`, and the distinction is about the
+        thing rather than the wording.** A COmmunity Library entry is a
+        private server's **own game client** -- an install directory, with its
+        own `ini/`, its own archives and its own engine build. The library is
+        the store we imported those bytes into; it is not what the user is
+        choosing. Presenting Zephyr as "a library" described our storage to
+        someone asking which client they are looking at.
+
+        The wire `id` keeps its `library:` prefix because `post_base` parses
+        it and it never reaches the screen.
         """
         srv = self.server
         entries = []
         for b in self._declared_bases():
+            # Grouped by what the client IS, which its plugin declares, not
+            # by the fact that it is installed. Classic Conquer 2.0 is a
+            # private server's client that happens to live in Program Files;
+            # "installed" and "official" are different claims and grouping
+            # on the first asserted the second.
             entries.append({
-                "id": "install:" + b["name"], "kind": "install",
+                "id": "install:" + b["name"],
+                "kind": {"official": "install",
+                         "server": "server"}.get(b.get("origin"), "other"),
                 "label": b["label"], "detail": b["root"],
                 "plugin": b["name"], "ready": b["indexed"],
                 "note": "" if b["indexed"] else "no index built yet",
@@ -2096,9 +2794,33 @@ class Handler(BaseHTTPRequestHandler):
                     bits.append("v" + str(prof["clientVersion"]))
                 if prof.get("files"):
                     bits.append(f"{prof['files']:,} files")
+                # An entry under `servers/` is one of two different things,
+                # and calling both "library" hid the difference:
+                #   * an IMPORTED CLIENT -- a private server's own game
+                #     install, carrying `client` (where it came from) and a
+                #     numeric `clientVersion`;
+                #   * the CURATED COLLECTION -- assets filed by hand, no
+                #     source install, `clientVersion: "curated"`.
+                # Keyed on `client` rather than on the name, so a server that
+                # happens to be called "collection" is still read correctly.
+                imported = bool(prof.get("client"))
+                tag = _core_colibrary().server_tag(name, prof)
                 entries.append({
-                    "id": "library:" + name, "kind": "library",
-                    "label": name + " (library)",
+                    # The wire id keeps its `library:` prefix -- `post_base`
+                    # parses it and it never reaches the screen. `kind` and
+                    # `label` do, and both used to say "library", which is
+                    # wrong about the thing: the library is where the bytes
+                    # are kept, not what the user is choosing.
+                    "id": "library:" + name,
+                    "kind": "server" if imported else "collection",
+                    # An imported client is named plainly, exactly like the
+                    # declared ones it now sits beside -- "Zephyr (private
+                    # server)" next to a bare "Classic Conquer 2.0" made two
+                    # peers look like different kinds of thing. The group
+                    # heading classifies; the option just names.
+                    # The Collection keeps its marker because it is NOT a
+                    # client, and that is worth saying even when collapsed.
+                    "label": tag if imported else tag + " (curated)",
                     "detail": ", ".join(bits) or str(Path(lib) / "servers" / name),
                     "plugin": "", "ready": True, "note": "",
                 })
@@ -2107,6 +2829,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             cur = "install:" + (srv.base_name or       # type: ignore[attr-defined]
                                 coroot.kind_for_root(srv.game_root) or "")  # type: ignore[attr-defined]
+        # The picker opens a new optgroup whenever `kind` changes, so a kind
+        # that appears twice in the list renders as two groups with the same
+        # heading. That is not hypothetical: declared installs are sorted by
+        # plugin name, and `cco` -- now a `server` -- sorts before every
+        # `patch*`, which would have put "Private server clients" above the
+        # official block AND again below it. Order the payload so each kind is
+        # contiguous; the renderer stays a renderer.
+        entries.sort(key=base_group_key)
         return self._json({"paths": entries, "current": cur})
 
     def post_base(self, body, arg):
@@ -2279,6 +3009,126 @@ class Handler(BaseHTTPRequestHandler):
                            "counts": col.counts(),
                            "entries": col.entries})
 
+    def api_map_closure(self, arg):
+        r"""What collecting this map would take, **before** it is taken.
+
+        A map has three surprises a mesh does not, and every one of them is
+        better seen than discovered:
+
+          * its scenery is a small named subset of an index shared with
+            dozens of other maps -- so collecting it is a decision about
+            them;
+          * almost all of its art lives inside the WDF archives, so "is it
+            on disk" is the wrong question and a file count from the
+            filesystem is wrong by an order of magnitude;
+          * the DMap, alone among these files, may be hashed by the
+            install's integrity manifest.
+
+        So this is a dry run by construction: it reads nothing into the
+        library and answers "what am I about to do".
+        """
+        name = str(arg("name", "")).strip()
+        if not name:
+            return self._json({"maps": self._map_names()})
+        fast = str(arg("fast", "")).lower() in ("1", "true", "yes")
+        try:
+            import mapparts
+            root = self.cat.root
+            parts = mapparts.gather_map_parts(name, root, with_shared=not fast)
+        except FileNotFoundError as e:
+            return self._error(404, str(e))
+        except Exception as e:                             # pragma: no cover
+            return self._error(500, f"{name}: {e}")
+
+        read = None
+        try:
+            read = mapparts.default_reader(root)
+        except Exception:                                  # pragma: no cover
+            pass
+        rows = []
+        for p in parts:
+            row = p.to_json()
+            if read is not None and p.role != "effect" and not p.missing:
+                try:
+                    blob = read(p.rel)
+                except Exception:                          # pragma: no cover
+                    blob = None
+                row["bytes"] = len(blob) if blob else 0
+                row["readable"] = bool(blob)
+            rows.append(row)
+        s = mapparts.summarise(parts)
+        s["totalBytes"] = sum(r.get("bytes", 0) for r in rows)
+        s["unreadable"] = sum(1 for r in rows if r.get("readable") is False)
+        s["sharedResolved"] = not fast
+        return self._json({"map": name, "parts": rows, "summary": s})
+
+    def post_collect_map(self, body: bytes, arg):
+        r"""Collect a whole map into the library.
+
+        The toggles are the ones the closure actually has: which roles
+        travel, and whether art shared with other maps comes along. Leaving
+        shared art behind is a real thing to want -- the map still draws,
+        from the install's own tiles -- and it is the only way to collect a
+        map without taking a position on every other map that uses them.
+        """
+        col = self._collection()
+        if col is None:
+            return self._error(400, "no COmmunity Library configured")
+        try:
+            doc = json.loads(body or b"{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        name = str(doc.get("map") or "").strip()
+        if not name:
+            return self._error(400, "map required")
+        dry = bool(doc.get("dryRun"))
+        fast = bool(doc.get("fast"))
+        roles = doc.get("roles")
+        want = None if roles is None else {str(r).lower() for r in roles}
+        with_shared = doc.get("shared", True)
+        _log(f"collect map{' (dry run)' if dry else ''}: {name}")
+
+        import mapparts
+        from collection import MAP_ROLES
+        root = self.cat.root
+        try:
+            parts = mapparts.gather_map_parts(name, root, with_shared=not fast)
+        except FileNotFoundError as e:
+            return self._error(404, str(e))
+        keep, dropped = [], []
+        for p in parts:
+            if p.role == "dmap":
+                continue
+            if p.role in MAP_ROLES and want is not None and p.role not in want:
+                dropped.append(p.rel)
+                continue
+            if p.role in MAP_ROLES and p.shared and not with_shared:
+                dropped.append(p.rel)
+                continue
+            keep.append(p)
+        if dry:
+            return self._json({
+                "dryRun": True, "map": name,
+                "would": [p.to_json() for p in keep],
+                "dropped": dropped,
+                "summary": mapparts.summarise(parts),
+            })
+        try:
+            entry = mapparts.collect_map(
+                col, name, root, server=str(doc.get("server") or ""),
+                with_shared=not fast, keep_only=[p.rel for p in keep])
+        except Exception as e:
+            return self._error(500, f"{name}: {e}")
+        col.save()
+        return self._json({"ok": True, "entry": entry, "dropped": dropped})
+
+    def _map_names(self):
+        try:
+            import mapparts
+            return mapparts.map_names(self.cat.root)
+        except Exception:                                  # pragma: no cover
+            return []
+
     def post_collect(self, body: bytes, arg):
         r"""Copy one asset into the collection.
 
@@ -2412,6 +3262,657 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"target": target,
                            "skinTo": self._skin_target(target)})
 
+    # -- the swap page -----------------------------------------------------
+    #
+    # The Replace panel asks for a target *path*; these back the page that
+    # asks for a target *asset* instead and derives the path from it.
+
+    def api_swap_kinds(self, arg):
+        """The six kinds the left pane offers, with what each can draw.
+
+        They come from two different subsystems and the page has to know
+        which: NPC/Monster/Mount are `tools/models.py` model kinds with a
+        directory per look, and Body/Head/Weapon are `tools/builder.py`
+        equipment slots stored as flat files. A picker that treated them as
+        one list would offer a Body where only an NPC fits.
+        """
+        import swapplan
+        mc = self.cat.models
+        counts = {k["kind"]: k.get("count", 0) for k in mc.kinds()}
+        rows = []
+        for k in swapplan.KINDS:
+            row = {"key": k.key, "label": k.label, "family": k.family,
+                   "source": k.source, "ref": k.ref, "tree": k.tree}
+            if k.source == "models":
+                row["count"] = counts.get(k.ref, 0)
+                row["usable"] = row["count"] > 0
+                row["reason"] = ("" if row["usable"] else
+                                 f"the model catalogue lists no {k.label} "
+                                 f"in this install")
+            else:
+                idx = self.cat.builder
+                opts = (idx.options.get(k.ref) or []) if idx else []
+                row["count"] = len(opts)
+                row["usable"] = bool(opts)
+                row["reason"] = ("" if opts else
+                                 f"no {k.label} appearance in this install "
+                                 f"resolves to art the client can open")
+            rows.append(row)
+        return self._json({"kinds": rows,
+                           "familyNote": (
+                               "Three of these are model directories and three "
+                               "are flat equipment files. The skin destination "
+                               "is derived from the target for that reason.")})
+
+    def api_swap_writable(self, arg):
+        """Can this process actually write to the install it would install to?
+
+        Probed by writing, not inferred from an elevation flag, because
+        Windows answers this by ACL and `comod._unwritable` is the same probe
+        the real install runs before it touches anything. Asking the same
+        question the installer asks is the only way this warning cannot
+        disagree with what happens when you press the button.
+
+        `elevated` is reported alongside as a HINT for the message -- it
+        explains the usual cause -- but it is not the verdict. An install
+        living somewhere the user owns is writable unelevated, and saying
+        "run as administrator" there would be wrong.
+        """
+        import comod
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        cache = getattr(self.server, "_writable_cache", None)
+        if cache is None:
+            cache = {}
+            self.server._writable_cache = cache      # type: ignore[attr-defined]
+        if arg("refresh", "") == "1":
+            cache.pop(root, None)
+        if root not in cache:
+            try:
+                cache[root] = comod._unwritable(root)
+            except Exception as e:
+                cache[root] = "could not probe %s: %s" % (root, e)
+        why = cache[root]
+        elevated = None
+        try:
+            import ctypes
+            elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            elevated = None
+        return self._json({
+            "root": root, "writable": not why, "why": why,
+            "elevated": elevated,
+            "basis": "probed by writing a temp file into the install, the "
+                     "same check comod runs before an install",
+            "headline": ("" if not why else
+                         "COMod cannot write to this install."),
+            "detail": ("" if not why else
+                       ("Staging works and changes nothing outside "
+                        "mods/stage. Installing needs write access to %s. "
+                        "%s" % (root,
+                                "Start COMod from a terminal opened with "
+                                "\"Run as administrator\"."
+                                if elevated is False else
+                                "Check the permissions on that folder.")))})
+
+    def post_swap_stage(self, body: bytes, arg):
+        """Stage a split into mods/stage. Writes nothing outside the stage tree.
+
+        Runs `tools/npcstage.py`, which runs `tools/npcsplit.py --json` for the
+        plan. Three processes, one planner: the page does not recompute the
+        free group, the cohort or the OLD values, so it cannot disagree with
+        the command line about what the split is.
+        """
+        import subprocess, sys as _sys
+        npc = str(arg("npc", "") or "").strip()
+        npc_type = str(arg("type", "") or "").strip()
+        if not npc and not npc_type:
+            return self._error(400, "npc= or type= is required")
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        dry = arg("dry", "0") == "1"
+        tool = Path(__file__).resolve().parent / "npcstage.py"
+        cmd = [_sys.executable, str(tool), "--root", root]
+        if npc_type:
+            cmd += ["--type", npc_type]
+        else:
+            cmd += ["--npc", npc]
+        # A donor makes this a SWAP rather than a split, and a swap needs the
+        # appearance fork: without it the donor's art lands on motion ids
+        # while the NPC's LOOK still resolves through the shared
+        # simple_object chain, and nothing visible changes.
+        donor = str(arg("donor", "") or "").strip()
+        if donor:
+            cmd += ["--donor", donor, "--fork-appearance"]
+        elif arg("fork", "") == "1":
+            cmd += ["--fork-appearance"]
+        if dry:
+            cmd += ["--dry-run"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=900)
+        except Exception as e:
+            return self._json({"ok": False, "staged": False,
+                               "headline": "Could not run npcstage.",
+                               "detail": "%s: %s" % (type(e).__name__, e),
+                               "text": ""})
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        return self._json({
+            "ok": r.returncode == 0, "staged": r.returncode == 0 and not dry,
+            "dry": dry, "exit": r.returncode, "text": out,
+            "command": "py -3 tools\\npcstage.py --root \"%s\" %s"
+                       % (root, ("--type " + npc_type) if npc_type
+                          else ('--npc "%s"' % npc)),
+            # A refusal is an answer, not an empty result: npcstage declines
+            # rather than staging half a split, and the reason is in the text.
+            "headline": ("" if r.returncode == 0 else
+                         "Nothing was staged -- npcstage refused (exit %d)."
+                         % r.returncode)})
+
+    def api_swap_library(self, arg):
+        """LEFT PANE: the curated Collection, and never an install.
+
+        Hardcoded by the owner's ruling -- the left panel is the library, and
+        if you want to swap you collect first. There is deliberately no `root`
+        argument, so this endpoint cannot be pointed at a client.
+
+        Three states the caller must tell apart, because an empty library is
+        the FIRST state this page will ever be in and it is not a fault:
+
+            configured=False              no library set up at all
+            configured=True, entries=[]   read fine, nothing collected yet
+            error=True                    the library path would not read
+        """
+        from collection import CATEGORIES
+        col = self._collection()
+        if col is None:
+            return self._json({
+                "configured": False, "entries": [], "categories": CATEGORIES,
+                "headline": "No COmmunity Library is configured.",
+                "detail": "The swap page draws its left pane from the library "
+                          "and from nothing else."})
+        try:
+            entries = list(col.entries)
+        except Exception as e:
+            return self._json({
+                "configured": True, "error": True, "entries": [],
+                "categories": CATEGORIES,
+                "headline": "The library would not read.",
+                "detail": "%s at %s: %s" % (type(e).__name__, col.library, e)})
+        rows = []
+        for e in entries:
+            rows.append({
+                "id": e.get("id", ""), "name": e.get("name", ""),
+                "category": e.get("category", "Other"),
+                "sourceMesh": e.get("sourceMesh", ""),
+                "sourceTexture": e.get("sourceTexture", ""),
+                "parts": len(e.get("parts", []) or []),
+                "skins": len(e.get("skins", []) or []),
+                "collectedAt": e.get("collectedAt", ""),
+                "server": e.get("server", "")})
+        return self._json({
+            "configured": True, "library": str(col.library),
+            "entries": rows, "categories": CATEGORIES,
+            "headline": ("" if rows else
+                         "Your library is empty -- collect something to begin."),
+            "detail": ("" if rows else
+                       "Open the Builder, pick an asset, and Collect it. The "
+                       "left pane draws only from the library.")})
+
+    def api_swap_targets(self, arg):
+        """RIGHT PANE: installed private servers. Today that is CCO alone.
+
+        Pinned by IDENTITY, never by whichever install the viewer happens to
+        have open -- several different roots are live on a normal box and the
+        naive choice renders one while labelling it another.
+
+        `basis` says what the identity RESTS ON: the user's own declaration,
+        not a measurement of bytes.
+        """
+        try:
+            declared = coroot.declared_kinds() or {}
+        except Exception as e:
+            return self._json({"targets": [], "error": True,
+                               "headline": "Could not read declared installs.",
+                               "detail": "%s: %s" % (type(e).__name__, e)})
+        # The install this process actually has OPEN. Only it can be drawn:
+        # /api/mesh resolves against the served catalogue, so a pane that
+        # lists one install's table while the renderer holds another fails on
+        # every row with "not found" -- which reads as missing art rather than
+        # as two panes disagreeing about which client is in front of you.
+        active = str(self.cat.root) if self.cat is not None else ""
+        rows = []
+        for path, kind in sorted(declared.items()):
+            p = Path(path)
+            is_active = (str(p) == active)
+            private = (kind == "cco")
+            rows.append({
+                "path": str(p), "kind": kind,
+                "label": ("Classic Conquer Online" if private else kind),
+                "exists": p.is_dir(), "private": private,
+                "active": is_active,
+                "offered": is_active,
+                "basis": "declared by you in config, not measured from bytes",
+                "why": ("" if is_active else
+                        "declared, but this viewer has %s open -- only the "
+                        "served install can be drawn" % (active or "nothing"))})
+        # The served root may not be declared at all; it is still the one on
+        # screen, so it is listed rather than omitted.
+        if active and not any(r["active"] for r in rows):
+            rows.append({
+                "path": active, "kind": "", "label": Path(active).name,
+                "exists": True, "private": False, "active": True,
+                "offered": True,
+                "basis": "the install this viewer has open",
+                "why": ""})
+        any_private_active = any(r["active"] and r["private"] for r in rows)
+        return self._json({
+            "targets": rows, "active": active,
+            "activeIsPrivateServer": any_private_active,
+            "headline": ("" if any_private_active else
+                         "The open install is not a private server."),
+            "detail": ("" if any_private_active else
+                       "The right pane swaps into a private server, and this "
+                       "viewer has %s open. Point it at your CCO install and "
+                       "reload to swap into it." % (Path(active).name
+                                                    if active else "nothing"))})
+
+    def api_swap_npcset(self, arg):
+        """RIGHT PANE, the standard NPC set: the groups ini/npc.json REFERENCES.
+
+        Keyed on the TABLE, deliberately, because that is what the owner edits.
+        The model catalogue is keyed on art discovery and the two disagree; a
+        page keyed on discovery misses groups that can actually be swapped and
+        offers ones no row points at.
+
+        The group key is `standby_motion // 1000` -- the motion id without its
+        trailing action. An earlier key of `str(v)[3:6]` parsed only the
+        999-prefixed family and silently dropped 47 of 437 rows on CCO
+        (Rooster, OldWolf, Andrea, FoxElder, Winni...), which rendered as
+        "that NPC does not exist" rather than "this key cannot read it".
+        `droppedRows` is reported so that failure can never be silent again.
+
+        Art resolution is a SECOND fact per row, never the key: a group the
+        table names whose art will not resolve is listed as `unresolved`, not
+        dropped.
+        """
+        import json as _json
+        kind = (str(arg("kind", "npc") or "npc")).lower()
+        root = Path(str(arg("root", "") or "") or self.cat.root)
+        if kind != "npc":
+            # Measured, not assumed: monster.json carries no standby/blaze/rest
+            # field at all, and its 374 rows hold 374 distinct `type` values --
+            # zero sharing. There is no group to split, so there is no honest
+            # group list to return. Say which endpoint does answer it.
+            # How many rows the install's own table names, so the caller can
+            # say "browsing N of M" instead of showing N as if it were all.
+            named = 0
+            tf = root / "ini" / ("%s.json" % kind)
+            if tf.is_file():
+                try:
+                    named = len(_json.loads(tf.read_text(encoding="utf-8",
+                                                         errors="replace")))
+                except Exception:
+                    named = 0
+            return self._json({
+                "groups": [], "root": str(root), "kind": kind,
+                "totalRows": 0, "droppedRows": 0, "tableRows": named,
+                "headline": "%s is not a table-keyed set." % kind,
+                "detail": ("Only NPCs share motion ids across rows, so only "
+                           "NPCs can need a split. Monsters and Weapons are "
+                           "browsed one look at a time via /api/swap/browse.")})
+        table = root / "ini" / "npc.json"
+        if not table.is_file():
+            return self._json({
+                "groups": [], "root": str(root), "kind": kind,
+                "headline": "This install ships no ini/npc.json.",
+                "detail": "The standard NPC set is read from that table."})
+        try:
+            rows = _json.loads(table.read_text(encoding="utf-8",
+                                               errors="replace"))
+        except Exception as e:
+            return self._json({"groups": [], "root": str(root), "error": True,
+                               "kind": kind,
+                               "headline": "ini/npc.json would not parse.",
+                               "detail": "%s: %s" % (type(e).__name__, e)})
+        # The table comes from `root`; resolution comes from the catalogue
+        # this process has OPEN. When they differ, every `resolves` below is a
+        # fact about a different client -- which is how this endpoint once
+        # reported 23 groups "ok" on CCO while the server held 7878.
+        served = Path(self.cat.root) if self.cat is not None else None
+        cross = bool(served and str(served) != str(root))
+
+        FIELDS = ("standby_motion", "blaze_motion", "rest_motion")
+        groups, dropped = {}, []
+        for r in rows:
+            v = r.get("standby_motion")
+            if not isinstance(v, int) or v <= 0:
+                dropped.append(r.get("name", "") or "(unnamed)")
+                continue
+            g = v // 1000
+            slot = groups.setdefault(g, {
+                "key": g, "members": [], "simpleObjects": set(),
+                "meshes": dict((f, r.get(f)) for f in FIELDS)})
+            slot["members"].append({"name": r.get("name", ""),
+                                    "type": r.get("type"),
+                                    "simpleObject": r.get("simple_object")})
+            if r.get("simple_object") is not None:
+                slot["simpleObjects"].add(r.get("simple_object"))
+        out = []
+        unknown_why: list = []
+        for g, slot in sorted(groups.items()):
+            s = str(g)
+            # The 999-family reads as a 3-digit look; everything else has no
+            # such short name and is shown by its full motion id instead of a
+            # slice that would be wrong.
+            label = s[3:6] if (s.startswith("999") and len(s) == 6) else s
+            paths, resolves = {}, {}
+            for f, v in slot["meshes"].items():
+                q = ("c3/npc/%d.c3" % v) if isinstance(v, int) else ""
+                paths[f] = q
+                if not q:
+                    resolves[f] = False
+                    continue
+                try:
+                    # `Catalog.exists` tests membership of the known-NAME set,
+                    # and CCO's archives are hash-addressed: this install
+                    # recovers 142 names for 24,757 archive entries, so that
+                    # test answers False for almost everything it can in fact
+                    # read. `AssetRoot.exists` is `locate() is not None` --
+                    # the same hash lookup `read()` performs, and therefore
+                    # the same question /api/mesh answers.
+                    resolves[f] = bool(self.cat.assets.exists(q))
+                except Exception as e:
+                    # NOT False. False here means "the install does not ship
+                    # it", and a probe that threw has not established that.
+                    # Collapsing the two is how a broken lookup renders as
+                    # missing art.
+                    resolves[f] = None
+                    unknown_why.append("%s: %s" % (q, e))
+            n_ok = sum(1 for v in resolves.values() if v is True)
+            n_unknown = sum(1 for v in resolves.values() if v is None)
+            out.append({
+                "group": label, "groupKey": g, "count": len(slot["members"]),
+                "members": slot["members"][:60],
+                "simpleObjects": sorted(slot["simpleObjects"]),
+                "meshes": slot["meshes"], "paths": paths, "resolves": resolves,
+                "art": ("unknown" if n_unknown else
+                        "ok" if n_ok == len(paths) else
+                        "partial" if n_ok else "unresolved"),
+                "artNote": ("the resolver failed rather than answering: %s"
+                            % "; ".join(unknown_why[:3]) if n_unknown else
+                            "" if n_ok == len(paths) else
+                            "the table names this group; art for %d of %d "
+                            "actions does not resolve here"
+                            % (len(paths) - n_ok, len(paths)))})
+        # Drawable first, the rest still listed and labelled -- the same rule
+        # api_swap_browse states. CCO's npc.json names 90 groups but the
+        # install ships art for 24 of them, so ordering by id alone opens the
+        # pane on a wall of "art unresolved" and reads as a broken pane.
+        RANK = {"ok": 0, "partial": 1, "unresolved": 2}
+        out.sort(key=lambda r: (RANK.get(r["art"], 3), r["groupKey"]))
+        shared = sum(1 for r in out if r["count"] > 1)
+        grouped = sum(r["count"] for r in out)
+        return self._json({
+            "root": str(root), "kind": kind, "groups": out,
+            "totalRows": len(rows), "groupedRows": grouped,
+            "droppedRows": len(dropped), "dropped": dropped[:20],
+            "totalGroups": len(out), "sharedGroups": shared,
+            "servedRoot": str(served or ""), "crossInstall": cross,
+            "crossNote": ("" if not cross else
+                          "the table was read from %s but art is resolved "
+                          "against the open install %s -- these are different "
+                          "clients, so `art` says nothing about the table's "
+                          "install" % (root, served)),
+            "keyedOn": "ini/npc.json standby_motion // 1000 -- the table you edit",
+            "detail": ("%d NPC rows across %d motion groups; %d shared by more "
+                       "than one NPC, so a naive swap changes every member.%s"
+                       % (len(rows), len(out), shared,
+                          ("" if not dropped else
+                           "  %d row(s) carry no usable standby_motion and are "
+                           "listed as dropped, not hidden." % len(dropped))))})
+    def api_swap_instructions(self, arg):
+        """The explicit steps for splitting ONE NPC off a shared set.
+
+        This RUNS `tools/npcsplit.py` and returns its output verbatim. It does
+        not reimplement the answer, and that is the point: the allocator's
+        reasoning, the union free set, the cohort, the OLD values read at
+        describe-time, the assertions and the named control all already exist
+        there. Two implementations of one question is how a page and a command
+        come to disagree in front of the person typing the result.
+
+        Nothing here writes. `npcsplit` describes; the applying is the user's.
+        """
+        import subprocess, sys as _sys
+        npc = str(arg("npc", "") or "").strip()
+        if not npc:
+            return self._error(400, "npc= is required")
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        tool = Path(__file__).resolve().parent / "npcsplit.py"
+        if not tool.is_file():
+            return self._json({"ok": False,
+                               "headline": "npcsplit.py is not in this tree.",
+                               "detail": str(tool), "text": ""})
+        cmd = [_sys.executable, str(tool), "--root", root, "--npc", npc]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=300)
+        except Exception as e:
+            return self._json({"ok": False,
+                               "headline": "Could not run npcsplit.",
+                               "detail": "%s: %s" % (type(e).__name__, e),
+                               "text": ""})
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode and r.stderr else "")
+        # A non-zero exit is a REFUSAL, not an empty answer: npcsplit declines
+        # to emit an instruction whose OLD value it could not read, and that
+        # must not render as "nothing to change".
+        return self._json({
+            "ok": r.returncode == 0,
+            "exit": r.returncode,
+            "npc": npc, "root": root,
+            "command": "py -3 tools\\npcsplit.py --root \"%s\" --npc \"%s\""
+                       % (root, npc),
+            "headline": ("" if r.returncode == 0 else
+                         "npcsplit refused rather than guessing (exit %d)."
+                         % r.returncode),
+            "text": out})
+
+    def api_swap_libmesh(self, arg):
+        """Draw a LIBRARY entry from the library's own copy of the art.
+
+        The bug this fixes: an entry carries both `mesh` (the file the library
+        holds) and `sourceMesh` (where it was collected FROM). Drawing it via
+        `sourceMesh` asks the currently-open INSTALL for a path that belongs to
+        a different client, so every entry fails with "could not load" -- which
+        reads as a broken library rather than as the wrong lookup.
+
+        The library is the donor. Read the donor's own bytes.
+        """
+        col = self._collection()
+        if col is None:
+            return self._error(400, "no COmmunity Library configured")
+        want = str(arg("id", "") or "")
+        if not want:
+            return self._error(400, "id= is required")
+        entry = None
+        for e in col.entries:
+            if e.get("id") == want:
+                entry = e
+                break
+        if entry is None:
+            return self._error(404, "no library entry with id %r" % want)
+        rel = str(entry.get("mesh") or "")
+        if not rel:
+            return self._json({"meshes": [], "note":
+                               "this entry has no mesh file in the library"})
+        base = Path(col.library) / "Collection"
+        f = base / rel
+        if not f.is_file():
+            return self._json({"meshes": [], "note":
+                               "the library index names %s but the file is not "
+                               "there" % rel})
+        data = f.read_bytes()
+        out = c3_to_json(data, rel)
+        if not out.get("meshes"):
+            out.setdefault("note", "no drawable geometry in %s" % rel)
+        skins = entry.get("skins") or []
+        if skins:
+            out["guessedTexture"] = "lib:" + str(skins[0])
+        out["libraryEntry"] = want
+        return self._json(out)
+
+    def api_swap_libtex(self, arg):
+        """A library entry's skin, decoded to PNG.
+
+        PNG, not the raw DDS on disk: applyTextureBundle's single-texture
+        fallback assigns the URL to `new Image().src`, so the browser has to
+        decode it. Serving DDS there fails inside the image element, where
+        nothing throws and nothing logs -- the model simply draws white and
+        looks like an art problem instead of a content-type one.
+        """
+        col = self._collection()
+        if col is None:
+            return self._error(400, "no COmmunity Library configured")
+        rel = str(arg("path", "") or "")
+        if not rel:
+            return self._error(400, "path= is required")
+        try:
+            f = safepath.confine(Path(col.library) / "Collection", rel)
+        except safepath.UnsafePath as e:
+            return self._error(400, str(e))
+        if not f.is_file():
+            return self._error(404, "not in the library: %s" % rel)
+        size = int(arg("size", "0") or 0)
+        level = int(arg("level", "0") or 0)
+        data = f.read_bytes()
+        try:
+            if data[:4] == b"DDS ":
+                png = dds.to_png(data, level=level, max_size=size)
+            else:
+                from PIL import Image
+                im = Image.open(io.BytesIO(data)).convert("RGBA")
+                if size and max(im.size) > size:
+                    im.thumbnail((size, size), Image.NEAREST)
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                png = buf.getvalue()
+        except Exception as e:
+            return self._error(415, "cannot decode %s: %s" % (rel, e))
+        return self._send(200, png, "image/png")
+
+    def api_swap_browse(self, arg):
+        """Pickable assets of one kind. `?kind=npc&q=store`"""
+        import swapplan
+        key = str(arg("kind", "") or "")
+        k = swapplan.KIND_BY_KEY.get(key)
+        if k is None:
+            return self._error(400, f"unknown kind {key!r}")
+        q = str(arg("q", "") or "")
+        limit = min(int(arg("limit", "300") or 300), 1000)
+        rows = []
+        total = 0
+        if k.source == "models":
+            res = self.cat.models.query(kind=k.ref, text=q, playable_only=False)
+            total = len(res.get("matched", []) or [])
+            for m in res.get("matched", [])[:limit]:
+                j = m.to_json()
+                # Listed even when it cannot draw, but never listed as if it
+                # could: the catalogue carries NPC rows whose mesh does not
+                # resolve in this build, and offering one as a donor fails
+                # only at the moment of the swap. The row says why instead.
+                mesh = j.get("mesh", "")
+                rows.append({"id": j.get("id", ""), "key": j.get("key", ""),
+                             "label": j.get("label", ""), "mesh": mesh,
+                             "texture": j.get("texture", ""), "kind": k.key,
+                             "playable": j.get("playable", 0),
+                             "usable": bool(mesh),
+                             "reason": ("" if mesh else
+                                        "the catalogue lists this entry but "
+                                        "no mesh file for it resolves in "
+                                        "this install")})
+        else:
+            idx = self.cat.builder
+            for o in ((idx.options.get(k.ref) or []) if idx else []):
+                if q and q.lower() not in (o.name + " " + o.ident).lower():
+                    continue
+                total += 1
+                if len(rows) >= limit:
+                    continue
+                # A builder Option is only constructed when both its mesh and
+                # its texture resolve, so these are usable by construction.
+                rows.append({"id": o.ident, "key": f"{k.key}:{o.ident}",
+                             "label": o.name or o.ident, "mesh": o.mesh,
+                             "texture": o.texture, "kind": k.key,
+                             "usable": True, "reason": ""})
+        # Drawable first, but the rest are still listed. Measured on
+        # Clients/7878: 29 of 300 catalogued NPC rows resolve a mesh, so
+        # withholding the other 271 silently would make most of the client
+        # look absent, and offering them unmarked would move every failure to
+        # the moment of the swap. They are shown, ranked last, and labelled.
+        rows.sort(key=lambda r: (not r.get("usable"), r.get("id", "")))
+        usable = sum(1 for r in rows if r.get("usable"))
+        # `count` used to report what was RETURNED, and the limit is capped at
+        # 1000, so a kind with more than that reported exactly 1000 and read as
+        # "that is all there is". Weapons on CCO hit it. The full size is
+        # counted before the slice and the shortfall is stated.
+        return self._json({"kind": k.key, "family": k.family, "rows": rows,
+                           "count": len(rows), "total": total,
+                           "truncated": total > len(rows),
+                           "truncNote": ("" if total <= len(rows) else
+                                         "showing %d of %d -- narrow the "
+                                         "search to see the rest"
+                                         % (len(rows), total)),
+                           "usable": usable,
+                           "unusable": len(rows) - usable,
+                           "unusableNote": (
+                               f"{len(rows) - usable} of {len(rows)} entries "
+                               f"in this kind have no mesh that resolves in "
+                               f"this install; they are listed last and "
+                               f"cannot be picked."
+                               if usable < len(rows) else "")})
+
+    def api_swap_parts(self, arg):
+        """What travels with an asset -- **and why the list is empty.**
+
+        The page renders `state` before it renders the checkboxes, because an
+        empty checkbox set and a failed lookup look identical and only one of
+        them is a model without animations.
+        """
+        import swapplan
+        mesh = str(arg("mesh", "") or "")
+        if not mesh:
+            return self._error(400, "mesh= is required")
+        c = self.cat
+        fx = []
+        try:
+            fx = self._effects_for_asset(mesh)
+        except Exception:                                 # pragma: no cover
+            fx = []
+        rep = swapplan.diagnose_parts(c.read, c.list_under, mesh, effects=fx)
+        return self._json(rep.to_json())
+
+    def api_swap_plan(self, arg):
+        """What the swap would write, before it writes it.
+
+        `?donor=<mesh>&target=<mesh>&kind=npc&mode=split&skin=1`
+        """
+        import swapplan
+        donor = str(arg("donor", "") or "")
+        target = str(arg("target", "") or "")
+        if not donor or not target:
+            return self._error(400, "donor= and target= are required")
+        cat = self._base_cat() or self.cat
+        rep = swapplan.diagnose_parts(self.cat.read, self.cat.list_under, donor)
+        plan = swapplan.plan_swap(
+            donor, target, kind=str(arg("kind", "") or ""),
+            exists=cat.exists, authored=cat.texture_for_mesh,
+            tables=cat.npc_tables, skin=arg("skin", "1") != "0",
+            mode=str(arg("mode", swapplan.DEFAULT_MODE) or ""),
+            parts=rep.parts,
+            cohort_provider=getattr(self.server, "cohort_provider", None),
+            target_ident=str(arg("targetId", "") or ""))
+        out = plan.to_json()
+        out["donorParts"] = rep.to_json()
+        return self._json(out)
+
     def post_collect_stage(self, body: bytes, arg):
         """Stage a collected entry over the asset it replaces.
 
@@ -2431,7 +3932,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, f"bad JSON: {e}")
         roles = doc.get("roles")
         if roles is None:
-            roles = ["motion", "effect", "sound"]
+            # Map roles travel unconditionally: there is no "stage the map
+            # without its background" that means anything, and `stage`
+            # already decides per file whether a shared tile is worth
+            # writing. Leaving them out of the default silently staged a
+            # map as a bare .DMap.
+            from collection import MAP_ROLES
+            roles = ["motion", "effect", "sound", *MAP_ROLES]
         skin_to = str(doc.get("skinTo") or "")
         if not skin_to and doc.get("skin", True):
             # Where does the skin go? The answer that is always right is
@@ -2461,7 +3968,9 @@ class Handler(BaseHTTPRequestHandler):
                             skin=bool(doc.get("skin", True)),
                             skin_to=skin_to,
                             roles=[str(r) for r in roles],
-                            read_target=_read_target)
+                            read_target=_read_target,
+                            shared_policy=str(doc.get("sharedPolicy")
+                                              or "skip-identical"))
         except Exception as e:
             return self._error(400, str(e))
         _log(f"stage: {res['id']} -> {res['target']} "
@@ -2602,9 +4111,25 @@ class Handler(BaseHTTPRequestHandler):
         if found is not None and rep["install"].get("found"):
             rep["install"]["source"] = found.source
             rep["install"]["detail"] = found.detail
-        rep["firstRunPrompt"] = health.should_prompt(rep.get("thumbnails"))
+        # A prompt is a question about generating them, so a user who has
+        # turned generation off must not be asked. Both prompt sites go
+        # through the same check; one of them alone would leave the page
+        # asking from whichever surface was missed.
+        rep["firstRunPrompt"] = (self._thumbs_off_reason() is None
+                                 and health.should_prompt(rep.get("thumbnails")))
+        rep["thumbnailsEnabled"] = cosettings.get("thumbnails")
         runner = self.server.thumbs                    # type: ignore[attr-defined]
         rep["thumbnailRun"] = runner.status() if runner else None
+        # The mesh<->texture index, offered on the same screen and for the
+        # same reason thumbnails are: it is a one-off build the user should be
+        # asked about rather than subjected to. `unifiedIndex` is the LIVE
+        # in-process state (is one being built right now, how far along);
+        # `indexRun` is the offered child process that makes it permanent.
+        if self.cat is not None:
+            rep["unifiedIndex"] = self.cat.unified_status()
+            ir = self._indexer()
+            rep["indexRun"] = ir.status() if ir else None
+            rep["indexOffer"] = not rep["unifiedIndex"]["prebuilt"]
         try:
             rep["writtenTo"] = str(health.write_report(rep))
         except OSError as e:
@@ -2631,6 +4156,60 @@ class Handler(BaseHTTPRequestHandler):
         import plugins as plugmod
         return plugmod
 
+    def api_settings(self, arg):
+        """Every declared setting: value, default, and what flipping it does.
+
+        `effect` is served rather than kept server-side because a settings
+        panel that lists names and values leaves the reader guessing, and a
+        knob nobody dares touch is a knob nobody uses. It is the same string
+        `comod settings <name>` prints, from the same registry, so the two
+        surfaces cannot drift into describing the same toggle differently.
+
+        `deferred` is served too, and deliberately: `thumbnails`,
+        `cache_derived` and `default_build` are in the settings brief and are
+        NOT wired yet. Naming them as pending is honest; showing them as
+        working switches would not be.
+        """
+        return self._json({
+            "settings": [
+                {"name": n, "value": v, "default": d, "isDefault": is_d,
+                 "help": h, "effect": e,
+                 "kind": cosettings.SETTINGS[n].kind.__name__,
+                 "choices": list(cosettings.SETTINGS[n].choices or ()),
+                 "bounds": list(cosettings.SETTINGS[n].bounds or ())}
+                for n, v, d, is_d, h, e in cosettings.describe()],
+            "deferred": list(cosettings.DEFERRED),
+            "storePath": str(cosettings.store_path()),
+        })
+
+    def post_settings(self, body: bytes, arg):
+        """Set one setting, or reset one/all.
+
+        Refuses an unknown name or a bad value with the reason, rather than
+        storing it: a value that silently does not apply reads back as the
+        default forever while sitting in the file looking set.
+        """
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            return self._error(400, "body must be JSON")
+        name = str(doc.get("name") or "")
+        try:
+            if doc.get("reset"):
+                cosettings.reset(name or None)
+            else:
+                if not name:
+                    return self._error(400, "name required")
+                if "value" not in doc:
+                    return self._error(400, "value required")
+                cosettings.set_value(name, doc["value"])
+        except cosettings.UnknownSetting:
+            return self._error(400, f"no setting called {name!r}; declared: "
+                                    f"{', '.join(sorted(cosettings.SETTINGS))}")
+        except cosettings.BadValue as e:
+            return self._error(400, str(e))
+        return self._json({"ok": True, "settings": cosettings.all_values()})
+
     def api_plugins(self, arg):
         """Every parser plugin the app can see, for the picker.
 
@@ -2640,8 +4219,30 @@ class Handler(BaseHTTPRequestHandler):
         pre-select the likely answer without deciding for the user.
         """
         plugmod = self._plugins()
+        # `problems` is served whether or not anything is wrong, because the
+        # picker's failure mode is a SHORT LIST THAT LOOKS COMPLETE: a user
+        # with ten clients and a broken checkout saw one entry, and nothing
+        # on the page distinguished that from a machine with one client.
+        # MEASURED before `plugins.DiscoveryError` existed -- poisoning
+        # `plugins/catalog.py` left `available()` returning `[plaintext]` with
+        # nothing raised, and the setup page then said, in its own words, "no
+        # parser plugin named 'patch6090'. Available: plaintext".
+        probs = [{"module": n, "why": why, "ours": ours}
+                 for n, why, ours in plugmod.problems()]
         out = []
-        for p in sorted(plugmod.available(), key=lambda x: x.label):
+        try:
+            found = plugmod.available()
+        except plugmod.DiscoveryError as e:
+            # A module this repo ships would not import. The list is served
+            # EMPTY rather than short: a partial list is the wrong answer that
+            # reads as a right one, and the picker renders `error` instead.
+            return self._json({"plugins": [], "suggested": "",
+                               "problems": probs, "error": str(e),
+                               "recommendations": cosettings.get(
+                                   "ui_recommendations"),
+                               "current": coroot.read_settings().get(
+                                   "game_kind", "")})
+        for p in sorted(found, key=lambda x: x.label):
             out.append({"name": p.name, "label": p.label,
                         "notes": getattr(p, "notes", ""),
                         "aliases": list(getattr(p, "aliases", ())),
@@ -2652,17 +4253,61 @@ class Handler(BaseHTTPRequestHandler):
                         "fieldWidths": p.key_field_widths(),
                         "auraConvention": p.aura_convention(),
                         "sockets": p.sockets_present() or {}})
+        # `suggested` is a RECOMMENDATION -- the picker pre-selects it. With
+        # `ui_recommendations` off the list is served whole and unranked, and
+        # the user chooses unaided. Note what is NOT withheld: every plugin,
+        # its quirks, and its measured field widths still ship, because those
+        # are findings about the clients rather than advice about which to
+        # pick.
         raw = arg("root", "")
         suggested = ""
-        if raw:
+        if raw and cosettings.get("ui_recommendations"):
             r = Path(raw)
             if r.is_dir():
                 best = plugmod.detect(r)
                 if best.name != plugmod.GENERIC.name:
                     suggested = best.name
+        # `kind_for_root`, not the bare `game_kind`. This field is what the
+        # setup page shows as the *current* client, and `game_kind` is one
+        # value for eight installs: with `game_root = Clients/5517` and
+        # `game_kind = patch7878` in the same config -- a real state, measured
+        # by COMod Parser -- it reported patch7878 while `Catalog.plugin`
+        # parsed with `kind_for_root()` -> patch5517. The label disagreed with
+        # the parser that produced everything beside it.
+        #
+        # Both warnings against this read already existed -- `Catalog.plugin`'s
+        # docstring and `coroot.kind_for_root`'s -- and both sit on the PARSING
+        # path, while the bare read was on the REPORTING path. A warning is
+        # only read by someone already looking at the line below it.
+        #
+        # ...and `self.cat.plugin.name` rather than re-deriving the kind at
+        # all. Recomputing it "the same way" is what put the first two
+        # versions of this line wrong: `kind_for_root()` with no argument
+        # resolves the CONFIGURED root, while `Catalog.plugin` asks about the
+        # root the catalogue was actually built for. Started with
+        # `--root Clients/7878` while the config's game_root is Clients/5517,
+        # measured:
+        #
+        #     bare game_kind            -> patch7878   (right, by accident)
+        #     kind_for_root()           -> patch5517   (wrong: config's root)
+        #     Catalog.plugin            -> patch7878   (what actually parses)
+        #
+        # So reading the plugin the catalogue RESOLVED cannot disagree with
+        # the parser, because it is the same object. A value that is derived
+        # twice can drift; a value that is read once cannot.
+        #
+        # Guarded because this is the page you open when the root is wrong:
+        # plugin resolution can raise RootNotHonoured, and a setup page that
+        # 500s when the root is unhonoured cannot be used to fix the root.
+        try:
+            current = self.cat.plugin.name
+        except Exception:
+            current = ""
         return self._json({"plugins": out, "suggested": suggested,
-                           "current": coroot.read_settings().get(
-                               "game_kind", "")})
+                           "problems": probs, "error": "",
+                           "recommendations": cosettings.get(
+                               "ui_recommendations"),
+                           "current": current})
 
     def post_setroot(self, body: bytes, arg):
         r"""Accept a path and kind from the setup page and remember both.
@@ -2681,7 +4326,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "no path given")
         kind = str(doc.get("kind") or "")
         plugmod = self._plugins()
-        plug = plugmod.for_kind(kind)
+        try:
+            plug = plugmod.for_kind(kind)
+        except plugmod.DiscoveryError as e:
+            # This is the line that used to answer "no parser plugin named
+            # 'patch6090'. Available: plaintext" on a checkout where nine
+            # plugins had failed to import -- naming a real plugin as absent
+            # and offering a one-item list as the whole truth.
+            return self._json({"ok": False, "path": raw, "error": str(e)}, 500)
         if plug is None:
             names = ", ".join(sorted(p.name for p in plugmod.available()))
             return self._json({
@@ -2722,17 +4374,78 @@ class Handler(BaseHTTPRequestHandler):
                            "confidence": conf, "savedTo": str(saved),
                            "restartRequired": self.cat is None})
 
+    # -- API: the mesh<->texture index -------------------------------------
+    def _indexer(self) -> "Optional[IndexRunner]":
+        """The runner for the base currently being browsed.
+
+        Rebound on a base switch rather than kept: `coverage.json` lives in
+        `out/indexes/<base-id>/`, so a runner pinned to the root the process
+        started with would quietly build the wrong client's index -- the exact
+        cross-base mistake `coroot.base_id` exists to prevent.
+        """
+        srv = self.server
+        cat = self.cat
+        if cat is None:
+            return None
+        run = getattr(srv, "indexer", None)
+        if run is None or Path(run.root) != Path(cat.root):
+            if run is not None and run.running():
+                return run                       # let the live job finish
+            run = IndexRunner(PROJECT, cat.root)
+            srv.indexer = run                    # type: ignore[attr-defined]
+        return run
+
+    def api_index_status(self, arg):
+        """What the index is doing, from both sides: the in-process live build
+        that a page request may have started, and the offered child process
+        that writes the permanent artefact."""
+        cat = self.cat
+        if cat is None:
+            return self._error(503, "no install configured")
+        run = self._indexer()
+        return self._json({
+            "index": cat.unified_status(),
+            "run": run.status() if run else None,
+            "root": str(cat.root),
+            # Offer the permanent build exactly when there isn't one. Not a
+            # nag: with `prebuilt` true this is a no-op the page hides.
+            "offer": not cat.unified_status()["prebuilt"],
+        })
+
+    def post_index_start(self, body, arg):
+        cat = self.cat
+        if cat is None:
+            return self._error(503, "no install configured")
+        run = self._indexer()
+        assert run is not None
+        return self._json(run.start())
+
+    def post_index_cancel(self, body, arg):
+        run = self._indexer()
+        if run is None:
+            return self._error(503, "no install configured")
+        return self._json(run.cancel())
+
     def api_thumbs_status(self, arg):
         runner = self.server.thumbs                    # type: ignore[attr-defined]
         state = health.thumbnail_state(
             getattr(self.server, "server_name", ""))
         out = {"state": state, "run": runner.status() if runner else None,
-               "prompt": health.should_prompt(state)}
+               "prompt": (self._thumbs_off_reason() is None
+                          and health.should_prompt(state)),
+               "enabled": cosettings.get("thumbnails")}
         # Generation is incremental: re-read the manifests so a page left open
         # during a run picks up what has landed.
         if self.cat is not None and runner and runner.running():
             try:
-                out["manifestEntries"] = self.cat.unified.refresh_thumbs()
+                # Non-blocking, and it has to be: this is POLLED every 1.5 s
+                # while thumbnails render, so a blocking read here would park
+                # the thumbnail panel for the length of an index build on a
+                # client that has no saved index. `refresh_thumbs` re-reads
+                # the out/thumbs/ manifests and touches the mesh<->texture
+                # relation not at all, so an index that is still building
+                # answers this perfectly.
+                out["manifestEntries"] = self.cat.unified_now().refresh_thumbs()
             except Exception:                          # pragma: no cover
                 pass
         return self._json(out)
@@ -2741,6 +4454,9 @@ class Handler(BaseHTTPRequestHandler):
         runner = self.server.thumbs                    # type: ignore[attr-defined]
         if runner is None:
             return self._error(503, "no install configured")
+        off = self._thumbs_off_reason()
+        if off:
+            return self._error(409, off)
         try:
             doc = json.loads(body.decode("utf-8") or "{}")
         except ValueError:
@@ -2766,7 +4482,19 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(runner.cancel())
 
     def post_thumbs_decision(self, body: bytes, arg):
-        """Record "not now" or "never ask again" without starting anything."""
+        """Record "not now" or "never ask again" without starting anything.
+
+        **"never" also turns the `thumbnails` setting off**, because these were
+        two mechanisms for one preference. `health.should_prompt` already
+        honoured a stored `choice == "never"` before the settings registry
+        existed; adding a `thumbnails` toggle beside it would have given the
+        user two switches for the same thing that could disagree -- answer the
+        dialog and the settings window still says On, or turn the setting off
+        and the dialog asks again tomorrow.
+
+        So the dialog writes through to the setting, and the setting is the
+        durable, visible form of the answer.
+        """
         try:
             doc = json.loads(body.decode("utf-8") or "{}")
         except ValueError:
@@ -2774,8 +4502,30 @@ class Handler(BaseHTTPRequestHandler):
         choice = str(doc.get("choice") or arg("choice", "later"))
         if choice not in ("later", "never", "meshes", "all", "textures"):
             return self._error(400, f"unknown choice {choice!r}")
-        return self._json({"ok": True,
-                           "decision": health.remember_thumbnail_choice(choice)})
+        decision = health.remember_thumbnail_choice(choice)
+        if choice == "never":
+            cosettings.set_value("thumbnails", False)
+        elif choice in ("meshes", "all", "textures"):
+            # Choosing a mode is a yes. If the setting was off, the explicit
+            # request is the newer answer and wins.
+            cosettings.set_value("thumbnails", True)
+        return self._json({"ok": True, "decision": decision,
+                           "thumbnails": cosettings.get("thumbnails")})
+
+    def _thumbs_off_reason(self) -> Optional[str]:
+        """Why thumbnail generation must not run, or None.
+
+        Applied in `coviewer` rather than in `tools/health.py` on purpose:
+        health REPORTS what the cache holds, and this is a POLICY about
+        whether to fill it. Putting the check in health would make a reporting
+        module read user preferences to decide what to say.
+        """
+        if cosettings.get("thumbnails"):
+            return None
+        return ("thumbnail generation is turned off in settings "
+                "(`thumbnails`). Existing thumbnails are still served; this "
+                "only stops new ones being rendered. Turn it back on at "
+                "/settings, or with `comod settings thumbnails true`.")
 
     def api_tables(self, arg):
         c = self.cat
@@ -3107,30 +4857,83 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(out)
 
     # -- API: categories ---------------------------------------------------
+    @staticmethod
+    def _hide_motion(arg) -> bool:
+        """`hideMotion=1` -- the Asset Viewer's "hide animation assets" toggle.
+
+        Absent means off. The default is *show everything*, because this tool's
+        job is "every asset the client can see" and a list that quietly omits a
+        bucket is worse than a long one. Every response that honours the flag
+        also reports what it removed, so the counts never disagree with the
+        list -- see `assetcat.animation_buckets()` for the set and why.
+        """
+        return arg("hideMotion", "") == "1"
+
     def api_categories(self, arg):
         """The browsing taxonomy with live counts. `why` travels with it so a
-        misfiled asset is visible rather than silent."""
+        misfiled asset is visible rather than silent.
+
+        With `hideMotion=1` the animation buckets are removed **and the counts
+        are recomputed to match** -- category totals, the sub chips and the
+        grand total. A chip that still said 1,739 next to a list that no longer
+        contains those files would be the readout lying about the instrument.
+        """
         c = self.cat
         c.wait_tables(20)
         s = c.category_summary()
+        hide = self._hide_motion(arg)
+        hidden = 0
         out = []
         for meta in assetcat.CATEGORIES:
             e = s.get(meta["id"])
             if not e:
                 continue
+            subs_raw = dict(e["subs"])
+            count = e["count"]
+            roles = dict(e["roles"])
+            if hide:
+                for sub in list(subs_raw):
+                    if not assetcat.is_animation(meta["id"], sub):
+                        continue
+                    n = subs_raw.pop(sub)
+                    count -= n
+                    hidden += n
+                    # `roles` is a readout too. Subtract the removed bucket's
+                    # own roles rather than leaving a total that counts files
+                    # this response no longer admits to.
+                    for p in c.category_index().get(meta["id"], {}).get(sub, []):
+                        r = c.assetcat.classify(p).role
+                        roles[r] = roles.get(r, 0) - 1
+                        if roles[r] <= 0:
+                            roles.pop(r)
+                if not count:
+                    continue
             order = assetcat.SUBCATEGORY_ORDER.get(meta["id"], [])
-            subs = sorted(e["subs"].items(),
+            subs = sorted(subs_raw.items(),
                           key=lambda kv: (order.index(kv[0]) if kv[0] in order else 99,
                                           -kv[1]))
-            out.append({**meta, "count": e["count"],
-                        "roles": e["roles"],
+            out.append({**meta, "count": count,
+                        "roles": roles,
                         "subs": [{"id": k, "count": v} for k, v in subs]})
-        return self._json({"categories": out,
-                           "total": sum(v["count"] for v in s.values())})
+        return self._json({
+            "categories": out,
+            "total": sum(cc["count"] for cc in out),
+            "motionFilter": hide,
+            "motionHidden": hidden,
+            "motionBuckets": sorted(f"{a}/{b}"
+                                    for a, b in assetcat.ANIMATION_BUCKETS),
+        })
 
     def api_catfiles(self, arg):
         """Files inside a category / subcategory, with the usual text filter,
-        tag filter and paging."""
+        tag filter and paging.
+
+        `hideMotion=1` drops the animation buckets *before* anything else runs,
+        so every number this route reports -- `total`, the role facet, the
+        group facet -- is a count of what the list actually contains. The
+        entries it removed are reported separately as `motionHidden`; they are
+        never folded into a total and left unexplained.
+        """
         c = self.cat
         c.wait_tables(20)
         cat_id = arg("category", "")
@@ -3140,8 +4943,15 @@ class Handler(BaseHTTPRequestHandler):
         query = arg("q", "").strip().lower().replace("\\", "/")
         offset = int(arg("offset", "0") or 0)
         limit = min(int(arg("limit", "300") or 300), 2000)
+        hide_motion = self._hide_motion(arg)
         idx = c.category_index()
         buckets = idx.get(cat_id, {})
+        if hide_motion:
+            buckets = {k: v for k, v in buckets.items()
+                       if not assetcat.is_animation(cat_id, k)}
+        motion_hidden = sum(
+            len(v) for k, v in idx.get(cat_id, {}).items()
+            if assetcat.is_animation(cat_id, k)) if hide_motion else 0
         paths = buckets.get(sub, []) if sub else [p for v in buckets.values() for p in v]
 
         store = self.server.tags                          # type: ignore[attr-defined]
@@ -3153,7 +4963,7 @@ class Handler(BaseHTTPRequestHandler):
         # when the user has explicitly filtered to one *kind* of file, because
         # "show me only textures" must not then hide the textures.
         unified = arg("unified", "1") != "0" and not role
-        u = c.unified if unified else None
+        u = c.unified_now() if unified else None
         folded_away = set()
         if u:
             present = set(paths)
@@ -3201,8 +5011,15 @@ class Handler(BaseHTTPRequestHandler):
             "groups": [{"id": k, "count": v} for k, v in top_groups],
             "rows": rows[offset:offset + limit],
             "allSubjects": [r["subject"] for r in rows],
-            "unified": bool(u),
+            # `bool(u)` was enough while `u` was either the real index or
+            # None. It is not now: an index that has not finished building
+            # is a real object that folds nothing, so the flag has to ask
+            # whether it can ANSWER, not whether it exists.
+            "unified": bool(u and u.available),
+            "unifiedIndex": c.unified_status(),
             "foldedAway": len(folded_away),
+            "motionFilter": hide_motion,
+            "motionHidden": motion_hidden,
         })
 
     # -- API: maps ---------------------------------------------------------
@@ -3318,6 +5135,42 @@ class Handler(BaseHTTPRequestHandler):
                     cache.clear()
                 cache[key] = hit
         return self._send(200, hit, "image/png",
+                          {"Cache-Control": "no-cache"})
+
+    def api_mapedit_puzzle(self, arg):
+        """The map's tile manifest -- the slot grid plus one entry per
+        distinct piece of art, with its offset into `/api/mapedit/tileset`.
+
+        This is `coplay`'s `/api/game/puzzle` pointed at an arbitrary map
+        instead of at the live client's current one, and it produces the same
+        format from the same builder (`tools/tileset.py`), so the page-side
+        consumer is `tilebake.js` unchanged.
+        """
+        art = self._mapart(arg)
+        if art is None:
+            return None
+        ts = art.tileset()
+        if ts is None:
+            return self._error(404, f"no placeable ground art: {art.reason}")
+        return self._json(ts[0])
+
+    def api_mapedit_tileset(self, arg):
+        """Every distinct tile and sprite of the map as raw DXT, concatenated
+        in manifest order. One fetch per map, and nothing decodes it: the
+        browser uploads the slices straight to the GPU.
+
+        Immutably cached against the manifest's own byte count, because the
+        thing that changes it -- staging art -- also drops the cached
+        manifest, so a stale bundle cannot outlive the manifest that indexes
+        into it.
+        """
+        art = self._mapart(arg)
+        if art is None:
+            return None
+        ts = art.tileset()
+        if ts is None:
+            return self._error(404, "no placeable ground art")
+        return self._send(200, ts[1], "application/octet-stream",
                           {"Cache-Control": "no-cache"})
 
     def api_mapedit_pick(self, arg):
@@ -3549,6 +5402,13 @@ class Handler(BaseHTTPRequestHandler):
 
         The playable geometry comes back through `effectplay` in the same shape
         `fx.js` already consumes, so playback is the tested path.
+
+        **One hand per call, and the two hands are independent.** `slot=`
+        selects the socket (`superfx.SLOT_SOCKET`), and asking twice for the
+        same weapon in the two hands returns two different anchors -- on
+        003131090 holding 480139, right x=-24.6 against left x=+23.4. There is
+        no shared aura state anywhere on this side; a UI that can only show one
+        at a time is a UI limitation, which is what it was.
         """
         ident = arg("id", "")
         slot = arg("slot", "r_weapon")
@@ -3585,8 +5445,23 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.cat.read(body["mesh"]) if body else None
                 if raw:
                     pm = attach.PartMesh.parse(raw, body["mesh"])
+                    # The motion set is a property of the LOADOUT, not of the
+                    # id being asked about: `anim.AnimDB.weaponset(right, left)`
+                    # takes both hands, and the socket matrix falls out of
+                    # whichever clip that resolves. `weapon=` used to default to
+                    # `ident`, so a left-hand query put the off-hand weapon in
+                    # the main hand and anchored that hand's aura on a pose the
+                    # body is not in. Callers should send both; when neither is
+                    # sent, `ident` goes in the hand `slot=` names.
+                    main_hand = arg("weapon", "")
+                    off_hand = arg("offHand", "")
+                    if not main_hand and not off_hand:
+                        if slot == "l_weapon":
+                            off_hand = ident
+                        else:
+                            main_hand = ident
                     clip = self._anim_clip(body_id, arg("action", "100"),
-                                           arg("weapon", ident), arg("offHand", ""))
+                                           main_hand, off_hand)
                     frame = max(0, int(arg("frame", "0") or 0))
                     m = builder_mod.superfxmod.SuperFxDB.anchor(
                         pm, slot, frame,
@@ -3747,7 +5622,8 @@ class Handler(BaseHTTPRequestHandler):
             anchors = partsmod.socket_anchors(raw, motion_set=clip.motion, frame=f)
             anchors, corr = apply_socket_corrections(
                 anchors, self.cat.plugin, body_id,
-                weapon_set=clip.weaponset, action=clip.action, frame=f)
+                weapon_set=clip.weaponset, action=clip.action, frame=f,
+                local_motion=clip.motion)
             if corr:
                 out["socketCorrections"] = corr
             out["sockets"].append({k: v.matrix for k, v in anchors.items()
@@ -3865,13 +5741,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(out)
 
     def api_monsterrows(self, arg):
-        r"""`ini/monster.json`, offered for the user to pair with a mesh.
+        r"""The client's monster table, offered for the user to pair with a
+        mesh -- `ini/monster.json` on CCO, the encrypted `ini/Monster.dat` on
+        every official client, picked by `models.load_monster_rows`.
 
         **There is no link in the data and this route does not invent one.**
-        `type` is a sequential index 1-374 and `bodyType` is 0 on every row, so
-        the client's own choice of appearance is made by the server at spawn.
-        What the row *does* carry is worth having: `zoomPercent` runs 60 to 350
-        and a monster drawn at 100% is simply the wrong size.
+        `bodyType` is 0 on every row of every client measured (CCO's 374 plus
+        431/439/586/762/1010 official), so the choice of appearance is made by
+        the server at spawn. `type` is a sequential 1-374 index in CCO's table
+        only; the .dat's TypeIDs are the server's own and are neither
+        sequential nor dense. What the row *does* carry is worth having:
+        `zoomPercent` runs 60 to 350 and a monster drawn at 100% is simply the
+        wrong size.
         """
         mc = self.cat.models
         q = (arg("q", "") or "").strip().lower()
@@ -4250,7 +6131,7 @@ class Handler(BaseHTTPRequestHandler):
         anchors = partsmod.socket_anchors(raw, motion_set=action, frame=pose_frame)
         anchors, socket_corr = apply_socket_corrections(
             anchors, c.plugin, body_id, weapon_set=pose_set,
-            action=action_code, frame=pose_frame)
+            action=action_code, frame=pose_frame, local_motion=action)
         bounds = partsmod.body_bounds(raw, motion_set=action, frame=pose_frame)
         pm = partsmod.PartManifest(c.root, tables=c.tables)
 
@@ -4426,9 +6307,16 @@ class Handler(BaseHTTPRequestHandler):
                            "hitSound": imp.hit_sound if imp else ""}
                 except Exception:
                     eff = {}
+        # `available` speaks for the *playback* db only. The linkage artefact
+        # is the other source this answer is built from, and it can be absent
+        # on its own -- so report it separately rather than letting one
+        # source's health stand for both.
+        link = self.cat.assetcat.linkage_status()
         out = {"id": ident, "type": eff.get("type", ""),
                "typeName": eff.get("typeName", ""),
                "available": pl.available, "error": pl._db_error,
+               "linkage": {k: link.get(k, "") for k in
+                           ("state", "rel", "base_id", "reason")},
                "roles": []}
 
         def add(role, name, note):
@@ -4450,9 +6338,25 @@ class Handler(BaseHTTPRequestHandler):
         add("block", eff.get("blockEffect", ""),
             "blocked-hit spark — drawn at the TARGET")
         out["hasTrail"] = any(r["role"].startswith("trail:") for r in out["roles"])
+        # The UI prints this whenever there is no trail, so it must not claim
+        # "correct data" when no table was consulted. This endpoint has TWO
+        # sources -- the derived linkage artefact and the live `EffectDB` built
+        # from the install -- and either one makes "no trail" a measurement.
+        # Only when neither is there is the absence about the tooling rather
+        # than about the weapon.
+        #
+        # Note the asymmetry this exposes: `assetcat.effect_assets()` has no
+        # live fallback, so the catalogue really is blind where this endpoint
+        # is not.
+        sourced = link.get("state") == "ok" or pl.available
+        out["sourced"] = bool(sourced)
         out["trailNote"] = (
             "No attack trail is correct data, not a missing asset: only weapon "
-            "quality 6-9 carries one (docs/effects.md §2.2).")
+            "quality 6-9 carries one (docs/effects.md §2.2)."
+            if sourced else
+            "Nothing was LOADED for this weapon, which is not the same as it "
+            "having no effects -- nothing here is a statement about its "
+            "quality. " + (link.get("reason") or ""))
         return self._json(out)
 
     def api_weaponmotion(self, arg):
@@ -4603,8 +6507,13 @@ class Handler(BaseHTTPRequestHandler):
         # the rule that linked them and whether that rule is authored or
         # inferred. Put first because it is the entry the user just clicked.
         subject = path or (appearance or {}).get("mesh") or ""
+        # Non-blocking: an entry with no components yet renders as the single
+        # file it is, which is exactly what it renders as on an install
+        # meshtex cannot answer for. Waiting 56 s to add a sub-panel to a page
+        # that is otherwise complete is the wrong trade.
+        uni = c.unified_now()
         if subject:
-            comp = c.unified.components(subject)
+            comp = uni.components(subject)
             items = []
             for cc in comp["components"]:
                 if not c.exists(cc["path"]):
@@ -4618,8 +6527,8 @@ class Handler(BaseHTTPRequestHandler):
                               "kind": cc["kind"], "method": cc["method"],
                               "detail": cc["detail"], "role": cc["role"],
                               "primary": cc["primary"],
-                              "thumbNote": c.unified.thumb_note(cc["path"]),
-                              "primarySkin": (c.unified.skins_a_model(cc["path"])
+                              "thumbNote": uni.thumb_note(cc["path"]),
+                              "primarySkin": (uni.skins_a_model(cc["path"])
                                               if cc["role"] == "texture" else None)})
             if len(items) > 1:
                 groups.insert(0, {
@@ -4648,7 +6557,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         return self._json({"id": ident, "table": table, "path": path,
                            "groups": groups,
-                           "unifiedSource": c.unified.source,
+                           "unifiedSource": uni.source,
+                           "unifiedIndex": c.unified_status(),
                            "effectsAvailable": assetcat.effects is not None,
                            "meshtexAvailable": assetcat.meshtex is not None})
 
@@ -4665,7 +6575,11 @@ class Handler(BaseHTTPRequestHandler):
         path = arg("path", "")
         if not path:
             return self._error(400, "path required")
-        u = self.cat.unified
+        # Non-blocking. This endpoint ALREADY reports `available`, so "the
+        # index cannot answer for this entry yet" is a shape the panel
+        # renders; `unifiedIndex` is what turns it from a shrug into a
+        # sentence with a progress bar behind it.
+        u = self.cat.unified_now()
         out = u.components(path)
         for c in out["components"]:
             c["exists"] = self.cat.exists(c["path"])
@@ -4679,7 +6593,33 @@ class Handler(BaseHTTPRequestHandler):
                 # the panel shows both rather than conflating them.
                 c["primarySkin"] = u.skins_a_model(c["path"])
         out["available"] = u.available
+        out["unifiedIndex"] = self.cat.unified_status()
         return self._json(out)
+
+    def _looks_like_dds(self, logical: str) -> bool:
+        """Is this asset DDS *by content*, whatever it is called?
+
+        Deliberately narrow. It is asked only where the extension has already
+        failed to explain the asset, never during bulk classification -- a
+        peek per path made `AssetCatalog.classify` **6x slower** over an
+        install's 77k paths (0.22s -> 1.28s per 40k), which is a bad trade for
+        the 61 mis-named files it would correct in a browsing index.
+
+        An asset that cannot be read is simply "not a DDS", which lands on
+        exactly the 404 the caller would have produced anyway.
+
+        **The except list is narrow on purpose.** The first version wrote
+        `self.read(...)` -- `read` is a `Catalog` method and this is a
+        `Handler` -- inside `except Exception`, so the `AttributeError` was
+        swallowed and the branch silently answered False for every asset. A
+        fix that cannot work, reporting nothing, is the exact shape this
+        project keeps paying for; a missing-asset error is worth catching,
+        a typo is not.
+        """
+        try:
+            return self.cat.read(logical)[:4] == b"DDS "
+        except (OSError, KeyError, ValueError):
+            return False
 
     def api_thumb(self, arg):
         r"""A thumbnail for any logical asset.
@@ -4693,7 +6633,10 @@ class Handler(BaseHTTPRequestHandler):
         path = arg("path", "")
         if not path:
             return self._error(400, "path required")
-        u = self.cat.unified
+        # Thumbnails are read from the out/thumbs/ manifest, which an index
+        # with no mesh<->texture answers still loads -- so a thumbnail must
+        # never wait on a relation it does not use.
+        u = self.cat.unified_now()
         if arg("refresh", "") == "1":
             u.refresh_thumbs()
         f = u.thumb_for(path)
@@ -4711,7 +6654,14 @@ class Handler(BaseHTTPRequestHandler):
                                   {"X-Thumb-Note": note} if note else None)
             except OSError:                              # pragma: no cover
                 pass
-        if path.lower().endswith(".dds"):
+        # The extension is not authoritative about the format. Zephyr ships 20
+        # DDS textures under a `.c3` name (and 8 meshes under `.dds`); on the
+        # extension alone a real, decodable texture falls past this branch,
+        # finds no "best texture" for what is not a mesh, and 404s -- so the
+        # asset renders as the missing-file checkerboard forever. One peek,
+        # only on the fallback path, only when the extension says otherwise.
+        # `docs/zephyr_6090_content_overlap.md` §4.
+        if path.lower().endswith(".dds") or self._looks_like_dds(path):
             return self.api_texture(arg)
         # a mesh with no rendered thumbnail: fall back to its best texture
         best = (u.textures_of(path) or [{}])[0].get("texture")
@@ -4756,7 +6706,7 @@ class Handler(BaseHTTPRequestHandler):
         # seven colourways stop being eight rows. Textures nothing owns -- map
         # tiles, icons, faces -- keep their own row. `unified=0` turns it off.
         unified = arg("unified", "1") != "0" and not ext
-        u = c.unified if unified else None
+        u = c.unified_now() if unified else None
 
         src = arg("source", "")
         want_tag = arg("tag", "").strip().lower()
@@ -4796,14 +6746,15 @@ class Handler(BaseHTTPRequestHandler):
                         "thumb": (r["textures"][0] if r["textures"] else
                                   (p if p.endswith(".dds") else None))})
         return self._json({"total": total, "offset": offset, "rows": out,
-                           "unified": bool(u),
+                           "unified": bool(u and u.available),
+                           "unifiedIndex": c.unified_status(),
                            "unifiedSource": (u.source if u else ""),
                            "unifiedNote": (
                                "One row per asset: a mesh and the textures "
                                "authored for it are the same thing, so they are "
                                "one entry. Open it and the right-hand panel "
                                "lists the mesh and every texture separately."
-                               if u else "")})
+                               if (u and u.available) else "")})
 
     # -- API: provenance ---------------------------------------------------
     def api_provenance(self, arg):
@@ -4896,6 +6847,107 @@ class Handler(BaseHTTPRequestHandler):
             if p.is_file():
                 return p.read_bytes()
         return self.cat.read(logical)
+
+    #: `/api/texbundle` wire format. One response, self-describing, so the
+    #: page needs one round trip and one `arrayBuffer()` for a whole figure.
+    #:
+    #:     "COTB"            4 bytes, magic
+    #:     version           u32 LE, currently 1
+    #:     manifest length   u32 LE
+    #:     manifest          that many bytes of UTF-8 JSON
+    #:     payloads          concatenated, in manifest order
+    #:
+    #: This mirrors `/api/game/puzzle` + `/api/game/tileset` (coplay.py), which
+    #: ships the same DXT payloads for map tiles -- except that path splits the
+    #: manifest and the blob across two routes because a map's manifest is
+    #: fetched on its own. A figure has four textures; two round trips to save
+    #: nothing is the wrong trade here.
+    TEXBUNDLE_MAGIC = b"COTB"
+    TEXBUNDLE_VERSION = 1
+
+    def api_texbundle(self, arg):
+        r"""Every texture a figure draws, as raw DXT, in one response.
+
+        `/api/texbundle?paths=<a>|<b>|<c>` -- pipe-separated because a logical
+        path contains `/` and may contain `,`.
+
+        **Why this exists.** `/api/texture` decodes a DXT block texture to RGBA
+        in pure Python and re-encodes it as PNG, the page decodes that PNG back
+        to RGBA, and the driver then uploads RGBA and builds a mip chain --
+        four conversions to hand the GPU something it could have consumed
+        directly, since `compressedTexImage2D` takes DXT blocks natively.
+        MEASURED on this install: one 512x512 DXT3 body texture costs 61-145 ms
+        through `/api/texture` and **0.6 ms** here, because here it is a
+        `read()` and a 128-byte header strip.
+
+        The slicing is `tileset.BundleWriter`, the same class that builds the
+        map tile bundle, reused rather than reimplemented -- see its docstring.
+        A texture that is not plain DXT is decoded once and shipped as raw
+        RGBA under `fmt: "RGBA"`, which is what the map path does too, so the
+        client has one branch and not two.
+
+        Paths that cannot be read are named in `missing` rather than dropped
+        silently: a figure quietly rendering untextured is the bug this
+        endpoint could most easily introduce.
+
+        Honours the `preview` token and `src=stage` the same way
+        `/api/texture` does, so a staged or previewed texture bundles as the
+        bytes the user is actually looking at.
+        """
+        raw = arg("paths", "")
+        if not raw:
+            return self._error(400, "paths= required (pipe-separated)")
+        wanted = [p for p in (s.strip() for s in raw.split("|")) if p]
+        if not wanted:
+            return self._error(400, "paths= listed nothing")
+        if len(wanted) > 64:
+            return self._error(400, f"{len(wanted)} paths; 64 is the limit")
+        token = arg("preview", "")
+        src = arg("src", "")
+
+        class _Reader:
+            """Adapts this request's resolution rules to BundleWriter's
+            `.read(path)` contract, so preview/stage overrides bundle as the
+            bytes on screen rather than the archive's."""
+
+            def __init__(self, h):
+                self.h = h
+
+            def read(self, logical: str) -> bytes:
+                if src == "stage":
+                    return safepath.confine(STAGE, logical).read_bytes()
+                return self.h._asset_bytes(logical, token)
+
+        w = tileset.BundleWriter()
+        rd = _Reader(self)
+        order, missing = [], []
+        for p in wanted:
+            try:
+                idx = w.add_dds(rd, p)
+            except safepath.UnsafePath as e:
+                return self._error(400, str(e))
+            except Exception as e:                        # noqa: BLE001
+                idx, _ = None, e
+            if idx is None:
+                missing.append(p)
+                order.append(None)
+            else:
+                order.append(idx)
+                # BundleWriter dedups by path and does not record it; the
+                # client needs the path back to key its texture slots.
+                w.entries[idx].setdefault("path", p)
+        blob = w.bundle()
+        manifest = json.dumps({
+            "version": self.TEXBUNDLE_VERSION,
+            "entries": w.entries,
+            "order": order,
+            "missing": missing,
+            "bytes": len(blob),
+        }, separators=(",", ":")).encode("utf-8")
+        body = (self.TEXBUNDLE_MAGIC
+                + struct.pack("<II", self.TEXBUNDLE_VERSION, len(manifest))
+                + manifest + blob)
+        return self._send(200, body, "application/octet-stream")
 
     def api_texture(self, arg):
         logical = arg("path")
@@ -5204,16 +7256,64 @@ class Handler(BaseHTTPRequestHandler):
         root, why = self._install_root(body)
         if why:
             return self._error(400, why)
-        return self._run_comod(["install", "--dry-run" if dry else "--yes"],
-                               root=root)
+        extra = ["install", "--dry-run" if dry else "--yes"]
+        # An amendment is recorded as its own dated entry with its own
+        # backups, so it can be peeled back on its own later.
+        if arg("amend", "") == "1":
+            extra.append("--amend")
+        label = str(arg("label", "") or "").strip()
+        if label:
+            extra += ["--label", label]
+        return self._run_comod(extra, root=root)
 
     def post_uninstall(self, body: bytes, arg):
         dry = arg("dry", "1") != "0"
         root, why = self._install_root(body)
         if why:
             return self._error(400, why)
-        return self._run_comod(["uninstall", "--dry-run" if dry else "--yes"],
-                               root=root)
+        extra = ["uninstall", "--dry-run" if dry else "--yes"]
+        # Selective reverts. Only a suffix of the record can be peeled back --
+        # comod enforces that -- so these narrow the revert rather than
+        # letting one pick an entry out of the middle.
+        if arg("last", "") == "1":
+            extra.append("--last")
+        elif str(arg("entry", "") or "").strip():
+            extra += ["--entry", str(arg("entry")).strip()]
+        elif str(arg("since", "") or "").strip():
+            extra += ["--since", str(arg("since")).strip()]
+        return self._run_comod(extra, root=root)
+
+    def api_swap_record(self, arg):
+        """The dated install record, so a revert can be aimed at what is there.
+
+        Read from comod's own manifest through comod's own loader, including
+        the v1 -> v2 migration, so this cannot describe the record in terms
+        the tool that reverts it would not recognise.
+        """
+        import comod
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        try:
+            man = comod.load_manifest(Path(root))
+        except Exception as e:
+            return self._json({"entries": [], "error": True, "root": root,
+                               "headline": "The install record would not read.",
+                               "detail": "%s: %s" % (type(e).__name__, e)})
+        if not man:
+            return self._json({"entries": [], "root": root,
+                               "headline": "Nothing is installed here.",
+                               "detail": "An install records a dated entry; "
+                                         "there are none."})
+        rows = []
+        for i, e in enumerate(man.get("entries", []), 1):
+            rows.append({"n": i, "at": e.get("at", ""),
+                         "label": e.get("label", ""),
+                         "count": len(e.get("files", [])),
+                         "files": [f["logical"] for f in e.get("files", [])]})
+        return self._json({"entries": rows, "root": root,
+                           "detail": "%d entr%s on record; a revert peels "
+                                     "them back newest first."
+                                     % (len(rows),
+                                        "y" if len(rows) == 1 else "ies")})
 
     def _run_comod(self, extra: list[str], root: str = ""):
         """Every write to the game install goes through comod.py, never through
@@ -5239,9 +7339,18 @@ def _safe_token(t: str) -> str:
 
 
 def _staged_files() -> list[Path]:
-    if not STAGE.is_dir():
-        return []
-    return sorted(p for p in STAGE.rglob("*") if p.is_file())
+    r"""The staged tree, as the viewer lists it.
+
+    Byte-identical to `comod._staged_files` before 2026-08-13, which is the
+    problem: the fix belongs in one place, so both now call
+    `safepath.confined_files`. An entry whose real path leaves the stage tree
+    -- a directory junction is the live case -- is dropped and reported, never
+    silently omitted. Hard links are not caught; `confined_files` says why.
+    """
+    kept, refused = safepath.confined_files(STAGE)
+    for p, why in refused:
+        print(f"[viewer] SKIPPED staged {p.name} -- {why}", file=sys.stderr)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -5287,8 +7396,10 @@ def serve(root: Optional[Path], port: int, host: str = "127.0.0.1",
     url = f"http://{host}:{port}/"
     _log(f"serving {url}   (Ctrl-C to stop)")
     if not dds.HAVE_NUMPY:
-        _log("numpy not installed -- running the pure-python paths "
-             "(everything works, texture decode is a little slower)")
+        why = "CO_DDS_SCALAR is set" if dds.SCALAR_ONLY else "numpy not installed"
+        _log(f"{why} -- block textures decode through the scalar reference "
+             "path, ~17x slower (MEASURED 35 ms vs 2 ms for a 256x256 DXT3 "
+             "tile). Everything works; maps and models just open slower.")
 
     # First-run report on the console as well as in the browser, so the
     # person who started this from a .cmd window sees it even if the browser
@@ -5329,7 +7440,12 @@ def main(argv=None) -> int:
     coroot.add_root_argument(ap)
     ap.add_argument("--port", type=int, default=8731)
     ap.add_argument("--library", metavar="DIR",
-                    help="COmmunity Library root (for --server)")
+                    help="COmmunity Library root, for this run only "
+                         "(for --server). Add --remember-library to make it "
+                         "the saved default.")
+    ap.add_argument("--remember-library", action="store_true",
+                    help="save --library as the default for future runs "
+                         "(the browser's 'Asset library' panel does the same)")
     ap.add_argument("--server", metavar="NAME",
                     help="browse an imported community client through its "
                          "server profile: its own appearance/motion tables "
@@ -5358,9 +7474,20 @@ def main(argv=None) -> int:
         raise SystemExit(
             f"--root {args.root} is not a Conquer Online install: missing "
             + ", ".join(coroot.missing_parts(args.root)))
-    # The COmmunity Library: given once with --library, remembered in the
-    # per-user config after that, so the server picker in the UI just works.
-    library = args.library or coroot.read_settings().get("community_library")
+    # The COmmunity Library. `--library` is **this run only**: it used to be
+    # written straight into the per-user config, so pointing the viewer at a
+    # scratch library for one look silently repointed the saved default and
+    # the next run -- and every other tool reading `community_library` --
+    # quietly followed it somewhere the user never chose.
+    #
+    # Session-only also makes this consistent with everything around it:
+    # `--root` in this same file does not persist (only the browser's setup
+    # page calls `save_root`), and `colibrary.py` / `comod.py` both take
+    # `--library` without saving it. Persisting is now something you ask for,
+    # here with `--remember-library` or in the browser's 'Asset library'
+    # panel, both of which are a deliberate act rather than a side effect.
+    saved_library = coroot.read_settings().get("community_library")
+    library = args.library or saved_library
     if not library:
         # Nothing configured: if exactly one library is sitting in an obvious
         # place, use it and say so. A viewer that finds your asset library by
@@ -5374,9 +7501,19 @@ def main(argv=None) -> int:
             library = found_libs[0]["path"]
             _log(f"found a COmmunity Library at {library} -- using it "
                  f"(change it in the browser: 'Asset library')")
-    if args.library:
+    if args.library and args.remember_library:
         saved = coroot.write_settings(community_library=str(Path(args.library)))
         _log(f"library: {args.library}  (remembered in {saved})")
+    elif args.library:
+        # Say which default is being shadowed, and for how long. Silence here
+        # is what made the old behaviour hard to notice in either direction.
+        note = (f"this run only; {saved_library} stays the saved default"
+                if saved_library and str(Path(saved_library)) != str(Path(args.library))
+                else "this run only")
+        _log(f"library: {args.library}  ({note}"
+             f"{'' if saved_library else '; --remember-library to keep it'})")
+    elif args.remember_library:
+        raise SystemExit("--remember-library needs --library DIR")
     server_view = None
     if args.server:
         if not library:

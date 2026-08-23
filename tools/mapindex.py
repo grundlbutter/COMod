@@ -137,6 +137,9 @@ class MapRecord:
     puzzle: str = ""                # logical path of the .pul
     ani: str = ""                   # logical path of the .ani/.json
     region: str = ""                # "island" -- the data/map/puzzle/<region> folder
+    #: What `dmap.open_map` actually read, and which rule chose it --
+    #: "desert.7z (named by the registry)". `file` stays the logical .DMap.
+    source: str = ""
     tile_count: int = 0             # distinct tiles actually placed
     tiles: list[str] = field(default_factory=list)      # logical .dds paths
     scenes: list[str] = field(default_factory=list)     # map/Scene/*.scene
@@ -156,7 +159,8 @@ class MapRecord:
             "name": self.name, "file": self.file, "version": self.version,
             "width": self.width, "height": self.height, "area": self.area,
             "documentId": self.document_id, "puzzle": self.puzzle, "ani": self.ani,
-            "region": self.region, "tileCount": self.tile_count,
+            "region": self.region, "source": self.source,
+            "tileCount": self.tile_count,
             "sceneCount": len(self.scenes), "coverCount": len(self.covers),
             "effectCount": len(self.effects), "soundCount": len(self.sounds),
             "layerCount": self.layer_count, "layersDecoded": self.layers_decoded,
@@ -208,14 +212,27 @@ class MapIndex:
 
     # -- the map list ------------------------------------------------------
     def _load_gamemap(self) -> None:
-        """ini/GameMap.json: 156 rows of DocumentId + FileName. 136 of them
-        match a shipped .DMap; the other 20 reference maps not in this build."""
-        p = self.root / "ini" / "GameMap.json"
-        if not p.is_file():
-            return
-        try:
-            rows = json.loads(p.read_text("utf-8", errors="replace"))
-        except Exception:
+        """The map registry: DocumentId + FileName, in whichever form ships.
+
+        Rows that match no shipped `.DMap` are normal -- they name maps this
+        build does not carry (20 of CCO's 156).
+
+        **Both forms, because the client decides which one you get.**
+        `ini/GameMap.json` is the *community* client's pre-parsed form; every
+        official client ships the binary `ini/GameMap.dat` and no `.json` at
+        all. Reading only the JSON left this index with no DocumentIds on any
+        official client -- the map list simply had none attached, with no
+        error, which is how it went unnoticed.
+
+        Same JSON-vs-original gap `docs/handoff_oracle_and_readers.md` §1
+        records for four other readers. `client/gamemap.py` and
+        `tools/puzzle.py` were both fixed; this one was missed. The parser is
+        COre's, imported rather than copied -- a fourth copy of a binary
+        layout is how one of them ends up subtly wrong and stays wrong.
+        """
+        from dmap import load_gamemap                     # noqa: PLC0415
+        _rel, rows = load_gamemap(self.root)
+        if not rows:
             return
         for r in rows:
             fn = str(r.get("FileName", "")).replace("\\", "/").lower()
@@ -223,6 +240,11 @@ class MapIndex:
                 self._doc_ids[Path(fn).stem] = r.get("DocumentId")
 
     def map_files(self) -> list[Path]:
+        """The loose `.DMap` files, which is **not** the map list.
+
+        Kept for callers that genuinely want files on disk; `names()` is the
+        map list and it is a different, larger set.  See `dmap.map_names`.
+        """
         d = self.root / "map" / "map"
         if not d.is_dir():
             return []
@@ -230,24 +252,37 @@ class MapIndex:
                       if p.is_file() and p.suffix.lower() == ".dmap")
 
     def names(self) -> list[str]:
-        return [p.stem for p in self.map_files()]
+        """Every map the install has, however it ships.
+
+        A `*.DMap` walk misses 20 of 5517's maps, 72 of 6090's and **122 of
+        6609's** -- 113 that ship only as a `.7z` plus nine registry rows
+        naming a map that ships in neither form.  RE-DERIVED 2026-08-11; see
+        `dmap.map_names`, which is the one place the union is computed.
+        """
+        from dmap import map_names                          # noqa: PLC0415
+        return map_names(self.root)
 
     # -- ani resolution ----------------------------------------------------
     def _ani(self, ani_path: str) -> dict:
-        """Load an `.ani` definition. In this build they ship as JSON under
-        ani/ with the same stem, mapping a tile key to a list of frame paths."""
+        """Load an `.ani` tile index: tile key -> list of frame paths.
+
+        Two forms, same fact. The community client ships `ani/<stem>.json`;
+        every official client ships `ani/<stem>.ani`, an INI-flavoured text
+        file. Reading only the JSON gave every official client an empty tile
+        index -- so a map resolved its `.pul` and then reported **zero
+        tiles**, with no error, and the ground simply had no art.
+
+        Third instance of the JSON-vs-original split in this one file after
+        the map registry; `read_ani` is COre's for that reason -- and so, now,
+        is choosing between the two spellings (`dmap.load_ani`). This function
+        held the second hand-rolled copy of that choice while `mapparts` held
+        none and collected every CCO map with no scenery at all (C-2026-08-09-ani-json-spelling).
+        """
         key = norm(ani_path)
         if key in self._ani_cache:
             return self._ani_cache[key]
-        stem = Path(key).stem
-        out: dict = {}
-        for cand in (self.root / "ani" / f"{stem}.json",):
-            if cand.is_file():
-                try:
-                    out = json.loads(cand.read_text("utf-8", errors="replace"))
-                except Exception:
-                    out = {}
-                break
+        from dmap import load_ani                     # noqa: PLC0415
+        _rel, out = load_ani(self.root, key)
         self._ani_cache[key] = out
         return out
 
@@ -271,20 +306,25 @@ class MapIndex:
 
     def _build(self, name: str) -> MapRecord:
         stem = Path(name).stem
-        path = self.root / "map" / "map" / f"{stem}.DMap"
-        if not path.is_file():
-            for p in self.map_files():
-                if p.stem.lower() == stem.lower():
-                    path = p
-                    break
-        rec = MapRecord(name=path.stem,
-                        file=f"map/map/{path.name}".lower(),
-                        document_id=self._doc_ids.get(path.stem.lower()))
-        if not path.is_file():
-            rec.error = "no such .DMap"
+        # The file the REGISTRY names, not the loose leftover beside it: on
+        # 6090 and 6609, 74 and 77 loose `.DMap` files disagree with their own
+        # archive, and 113 maps on 6609 have no loose file at all.
+        from dmap import open_map                           # noqa: PLC0415
+        raw, src = open_map(self.root, stem)
+        # `file` keeps its old meaning -- the logical `.DMap` path -- because
+        # consumers key on it and one of them asserts the extension. What is
+        # NEW is `source`, which says what was actually read and why. Widening
+        # an existing field's meaning as a side effect of a fix is how a value
+        # stops answering the question it was defined for.
+        rec = MapRecord(name=stem,
+                        file=f"map/map/{stem}.DMap".lower(),
+                        document_id=self._doc_ids.get(stem.lower()))
+        rec.source = src
+        if raw is None:
+            rec.error = src
             return rec
         try:
-            m = DMap.load(path)
+            m = DMap.parse(raw)
         except Exception as e:
             rec.error = f"DMap parse failed: {e}"
             return rec

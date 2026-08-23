@@ -99,6 +99,31 @@ load();
   try { d = await (await fetch('/api/plugins')).json(); }
   catch (e) { host.textContent = 'could not list parser plugins: ' + e.message; return; }
   host.innerHTML = '';
+
+  /* A SHORT LIST IS THE FAILURE, so the short list is what has to speak.
+     Before this, a checkout where plugins/catalog.py would not import
+     rendered ONE radio button and looked exactly like a machine with one
+     client -- nothing on the page, and nothing in the payload, told the two
+     apart. `error` is discovery refusing to answer at all (one of this
+     repo's own modules is broken); `problems` is the survivable half, a
+     contributor's plugin that was skipped, which is still worth saying out
+     loud rather than deducting from a count nobody knows. */
+  if (d.error) {
+    const b = document.createElement('div');
+    b.className = 'warn';
+    b.textContent = 'The parser plugin list could not be built, so no client '
+                  + 'kinds are offered. This is a broken checkout, not a '
+                  + 'machine without clients. ' + d.error;
+    host.appendChild(b);
+  }
+  for (const pr of (d.problems || [])) {
+    const n = document.createElement('div');
+    n.className = 'mut small';
+    n.textContent = (pr.ours ? 'this repo’s module ' : 'contributed plugin ')
+                  + 'plugins/' + pr.module + ' was skipped: ' + pr.why;
+    host.appendChild(n);
+  }
+
   for (const p of d.plugins) {
     const lab = document.createElement('label');
     lab.className = 'chk';

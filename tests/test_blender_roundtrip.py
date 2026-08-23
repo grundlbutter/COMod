@@ -20,7 +20,17 @@ import sys
 import tempfile
 import traceback
 
-import bpy
+try:
+    import bpy
+except ModuleNotFoundError as _exc:                           # not inside Blender
+    # See the same guard in test_addon_install.py: discovery reports a
+    # module-level SkipTest as a SKIP and a bare ModuleNotFoundError as an
+    # ERROR, and "no Blender here" is a skip, not a failure.
+    import unittest
+    raise unittest.SkipTest(
+        "needs Blender's bundled Python (no `bpy` module). Run it the way the "
+        "docstring above says: blender --background --python "
+        "tests/test_blender_roundtrip.py") from _exc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "blender"))

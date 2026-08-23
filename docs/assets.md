@@ -416,25 +416,180 @@ written under their recovered paths. Full extraction is available via
 
 ## 6. NetDragonDatPkg — .tpi / .tpd (community clients)
 
-Older and community clients (seen: "Zephyr Conquer", `version.dat` = 1064)
-ship `c3.tpi/c3.tpd` and `data.tpi/data.tpd` instead of the WDF pair. Reader:
-`core/tpd.py`. Everything below is **verified** against both Zephyr pairs
-(53,609 + 76,923 entries): every offset/size cross-checked for contiguity,
-`sum(compressed) + 0x20 == tpd file size` exactly, and every payload
-decompresses to the size the index promises.
+Older and community clients ship `c3.tpi/c3.tpd` and `data.tpi/data.tpd`
+instead of the WDF pair. Seen on "Zephyr Conquer" (`version.dat` = 1064) and
+on the 7878 client, which also ships the patch overlays `c31` and `data1`.
 
-- Both files open with the 16-byte magic `"NetDragonDatPkg\0"`.
-- `.tpi`: `u32 ×4` (1000, 0, 1, 3 — constant), then at `0x20`
-  `u32 indexOffset` (= 0x30), `u32 fileCount`, two more u32s (~index length,
-  0). Entries are variable-length, back to back:
-  `u8 nameLen · name · u16 flag(=1) · u32 uncompSize · u32 compSize ·
-  u32 compSize(dup) · u32 uncompSize(dup) · u32 offset`.
-- **Names are plaintext** forward-slash paths in the same logical namespace
-  the WDF clients hash (`data/arrow.dds`, `c3/0001/000/001.c3`) — so
-  `tq_hash(name)` matches entries across packaging schemes, and a DatPkg
-  client is a free wordlist for WDF name recovery.
-- `.tpd`: same 0x20-byte header, then raw zlib streams (`78 DA`) laid out
-  contiguously; first payload at 0x20.
+**Reader: `core/tpd.py`, and that module is the authoritative statement of
+this grammar.** The structural constants in §6.1–§6.4 below are held to the
+code by `tests/test_tpd_doc_sync.py` — if this section and the reader
+disagree about an offset, a flag value or a tail length, that gate goes red
+and names the disagreement. Prose that only *describes* a parser drifts from
+it; §6 drifted for four months (below), which is what bought the gate.
+
+Measured against the six archives on this machine — 7878's `c3`, `c31`,
+`data`, `data1` (59,964 + 82 + 86,149 + 1 entries) and both Zephyr pairs
+(53,609 + 76,923). Everything below is **verified** unless labelled
+otherwise, and the label is not decoration: `0x28` and the free-list grammar
+are the two places this section is weaker than it looks.
+
+> **This section documented a refuted grammar from `c743111` until
+> 2026-08-15.** It described the 3rd and 4th `u32` of a record as duplicates
+> of the 1st and 2nd, and `flag` as always 1. Both are false; see §6.2. The
+> reader was corrected on 2026-08-10 (`f6243e5`, `0667d6a`, and
+> `docs/CORRECTIONS.md` C-2026-08-10-parser-tpd-grammar) and this prose was
+> not, because nothing connected the two. The reason the wrong grammar
+> survived verification is worth keeping: **both Zephyr archives contain
+> flag-1 records and nothing else** (53,609 and 76,923 of them), so on the
+> only client that had been read, the duplicate fields genuinely are
+> duplicates. It was a true statement about two archives, written down as a
+> property of the format.
+
+### 6.1 `.tpi` header — `0x30` bytes, **verified**
+
+| offset | field |
+|---|---|
+| `0x00` | `char[16]` magic — `"NetDragonDatPkg\0"` |
+| `0x10` | `u32` = 1000 — identical in all six archives; a version, presumably |
+| `0x14` | `u32` = 0 |
+| `0x18` | `u32` = 1 |
+| `0x1C` | `u32` = 3 |
+| `0x20` | `u32` indexOffset — `0x30` in all six; the first entry starts there |
+| `0x24` | `u32` fileCount |
+| `0x28` | `u32` entry-region byte length — **approximate; never seek by it** |
+| `0x2C` | `u32` freeCount — free-list records following the entries |
+
+`0x28` is the field to distrust, and the reader deliberately ignores it: it
+never reads offset `0x28` at all, and walking the records is the only
+reliable measure of where the index ends. What it actually holds, measured:
+
+* On all four 7878 archives it is **exactly** the byte length of the entry
+  region **excluding** the free list. (Measure the region *including* the
+  free list instead and 7878 `c31.tpi` comes out 24 bytes short — which is
+  3 × 8, its three free-list records. That is the same fact seen from the
+  wrong end, not a second discrepancy.)
+* On Zephyr it is simply **wrong**: `c3.tpi` states 2,653,672 against an
+  actual 2,653,681, and `data.tpi` states 5,176,898 against 5,176,899 —
+  short by 9 and by 1, with no free list to account for either.
+
+So there is no reading of `0x28` that is correct on all six archives. Treat
+it as **inferred and unreliable**.
+
+### 6.2 Index entry — the tail length depends on `flag`, **verified**
+
+`fileCount` variable-length entries follow the header back to back. Every
+entry starts the same way:
+
+```
+u8   nameLen
+char name[nameLen]      forward-slash path, no NUL terminator
+u16  flag               0, 1 or 2 — and NOTHING ELSE is accepted
+```
+
+`flag` then decides how many bytes follow. This is the whole of the refuted
+grammar's error, and it is unforgiving: a walk that assumes one tail length
+reads every subsequent entry at the wrong offset.
+
+**`flag` 1 — one zlib stream. A 22-byte tail** (the `u16 flag` plus five
+`u32`):
+
+```
+u32  uncompressedSize    the whole file
+u32  compressedSize      the whole file
+u32  compressedSize      of the FIRST CHUNK  — equal to the above only
+u32  uncompressedSize    of the FIRST CHUNK  — because there is one chunk
+u32  offset              absolute offset of the payload in the .tpd
+```
+
+The 3rd and 4th `u32` are **not duplicates**. They are the first row of a
+chunk table, and they coincide with the 1st and 2nd exactly when the file
+fits in one chunk — which is every record in both Zephyr archives.
+
+**`flag` 2 — chunked. The same 22-byte tail, then a chunk table** of
+`chunkCount − 1` further descriptors, 12 bytes each, in order:
+
+```
+u32  compressedSize      of this chunk
+u32  uncompressedSize    of this chunk
+u32  offset              of this chunk in the .tpd
+```
+
+`chunkCount` is **derived, never stored**:
+`ceil(uncompressedSize / firstChunkUncompressedSize)`. The chunk size is
+**2 MiB (2,097,152 bytes)** — verified as the first chunk's uncompressed size
+on all 14 flag-2 entries across 7878's `c3.tpi` (6) and `data.tpi` (8), with
+no other value appearing, and the derived `chunkCount` matching the actual
+descriptor count on all 14. Each chunk is its own zlib stream; concatenating
+the inflated chunks gives the file.
+
+**`flag` 0 — an empty file. A 10-byte tail**, and this is the load-bearing
+one:
+
+```
+u32  uncompressedSize    (0)
+u32  compressedSize      (0)
+```
+
+**There is no `offset` field** — an empty file has no payload to point at —
+so the record is **12 bytes shorter** than every other record. Rare (4
+entries in 7878 `c3.tpi`, 1 in its `data.tpi`, 0 in either Zephyr archive)
+and expensive: a walk that reads the 22-byte tail here over-reads by 12 and
+desynchronises everything after it, so the damage surfaces thousands of
+entries later as drifting garbage and reads like a chunk-size problem. The
+reader refuses an unknown `flag` **at the record that carries it** rather
+than guessing a tail length, and checks that the walk consumed the index
+exactly.
+
+### 6.3 The free list — **verified, but on n = 1**
+
+`freeCount` records of `{u32 size, u32 offset}` follow the last entry, 8
+bytes each, naming space in the `.tpd` that no entry references any more
+because a patch replaced a file in place and orphaned its old payload.
+
+> **Read this before relying on the free list.** It rests on a **single
+> archive**: 7878 `c31.tpi` is the only file on this machine with a non-zero
+> `0x2C` (it ships 3; the other five archives ship 0). It is confirmed twice
+> *within* that file — the three records `{1262, 350434}`, `{633, 364254}`,
+> `{3819, 698252}` are exactly, and only, the three gaps left in `c31.tpd`
+> by the 82 entries' payload coverage — but one file is the same evidence
+> base that produced the refuted grammar in §6.2. A second patch overlay
+> could show the field order is `{offset, size}` on a file where the two
+> happen not to be distinguishable here, or that `size` excludes something.
+> **n = 1.**
+
+### 6.4 `.tpd` data file — **verified**
+
+The same 16-byte magic in a `0x20`-byte header, then zlib streams (`78 DA`).
+Payloads are laid out contiguously — `offset[i] + compressedSize[i] ==
+offset[i+1]` for every `i`, first payload at `0x20`, and a file's chunks are
+contiguous with each other. **A chunk, not a file, is the unit that gets an
+offset**, which is why §6.2's chunk table is the thing the layout is built
+out of.
+
+**The size identity, with the clause the old text was missing.**
+`sum(compressed) + 0x20 == tpd file size` holds **exactly on full
+archives** — 7878 `c3` (1,076,058,840), `data` (896,279,080), `data1`
+(145,649) and both Zephyr pairs (998,813,460 and 1,075,033,824). On a
+**patch overlay it is short by the free-list bytes**, because those bytes are
+still in the file and no entry claims them: 7878 `c31.tpd` is 1,156,978
+bytes against a sum of 1,151,264, a shortfall of **5,714 — exactly its three
+free-list records** (1,262 + 633 + 3,819). So the identity to use is
+
+```
+sum(compressed) + 0x20 + sum(freeList.size) == tpd file size
+```
+
+which holds on all six, and reduces to the old form when the free list is
+empty. Every payload decompresses to the size the index promises on all six.
+
+### 6.5 Plaintext names, and the tooling built on this format
+
+Unlike WDF, which stores only a 32-bit hash, **DatPkg names are plaintext**
+forward-slash paths — and they are in the same logical namespace the WDF
+clients hash (`data/arrow.dds`, `c3/0001/000/001.c3`). So `tq_hash(name)`
+matches entries across packaging schemes, and a DatPkg client is a free
+wordlist for WDF name recovery (§6.6). That property, not the compression,
+is what makes these archives worth reading.
 
 `tools/assetdiff.py` builds on this: content-hash diff of a second client
 install against the baseline (both packagings + loose files), with optional
@@ -519,7 +674,7 @@ targets the *active* view: with a server selected it shows that library's
 cache state and generates into it; the base install's renders are never
 reused for a server (same path, different bytes).
 
-### 6.1 Using a DatPkg client as a WDF wordlist
+### 6.6 Using a DatPkg client as a WDF wordlist
 
 `wdf_recover.py --tpi <client-dir-or-.tpi>` mines those ~130k plaintext paths.
 Against the baseline this lifted combined recovery from 24,426 → **24,641 /
@@ -528,7 +683,7 @@ enumeration" to "confirmed by an observed string" (24,415 dictionary-certain,
 up from ~24,043). Enumerated candidates whose payload magic contradicts the
 extension are now dropped rather than counted (`out/wdf/*_rejected_names.json`).
 
-### 6.2 The community garments\*.wdf names are **not** recoverable
+### 6.7 The community garments\*.wdf names are **not** recoverable
 
 Zephyr ships five `garments*.wdf` archives (14,051 unique-hash entries, custom
 fashion) keyed by the same `tq_hash` — one `TqPackageWdf.dll`, and `package.ini`

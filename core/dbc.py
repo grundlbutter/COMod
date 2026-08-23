@@ -11,10 +11,23 @@ years out of date.
 
 Each compiled table opens with a four-byte magic naming its own layout:
 
-    RSDB    id -> path rows          3DObj, 3DTexture, 3DEffectobj, 3dmotion
+    RSDB    id -> path rows          3DObj, 3DTexture, 3DEffectobj, 3dmotion,
+                                     miscmotion, mountmotion, weaponmotion
     SIMO    simple-object records    3DSimpleObj
-    EFFE    (not parsed here)        3DEffect
-    EMOI    (not parsed here)        EmotionIco
+    MESH    appearance -> parts      armor, armet, weapon, misc, mount
+    EFFE    effect definitions       3DEffect
+    EMOI    emotion-icon names       EmotionIco
+
+That list is exhaustive for the 15 ``.dbc`` files 6090 ships: every one opens
+with one of these five magics.
+
+**A missing ``.dbc`` is normal, not an error.** Compiled twins first appear
+at **5517**; 5017, 5065, 5165 and CCO ship none at all, and on those clients
+the plaintext ini *is* the live table -- the exact inverse of the 6090 trap
+above. ``EmotionIco.dbc`` narrows it further: it exists **only on 6090**,
+while 5517 ships the plaintext ``EmotionIco.ini`` alone. Callers pick the
+form the install actually has (`npcart.detect_profile` is the pattern);
+nothing here should be reached for unconditionally.
 
 ``RSDB`` is the same row-table format ``wdb.py`` documents inside
 ``ini/c3.wdb`` -- here it stands alone as a whole file (VERIFIED against the
@@ -33,6 +46,40 @@ not assumed: for the right stride every row's offset lands inside the string
 region, and for the wrong one the interleaved fields land outside it.  The
 meaning of ``extra`` is unestablished (0 on role motions, 2 on NPC motions,
 13634 on some late role rows); it is preserved, not interpreted.
+
+**Parsing an ``RSDB`` is not the same as being able to KEY it, and one table
+proved the gap.**  ``weaponmotion.dbc`` parses cleanly (130,049 rows at 5517,
+169,968 at 6090, every offset in-file) and its ids do not join
+``WeaponMotion.ini``'s under identity, the ``& 0xFFFFFFFF`` wrap that works
+for ``3dmotion``, or truncation: **0 of 25,944**.
+
+**SOLVED 2026-08-09 -- it was a key WIDTH, and the composition is now
+implemented.**  See `weaponmotion_key` / `weaponmotion_join` below.  The ini
+spells the action in a **3-digit** decimal field and the twin packs it in a
+**4-digit** one, wrapping mod 2**32::
+
+    id = (appearance * 10_000 + action) mod 2**32
+
+Verified on 5517 at **25,944 of 25,944, 0 wrong, 0 absent**, with every
+alternative width scoring **zero** on both compiled bases -- a wrong width
+here cannot produce a plausible partial match, only total absence, which is
+precisely why the old ``str(id)`` keying reported the whole table missing and
+raised nothing (CORRECTIONS §2).
+
+**What the join then exposed is a bigger finding than the key.**
+``WeaponMotion.ini`` is **byte-identical on all five official clients**
+(md5 ``edf77851440297a05dd3fcfb0d797a1e``, 5017 through 6090), while the twin
+is not -- so the plaintext is frozen 2009 content and the compiled table has
+moved on without it.  Measured coverage of the ini against its own base's
+twin:
+
+    5517   25,944 / 25,944 ini rows resolve   but name only  19.9% of the twin
+    6090    2,808 / 25,944 ini rows resolve   and name only   1.7% of the twin
+
+So on 6090 the plaintext is a **1.7% view** of the live table, and 2,133 of
+the 2,375 appearances it lists are not in the compiled one at all.  Any claim
+that 5517 and 6090 "agree" about ``WeaponMotion`` is a statement about one
+frozen file, not about the two clients.
 
 ``SIMO`` (VERIFIED: 388 records in 6090, walks to exactly EOF):
 
@@ -58,15 +105,88 @@ which is consistent with all five official clients sharing ``c3.wdf`` byte
 for byte.  Measured over the whole table: 2,165 of 2,232 standby motions
 resolve through the wrapped key.
 
+``EFFE`` (VERIFIED: 5517 3,391 records / 8,759 layers, 6090 4,483 records /
+13,285 layers, both walking to exactly EOF, every name a clean NUL-terminated
+printable string with no bytes after the terminator):
+
+    0x00  char[4]  "EFFE"
+    0x04  u32      recordCount
+    then per record, a 66-byte header followed by ``amount`` x 16-byte layer:
+        char[32] name          NUL-padded, latin-1
+        u16      amount        layer count, 0..15 observed
+        u32      delay         ms   (Delay)
+        u32      loopTime           (LoopTime; >= 99999 means "forever")
+        u32      frameInterval ms   (FrameInterval)
+        u32      loopInterval  ms   (LoopInterval)
+        f32      offsetX, offsetY, offsetZ
+        u8       unk62, u8 unk63, u16 unk64
+    layer:
+        u32 effectId, u32 textureId, f32 scale, u8 asb, u8 adb, u16 pad
+
+**``amount`` is a u16, and reading it as a u32 is the trap.** Every record
+whose ``Delay`` is 0 parses identically either way -- 4,411 of 6090's 4,483 --
+so a u32 read survives 740 records before ``Blood`` (``Delay=500``) turns into
+a layer count of 32,768,001. The width is decidable rather than assumed: only
+the u16 form walks to exactly EOF on both clients.
+
+Decoded against the 2009 ``3DEffect.ini`` as a Rosetta, the same method
+``SIMO`` and ``MESH`` used. On **5517** the compiled table reproduces the
+plaintext one almost exactly -- all 2,595 ini sections are present and
+**2,590** match on every compared field -- which is what establishes the
+field layout. The layer ids are then checked against the *other* compiled
+tables, an independent source: 5517 resolves **8,759 of 8,759** effect ids in
+``3DEffectobj.dbc`` and 8,759 of 8,759 texture ids in ``3DTexture.dbc``; 6090
+resolves 13,276 of 13,285 in each. A misread field offset cannot score that.
+
+A third check on the layer row, found while wiring the reader onto the
+definitions path and worth recording because nobody fitted it: the layer's
+``scale`` is a **f32 fraction** and the plaintext ``Scale<i>`` is the same
+value as an **integer percent** (``red-flower-small``'s ``Scale0=78`` reads
+``0.78``). On 5517, where the two tables otherwise agree, ``ini / 100``
+matches the compiled float on **5,099 of 5,099** shared layers -- zero
+exceptions. On 6090 five disagree and all five are inside the 56 records
+``docs/effects.md`` §7a already reports as content edits. A stride or
+field-offset error does not produce a clean unit relation across 5,099 rows.
+
+``unk62`` (0/1, set on 6 records at 5517 and 8 at 6090), ``unk63`` (0/1) and
+``unk64`` (1..4) are **preserved, not interpreted**, on the same footing as
+``Rsdb.extra``. What is known:
+
+* ``unk64`` is **not** ``Lev``. On 5517, where 2,590 of 2,595 shared records
+  are otherwise identical to the ini, ``Lev=1`` maps to ``unk64`` 1 *and* 2,
+  and 858 sections with no ``Lev`` at all map to 4. No function fits.
+* ``unk62`` is **not** ``Billboard`` -- the one ini section that declares
+  ``Billboard=1`` reads ``unk62=0`` in both compiled tables. (n=1.)
+* ``unk63`` **could** be ``ColorEnable`` and nothing here can say so. Both
+  are ~1 everywhere: the 5165+ ini writes ``ColorEnable=1`` in all 2,595
+  sections and ``unk63`` is 1 in 4,319 of 4,483 records. Per CORRECTIONS §2
+  -- if the model were wrong this would read the same, so it is not evidence.
+  Settling it needs the loader disassembled, not another table.
+
+``EMOI`` (VERIFIED on 6090, the only client that ships one: 70 records,
+``8 + 70 x 36`` bytes exactly, tiling the file with no slack):
+
+    0x00  char[4]  "EMOI"
+    0x04  u32      recordCount
+    0x08  ...      recordCount x { u32 id, char[32] name }
+
+Ids are **not** dense: 6090 carries 0..67 plus 76 and 77. Verified against
+the plaintext ``EmotionIco.ini`` (a bare ``<id> <name>`` list, not sections):
+all 68 shared ids carry byte-identical names, and the compiled table adds
+``76 Silver`` and ``77 CP``.
+
 Usage::
 
-    from dbc import Rsdb, read_simo
+    from dbc import Rsdb, read_simo, read_effe, read_emoi
     obj = Rsdb.parse(assets.read("ini/3DObj.dbc"))
     obj.get(9990010)                  -> 'c3/mesh/9990010.c3'
     motion = Rsdb.parse(assets.read("ini/3dmotion.dbc"))
     motion.get(9990010100 & 0xFFFFFFFF) -> 'c3/npc/999001100.c3'
     simo = read_simo(assets.read("ini/3DSimpleObj.dbc"))
     simo[211]                         -> [(9990010, 9990211)]
+    effe = read_effe(assets.read("ini/3DEffect.dbc"))
+    effe[0]["name"], effe[0]["layers"][0]["effect"]  -> ('M_Fire', 1066)
+    read_emoi(assets.read("ini/EmotionIco.dbc"))[0]  -> 'Hoho'
 
 CLI::
 
@@ -83,8 +203,8 @@ MAGICS = {
     b"RSDB": "id -> path row table",
     b"SIMO": "simple-object records (3DSimpleObj)",
     b"MESH": "appearance records (armor/armet/weapon/... .dbc)",
-    b"EFFE": "3DEffect records (not parsed)",
-    b"EMOI": "EmotionIco records (not parsed)",
+    b"EFFE": "effect definitions (3DEffect)",
+    b"EMOI": "emotion-icon names (EmotionIco)",
 }
 
 
@@ -153,6 +273,80 @@ class Rsdb:
         raise ValueError("no stride in (8, 12) makes every offset valid")
 
 
+#: ``WeaponMotion``'s two spellings of one key, and the width between them.
+#:
+#: SOLVED 2026-08-09; this file previously said the composition was unknown.
+#: The ini spells a key as ``appearance`` then a **3-digit** action field, in
+#: decimal (``1050000999`` + ``300`` -> ``"1050000999300"``).  The compiled
+#: twin packs the same pair with a **4-digit** action field and lets the
+#: product wrap::
+#:
+#:     id = (appearance * 10_000 + action) mod 2**32
+#:
+#: MEASURED on 5517: **25,944 of 25,944 ini rows resolve, 0 wrong, 0 absent.**
+#: The controls are what make that a result rather than a coincidence -- the
+#: same sweep with ``10**3`` or ``10**5``, with the whole key taken ``mod
+#: 2**32``, and with ``<<12`` / ``<<16`` bit-packings, scores **zero hits on
+#: both compiled bases**.  A wrong width here reads as total absence, never as
+#: a plausible partial match, which is exactly why the old ``str(id)`` keying
+#: reported a whole table missing with total confidence (CORRECTIONS §2).
+WEAPONMOTION_INI_ACTION_DIGITS = 3
+WEAPONMOTION_DBC_ACTION_DIGITS = 4
+
+
+def weaponmotion_key(ini_key) -> int:
+    """One ``WeaponMotion.ini`` key -> the id its compiled twin stores.
+
+    ``ini_key`` is the ini's own spelling, 12 or 13 digits.  The last
+    `WEAPONMOTION_INI_ACTION_DIGITS` are the action; everything before is the
+    appearance.
+    """
+    s = str(ini_key).strip()
+    if not s.isdigit() or len(s) <= WEAPONMOTION_INI_ACTION_DIGITS:
+        raise ValueError(f"not a WeaponMotion ini key: {ini_key!r}")
+    app = int(s[:-WEAPONMOTION_INI_ACTION_DIGITS])
+    act = int(s[-WEAPONMOTION_INI_ACTION_DIGITS:])
+    return (app * 10 ** WEAPONMOTION_DBC_ACTION_DIGITS + act) % (1 << 32)
+
+
+def weaponmotion_join(rsdb, ini_keys):
+    """Re-key a parsed ``weaponmotion.dbc`` into the ini's spelling.
+
+    Returns ``(joined, stats)`` -- ``joined`` maps the ini key to the twin's
+    path for every key the twin carries, and ``stats`` reports what happened.
+
+    **It refuses rather than returning an empty dict.**  Zero matches is the
+    signature of a wrong key width, not of an empty table, and the whole
+    reason this function exists is that the previous keying returned ``{}``
+    and no error.  If nothing joins, that is a defect in the caller or in this
+    composition, and it is raised.
+    """
+    paths = rsdb.paths if hasattr(rsdb, "paths") else rsdb
+    joined, absent, bad = {}, [], []
+    for k in ini_keys:
+        try:
+            i = weaponmotion_key(k)
+        except ValueError:
+            bad.append(k)
+            continue
+        if i in paths:
+            joined[str(k)] = paths[i]
+        else:
+            absent.append(str(k))
+    if ini_keys and not joined:
+        raise ValueError(
+            f"weaponmotion_join matched 0 of {len(ini_keys)} ini keys against "
+            f"{len(paths)} twin rows. That is the key-width signature, not an "
+            f"empty table -- see WEAPONMOTION_DBC_ACTION_DIGITS. Refusing to "
+            f"return an empty map, because reporting absence with confidence "
+            f"is the failure this join was written to end.")
+    stats = {"ini_keys": len(ini_keys), "joined": len(joined),
+             "absent_from_twin": len(absent), "unparsable": len(bad),
+             "twin_rows": len(paths),
+             "twin_rows_the_ini_cannot_name": len(paths) - len(joined)}
+    return joined, stats
+
+
 def read_simo(data: bytes) -> dict:
     """``3DSimpleObj.dbc``: id -> [(partId, textureId), ...].
 
@@ -182,38 +376,164 @@ def read_simo(data: bytes) -> dict:
 def read_mesh(data: bytes) -> dict:
     """A ``MESH`` appearance table: id -> ordered part rows.
 
-    The compiled twin of armor.ini / armet.ini / weapon.ini. Fixed 24-byte
-    records -- every one of the three 6090 files is exactly
-    ``8 + rowCount x 24`` bytes (armor 3,338 rows, armet 2,609, weapon
-    11,185) -- laid out as six u32s mirroring the ini schema:
+    The compiled twin of armor.ini / armet.ini / weapon.ini.  Records are
+    **variable length**, ``SIMO``-style -- a count followed by that many
+    16-byte parts::
 
-        u32 id, u32 partCount, u32 meshId, u32 textureId, u32 mixTexId,
-        u32 packed  -- bytes [mixOpt, asb, adb, 0]
+        0x00  char[4]  "MESH"
+        0x04  u32      recordCount
+        then per record:
+            u32 id, u32 partCount,
+            partCount x { u32 meshId, u32 textureId, u32 mixTexId,
+                          u32 packed -- bytes [mixOpt, asb, adb, 0] }
 
-    VERIFIED against the stale inis as Rosetta: every one of armet's 1,168
-    shared ids matches Mesh0/Texture0 exactly; weapon differs on 14 of
-    4,835 (patch-era retextures) and carries 6,350 rows the 2008 ini never
-    heard of. Ids are the ini section numbers stored as ints, so the CCO
-    form ``002135000`` appears here as ``2135000`` -- ``str(id)`` matches
-    the 6090 inis' own unpadded convention and `coassets.PartIni.get`
-    bridges the zero-padded spelling. A multi-part appearance repeats its
-    id on consecutive rows; the returned lists keep that order.
+    VERIFIED: all five 6090 tables walk to **exactly EOF** -- armor 3,338
+    records / 80,120 B, armet 2,609 / 62,624, weapon 11,185 / 268,448,
+    misc 1 / 32, mount 1,677 / 56,320.
+
+    > **CORRECTED -- this was read as a FIXED 24-byte record, and four of
+    > the five tables cannot tell the difference.**  ``partCount`` is 1 on
+    > every row of armor, armet, weapon and misc, and a 1-part record *is*
+    > 24 bytes, so the fixed model tiled those four files exactly and
+    > looked verified.  **``mount.dbc`` has 1,004 multi-part records**; under
+    > the fixed model it does not tile (``8 + 1677*24 = 40,256`` against
+    > 56,320) and was refused outright -- the only reason the error surfaced
+    > as a refusal rather than as 2,346 rows of drift is that the stride
+    > check happened to be a whole-file one.  The docstring's claim that "a
+    > multi-part appearance repeats its id on consecutive rows" described
+    > behaviour **no shipped table ever exercised**: the fixed model had zero
+    > multi-part records by construction.  `docs/CORRECTIONS.md`
+    > `C-2026-08-09-claude-elastic-elion-0da45c`.
+
+    Cross-checked against the stale inis as Rosetta: every one of armet's
+    1,168 shared ids matches Mesh0/Texture0 exactly, and armor's 955 shared
+    ids differ on one.  Ids are the ini section numbers stored as ints, so
+    the CCO form ``002135000`` appears here as ``2135000`` -- ``str(id)``
+    matches the 6090 inis' own unpadded convention and `coassets.PartIni.get`
+    bridges the zero-padded spelling.  **Ids are not unique**: armor
+    declares 3,338 records over 3,326 ids and weapon 11,185 over 11,164, so
+    a later record replaces an earlier one under the same key.
     """
     if data[:4] != b"MESH":
         raise ValueError(f"not a MESH table: magic {data[:4]!r}")
     (count,) = struct.unpack_from("<I", data, 4)
-    if 8 + count * 24 != len(data):
+    out: dict = {}
+    pos = 8
+    for i in range(count):
+        rid, parts = struct.unpack_from("<II", data, pos)
+        pos += 8
+        # A wild partCount walks past EOF and raises struct.error, which is
+        # this format's only integrity check: there is no string region whose
+        # offsets must land in-file, so nothing else can catch a bad stride.
+        rows = []
+        for _ in range(parts):
+            mesh, tex, mixtex, packed = struct.unpack_from("<4I", data, pos)
+            pos += 16
+            b = packed.to_bytes(4, "little")
+            rows.append({"mesh": mesh, "texture": tex, "mixtex": mixtex,
+                         "mixopt": b[0], "asb": b[1], "adb": b[2]})
+        out[rid] = rows
+    if pos != len(data):
         raise ValueError(
-            f"MESH row count {count} does not tile the file "
-            f"({len(data)} bytes, expected {8 + count * 24})")
+            f"MESH walk ended at {pos} of {len(data)} bytes -- "
+            f"{count} records do not tile the file")
+    return out
+
+
+#: The ``EFFE`` per-record header and per-layer row. Sizes are asserted
+#: rather than commented because every count in the docstring above depends
+#: on them: 66 and 16 are what make the walk land on EOF.
+EFFE_HEADER = struct.Struct("<32sHIIII3fBBH")
+EFFE_LAYER = struct.Struct("<IIfBBH")
+assert EFFE_HEADER.size == 66 and EFFE_LAYER.size == 16
+
+#: ``EMOI`` row: ``{u32 id, char[32] name}``.
+EMOI_ROW = struct.Struct("<I32s")
+assert EMOI_ROW.size == 36
+
+
+def _fixed_name(raw: bytes, what: str) -> str:
+    """A NUL-terminated string in a fixed-width field, or an error.
+
+    The integrity check that a fixed-record format offers in place of
+    ``RSDB``'s "every offset lands in-file": if the record stride were wrong
+    the name field would slide onto numeric fields, and both the printable
+    test and the clean-padding test would fail immediately. Measured over
+    every record of both compiled tables -- 3,391 at 5517 and 4,483 at 6090 --
+    zero names carry an unprintable byte and zero carry anything but NULs
+    after the terminator.
+    """
+    name, _, pad = raw.partition(b"\0")
+    if pad.strip(b"\0"):
+        raise ValueError(f"{what}: bytes after the NUL terminator: {raw!r}")
+    if not all(32 <= c < 127 for c in name):
+        raise ValueError(f"{what}: name is not printable: {raw!r}")
+    return name.decode("latin-1")
+
+
+def read_effe(data: bytes) -> list:
+    """``3DEffect.dbc``: the compiled effect definitions, in file order.
+
+    Returns a list of dicts -- **not** a name-keyed mapping, because names
+    are not unique: 6090 ships 4,483 records under 4,472 distinct names
+    (``FF03_1``, ``zf2-e222``, ``elf-follow`` and eight others appear twice).
+    5517's 3,391 names are all distinct, so a dict would have looked correct
+    on the client its author had configured. Callers that want a lookup
+    should build one and decide for themselves which duplicate wins.
+
+    Records are variable-length, so the file is walked, and the walk must
+    land exactly on EOF -- see ``read_simo`` for why that is an error rather
+    than a truncation to tolerate.
+    """
+    if data[:4] != b"EFFE":
+        raise ValueError(f"not an EFFE table: magic {data[:4]!r}")
+    (count,) = struct.unpack_from("<I", data, 4)
+    pos, out = 8, []
+    for i in range(count):
+        (raw, amount, delay, loop, frame, interval,
+         ox, oy, oz, unk62, unk63, unk64) = EFFE_HEADER.unpack_from(data, pos)
+        pos += EFFE_HEADER.size
+        layers = []
+        for _ in range(amount):
+            eid, tid, scale, asb, adb, pad = EFFE_LAYER.unpack_from(data, pos)
+            pos += EFFE_LAYER.size
+            layers.append({"effect": eid, "texture": tid, "scale": scale,
+                           "asb": asb, "adb": adb, "pad": pad})
+        out.append({
+            "name": _fixed_name(raw, f"EFFE record {i}"),
+            "amount": amount, "delay": delay, "loop_time": loop,
+            "frame_interval": frame, "loop_interval": interval,
+            "offset": (ox, oy, oz),
+            "unk62": unk62, "unk63": unk63, "unk64": unk64,
+            "layers": layers})
+    if pos != len(data):
+        raise ValueError(f"EFFE walk ended at {pos}, file is {len(data)}")
+    return out
+
+
+def read_emoi(data: bytes) -> dict:
+    """``EmotionIco.dbc``: emotion id -> icon name.
+
+    **6090 is the only client that ships one.** 5517 has compiled twins for
+    fourteen other tables and still reads the plaintext ``EmotionIco.ini``,
+    so a caller must handle absence rather than treat it as a broken install.
+
+    Fixed 36-byte rows, so the count has to tile the file exactly, and a
+    stride error cannot pass silently.  ``read_mesh`` and ``read_simo`` reach
+    the same guarantee the other way round -- their records are variable
+    length, so they walk and then require the walk to **end on EOF**.
+    """
+    if data[:4] != b"EMOI":
+        raise ValueError(f"not an EMOI table: magic {data[:4]!r}")
+    (count,) = struct.unpack_from("<I", data, 4)
+    if 8 + count * EMOI_ROW.size != len(data):
+        raise ValueError(
+            f"EMOI row count {count} does not tile the file "
+            f"({len(data)} bytes, expected {8 + count * EMOI_ROW.size})")
     out: dict = {}
     for i in range(count):
-        rid, part, mesh, tex, mixtex, packed = struct.unpack_from(
-            "<6I", data, 8 + i * 24)
-        b = packed.to_bytes(4, "little")
-        out.setdefault(rid, []).append({
-            "part": part, "mesh": mesh, "texture": tex, "mixtex": mixtex,
-            "mixopt": b[0], "asb": b[1], "adb": b[2]})
+        eid, raw = EMOI_ROW.unpack_from(data, 8 + i * EMOI_ROW.size)
+        out[eid] = _fixed_name(raw, f"EMOI row {i}")
     return out
 
 
@@ -243,6 +563,23 @@ def _main(argv=None) -> int:
         print(f"{len(t)} records")
         for rid in list(t)[:a.limit]:
             print(f"  {rid:>6}  {t[rid]}")
+    elif m == b"EFFE":
+        t = read_effe(data)
+        layers = sum(len(r["layers"]) for r in t)
+        print(f"{len(t)} records, {len(set(r['name'] for r in t))} distinct "
+              f"names, {layers} layers")
+        for r in t[:a.limit]:
+            print(f"  {r['name']:<32} amount={r['amount']} "
+                  f"loop={r['loop_time']} frame={r['frame_interval']}ms "
+                  f"offset={r['offset']}")
+            for L in r["layers"]:
+                print(f"      effect={L['effect']:<8} texture={L['texture']:<8}"
+                      f" scale={L['scale']:g} asb={L['asb']} adb={L['adb']}")
+    elif m == b"EMOI":
+        t = read_emoi(data)
+        print(f"{len(t)} records")
+        for eid in list(t)[:a.limit]:
+            print(f"  {eid:>4}  {t[eid]}")
     else:
         print("recognised but not parsed here")
     return 0

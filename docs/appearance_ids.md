@@ -205,6 +205,48 @@ covers 99 % rather than 66 %. The family match is used to show the item name.)*
 
 ---
 
+## 4.5 Monsters do not use this id at all — VERIFIED
+
+Everything above is about **body appearance** ids. A monster is addressed
+differently, and the difference is easy to miss because both are numbers in
+the same neighbourhood.
+
+A monster's art is chosen by the **server**, through `monstertype.Mesh`, and
+that value is an id in the same space as the *texture*, not a directory:
+
+```
+body 0103  ThunderApe   c3/monster/103/   own dir     c3/texture/103000000.dds
+body 0303  SnowApe      c3/monster/103/   BORROWED    c3/texture/303000000.dds
+body 0403  FireSnake    c3/monster/203/   BORROWED    c3/texture/403000000.dds
+```
+
+**A colour morph ships a texture and no geometry.** The trailing two digits
+name a shipped directory and the leading digit(s) are the colour, counted in
+hundreds above it — so `SnowApe` really is the ape wearing a different skin.
+Families sharing a tail (117 BullMonster, 217 NightDevil) interleave by 200,
+which is what puts `FireSnake 0403` on the snake dir rather than the ape dir.
+
+`core/monsterart.py` holds the rule, its verified examples and the two traps:
+a body with its own directory must never be morphed (217 satisfies the
+arithmetic *and* ships its own art), and a directory name is not always its
+number (`c3/monster/104n/`).
+
+Two things the id genuinely cannot tell you:
+
+* **The monster's name.** No client table links art to a name — `Monster.dat`
+  has no mesh column and `bodyType` is 0 on every row at 5517 and 6090. One
+  directory commonly serves several monsters (`0103` serves seven), so there
+  is no single right label. That link is server-side.
+* **Size.** Monsters sharing a mesh are differentiated by `zoomPercent` in
+  `Monster.dat` — the seven on `0103` run 100/120/110/120/100/100/150 and are
+  identical in every other field. **Texture plus zoom is the whole visual
+  difference.**
+
+Measured on 5517: 83 monster directories carry meshes, and 46 of them (55 %)
+have more than one texture.
+
+---
+
 ## 5. Reproducing
 
 ```bash

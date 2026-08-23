@@ -30,10 +30,129 @@ from typing import Iterator, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import coroot                       # noqa: E402
+import dbcshadow                    # noqa: E402
 import safepath                     # noqa: E402
 import tqdat                        # noqa: E402
 from tqhash import tq_hash          # noqa: E402
+from tpd import TpdArchive          # noqa: E402
 from wdf import WdfArchive          # noqa: E402
+
+
+class _TpdContainer:
+    """A NetDragon DatPkg pair behind `WdfArchive`'s lookup interface.
+
+    `core/tpd.py` has read this format since it landed -- verified against
+    Zephyr-1057's two pairs, 53,609 and 76,923 entries -- but nothing ever
+    consumed it: until now no reference to `tpd`, `TpdArchive` or `.tpi`
+    existed in `coassets.py`, `coroot.py` or any plugin. So `AssetRoot`
+    refused the very client the reader was verified on. This adapter is the
+    consumer, and it lands Zephyr and 7878 from one change.
+
+    **A TPD root resolves EXACTLY, and that is a capability WDF does not
+    have.** The index stores plaintext paths, so a name is looked up as
+    itself. WDF stores only `tq_hash(name)`, which is why `out/wdf/*.json`
+    name recovery exists at all and why 331 of the official archive's 24,757
+    names were never recovered -- a real texture can be nameless yet
+    perfectly readable there. Nothing of that applies here: `get_by_name` is
+    the primary lookup and `get` is kept only so callers written against the
+    WDF interface keep working.
+    """
+
+    def __init__(self, path: Path):
+        self._arc = TpdArchive(path)
+        self.path = Path(path)
+        self._by_name = {e.name.replace("\\", "/").lower(): e
+                         for e in self._arc.entries}
+        #: Built on FIRST HASH LOOKUP, not here.  See `_hashes`.
+        self._by_hash: Optional[dict] = None
+
+    #: **This map cost 2.7 of the 3.0 seconds it took to open a 7878 root, for
+    #: a lookup that root never performs.**  MEASURED before the change:
+    #:
+    #:      c3.tpi    59,964 entries   parse 137.6 ms   by_name 13.7 ms   by_hash   960.3 ms
+    #:      data.tpi  86,149 entries   parse 212.1 ms   by_name 17.3 ms   by_hash 1,773.1 ms
+    #:
+    #: 86-89% of the whole open, against 6.8 ms for a WDF root's two archives.
+    #: The index PARSE is only 350 ms; the rest was hashing 146,113 names.
+    #:
+    #: It is not dead code, which is why it is deferred rather than deleted:
+    #: `AssetRoot.locate` and `.read` prefer `get_by_name` whenever a container
+    #: has it, so a DatPkg root never reaches `get`/`read_by_hash` -- but
+    #: `core/colibrary.py` looks entries up by a stored hex hash and can. Every
+    #: caller was checked before this was changed.
+    #:
+    #: So the cost now falls on whoever actually asks by hash, once, instead of
+    #: on every tool that opens the install.  Same map, same collision
+    #: behaviour (last wins, as the eager comprehension did), same answers.
+    def _hashes(self) -> dict:
+        if self._by_hash is None:
+            self._by_hash = {tq_hash(n): e for n, e in self._by_name.items()}
+        return self._by_hash
+
+    @property
+    def file_size(self) -> int:
+        """Bytes on disk, under the name `WdfArchive` uses for it.
+
+        This adapter claims WdfArchive's interface, and `file_size` is part of
+        that interface -- `coviewer.api_status` reads it for every archive, so
+        a container missing it takes the whole status endpoint down with an
+        `AttributeError` rather than degrading. That is what happened the first
+        time a TPD root was actually served: the reader had been correct for
+        months and had no consumer, so the gap could not show.
+
+        **Both halves are counted, because a TPD is a PAIR.** Returning only
+        the `.tpd` would understate every archive by its whole index, and
+        returning only the `.tpi` would understate it by the payload -- and
+        either would look like a plausible number sitting next to WDF's, which
+        is the worst way to be wrong. A half that cannot be stat'd contributes
+        nothing rather than raising, since a size is a nicety and the catalogue
+        is not.
+        """
+        total = 0
+        for half in (getattr(self._arc, "tpi", None),
+                     getattr(self._arc, "tpd", None)):
+            try:
+                if half is not None:
+                    total += Path(half).stat().st_size
+            except OSError:
+                continue
+        return total
+
+    # -- the WdfArchive lookup interface -----------------------------------
+    def get(self, name_hash: int):
+        return self._hashes().get(name_hash)
+
+    def read_by_hash(self, name_hash: int) -> bytes:
+        e = self._hashes().get(name_hash)
+        if e is None:
+            raise KeyError(name_hash)
+        return self._arc.read(e)
+
+    # -- the exact interface, preferred when present -----------------------
+    def get_by_name(self, logical: str):
+        return self._by_name.get(logical.replace("\\", "/").lower())
+
+    def read_entry(self, entry) -> bytes:
+        return self._arc.read(entry)
+
+    @property
+    def entries(self):
+        """The entry list, under the name `WdfArchive` uses for it.
+
+        Callers that enumerate an archive rather than look one path up --
+        `coviewer.Catalog` building its archive index is the one that matters
+        -- iterate `arc.entries`. A `TpdEntry` carries `.name` and `.size` but
+        **no `.hash`**, because this container is keyed by path and does not
+        need one; a caller wanting the WDF-style key computes
+        `tq_hash(e.name)`, which is exact here rather than recovered.
+        """
+        return self._arc.entries
+
+    def close(self) -> None:
+        self._arc.close()
+
+    def __len__(self) -> int:
+        return len(self._by_name)
 
 #: The install root, resolved once per process by ``coroot`` -- explicit
 #: ``--root`` beats ``CO_ROOT`` beats a saved config beats auto-discovery.
@@ -47,14 +166,24 @@ DEFAULT_ROOT = coroot.default_root()
 # ini tables
 # ---------------------------------------------------------------------------
 
-def parse_ini(path: Path, encoding: str = "latin1") -> dict[str, dict[str, str]]:
+def parse_ini(path: Path, encoding: str = "latin1", *,
+              allow_stale: bool = False) -> dict[str, dict[str, str]]:
     """Parse a TQ-style ini into {section: {key: value}}.
 
     TQ inis are not standard: keys repeat across sections, values are untyped,
     and section names are usually numeric asset IDs. codepage.ini is "0" in this
     install, so text is read as latin1 and any GBK names are kept as raw bytes
     round-trippable through latin1.
+
+    **Raises `dbcshadow.ShadowedIni` if the file has a compiled `.dbc` twin on
+    its own base.** From 5517 onward the client reads the twin, so the
+    plaintext here is not the live table; see `core/dbcshadow.py`. The check
+    is per path and per call, so it is silent on 5017/5065/5165/CCO, which
+    ship no `.dbc`. Pass `allow_stale=True` where reading the stale plaintext
+    is the point -- a Rosetta comparison, or a table whose compiled form has
+    no reader yet -- and say which at the call site.
     """
+    dbcshadow.check_ini(path, allow_stale=allow_stale)
     sections: dict[str, dict[str, str]] = {}
     cur: Optional[dict[str, str]] = None
     for line in path.read_text(encoding, errors="replace").splitlines():
@@ -108,14 +237,69 @@ class PartIni:
         # missing 1,441 of the dbc's 2,609 rows. Prefer the twin when it
         # parses; the ini remains the format everywhere it is all there is.
         self.source = self.name
+        #: The twin's filename when a **MESH** twin is on disk, else None.
+        #: Set whether or not it parsed, so `twin_error` reads against it.
+        self.twin: Optional[str] = None
+        #: None when the twin parsed, when there is no twin, and when the
+        #: `.dbc` beside this ini is a different kind of table. A string ONLY
+        #: when a MESH twin was **present and unreadable** -- a defect in us
+        #: or in the install, and NOT the same event as shipping no twin.
+        self.twin_error: Optional[str] = None
         dbc_twin = self.path.with_suffix(".dbc")
-        if dbc_twin.is_file():
+        # MEASURED on 5517: 14 of the inis with a `.dbc` beside them, and only
+        # **6** of those twins are MESH. The other 8 are `RSDB` path tables
+        # (`3dobj`, `3dtexture`, `WeaponMotion`, ...), one `SIMO` and one
+        # `EFFE`. Those are not appearance tables and `read_mesh` refusing
+        # them is the correct answer, not a failure -- so the magic is checked
+        # BEFORE the load, and a non-MESH twin leaves `twin_error` None.
+        #
+        # This distinction is not decoration: without it `twin_error` is
+        # non-None for 8 tables that are working exactly as intended, and the
+        # gate built on it goes red over nothing. It did, on the first run.
+        if dbc_twin.is_file() and dbcshadow.twin_magic(dbc_twin) == b"MESH":
+            self.twin = dbc_twin.name
             try:
                 self._load_mesh_dbc(dbc_twin)
                 return
-            except Exception:
-                pass
-        self.sections = parse_ini(self.path)
+            except (ValueError, struct.error, OSError) as e:
+                # NARROWED from `except Exception: pass` (2026-08-10).
+                #
+                # Two halves, and the second is the one the rule is about.
+                #
+                # Narrowing: these three are what a real parse failure looks
+                # like -- `dbc.read_mesh` raises `ValueError` on bad magic and
+                # on a walk that does not reach EOF, `struct` raises on a
+                # short read, and the file read raises `OSError`. Everything
+                # else now propagates. **`ImportError` in particular**: `dbc`
+                # is imported inside `_load_mesh_dbc`, which is called from
+                # inside this `try`, so a broken first-party module used to
+                # arrive here as "this install ships no twin". `CONTRIBUTING`
+                # §"A tool degrades; a test refuses" -- a guard on a
+                # first-party module protects nothing.
+                #
+                # Audibility: `PartIni` is a reader that tools use, so it
+                # still degrades to the ini rather than refusing. What changes
+                # is that the degradation leaves a trace. Before this, the
+                # stale read below was reached by two completely different
+                # events -- "no twin, and the ini IS the live table" (true on
+                # the whole 5017/5065/5165/CCO lineage) and "the twin is right
+                # there and we could not read it" -- and **nothing could tell
+                # them apart**, because `self.source` is `armor.ini` either
+                # way. On a 5517+ base the second silently serves the 2008-era
+                # table: armet's ini is missing 1,441 of the twin's 2,609
+                # rows.
+                #
+                # `tools/test_viewer.py::PartIniTwinFailureIsAudible` is the
+                # reader. `self.source` alone was not one: it is written in
+                # both branches and, MEASURED across `core/`, `tools/`,
+                # `client/`, `capture/` and `tests/`, **had no readers at
+                # all** -- the same shape as `_np` in C46, a channel nobody
+                # listened to.
+                self.twin_error = f"{type(e).__name__}: {e}"
+        # Declared stale read: the MESH twin was preferred above and either is
+        # absent (the whole 5017/5065/5165/CCO lineage, where this ini IS the
+        # live table) or failed to parse -- and `twin_error` now says which.
+        self.sections = parse_ini(self.path, allow_stale=True)
         self.appearances: dict[str, Appearance] = {}
         for ident, kv in self.sections.items():
             try:
@@ -142,8 +326,11 @@ class PartIni:
 
         Idents are `str(id)` -- the dbc stores section numbers as ints,
         which is also the 6090 inis' own unpadded spelling; `get` bridges
-        the zero-padded CCO form. Multi-part appearances arrive as repeated
-        ids on consecutive rows, in part order.
+        the zero-padded CCO form. A multi-part appearance arrives as one
+        record carrying a **list** of parts, in part order -- `read_mesh`
+        used to be read as a fixed-stride table in which such a record could
+        not occur at all, and `mount.dbc`'s 1,004 of them are why that was
+        found. `docs/CORRECTIONS.md` `C-2026-08-09-claude-elastic-elion-0da45c`.
         """
         import dbc
         rows = dbc.read_mesh(twin.read_bytes())
@@ -625,7 +812,15 @@ class Located:
 
 
 class AssetRoot:
-    """The client's asset namespace: loose files shadow the WDF archives.
+    """The client's asset namespace: loose files shadow the archives.
+
+    **The archives are a set, not a pair, and not all one format.** This used
+    to be hardcoded to `c3.wdf` + `data.wdf`; `Zephyr-1057-local` ships
+    `c3.tpi`/`c3.tpd` *and* `garments0-4.wdf` in one install, and 7878 ships
+    four DatPkg pairs and no WDF at all. Both were unopenable. See
+    `_discover_archives` for what is found and `_TpdContainer` for the second
+    reader -- including why a DatPkg root resolves names exactly where a WDF
+    root resolves them through a recovered hash table.
 
     VERIFIED load order. TqPackage!TqFOpen calls two handlers in sequence: the
     native-filesystem handler first, and only if it returns 3 (not found) does
@@ -640,7 +835,63 @@ class AssetRoot:
     .wdf files never need to be repacked.
     """
 
-    ARCHIVES = ("c3.wdf", "data.wdf")
+    # `ARCHIVES = ("c3.wdf", "data.wdf")` used to live here and was kept "for
+    # callers that read it" when discovery replaced it. MEASURED: there are
+    # none -- the only greps outside this file are comments and
+    # `wdf_recover.py`'s own unrelated module-level constant. So it was a
+    # class attribute asserting the archives are two WDF files, which is false
+    # on every DatPkg root, read by nobody, and exactly the shape that gets
+    # believed later. What replaced it is below, and it is a function of the
+    # root rather than a constant, because that is what the question actually
+    # depends on.
+
+    #: **A root is a set of archives, each with its own reader** -- not "a WDF
+    #: root" or "a TPD root". `Zephyr-1057-local` settles it: it ships
+    #: `c3.tpi`/`c3.tpd` AND `garments0-4.wdf`, both containers in one install,
+    #: so a two-way switch on the root would have to pick one and lose the
+    #: other.
+    #:
+    #: Index suffix -> reader. `.tpi` is the index half of the pair; `tpd.py`
+    #: finds the `.tpd` beside it.
+    CONTAINERS = ((".wdf", WdfArchive), (".tpi", _TpdContainer))
+
+    #: Tried first and in this order, so the primary pair keeps the precedence
+    #: it has always had. Everything else on disk is opened after them.
+    ARCHIVE_STEMS = ("c3", "data")
+
+    @classmethod
+    def _discover_archives(cls, root: Path) -> list[Path]:
+        """Every archive in `root`, primary pair first.
+
+        MEASURED before this replaced the hardcoded pair: 5017, 5065, 5165,
+        5517, 6090 and 6609 each ship **exactly** `c3.wdf` and `data.wdf`, so
+        discovery is a no-op on every client that worked before it. Only the
+        two that could not be opened at all gain anything -- 7878 (four TPD
+        pairs, two of them patch overlays) and Zephyr (a TPD pair plus five
+        garment WDFs that were previously invisible even though the root was
+        already unopenable for a different reason).
+        """
+        found: list[Path] = []
+        seen: set[str] = set()
+        for stem in cls.ARCHIVE_STEMS:
+            for suffix, _reader in cls.CONTAINERS:
+                p = root / f"{stem}{suffix}"
+                if p.is_file():
+                    found.append(p)
+                    seen.add(p.name.lower())
+        for suffix, _reader in cls.CONTAINERS:
+            for p in sorted(root.glob(f"*{suffix}")):
+                if p.is_file() and p.name.lower() not in seen:
+                    found.append(p)
+                    seen.add(p.name.lower())
+        return found
+
+    @classmethod
+    def _reader_for(cls, path: Path):
+        for suffix, reader in cls.CONTAINERS:
+            if path.suffix.lower() == suffix:
+                return reader
+        return None
 
     def __init__(self, root: Path | str | None = None, overlay: Optional[Path] = None):
         self.root = Path(root) if root else DEFAULT_ROOT
@@ -655,11 +906,15 @@ class AssetRoot:
                 + "\nPoint the tools somewhere else with "
                   "`py -3 core/coroot.py --set DIR`, CO_ROOT, or --root.")
         self.overlay = Path(overlay) if overlay else None
-        self._archives: dict[str, WdfArchive] = {}
-        for a in self.ARCHIVES:
-            p = self.root / a
-            if p.is_file():
-                self._archives[a] = WdfArchive(p)
+        self._archives: dict = {}
+        for p in self._discover_archives(self.root):
+            reader = self._reader_for(p)
+            if reader is None:                      # pragma: no cover
+                continue
+            # An archive that will not open is not silently skipped: a client
+            # missing half its art because one container failed reads exactly
+            # like a client that never shipped it.
+            self._archives[p.name] = reader(p)
         self._names: Optional[dict[int, str]] = None
 
     # -- name recovery -----------------------------------------------------
@@ -669,6 +924,21 @@ class AssetRoot:
     #: first pass and holds only 10,126 — kept as a fallback for the case where
     #: `out/` has not been bootstrapped, never preferred over the newer pair.
     NAME_TABLES = ("out/wdf/c3_names.json", "out/wdf/data_names.json")
+
+    #: Hashes where two recovery runs produced DIFFERENT names, written by
+    #: `tools/wdf_merge_names.py`. One hash is one archive entry, so both
+    #: cannot be right; the merge keeps the committed name and records the
+    #: loser here rather than discarding it.
+    #:
+    #: **A resolved conflict that forgets it happened is the failure this
+    #: avoids.** The recovery verifies an enumerated name only by checking the
+    #: payload's magic against the claimed extension, and against ~1,534
+    #: expected spurious hash hits that dropped 7 -- a collision onto a
+    #: same-extension neighbour is invisible to it. So a name being contested
+    #: is real information about how much to trust it, and the only place it
+    #: survives.
+    CONTESTED_TABLES = ("out/wdf/c3_contested_names.json",
+                        "out/wdf/data_contested_names.json")
     NAME_TABLE_FALLBACK = "out/dll/wdf_name_recovery.json"
 
     @staticmethod
@@ -687,7 +957,17 @@ class AssetRoot:
 
         Relative paths go through ``coroot.find_derived``, so a linked git
         worktree reads the primary checkout's tables instead of silently
-        seeing none."""
+        seeing none.
+
+        **Skipped when no WDF archive is open**, because the tables exist to
+        put names back on WDF entries, which are keyed by ``tq_hash(name)``
+        alone. A DatPkg index stores plaintext paths, so there is nothing to
+        recover: a 7878 root used to build 24,426 hash->name entries it could
+        never consult. The condition is *no WDF present*, **not** *is this a
+        DatPkg root* -- `Zephyr-1057-local` is both at once, and its five
+        `garments*.wdf` need the tables exactly as any official client does.
+        An explicit ``path`` still loads unconditionally, so a caller that
+        knows what it wants is never second-guessed."""
         base = Path(__file__).resolve().parent.parent
 
         def resolve(x) -> Path:
@@ -699,6 +979,10 @@ class AssetRoot:
         if path is not None:
             self._names = self._read_name_table(resolve(path))
             return len(self._names)
+
+        if not any(n.lower().endswith(".wdf") for n in self._archives):
+            self._names = {}
+            return 0
 
         merged: dict[int, str] = {}
         for rel in self.NAME_TABLES:
@@ -712,6 +996,32 @@ class AssetRoot:
         self._names = merged
         return len(self._names)
 
+    def contested_names(self) -> dict:
+        """`{hash: {kept, kept_from, rejected, rejected_from}}`, or `{}`.
+
+        Resolved through `coroot.find_derived` for the same reason
+        `load_names` is: a linked worktree must read the primary checkout's
+        derived tree, and reading `./out/wdf` from a worktree finds nothing
+        and reports "no disagreements" -- which is the wrong answer in the
+        one direction that matters.
+
+        Empty is a real answer here and means "the tables were installed by a
+        merge that found no conflict, or by a plain run that never looked".
+        It does NOT mean the names are certain.
+        """
+        base = Path(__file__).resolve().parent.parent
+        out: dict = {}
+        for rel in self.CONTESTED_TABLES:
+            p = coroot.find_derived(rel) or (base / rel)
+            try:
+                if p and Path(p).is_file():
+                    doc = json.loads(Path(p).read_text("utf-8"))
+                    if isinstance(doc, dict):
+                        out.update({int(k, 16): v for k, v in doc.items()})
+            except (OSError, ValueError):
+                continue
+        return out
+
     def name_for(self, name_hash: int) -> Optional[str]:
         if self._names is None:
             try:
@@ -723,7 +1033,21 @@ class AssetRoot:
     # -- lookup ------------------------------------------------------------
     def locate(self, logical: str) -> Optional[Located]:
         """Resolve a logical path (e.g. "c3/texture/001130200.dds") the way the
-        client does: overlay, then loose file, then archives."""
+        client does: overlay, then loose file, then archives.
+
+        A non-string `logical` is refused by name rather than left to fail on
+        the next attribute access. `None` reaches here whenever a caller's own
+        lookup missed -- an appearance id that this client does not ship, most
+        often -- and the bare `.replace` turned that into
+        `AttributeError: 'NoneType' object has no attribute 'replace'` four
+        frames below the caller, which reads as a fault in the asset layer
+        instead of a miss upstream. Loud, with the fix in the message.
+        """
+        if not isinstance(logical, str):
+            raise TypeError(
+                f"locate() wants a logical path string, got {type(logical).__name__}"
+                f" ({logical!r}). A None here usually means the caller's own "
+                f"lookup missed -- check that before looking at the asset layer.")
         logical = logical.replace("\\", "/").lstrip("/")
         # Both joins are confined. `logical` reaches here from HTTP query
         # strings (`/api/mesh`, `/api/texture`, `/api/rawinfo`), so a bare
@@ -739,7 +1063,11 @@ class AssetRoot:
             return Located(logical, "loose", p, p.stat().st_size)
         h = tq_hash(logical)
         for aname, arc in self._archives.items():
-            e = arc.get(h)
+            # A container that stores plaintext paths is asked for the name
+            # itself. That is EXACT, where the hash path is only as good as
+            # the recovered name tables -- and it needs no tables at all.
+            by_name = getattr(arc, "get_by_name", None)
+            e = by_name(logical) if by_name is not None else arc.get(h)
             if e:
                 return Located(logical, aname, None, e.size)
         return None
@@ -750,7 +1078,13 @@ class AssetRoot:
             raise FileNotFoundError(logical)
         if loc.real_path:
             return loc.real_path.read_bytes()
-        return self._archives[loc.source].read_by_hash(tq_hash(loc.logical))
+        arc = self._archives[loc.source]
+        by_name = getattr(arc, "get_by_name", None)
+        if by_name is not None:
+            e = by_name(loc.logical)
+            if e is not None:
+                return arc.read_entry(e)
+        return arc.read_by_hash(tq_hash(loc.logical))
 
     def exists(self, logical: str) -> bool:
         return self.locate(logical) is not None
@@ -770,10 +1104,18 @@ class AssetRoot:
                 continue
             p = self.root / rel.replace("/", "\\")
             if p.is_file() and rel not in {t.path.name for t in out.values()}:
+                # NARROWED from `except Exception: pass` (2026-08-10), for the
+                # same reason as `PartIni.__init__`: this one sits one layer
+                # up and would have re-hidden anything the narrowing there
+                # let through. A table that is declared in the config and
+                # present on disk but unreadable is dropped from the mapping
+                # with no key, so a caller sees "this install has no armour
+                # table" -- the shape `dbc.weaponmotion_join` was changed to
+                # refuse rather than return empty.
                 try:
                     out[part] = PartIni(p)
-                except Exception:
-                    pass
+                except (ValueError, struct.error, OSError):
+                    continue
         return out
 
     # -- ID -> file --------------------------------------------------------

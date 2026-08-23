@@ -50,7 +50,14 @@ from coassets import DEFAULT_ROOT, AssetRoot              # noqa: E402
 
 Mat4 = tuple
 
-#: The action group that carries the always-on effect (`docs/effects.md` 2.1).
+#: The action group that carries the always-on effect (`docs/effects.md` 2.1),
+#: **in CCO's three-wide spelling**.
+#:
+#: Kept because something has to name the group, but **do not compare against
+#: it**: the official clients write the action field four wide and spell this
+#: group `9999`, so a literal comparison matched nothing on 5517 or 6090 for
+#: as long as this file existed. Ask `effects.is_always_on(action)` or
+#: `EffectDB.always_on_effect()`, which are width-agnostic. CORRECTIONS C35.
 AURA_ACTION = "999"
 
 #: Slot -> the `[Dumy]` socket its effect anchors to.  Same table the weapon
@@ -124,26 +131,45 @@ class SuperFxDB:
 
     # -- resolution --------------------------------------------------------
     def effect_name(self, appearance: str, *, shape: str = "999") -> str:
-        """`Action3DEffect[<shape>.999.<type>.<sub>]`, wildcards honoured.
+        r"""`Action3DEffect[<shape>.<always-on>.<type>.<sub>]`, then a fallback.
 
         VERIFIED table, INFERRED matcher (`docs/effects.md` 2.4): the row with
         the most non-wildcard fields wins.
+
+        **CORRECTED 2026-08-09 -- this used to spell the always-on action
+        `"999"` itself, and that is CCO's spelling only.** The comment that
+        stood here claimed *"6090 ships ZERO action-999 rows"* and concluded
+        that 6090 declares an aura by naming an effect after the appearance
+        id. Both halves were wrong, and the second was invented to explain the
+        first. MEASURED on the raw ini of all three installs:
+
+            CCO    826 always-on rows, keyed 999.999.410.009=410009
+            5517   972 always-on rows, keyed 999.9999.410.009=410009
+            6090  2604 always-on rows, keyed 999.9999.410.009=410009
+
+        The rows were always there; the four-wide action field meant this
+        lookup asked for action 999 and the table answered, correctly, that it
+        has none. `EffectDB.always_on_effect` asks the width-agnostic question
+        so no caller carries the sentinel again. CORRECTIONS C35.
         """
-        name = self.fx.lookup_action_effect(appearance, AURA_ACTION, shape=shape)
+        name = self.fx.always_on_effect(appearance, shape=shape)
         if name and name.lower() != "none":
             return name
-        # 6090 dropped the indirection. CCO ships 826 always-on rows of the
-        # form `999.999.410.009=410009` -- the effect is named after the
-        # appearance id, and the row exists only to say so. 6090 ships ZERO
-        # action-999 rows and instead defines the effect directly:
-        # `3DEffect.ini [410199]` is Rainbow Blade Super's aura, and no such
-        # section exists for 410195 or 410196. So the aura is declared by the
-        # existence of an effect bearing the appearance's own id.
+        # The fallback: an effect whose NAME is the appearance id is taken as
+        # its own declaration. This is ours, not the client's -- it was
+        # written to cover the table lookup that was silently returning
+        # nothing, and on both official clients it was supplying every aura
+        # the app drew (373 of them). It is kept because it costs nothing and
+        # covers a client that really does ship no rows, but it is now the
+        # second answer rather than the only one.
         #
-        # VERIFIED both ways on the 6090 base: 410009, 410099 and 410199 all
-        # resolve (every one a Super, ...9), and the Normal and Refined ids of
-        # the same family resolve to nothing. The author confirms a Super Rainbow
-        # Blade glows in the real client, which is what sent us looking.
+        # It was also WRONG on 35 of those 373, and that is the measurement
+        # that decided this: where the table and this guess disagree, all
+        # three clients' tables agree with each other and against the guess
+        # (35 of 35 -- e.g. 430009's aura is effect `430029`, not `430009`).
+        # CCO's table has never been broken, so on CCO the table answer has
+        # been the drawn answer all along; adopting it on the official clients
+        # makes them agree with a base where it is already proven.
         ident = (appearance or "").strip()
         if ident and self.fx.resolve(ident) is not None:
             return ident
@@ -217,8 +243,7 @@ class SuperFxDB:
         graphic.dll `0x2607E`).
         """
         for c in effect_mesh.bind_chunks():
-            q = copy.deepcopy(c.phy)
-            c3phy.apply_matrix_to(q)
+            q = c3phy.apply_matrix_copy(c.phy)
             for v in q.vertices:
                 yield attach.transform_vertex(v, c.motion, anchor, frame)
 
@@ -243,8 +268,7 @@ def _bbox(part: attach.PartMesh, world: Mat4 = attach.IDENTITY,
     for c in part.bind_chunks():
         if attach.is_socket_name(c.name):
             continue
-        q = copy.deepcopy(c.phy)
-        c3phy.apply_matrix_to(q)
+        q = c3phy.apply_matrix_copy(c.phy)
         for v in q.vertices:
             p = attach.transform_vertex(v, c.motion if use_motion else None,
                                         world, frame)
@@ -387,7 +411,7 @@ def cmd_families(db: SuperFxDB) -> None:
     fams: dict[str, dict] = {}
     weapons = set(db.fx.weapon_appearances)
     for r in db.fx.action_rules:
-        if r.action != AURA_ACTION or not r.effect or r.effect == "none":
+        if not fx.is_always_on(r.action) or not r.effect or r.effect == "none":
             continue
         d = db.fx.resolve(r.effect)
         if d is None:
@@ -430,11 +454,14 @@ def validate(db: SuperFxDB, limit: Optional[int] = None) -> int:
     print("=" * 78)
     print("1. which equipment carries an always-on (super) effect")
     print("=" * 78)
-    rows = [r for r in db.fx.action_rules
-            if r.action == AURA_ACTION and r.effect and r.effect != "none"]
+    rows = [r for r in db.fx.always_on_rules()
+            if r.effect and r.effect != "none"]
     apps = {r.appearance for r in rows}
     inw = {a for a in apps if a in weapons}
-    print("  Action3DEffect rows with action 999 and a real effect : %d" % len(rows))
+    widths = sorted({len(r.action) for r in db.fx.always_on_rules()})
+    print("  always-on action field written %s wide in this base"
+          % (" and ".join(str(w) for w in widths) or "-"))
+    print("  Action3DEffect always-on rows with a real effect      : %d" % len(rows))
     print("  distinct appearances                                   : %d" % len(apps))
     print("  ... that are literal weapon.ini sections               : %d" % len(inw))
     print("  ... that are not (garment / cosmetic auras)            : %d"

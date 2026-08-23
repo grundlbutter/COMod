@@ -11,7 +11,7 @@
 <header>
   <h1>CO Asset Viewer</h1>
   <label id="path-label" class="hidden"
-         title="What to browse — an installed client, or a server in your COmmunity Library. The parser plugin follows the path, so tables, id conventions and linkages all change with it. Each keeps its own derived indexes.">
+         title="What to browse — an installed client, or a private server's own client. The parser plugin follows the path, so tables, id conventions and linkages all change with it. Each keeps its own derived indexes.">
     Path
     <select id="path-select"></select>
   </label>
@@ -26,7 +26,7 @@
   <button id="btn-health" class="ghost"
           title="Where the game install was found, what is installed, and the state of the thumbnail cache">Health &amp; thumbnails</button>
   <button id="btn-library" class="ghost"
-          title="Choose the COmmunity Library folder — the imported community-server assets this viewer can browse.">Asset library</button>
+          title="Choose the COmmunity Library folder — where this tool stores private-server clients it has imported, so they can be browsed here.">Asset library</button>
   <button id="btn-mods" class="ghost">Mod staging</button>
 </header>
 
@@ -42,6 +42,16 @@
     </div>
 
     <div id="pane-category" class="pane">
+      <!-- Animations cannot be previewed here — only the character builder and
+           the model view bind a motion over a mesh and play it — so the motion
+           buckets are noise in this mode. Off by default: this tool's job is
+           "every asset the client can see", and nothing may vanish from it
+           without being asked for and without saying so. #motion-note is the
+           "saying so", and the server recomputes every count to match. -->
+      <label class="chk" id="motion-label"
+             title="Hide the entries the taxonomy files under ‘motion’ — the per-body-type motion sets under c3/0001…3004, which ini/3dmotion.dbc names and which carry no geometry. They cannot be previewed in the Asset Viewer; the character builder and the model view play them. Counts update to match.">
+        <input type="checkbox" id="chk-hide-motion"> hide animation assets</label>
+      <div id="motion-note" class="filter-note hidden"></div>
       <div id="cat-tree" class="list"></div>
       <div id="cat-controls" class="hidden">
         <div id="cat-crumbs" class="small mut"></div>
@@ -99,12 +109,12 @@
         </select>
       </label>
       <label id="origin-label" class="hidden"
-             title="Where this server's bytes come from: files unique to the server (library) or files shared with the baseline install.">
+             title="Where this client's bytes come from: files unique to this client, or files it shares byte-for-byte with the baseline install.">
         Origin
         <select id="source-select">
           <option value="" selected>everything</option>
-          <option value="library">this server only (library)</option>
-          <option value="baseline">shared with baseline</option>
+          <option value="library">this client only</option>
+          <option value="baseline">shared with the baseline</option>
         </select>
       </label>
       <input id="file-search" type="search" placeholder="filter path…">
@@ -293,10 +303,13 @@
       <button id="libdrawer-close" class="ghost">close</button>
     </div>
     <p class="mut small">
-      A <b>COmmunity Library</b> is a folder holding assets imported from other
-      Conquer clients — one <code>servers/&lt;name&gt;/</code> profile per
-      server. Pick one here and its servers appear in the <b>Server</b> menu at
-      the top left. Your game install in Program Files is never modified.
+      A <b>COmmunity Library</b> is a folder where this tool <em>stores</em>
+      clients it has imported — one <code>servers/&lt;name&gt;/</code> profile
+      per private server, each one that server's own game install. Pick a
+      folder here and those clients appear under <b>Private server clients</b>
+      in the path menu at the top left, alongside your installed clients —
+      they are clients, not "libraries"; the library is only where their bytes
+      are kept. Your game install in Program Files is never modified.
     </p>
     <div id="lib-current" class="small"></div>
     <div id="lib-found"></div>

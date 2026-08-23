@@ -101,23 +101,25 @@
 
   // ------------------------------------------------------------ thumbnails
   //
-  // With a community server selected, generation targets that library's own
-  // cache (out/thumbs/servers/<name>/) -- a much simpler card, because the
-  // install-corpus estimates do not apply to an arbitrary library.
+  // With a private server's client selected, generation targets that
+  // server's own cache (out/thumbs/servers/<name>/) -- a much simpler card,
+  // because the install-corpus estimates do not apply to an arbitrary client.
+  // "library" is where we store the imported bytes; the thing on screen is a
+  // game client, and saying "library" described our storage instead.
   function serverThumbPrompt(rep) {
     const th = rep.thumbnails || {};
     const box = mk('div');
     box.appendChild(mk('h3', null,
-      `Thumbnails — “${rep.activeServer}” library`));
+      `Thumbnails — “${rep.activeServer}” client`));
     if (th.status === 'generated') {
       box.appendChild(mk('p', null,
-        `This library's cache holds ${(th.meshes || 0).toLocaleString()} ` +
+        `This client's cache holds ${(th.meshes || 0).toLocaleString()} ` +
         `mesh and ${(th.textures || 0).toLocaleString()} texture ` +
         `thumbnails. Re-running only renders what changed.`));
     } else {
       box.appendChild(mk('p', null,
-        'No thumbnails have been generated for this library yet. ' +
-        'Generation renders the library’s own meshes and textures ' +
+        'No thumbnails have been generated for this client yet. ' +
+        'Generation renders this client’s own meshes and textures ' +
         '(paired through the server’s tables and conventions) into ' +
         'its own cache — the base install’s thumbnails are ' +
         'never reused for it, because the same path can be different art.'));
@@ -232,7 +234,7 @@
     const box = mk('div');
     const p = run.progress || {};
     box.appendChild(mk('h3', null, run.server
-      ? `Generating thumbnails — “${run.server}” library`
+      ? `Generating thumbnails — “${run.server}” client`
       : 'Generating thumbnails'));
     const frac = p.total ? p.done / p.total : 0;
     const track = mk('div', 'progress-track');
@@ -274,6 +276,112 @@
     await refresh();
   }
 
+  // ------------------------------------------------------------ asset index
+  //
+  // The mesh<->texture index (out/indexes/<base>/meshtex/coverage.json). Same
+  // shape as the thumbnail card above, deliberately: it is the same kind of
+  // thing -- a one-off derived build, offered rather than imposed, run in a
+  // separate process, polled, cancellable.
+  //
+  // The difference worth showing is that this one has a LIVE fallback. The
+  // viewer will build the relation in memory when a page asks for it, so the
+  // catalogue is never wrong without it -- it is only slower, and only until
+  // the build lands. So this card says two things at once: what is happening
+  // right now, and how to stop it happening every time.
+  function progressBar(p) {
+    const frac = p && p.total ? p.done / p.total : 0;
+    const track = mk('div', 'progress-track');
+    const fill = mk('div', 'progress-fill');
+    fill.style.width = (frac * 100).toFixed(1) + '%';
+    track.appendChild(fill);
+    return track;
+  }
+
+  function indexCard(rep) {
+    const idx = rep.unifiedIndex || {};
+    const run = rep.indexRun || {};
+    const live = idx.state === 'building';
+    if (!rep.indexOffer && !live && !run.running) return null;
+
+    const box = mk('div');
+    box.appendChild(mk('h3', null, 'Asset index'));
+
+    if (live) {
+      const p = idx.progress || {};
+      box.appendChild(mk('p', null,
+        'The mesh↔texture relation for this client is being built right now, ' +
+        'in memory, because there is no saved index for it. The viewer stays ' +
+        'usable while it runs — asset lists just show one row per file ' +
+        'instead of folding a mesh and its skins into one row.'));
+      box.appendChild(progressBar(p));
+      box.appendChild(mk('div', 'mut small',
+        (p.total
+          ? `${p.done.toLocaleString()} / ${p.total.toLocaleString()} meshes`
+          : 'starting…') +
+        `  ·  ${idx.elapsedSeconds} s elapsed`));
+    }
+
+    if (run.running) {
+      const p = run.progress || {};
+      box.appendChild(mk('p', null, 'Building the saved index…'));
+      // Only draw a bar when there is something to put in it. A bar stuck at
+      // zero for a minute says "hung"; the builder's own last line says what
+      // it is doing.
+      if (p.total) box.appendChild(progressBar(p));
+      box.appendChild(mk('div', 'mut small',
+        (p.total
+          ? `scanning ${p.done.toLocaleString()} / ${p.total.toLocaleString()}`
+          : (run.phase || 'starting…')) +
+        `  ·  running for ${run.elapsedSeconds} s. You can close this panel — ` +
+        'the job keeps going. Reload the page when it finishes.'));
+      if ((run.tail || []).length) {
+        box.appendChild(mk('pre', 'setup-pre', run.tail.join('\n')));
+      }
+      const actions = mk('div', 'setup-actions');
+      const stop = mk('button', 'primary secondary', 'Stop');
+      stop.addEventListener('click', async () => {
+        await jpost('/api/index/cancel', {}); refresh();
+      });
+      const hide = mk('button', 'primary secondary', 'Close (keeps running)');
+      hide.addEventListener('click', close);
+      actions.appendChild(stop); actions.appendChild(hide);
+      box.appendChild(actions);
+      return box;
+    }
+
+    if (rep.indexOffer) {
+      box.appendChild(mk('p', null,
+        `This client (${idx.baseId || rep.baseId || 'this base'}) has no ` +
+        'saved mesh↔texture index, so the viewer rebuilds it in memory every ' +
+        'time the client is opened. Building it once writes it to disk and ' +
+        'the next open is near-instant instead.'));
+      box.appendChild(mk('p', 'mut small',
+        'One process, a minute or so, a few tens of MB. Nothing starts ' +
+        'without you asking, and declining costs only the wait — the ' +
+        'catalogue is complete either way. Cancelling part-way leaves the ' +
+        'container scan behind, so a second attempt is quicker; unlike ' +
+        'thumbnails it is not resumable image by image.'));
+      const actions = mk('div', 'setup-actions');
+      const go = mk('button', 'primary', 'Build the index');
+      go.addEventListener('click', async () => {
+        await jpost('/api/index/start', {}); await refresh();
+      });
+      actions.appendChild(go);
+      box.appendChild(actions);
+      const cmd = ((rep.derived || {}).artefacts || [])
+        .find(a => a.path === 'out/meshtex/coverage.json');
+      if (cmd) box.appendChild(mk('p', 'mut small', 'CLI: ' + cmd.command));
+    }
+    if (run.returncode !== null && run.returncode !== undefined) {
+      box.appendChild(mk('p', 'mut small',
+        run.cancelled
+          ? 'The last index build was stopped.'
+          : `Last index build finished with exit code ${run.returncode}. ` +
+            'Reload the page to use it.'));
+    }
+    return box;
+  }
+
   // ------------------------------------------------------------- rendering
   function render(rep) {
     lastReport = rep;
@@ -298,13 +406,15 @@
       }
     }
 
+    // Before thumbnails: this is the one that is costing time *right now*.
+    const ic = indexCard(rep);
+    if (ic) card.appendChild(ic);
+
     const run = rep.thumbnailRun || {};
     const th = rep.thumbnails || {};
     if (run.running) {
       card.appendChild(thumbRunning(run));
-      if (!poll) poll = setInterval(refresh, 1500);
     } else {
-      if (poll) { clearInterval(poll); poll = null; }
       if (rep.activeServer || th.status === 'none'
           || th.status === 'meshes-only') {
         card.appendChild(thumbPrompt(rep));
@@ -323,6 +433,15 @@
                         : `Last run finished with exit code ${run.returncode}.`));
       }
     }
+
+    // ONE place decides whether to keep polling, and it asks about every job
+    // on the card. Two independent decisions is how the index poll came to be
+    // cancelled by the thumbnail branch it knew nothing about.
+    const busy = (rep.thumbnailRun || {}).running ||
+                 (rep.indexRun || {}).running ||
+                 (rep.unifiedIndex || {}).state === 'building';
+    if (busy && !poll) poll = setInterval(refresh, 1500);
+    if (!busy && poll) { clearInterval(poll); poll = null; }
 
     const foot = mk('div', 'setup-actions');
     const done = mk('button', 'primary', 'Close');

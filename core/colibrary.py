@@ -51,8 +51,18 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import safepath
 from coassets import AssetRoot, Located, PartIni, parse_ini
 from tqhash import tq_hash
+
+
+class GameMapUnreadable(Exception):
+    """``ini/GameMap.dat`` is present and does not parse.
+
+    Distinct from "this server ships no map registry", which is an ordinary
+    empty result. Conflating the two is what made the old inline parser
+    silent: a drifted table and an absent one were both ``[]``.
+    """
 
 
 def list_servers(library: Path | str) -> list[str]:
@@ -228,6 +238,28 @@ class ServerView(AssetRoot):
     def _norm(logical: str) -> str:
         return logical.replace("\\", "/").lstrip("/").lower()
 
+    def _library_path(self, rel: str) -> Path:
+        r"""``self.library / rel``, confined -- or ``UnsafePath``.
+
+        **The VALUE side of a filemap entry is as untrusted as the key side.**
+        `3629237` confined the keys, because ``materialize_maproot`` writes
+        them; but ``["l", "../../../Users/Public/creds.txt"]`` is the same
+        third-party JSON steering a *read*, and every "l" lookup below joined
+        it onto the library with a bare ``/``. On Windows an absolute value
+        (``["l", "C:\Windows\win.ini"]``) discards the library entirely.
+
+        Traced: `locate`/`read` returned the foreign bytes, and
+        ``materialize_maproot`` then wrote them into the materialised tree at
+        the confined *destination* -- so the write guard held and the file was
+        still not the library's. Reported ``failed: 0``, i.e. a clean run.
+
+        MEASURED before landing, on the real `COmmunity Library`: **108,297
+        "l" entries across `zephyr` and `collection`, 0 refused** -- the guard
+        cannot reject legitimate content, only the shape no writer produces.
+        `tests/test_colibrary_source.py` carries the mutant control.
+        """
+        return safepath.confine(self.library, rel)
+
     # -- resolution --------------------------------------------------------
 
     def locate(self, logical: str) -> Optional[Located]:
@@ -236,13 +268,13 @@ class ServerView(AssetRoot):
         if ref is None:
             # not something the client shipped: try the library tree (covers
             # probing with un-normalised IDs) and then the baseline.
-            p = self.library / "assets" / key
+            p = self._library_path("assets/" + key)
             if p.is_file():
                 return Located(key, "library", p, p.stat().st_size)
             return super().locate(logical)
         kind = ref[0]
         if kind == "l":
-            p = self.library / ref[1]
+            p = self._library_path(ref[1])
             if p.is_file():
                 return Located(key, "library", p, p.stat().st_size)
             return None                              # library tree incomplete
@@ -267,13 +299,13 @@ class ServerView(AssetRoot):
         key = self._norm(logical)
         ref = self.filemap.get(key)
         if ref is None:
-            p = self.library / "assets" / key
+            p = self._library_path("assets/" + key)
             if p.is_file():
                 return p.read_bytes()
             return super().read(logical)
         kind = ref[0]
         if kind == "l":
-            return (self.library / ref[1]).read_bytes()
+            return self._library_path(ref[1]).read_bytes()
         if kind in ("b", "e"):
             return super().read(ref[1])
         if kind == "w":
@@ -289,6 +321,15 @@ class ServerView(AssetRoot):
         names whose table actually exists.  A table the client resolves by
         convention instead of a file (old-engine body armour) is simply
         absent, exactly as it is absent from the client's own disk.
+
+        `MeshIni<i>` is a path out of **the library's own ini snapshot**, so it
+        is third-party text and is confined against `tables_dir` for the same
+        reason the filemap's values are (see `_library_path`). A refused row is
+        DROPPED, and the cost is named rather than hidden: it is
+        indistinguishable here from a table the client does not ship -- which is
+        already this method's contract for a row that does not resolve, and one
+        poisoned row must not cost the other seven. MEASURED: 16 real
+        `MeshIni`/`MotionIni` values on `zephyr`, 0 refused.
         """
         rp = self.tables_dir / "ini" / "RolePart.ini"
         if not rp.is_file():
@@ -302,7 +343,10 @@ class ServerView(AssetRoot):
             rel = conf.get(f"MeshIni{i}")
             if not part or not rel:
                 continue
-            p = self.tables_dir / Path(rel.replace("\\", "/"))
+            try:
+                p = safepath.confine(self.tables_dir, rel)
+            except safepath.UnsafePath:
+                continue
             if p.is_file() and rel not in {t.path.name for t in out.values()}:
                 try:
                     out[part] = PartIni(p)
@@ -394,6 +438,45 @@ class ServerView(AssetRoot):
         ships none.  A missing table is created; a table the client does ship
         is only ever *appended to* (below a marker), never rewritten.
         Returns the files written.
+
+        **THE TRAP: after this runs, the library snapshot holds a table the
+        client does not ship.**  A presence check against the snapshot and a
+        presence check against the install are then *different questions*, and
+        the snapshot's answer looks exactly like the install's::
+
+            <library>/servers/zephyr/ini/armor.ini   530,520 B   <- written here
+            <install>/Zephyr-1057-local/ini/armor.ini            -> ENOENT
+
+        Someone asking "does this client ship an armour table?" against the
+        library gets **yes**, and it is not merely a wrong answer -- it is a
+        confident answer to a question they did not ask.
+
+        Two independent tells, either sufficient:
+
+        * **The header.**  Every file this writes opens with
+          ``; SYNTHESISED by core/colibrary.py``, and the mount path uses the
+          ``; SYNTHESISED-MOUNTS`` marker.
+        * **The mtime, which needs no header and survives truncation,
+          concatenation and a copy that drops the first line.**  On Zephyr the
+          shipped ``weapon.ini`` carries **Dec 2008** and the synthesised
+          ``armor.ini`` carries **this month's** date.  A part table with a
+          date from this year is derived; TQ has not re-authored these since
+          2015 and the plaintext ones since 2009.
+
+        The cheap habit that covers both: **name the view you measured.**
+        Install, library snapshot and ``ini/c3.wdb`` are three different
+        questions about the same client -- and ``c3.wdb`` additionally answers
+        ids it was never asked about, so a lookup succeeding there is not
+        evidence the id is real.
+
+        What this synthesises **from** is a directory convention
+        (``synthesize_body_table`` above), and on Zephyr that convention does
+        **not** cover the armour id space -- 9.2% of 6090's ``armor.dbc``
+        series appear as ``<look>`` directories against a 3.5% random control
+        and 46.0% for *weapons*.  So the output is a usable approximation, not
+        a recovered table, and it is not evidence about how the client resolves
+        armour.  `docs/CORRECTIONS.md`
+        `C-2026-08-09-claude-elastic-elion-0da45c`.
         """
         wrote = []
         armor = self.tables_dir / "ini" / "armor.ini"
@@ -426,43 +509,46 @@ class ServerView(AssetRoot):
     def parse_gamemap_dat(self) -> list[dict]:
         r"""The old client's binary map registry, as GameMap.json-shaped rows.
 
-        ``ini/GameMap.dat`` layout (VERIFIED against the Zephyr snapshot --
-        337 rows parse to exactly EOF):
+        **Parsing is `dmap.read_gamemap_dat`'s job, not this method's.** This
+        file used to carry its own copy of the layout, and the copy was the
+        silent one: it raised on an EOF mismatch under the comment *"a layout
+        drift would silently mis-scope every later row"* and then caught its
+        own ``ValueError`` two lines below, returning ``[]``. The COre reader
+        makes the same check and returns ``None``, and it is tested for it
+        (`tests/test_client.py::GameMapDatTest`, truncation and trailing
+        garbage on synthetic bytes). So the loud copy was the tested one and
+        the silent copy was not, for byte-identical input.
 
-            u32 rowCount
-            per row: u32 documentId, u32 pathLen, char path[pathLen],
-                     u32 puzzleGridSize
+        `dmap.read_gamemap_dat`'s own docstring is explicit that it lives in
+        COre because *"both readers of the map index need it and neither can
+        import the other"*. This was a third reader that did not ask.
 
-        Paths name the shipped ``.7z``; the materialized tree stores the
-        decompressed ``.DMap``, so the suffix is rewritten to match.
+        The one thing genuinely local: paths name the shipped ``.7z`` and the
+        materialized tree stores the decompressed ``.DMap``, so the suffix is
+        rewritten here. That is a property of *this destination*, not of the
+        format, which is why it does not belong in the COre reader.
+
+        Raises `GameMapUnreadable` when the table is present but does not
+        parse -- a distinction the caller needs and could not previously make,
+        since "no file", "empty table" and "layout drift" were all ``[]``.
         """
-        import struct
+        import dmap
         p = self.tables_dir / "ini" / "GameMap.dat"
         if not p.is_file():
             return []
-        d = p.read_bytes()
-        try:
-            (count,) = struct.unpack_from("<I", d, 0)
-            off = 4
-            rows = []
-            for _ in range(count):
-                doc_id, plen = struct.unpack_from("<II", d, off)
-                off += 8
-                path = d[off:off + plen].decode("latin-1")
-                off += plen
-                (grid,) = struct.unpack_from("<I", d, off)
-                off += 4
-                fn = path.replace("\\", "/")
-                if fn.lower().endswith(".7z"):
-                    fn = fn[:-3] + ".DMap"
-                rows.append({"DocumentId": doc_id, "FileName": fn,
-                             "PuzzleGridSize": grid})
-            if off != len(d):
-                # a layout drift would silently mis-scope every later row
-                raise ValueError(f"{off} != {len(d)} bytes consumed")
-            return rows
-        except (struct.error, ValueError):
-            return []
+        rows = dmap.read_gamemap_dat(p)
+        if rows is None:
+            raise GameMapUnreadable(
+                f"{p} is present but does not parse as GameMap.dat -- a "
+                f"partial read would mis-scope every later row, so no rows "
+                f"are returned. PuzzleGridSize lives only here, so every map "
+                f"in the materialized tree would read as art-less.")
+        for r in rows:
+            fn = str(r["FileName"]).replace("\\", "/")
+            if fn.lower().endswith(".7z"):
+                fn = fn[:-3] + ".DMap"
+            r["FileName"] = fn
+        return rows
 
     def materialize_maproot(self, dest: Path | str,
                             log=lambda s: None) -> dict:
@@ -479,15 +565,26 @@ class ServerView(AssetRoot):
         import subprocess
         dest = Path(dest)
         stats = {"copied": 0, "extracted": 0, "kept": 0, "failed": 0}
+        # Probing candidates: `continue` on a candidate that will not run is
+        # the RIGHT behaviour here -- this asks "is 7-Zip at this path", and a
+        # no is an answer, not a swallowed error.  Unlike C25 nothing is
+        # inverted by it: `seven is None` is reported per file below, counted
+        # in `stats["failed"]`, and returned to the caller.
+        #
+        # What was missing is that `timeout=` raises `TimeoutExpired`, which is
+        # NOT an OSError -- so a hung candidate took the whole materialise down
+        # instead of moving to the next one.
         seven = None
         for cand in (r"C:\Program Files\7-Zip\7z.exe",
                      r"C:\Program Files (x86)\7-Zip\7z.exe", "7z"):
+            if Path(cand).is_absolute() and not Path(cand).is_file():
+                continue                      # cheaper than spawning to find out
             try:
                 subprocess.run([cand], capture_output=True, timeout=10)
-                seven = cand
-                break
-            except OSError:
+            except (OSError, subprocess.SubprocessError):
                 continue
+            seven = cand
+            break
         for logical in self.filemap:
             # map data plus the ani/ placement scripts (MapScene.ani and kin)
             # that scene rendering parses from disk.
@@ -495,8 +592,21 @@ class ServerView(AssetRoot):
                     or (logical.startswith("ani/")
                         and logical.endswith(".ani"))):
                 continue
-            out = dest / Path(*[p for p in logical.split("/")
-                                if p not in ("", ".", "..")])
+            # The key comes from a third-party COmmunity Library's
+            # filemap.json (see the module docstring) -- untrusted. The old
+            # `dest / Path(*split("/"))` filtered `..` only between forward
+            # slashes, so a Windows backslash (`map/..\..\evil`) or a drive
+            # letter (`C:\Windows\...`) re-parsed past the filter and wrote
+            # anywhere on disk, at BOTH sinks below (write_bytes and the 7z
+            # -o target). `safepath.confine` resolves before the containment
+            # test, so it catches every one -- the single sink in this repo
+            # that was not already using it.
+            try:
+                out = safepath.confine(dest, logical)
+            except safepath.UnsafePath as e:
+                stats["failed"] += 1
+                log(f"refused unsafe library path: {e}")
+                continue
             if logical.endswith(".7z"):
                 out = out.with_suffix(".DMap")
             if out.is_file():
@@ -506,6 +616,15 @@ class ServerView(AssetRoot):
                 data = self.read(logical)
             except (FileNotFoundError, KeyError):
                 stats["failed"] += 1
+                continue
+            except safepath.UnsafePath as e:
+                # The entry's VALUE pointed outside the library (`_library_path`).
+                # Counted and logged like any other refusal rather than allowed
+                # to abort the run: one poisoned entry must not cost the other
+                # 108,296, and a refusal that kills the import would push users
+                # back to the unguarded path.
+                stats["failed"] += 1
+                log(f"refused unsafe library source: {e}")
                 continue
             out.parent.mkdir(parents=True, exist_ok=True)
             if logical.endswith(".7z"):
@@ -537,15 +656,345 @@ class ServerView(AssetRoot):
         # only exists here, so without it every map reads as art-less.
         gm = dest / "ini" / "GameMap.json"
         if not gm.is_file():
-            rows = self.parse_gamemap_dat()
+            # An unreadable table is recorded, not swallowed. It is not fatal
+            # -- the rest of the tree is already written and usable -- but
+            # "every map reads as art-less" must not be indistinguishable
+            # from "this server ships no registry", which is what a bare
+            # `if rows:` gave.
+            try:
+                rows = self.parse_gamemap_dat()
+            except GameMapUnreadable as e:
+                rows = []
+                stats["gamemapError"] = str(e)
+                log(f"GameMap.dat is present but unreadable: {e}")
             if rows:
                 gm.parent.mkdir(parents=True, exist_ok=True)
                 gm.write_text(json.dumps(rows, indent=1), "utf-8")
                 stats["gamemapRows"] = len(rows)
         return stats
 
+    # -- parse profile -------------------------------------------------------
+
+    #: The composed case's pin.  Named once, here, because the reason is long
+    #: and three call sites quote the answer.
+    PINNED_COMPOSED_PROFILE = "plaintext"
+
+    #: Baselines over which `PINNED_COMPOSED_PROFILE` is MEASURED invariant.
+    #: Not a guess and not open-ended -- see `table_profile`.
+    PIN_INVARIANT_OVER = ("patch5165", "patch5517", "patch6090")
+
+    def ships(self, logical: str) -> bool:
+        """Did the CLIENT ship this path -- as opposed to the composed view
+        being able to resolve it?
+
+        The distinction is the whole of the defect this method exists for.
+        `locate`/`read` fall back to the library tree and then the baseline,
+        so *every* probe of the composed view is answered by the baseline
+        when the client is silent.  The filemap is the record of what the
+        client itself carried, written by `tools/assetdiff.py` while it had
+        the client's own tree open, so it is the only thing here that can
+        answer a question *about the client*.
+
+        Deliberately the filemap and NOT the `ini/` snapshot: the snapshot is
+        contaminated.  `write_synthesized_tables` writes a 530 KB `armor.ini`
+        into it for a client that ships none, so snapshot presence proves the
+        library derived a table, not that the client shipped one.  MEASURED
+        on `zephyr` 2026-08-09: `ini/armor.ini` snapshot=True filemap=absent.
+
+        Kind is not consulted, deliberately.  A `"b"`/`"w"`/`"e"` entry means
+        the client shipped that path with bytes the baseline already had --
+        it shipped it.  Only absence from the filemap means it did not.
+        """
+        return self._norm(logical) in self.filemap
+
+    def table_profile(self):
+        r"""The `npcart.Profile` for the CLIENT THIS VIEW SHOWS, or None.
+
+        **THE DEFECT THIS REPLACES.** `__init__` calls `super().__init__(root)`,
+        so a `ServerView` *is* an `AssetRoot` rooted at the **baseline**.  Every
+        parse-profile probe asked of the composed view -- `npcart.detect_profile`
+        on `self.read`, or `plugin_for(self.root)` -- is therefore answered by
+        whichever baseline the user happens to have configured, never by the
+        community client whose assets are on screen.  Register citation:
+        `docs/CORRECTIONS.md` **C-2026-08-09-plugin-c-serverview-profile** --
+        *"a DatPkg `ServerView` takes its parse profile from the BASELINE, not
+        from the client whose assets it shows -- and 25 of 397 NPCs silently
+        lose their art"*.
+
+        **WHAT THIS BUYS, AND -- MORE IMPORTANTLY -- WHAT IT DOES NOT.**
+
+        It makes the answer **STABLE**.  It does **NOT** show that the chosen
+        profile's answers are the CORRECT ones for this client.  Which profile
+        is right for a community client is **UNMEASURED** and is a separate
+        question with a separate owner; nothing below is evidence about it.
+        Read that as written -- the temptation this method sits next to is to
+        conclude that the profile which resolves more rows is the true one, and
+        that inference is refuted, not merely unproven.  See `PIN`, below.
+
+        **MEASURED, on `21f2501`**, `zephyr` over the five official baselines,
+        superseding the register entry's `25 of 400` file-order sample:
+
+            5165/plaintext vs 6090/official, ALL rows :  646 / 2785  =  23.2%
+            the same, per distinct npc_type           :  639 / 2747  =  23.3%
+
+        (Both are right.  Zephyr's `npc.ini` carries 38 duplicated `NpcType`
+        sections, so 2,785 rows collapse to 2,747 types.  Quote the unit.)
+
+        And the register's framing -- *"RESOLVED DIFFERENTLY"*, *"the answer
+        moves"* -- is **REFUTED**.  Over all 105 pairings of 5 baselines x 3
+        profiles the number of NPCs where both sides resolve to a **non-empty
+        but different** mesh/texture is **ZERO**.  Every single difference is
+        one-sided: one side resolves, the other returns `('', '')`.  The answer
+        never moves; it only appears or disappears, and every option is a strict
+        subset of 6090/official.  That nesting is exactly what a larger table
+        answering ids from a foreign id space produces, which is why "6090
+        resolves more" is not evidence that 6090 is right --
+        `docs/handoff_zephyr_planning.md` §3.4 is the same trap caught once
+        already on this client.
+
+        **THE PIN, and why it is the STABLE profile rather than the rich one.**
+
+        Fully-resolved rows, holding each axis fixed (MEASURED, `21f2501`):
+
+            baseline   PROFILE_PLAINTEXT   PROFILE_OFFICIAL   PROFILE_CCO
+            5017            1769                   0                0
+            5065            1769                   0                0
+            5165            1989                   0                0
+            5517            1989                2224                0
+            6090            1989                2628                0
+
+        Pinning `plaintext` is **invariant across 5165 / 5517 / 6090** -- 0
+        differences on every pairing -- because the plaintext lookup layer froze
+        at 5165 and the later clients ship byte-identical copies
+        (`tools/frozentables.py`).  Pinning `official` buys nothing: two
+        baselines that both select `official` still disagree on **404** NPCs
+        (5517 vs 6090).  **Stability is a property of WHICH profile is pinned,
+        not of pinning one.**
+
+        Scope the invariance honestly rather than rounding it up: it does
+        **not** extend to 5017/5065, which differ from 5165 on **220** NPCs
+        under `plaintext`.  Hence `PIN_INVARIANT_OVER`, which names the three
+        it was measured over and no more.
+
+        `official` over 6090 resolves **639 more** distinct npc_types (2628 vs
+        1989; 646 more rows).  Those are NOT taken, and the reason is a control
+        rather than a preference: splitting resolved art by filemap provenance
+        scores 100.0% ("every resolved path is one Zephyr ships"), but the SAME
+        metric scores 99.7% under an id mapping **shuffled wrong by
+        construction** -- so it measures namespace density, not id-space
+        agreement.  The sharpest sub-measure ran backwards (Zephyr-exclusive art
+        663 real vs 939 shuffled).  639 rows that nothing distinguishes from
+        noise are not a benefit to be smuggled in.  This is an instance of
+        `docs/CORRECTIONS.md` **C-2026-08-09-reproduce-not-hold** -- *"a number
+        that REPRODUCES is not a claim that HOLDS"*.
+
+        **THE TRAP THIS MUST NOT FALL INTO.**  Probing the client's own
+        namespace naively reaches `npcart.detect_profile`'s terminal
+        `return PROFILE_CCO` -- Zephyr ships no `npc.json`, no
+        `3DSimpleObj.dbc` and no `3DSimpleObj.ini`.  MEASURED: `PROFILE_CCO`
+        over `zephyr` loads **0 rows and resolves 0 NPCs on every one of the
+        five baselines**.  1,989 resolved NPCs would become 0, silently --
+        `detect_profile`'s own *"a default wearing an identity's label"*,
+        wearing a fix's clothes.  So the composed case below lands somewhere
+        **CHOSEN**, and this method NEVER returns `PROFILE_CCO` by
+        fallthrough: it returns `None` instead, which means "no opinion, the
+        baseline route answers" and is a statement, not a default.
+
+        Returns `None` when the client ships no npc table of its own -- the
+        `collection` server (38 files, `clientVersion: "curated"`) is that
+        case.  Callers then keep exactly today's behaviour.
+        """
+        import npcart                                    # noqa: PLC0415
+        # Probes in `detect_profile`'s order and for its reasons: the compiled
+        # twin wins wherever one exists, because 5517/6090 ship the frozen
+        # plaintext tables too and the third probe would claim them if it ran
+        # first.  Asked of `ships` -- the CLIENT -- not of `read`.
+        if self.ships(npcart.PROFILE_CCO.npc_table):
+            return npcart.PROFILE_CCO
+        if self.ships(npcart.PROFILE_OFFICIAL.simple_obj_table):
+            return npcart.PROFILE_OFFICIAL
+        if (self.ships(npcart.PROFILE_PLAINTEXT.npc_table)
+                and self.ships(npcart.PROFILE_PLAINTEXT.simple_obj_table)):
+            return npcart.PROFILE_PLAINTEXT
+        # THE COMPOSED CASE, and it is the common one rather than an edge:
+        # the client ships the ROW table and NONE of the deciding lookup
+        # tables, so the rows are its own and the lookups are the baseline's
+        # whichever way this goes.  MEASURED on zephyr (162,050 filemap
+        # entries, 548 under ini/): `ini/npc.ini` present; `npc.json`,
+        # `3DSimpleObj.{ini,dbc}`, `3dobj.ini`/`3DObj.dbc`,
+        # `3dtexture.ini`/`3DTexture.dbc` and `3dmotion.{ini,dbc}` ALL absent.
+        # Pinned, not fallen through to.
+        if self.ships(npcart.PROFILE_PLAINTEXT.npc_table):
+            # Resolved by an explicit table rather than by building an
+            # attribute name out of the string: a typo in the pin must fail
+            # here, loudly and saying what it was, not as an `AttributeError`
+            # naming a symbol nobody wrote.
+            by_name = {p.name: p for p in (npcart.PROFILE_PLAINTEXT,
+                                           npcart.PROFILE_OFFICIAL,
+                                           npcart.PROFILE_CCO)}
+            pin = by_name.get(self.PINNED_COMPOSED_PROFILE)
+            if pin is None:                              # pragma: no cover
+                raise ValueError(
+                    f"PINNED_COMPOSED_PROFILE={self.PINNED_COMPOSED_PROFILE!r}"
+                    f" is not one of {sorted(by_name)}")
+            return pin
+        return None
+
+    def _table_origin(self, logical: str) -> str:
+        """Which layer of the composition actually answered ``logical``.
+
+        Three layers can, and which one did is not inferable from the profile
+        name -- see the `npcTableFrom` note in `table_profile_report`.
+        """
+        if self.ships(logical):
+            return "client"
+        try:
+            loc = self.locate(logical)
+        except Exception:                                # pragma: no cover
+            return "unresolved"
+        if loc is None:
+            return "unresolved"
+        if loc.source == "library":
+            return ("library tree (SHARED across servers -- may be another "
+                    "server's file)")
+        return "baseline"
+
+    def table_profile_report(self, resolve: bool = True, tables=None) -> dict:
+        """What answered, in a form a caller can show a user.
+
+        **This is the deliverable, not decoration.**  Pinning removes the
+        variance BY FIAT, which converts a wrong-and-unstable answer into a
+        *narrower* one -- and a silent narrower answer is the single failure
+        shape this project has recorded most often (`WeaponSkillName`'s vacuous
+        zero, the armed-motion fallback that reported success,
+        `detect_profile`'s default wearing an identity's label, `malformed`
+        reading 0 because a garbage offset always finds some NUL).  **A
+        fallback is not a fix unless the miss is audible.**
+
+        So this reports the three things a user needs to tell *"we chose
+        stability"* from *"we chose stability and you can tell"*:
+
+        * `profile` / `how` -- the pin in force, and that it came from the
+          client's own recorded namespace rather than from the baseline;
+        * `baseline` / `baselineKind` -- what the lookup tables were composed
+          over, because they still come from there and that is the honest
+          description of the composition;
+        * `unresolved` -- the count this pin could NOT resolve.
+
+        It also pays forward: when someone settles the id-space question, the
+        artefact already states what it gave up, so the correction lands where
+        the error would be made rather than in a document nobody opens.
+
+        ``resolve=False`` skips building the tables (a parse of the client's
+        npc table plus the baseline's lookups, ~0.21 s on zephyr/6090) and
+        omits the counts.
+
+        **Pass ``tables=`` the `npcart.Tables` you are actually going to use.**
+        Without it this builds a second one, and then the counts describe a
+        parallel object rather than the one answering the user -- which is a
+        small instance of exactly the failure this whole change is about, a
+        report about something other than what answered.
+        """
+        import npcart                                    # noqa: PLC0415
+        prof = self.table_profile()
+        if prof is None:
+            how = ("this client ships no npc table of its own; whatever the "
+                   "composed view resolves answers")
+            pinned = False
+        elif self.ships(prof.simple_obj_table) or self.ships(
+                npcart.PROFILE_CCO.npc_table):
+            how = "declared by the client's own filemap"
+            pinned = False
+        else:
+            how = (f"PINNED to {prof.name}: this client ships only the row "
+                   f"table, so the lookup tables come from the baseline. "
+                   f"Pinned to the profile MEASURED invariant across "
+                   f"{'/'.join(k.replace('patch', '') for k in self.PIN_INVARIANT_OVER)}"
+                   f", not to the one that resolves most")
+            pinned = True
+        kind = ""
+        try:
+            import coroot                                # noqa: PLC0415
+            kind = coroot.kind_for_root(self.root) or ""
+        except Exception:                                # pragma: no cover
+            kind = ""
+        out = {
+            "server": self.server,
+            "profile": prof.name if prof else None,
+            "how": how,
+            "pinned": pinned,
+            "baseline": str(self.root),
+            "baselineKind": kind,
+            "clientVersion": self.profile.get("clientVersion"),
+            # Stability is claimed only over the baselines it was measured
+            # over.  `""` (an undeclared root) is not one of them, and saying
+            # so beats implying a guarantee nobody measured.
+            "stableOverBaseline": bool(pinned
+                                       and kind in self.PIN_INVARIANT_OVER),
+            "invariantOver": list(self.PIN_INVARIANT_OVER),
+            "correction": "C-2026-08-09-plugin-c-serverview-profile",
+            # WHERE THE ROWS ACTUALLY CAME FROM, which is not inferable from
+            # `profile` and is not always what a reader would assume.  MEASURED
+            # 2026-08-09: the `collection` server ships no `ini/npc.ini`, and
+            # the composed read does NOT reach the baseline for it -- it lands
+            # on `<library>/assets/ini/npc.ini`, which is **Zephyr's** file
+            # (byte-identical, sha256 4bc335d0…, 480,386 bytes; the 6090
+            # baseline's own is 6d00f5b3…).  `ServerView.locate`'s library-tree
+            # fallback is keyed on the library, not on the server, so one
+            # server's view can be answered by another server's extracted file.
+            # That is a SEPARATE defect from the one this method fixes and it
+            # is deliberately not fixed here; recording it at the point of use
+            # so the count above is not read as the baseline's answer.
+            "npcTableFrom": self._table_origin(
+                prof.npc_table if prof else npcart.PROFILE_PLAINTEXT.npc_table),
+        }
+        if not resolve:
+            return out
+        try:
+            t = tables if tables is not None else npcart.Tables(self.read, prof)
+            n = res = 0
+            for row in t.npcs:
+                n += 1
+                p = t.plan_for_npc(row)
+                if p.geometry and p.texture:
+                    res += 1
+            out.update(npcs=n, resolved=res, unresolved=n - res)
+        except Exception as e:                           # pragma: no cover
+            out["countsError"] = str(e)
+        return out
+
+    def table_profile_note(self, tables=None) -> str:
+        """One line, in `coviewer`'s established ``parser plugin: <name>
+        (<how>)`` shape, carrying the unresolved count.
+
+        The count of NPCs a pin could not resolve must appear somewhere a user
+        MEETS, not only in a docstring -- that is the whole difference between
+        a named cost and a silent one.
+        """
+        r = self.table_profile_report(tables=tables)
+        head = (f"npc parse profile: {r['profile'] or 'none'} "
+                f"({r['how']}); lookup tables composed over baseline "
+                f"{r['baselineKind'] or r['baseline']}")
+        if r.get("npcTableFrom") and r["npcTableFrom"] != "client":
+            head += f"; npc rows from the {r['npcTableFrom']}"
+        if "unresolved" in r:
+            head += (f" -- {r['resolved']}/{r['npcs']} rows resolve, "
+                     f"{r['unresolved']} do NOT under this pin")
+        if r["pinned"] and not r["stableOverBaseline"]:
+            head += (" [the pin's invariance was measured over "
+                     + "/".join(k.replace("patch", "")
+                                for k in self.PIN_INVARIANT_OVER)
+                     + "; this baseline is not one of them]")
+        return head
+
     def motion_tables(self) -> dict[str, Path]:
-        """part name -> the server's motion table file, where one exists."""
+        """part name -> the server's motion table file, where one exists.
+
+        `MotionIni<i>` is confined against `tables_dir`, same as `MeshIni<i>` in
+        `part_tables` and for the same reason: it is a path read out of a
+        third-party library's ini snapshot, and the bare join let it name any
+        file on the box (`MotionIni0=C:\\Windows\\win.ini`) -- which the caller
+        then opens and parses."""
         rp = self.tables_dir / "ini" / "RolePart.ini"
         if not rp.is_file():
             return {}
@@ -556,7 +1005,10 @@ class ServerView(AssetRoot):
             rel = conf.get(f"MotionIni{i}")
             if not part or not rel:
                 continue
-            p = self.tables_dir / Path(rel.replace("\\", "/"))
+            try:
+                p = safepath.confine(self.tables_dir, rel)
+            except safepath.UnsafePath:
+                continue
             if p.is_file():
                 out[part] = p
         return out

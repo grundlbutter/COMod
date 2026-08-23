@@ -40,7 +40,7 @@ fast = ["numpy>=1.24"]
 
 [tool.setuptools]
 # The set is closed under its own imports: coassets needs coroot, safepath,
-# tqhash, wdf and tqdat; dmap needs coroot; the rest are leaves that import
+# tqhash, wdf, tqdat and dbcshadow; dmap needs coroot; the rest are leaves that import
 # only the standard library. `tools/test_viewer.py::CoreBoundary` enforces that.
 py-modules = [
     "coroot",     # install discovery: --root -> CO_ROOT -> saved config -> autodiscovery
@@ -57,8 +57,35 @@ py-modules = [
     "wdb",        # ini/c3.wdb, the client's BDMG/RSDB resource database
     "dbc",        # the compiled ini/*.dbc tables of official clients
                   #   (RSDB id->path, SIMO simple objects)
-    "npcart",     # npc table -> 3DSimpleObj -> obj/texture tables: where an
+    "dbcshadow",  # the gate: is this ini shadowed by a compiled .dbc twin on
+                  #   THIS base? Resolved per path, per call -- never at import
+    "npcart",   # npc table -> 3DSimpleObj -> obj/texture tables: where an
                   #   NPC's geometry, texture and motion each live
     "tqdat",      # the TQ File Cipher and the encrypted ini/*.dat tables
                   #   (itemtype.dat, Monster.dat)
+    "inidat",     # WHICH cipher an ini/*.dat is under: RSA, TQ stream, the
+                  #   12-byte block cipher (tail only), or destroyed
+    "provenance", # stamp a derived artefact with the install it came from,
+                  #   and refuse one that came from somewhere else
+    "monsterart", # a monster body id -> its geometry directory and skin;
+                  #   colour morphs borrow another family's mesh
+    "dcache",
+    "npcalloc",
+    "verdict",     # cache decoded tables between runs; a cached decode is
+                  #   reported as its own control kind, never as a fresh one
+    "weaponparts",# one weapon's motions, effects and alt skins, per install:
+                  #   a four-status Facet per surface, and a key grammar that
+                  #   is DETECTED because the two installs spell it
+                  #   differently and the wrong one returns a silent zero
+    "weaponswap", # what a donor weapon DISPLACES on a target install, decided
+                  #   on byte-identity of the resolved mesh rather than on
+                  #   table-key equality -- which is silent on 3,762 of the
+                  #   4,146 real overwrites between 6609 and CCO
+    "cosettings", # declared user settings: each one's default, its type, and
+    "swapplan",  # plan a mesh/texture swap: what parts travel, where each
+                 # role is written, and whether it is a per-row SPLIT or a
+                 # cohort-wide OVERWRITE.  Domain logic, not UI: the page
+                 # renders what this decides.
+                  #   what OBSERVABLY changes when it is flipped. Imports only
+                  #   coroot and the stdlib, so COre stays extractable.
 ]

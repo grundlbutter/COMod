@@ -331,6 +331,9 @@ class MapArt:
         self._walk: Optional[tuple[bytes, bytes, object]] = None
         self._tile_rgba: dict[int, Optional[bytes]] = {}
         self._sprite_cache: dict[tuple, tuple] = {}
+        #: `(manifest, bundle)` from `tileset()`. Up to ~47 MB, so it is built
+        #: once per map and dropped by the same invalidations as the art.
+        self._tileset: Optional[tuple[dict, bytes]] = None
         self._lock = threading.RLock()
 
     # -- the .DMap ---------------------------------------------------------
@@ -350,8 +353,16 @@ class MapArt:
 
     @property
     def dmap_logical(self) -> str:
-        p = self.dmap_path
-        return f"map/map/{p.name}" if p is not None else ""
+        """The map's logical `.DMap` path, by NAME.
+
+        **Not derived from the loose file.** It used to be
+        `f"map/map/{dmap_path.name}"`, which is the empty string for any map
+        that ships only as a `.7z` -- 113 of 6609's and every one of 7878's --
+        so staging one wrote to the stage root. That was unreachable while the
+        writer refused an absent loose file, and became reachable the moment
+        the writer started basing edits on what the registry names.
+        """
+        return f"map/map/{self.name}.DMap"
 
     def read_path(self) -> Optional[Path]:
         """Which `.DMap` the editor reads.
@@ -381,6 +392,7 @@ class MapArt:
             self._walk = None
             self._scenery = None
             self._items = None
+            self._tileset = None
 
     def invalidate_art(self) -> None:
         """Forget every decoded texture -- called after a `.dds` is staged or
@@ -389,6 +401,7 @@ class MapArt:
             self._tile_rgba.clear()
             self._sprite_cache.clear()
             self._items = None
+            self._tileset = None
             # The backdrop planes carry their own decoded-tile cache inside
             # `puzzle.PuzzleMap`, and they are rebuilt from scratch, so
             # dropping the list is enough.
@@ -700,6 +713,37 @@ class MapArt:
         rect = tile_rect(tx, ty, z, tile=tile)
         w, h, rgba = self.render_layer(layer, rect, z, time_ms=time_ms)
         return encode_png_rgba(w, h, rgba)
+
+    # -- the resident tile set ---------------------------------------------
+
+    def tileset(self) -> Optional[tuple[dict, bytes]]:
+        """`(manifest, bundle)` -- everything this map draws, still DXT.
+
+        This is the coplay/VibeCO residency model (`docs/map_memory.md`)
+        applied to the editor: the whole map's distinct art, shipped once,
+        compressed, and composited by the page instead of by this process.
+        The route above renders a PNG per 256-px tile per layer per zoom and
+        decodes the same `.dds` again for each of them; this decodes nothing
+        at all.  `tools/tileset.py` owns the format, unchanged -- the page
+        that consumes it is `tilebake.js`, also unchanged in what it expects.
+
+        `None` when the map has no placeable art, which is exactly when the
+        PNG path is the only one that works: the caller falls back.
+        """
+        if self.pm is None:
+            return None
+        with self._lock:
+            if getattr(self, "_tileset", None) is None:
+                import tileset as tilesetmod                 # noqa: PLC0415
+                sc = self.scenery()
+                manifest, bundle = tilesetmod.build_full(
+                    self.pm, sc, self.lib.sprites, self.backdrops())
+                manifest["map"] = self.name
+                manifest["backdrops"] = len(self.backdrops())
+                manifest["sceneParts"] = len(sc.scenes) if sc else 0
+                manifest["coverCount"] = len(sc.covers) if sc else 0
+                self._tileset = (manifest, bundle)
+            return self._tileset
 
     # -- hit testing -------------------------------------------------------
 
@@ -1047,6 +1091,10 @@ class MapEditor:
         self.sprites = scenemod.SpriteCache(self.root, assets=self.assets)
         self._maps: dict[str, MapArt] = {}
         self._rows: Optional[list[dict]] = None
+        #: which spelling of the map registry answered, "" until `rows()` runs
+        #: and "" after it if this install ships neither. Recorded rather than
+        #: inferred so the picker can say which file it read (C-2026-08-09-ani-json-spelling).
+        self.registry_rel: str = ""
         self._lock = threading.RLock()
 
     def invalidate(self, logical: str = "") -> list[str]:
@@ -1073,11 +1121,23 @@ class MapEditor:
     # -- the picker --------------------------------------------------------
 
     def rows(self) -> list[dict]:
-        """Every `ini/GameMap.json` row, with what state its art is in.
+        """Every map-registry row, with what state its art is in.
 
-        156 rows against 155 `.DMap` files: the picker lists all of them and
-        says which are unusable and why, because a map that silently vanishes
-        from a list is indistinguishable from a bug.
+        The picker lists all of them and says which are unusable and why,
+        because a map that silently vanishes from a list is indistinguishable
+        from a bug.
+
+        The registry is `ini/GameMap.json` on the community client and the
+        binary `ini/GameMap.dat` on every official one; `registry_rel` says
+        which answered. MEASURED across the six declared installs -- rows,
+        distinct stems, `.DMap` files on disk:
+
+            cco   156/137/136    5017  145/119/142    5065  153/124/144
+            5165  179/138/154    5517  262/180/181    6090  303/216/184
+
+        **Rows outnumber maps on every base**, because a map is reused under
+        several DocumentIds, so this list is deliberately longer than the map
+        count and duplicate names in it are data rather than a defect.
         """
         with self._lock:
             if self._rows is not None:
@@ -1086,13 +1146,14 @@ class MapEditor:
             if self.root is None:
                 self._rows = rows
                 return rows
-            gm = self.root / "ini" / "GameMap.json"
-            raw = []
-            if gm.is_file():
-                try:
-                    raw = json.loads(gm.read_text("utf-8", errors="replace"))
-                except Exception:                        # noqa: BLE001
-                    raw = []
+            # Both spellings. Reading only the .json gave every official
+            # client an empty registry -- the picker still listed maps,
+            # because the `.DMap` scan below fills it, so it LOOKED right
+            # while `documentId` and `gridSize` were None on every row
+            # (156/156 populated on CCO, 0 of 142-184 elsewhere). A partial
+            # failure that leaves the list intact is why this one outlived
+            # the two that were fixed. See `dmap.load_gamemap` and C-2026-08-09-ani-json-spelling.
+            self.registry_rel, raw = dmapmod.load_gamemap(self.root)
             files = {}
             d = self.root / "map" / "map"
             if d.is_dir():
@@ -1111,6 +1172,14 @@ class MapEditor:
                 if key not in seen:
                     rows.append(self._row(p.stem, p, None))
             rows.sort(key=lambda x: (-x["area"], x["name"].lower()))
+            if rows and not self.registry_rel:
+                # Every row came from the `.DMap` scan, so none carries a
+                # DocumentId or a PuzzleGridSize. That is a missing registry,
+                # not a client whose maps have no ids -- say which.
+                print(f"mapedit: no map registry under {self.root / 'ini'} "
+                      f"(neither GameMap.json nor GameMap.dat); "
+                      f"{len(rows)} maps listed from the .DMap scan alone, "
+                      f"all without a DocumentId", file=sys.stderr)
             self._rows = rows
             return rows
 
@@ -1121,7 +1190,10 @@ class MapEditor:
                "state": "missing", "why": "", "consistent": None,
                "inGameMap": gm is not None}
         if path is None:
-            row["why"] = "GameMap.json names it but no .DMap ships"
+            # Spelling-neutral: this row can come from GameMap.json or from
+            # GameMap.dat, and naming the wrong one sends a reader to a file
+            # their install does not have.
+            row["why"] = "the map registry names it but no .DMap ships"
             return row
         try:
             d = dmapmod.parse(path, want_cells=False, verify=False)
@@ -1130,7 +1202,19 @@ class MapEditor:
             row["state"] = "broken"
             return row
         row |= {"width": d.width, "height": d.height, "area": d.width * d.height,
-                "puzzle": _norm(d.puzzle_path), "layerCount": d.layer_count}
+                "puzzle": _norm(d.puzzle_path), "layerCount": d.layer_count,
+                "archive": d.archive}
+        if d.archive == "stale":
+            # Carried on every row, not only as a state, because a stale map is
+            # otherwise indistinguishable from a good one at every level of
+            # this picker: it parses, it has art, and it opens.  The row stays
+            # usable -- refusing to list it would hide a map the user can see
+            # in their own folder -- but it must not present as `ok`.
+            row["state"] = "stale"
+            row["why"] = ("this loose .DMap is not the one inside the .7z "
+                          "beside it; the archive is what the client reads, "
+                          "so this is a previous client's map")
+            return row
         if row["puzzle"].endswith(".pux"):
             row["state"] = "pux"
             row["why"] = ("uses map/PuzzleSave/*.pux (TqTerrain), which is not "
@@ -1225,16 +1309,28 @@ def stage_passability(art: MapArt, edits, *, ack: str = "",
             "map/map/*.DMap is listed in integrity.json. Editing it changes a "
             "file the client verifies. Pass the acknowledgement to proceed.")
     stage = Path(stage) if stage else art.lib.stage
-    src = art.dmap_path
-    if src is None:
-        raise FileNotFoundError(f"no .DMap for {art.name}")
     logical = art.dmap_logical
     staged = stage / logical
-    data = bytearray(staged.read_bytes() if staged.is_file() else src.read_bytes())
+    if staged.is_file():
+        data = bytearray(staged.read_bytes())
+        base_src = f"{logical} (staged)"
+    else:
+        # **The base is what the REGISTRY names, not the loose leftover.**
+        # From 5517 on the registry names `map/map/<stem>.7z` and the loose
+        # `.DMap` beside it is a previous client's: 77 of 6609's 184 disagree,
+        # and 7878 ships no loose `.DMap` at all.  Editing the loose file means
+        # your edit lands on the wrong content before the client reads
+        # anything -- a defect one layer beneath the one this staging note is
+        # about.  See `docs/map_twin_precedence.md`.
+        raw, base_src = dmapmod.open_map(art.lib.root, art.name)
+        if raw is None:
+            raise FileNotFoundError(f"no readable map for {art.name}: {base_src}")
+        data = bytearray(raw)
 
     width, height = struct.unpack_from("<II", data, dmapmod.DIMS_OFF)
     row_stride = width * dmapmod.CELL_SIZE + 4
     changed, unchanged, outside = [], 0, 0
+    refused: list[dict] = []
     rows_touched = set()
     for e in edits:
         x, y = int(e["x"]), int(e["y"])
@@ -1244,6 +1340,16 @@ def stage_passability(art: MapArt, edits, *, ack: str = "",
             continue
         off = dmapmod.GRID_OFF + y * row_stride + x * dmapmod.CELL_SIZE
         (old,) = struct.unpack_from("<H", data, off)
+        if old not in (0, 1):
+            # **Refuse rather than clobber.**  `mask` is not a boolean: the
+            # corpus carries 2, 4 and 5 as well (`core/dmap.row_checksum`), and
+            # writing `0` or `1` over one silently discards a bit nobody has
+            # decoded.  Unblocking a mask-4 cell cannot be done without either
+            # losing bit 2 or assuming bit 0 is the blocked bit -- and that is
+            # a hypothesis, not a finding (`docs/map_scenery.md` section 10).
+            # Declining costs an edit; guessing costs a value.
+            refused.append({"x": x, "y": y, "mask": old})
+            continue
         new = 1 if blocked else 0
         if (old != 0) == blocked:
             unchanged += 1
@@ -1290,6 +1396,12 @@ def stage_passability(art: MapArt, edits, *, ack: str = "",
         "logical": logical, "staged": str(dest), "bytes": len(data),
         "changed": changed, "changedCount": len(changed),
         "alreadyThatWay": unchanged, "outsideMap": outside,
+        # Cells declined because their mask is not 0/1 -- reported, never
+        # silently dropped, because a refusal the caller cannot see is
+        # indistinguishable from an edit that worked.
+        "refusedNonBooleanMask": refused,
+        "refusedCount": len(refused),
+        "base": base_src,
         "rowsRechecksummed": len(rows_touched),
         "rowChecksumsBad": bad,
         "note": ("The original was copied byte for byte apart from the cell "

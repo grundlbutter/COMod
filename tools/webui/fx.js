@@ -24,7 +24,15 @@
  *     bracketing keys; draw is an EXACT frame match only; changeTex is a step
  *     function. Treating all three the same is silently wrong.
  *
- *  4. A SHAP TRAIL IS DRIVEN BY THE PARENT'S MOTION, NOT ITS OWN. The SMOT on
+ *  4. A PARTICLE SYSTEM IS BAKED, NOT SIMULATED. `frames[i]` is the solved
+ *     set for frame i -- position, flipbook phase and half-size per particle,
+ *     plus one 4x4 for the whole frame -- so there is no integrator here, and
+ *     writing one would be inventing motion the file already states. What the
+ *     draw path does add is the billboard plane, because `Ptcl_Draw` gets it
+ *     from a world matrix its caller built and we are that caller: the quads
+ *     are rebuilt against the CAMERA's right/up every draw, not every tick.
+ *
+ *  5. A SHAP TRAIL IS DRIVEN BY THE PARENT'S MOTION, NOT ITS OWN. The SMOT on
  *     the shipped flash meshes is a constant matrix on all 101 frames; the
  *     streak exists because the weapon moves. A static weapon therefore
  *     produces a static line, which is correct and is why the viewer offers an
@@ -37,6 +45,20 @@
 
 const FX = {
   IDENT: [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+
+  /** Billboard corner offsets as (right, up) multiples plus the (u, v) corner
+   *  of the atlas cell, in two-triangle order. V grows DOWNWARD: the viewer
+   *  sets no UNPACK_FLIP_Y_WEBGL and D3D's V axis runs top-down, so the atlas
+   *  row index counts from the top exactly as the PHY ChangeTex channel's does
+   *  (docs/effects.md §6.4) and screen-up is the SMALL v. */
+  QUAD: [
+    [-1,  1, 0, 0],
+    [-1, -1, 0, 1],
+    [ 1,  1, 1, 0],
+    [ 1,  1, 1, 0],
+    [-1, -1, 0, 1],
+    [ 1, -1, 1, 1],
+  ],
 
   mul(a, b) {                        // column-major a*b: apply b, then a
     const o = new Array(16);
@@ -145,6 +167,76 @@ const FX = {
     return at(keys[keys.length - 1]);
   },
 
+  // ------------------------------------------------------------- particles
+  //
+  // docs/effects.md §6.6. The simulation is BAKED -- `frames[i]` is the solved
+  // particle set for frame i -- so there is no integrator here and there is
+  // not supposed to be one. Mirrors effectplay.particle_scale /
+  // particle_frame / particle_quads; that module's docstrings carry the RVAs
+  // and the list of fields this path does NOT apply.
+
+  /** `Ptcl_Draw`'s size multiplier (RVA 0x1EC968): the length of the matrix's
+   *  transformed (1,1,1) direction times 1/sqrt(3). 1.0 for a rotation. */
+  particleScale(m) {
+    const x = m[0] + m[4] + m[8];
+    const y = m[1] + m[5] + m[9];
+    const z = m[2] + m[6] + m[10];
+    return Math.sqrt(x*x + y*y + z*z) / Math.sqrt(3);
+  },
+
+  /** The solved set for `frame`, or null when nothing is alive. The modulus is
+   *  `Ptcl_SetFrame` (0x61570); the empty case is `Ptcl_Draw`'s early-out at
+   *  0x605CF and it is the COMMON case -- 47 % of patch5517's particle frames
+   *  have no particles at all. */
+  particleFrame(part, frame) {
+    const frames = (part && part.frames) || [];
+    if (!frames.length) return null;
+    const f = frames[((frame | 0) % frames.length + frames.length) % frames.length];
+    return (f && f.n) ? f : null;
+  },
+
+  /** One baked frame as camera-facing quads: `{n, pos, uv, alpha}` with 6*n
+   *  vertices in each flat array (two triangles per particle).
+   *
+   *  `right` / `up` are the CAMERA basis in world space and are passed in
+   *  rather than derived, because the engine gets its billboard plane from a
+   *  world matrix its caller built and we have no such caller. gl.js takes
+   *  them straight out of the view matrix it is already building -- NOT out of
+   *  `_basis()`, whose `right` is the opposite sign (see the note on
+   *  `screenToGround`). */
+  particleQuads(part, frame, world, right, up) {
+    const out = { n: 0, pos: null, uv: null, alpha: 1.0 };
+    const f = FX.particleFrame(part, frame);
+    if (!f) return out;
+    const m = FX.mul(Array.from(world), f.m || FX.IDENT);
+    const scale = FX.particleScale(m);
+    const N = Math.max(1, part.atlas || 1);
+    const cell = 1 / N, last = N * N - 1;
+    const sa = part.systemAlpha;
+    if (sa && sa.length) out.alpha = sa[Math.min(frame | 0, sa.length - 1)];
+
+    const n = f.n | 0;
+    const pos = new Float32Array(n * 18);
+    const uv = new Float32Array(n * 12);
+    for (let i = 0; i < n; i++) {
+      const p = FX.xform(m, [f.p[i*3], f.p[i*3+1], f.p[i*3+2]]);
+      const s = f.s[i] * scale;
+      const c = Math.min(Math.trunc(f.c[i] * N * N), last);
+      const u0 = (c % N) * cell, v0 = Math.floor(c / N) * cell;
+      for (let q = 0; q < 6; q++) {
+        const [dr, du, cu, cv] = FX.QUAD[q];
+        const o = (i * 6 + q) * 3, t = (i * 6 + q) * 2;
+        pos[o]     = p[0] + right[0]*dr*s + up[0]*du*s;
+        pos[o + 1] = p[1] + right[1]*dr*s + up[1]*du*s;
+        pos[o + 2] = p[2] + right[2]*dr*s + up[2]*du*s;
+        uv[t]     = u0 + cu * cell;
+        uv[t + 1] = v0 + cv * cell;
+      }
+    }
+    out.n = n; out.pos = pos; out.uv = uv;
+    return out;
+  },
+
   /** Push one more transformed blade line onto a ribbon, subdividing into
    *  `subdiv` pairs between the previous line and the new one, and dropping
    *  the oldest once `maxPairs` is reached (Shape_SetSegment, RVA 0x5D8C0). */
@@ -188,6 +280,51 @@ class EffectInstance {
     this.def = def;
     opts = opts || {};
     this.role = opts.role || '';
+    /** Which equipment slot this instance belongs to, when it belongs to one.
+     *  Two weapon auras are two instances of the same `role`, riding two
+     *  different sockets, so `role` alone cannot tell them apart and the
+     *  caller that supplies the moving parent matrix needs to. Empty for
+     *  effects that are not slot-bound. */
+    this.slot = opts.slot || '';
+    /** Milliseconds to subtract from the clock this instance is ticked with.
+     *
+     *  ONE CLOCK, MANY PHASES. `Viewer.setEffectTime(ms, ..)` advances every
+     *  live instance to the same `ms`, which is right for the map's ambient
+     *  decoration -- the engine spawns those at map load, so every torch on a
+     *  map really is in phase -- and wrong for anything that starts when
+     *  something happens to one entity. Two players buffed four seconds apart
+     *  are four seconds out of phase, and drawing them in lockstep is the
+     *  scene-level version of putting the player's walk stride on every
+     *  lookalike: it reads as an animation choice rather than as the bug it
+     *  is.
+     *
+     *  A phase is therefore PER INSTANCE, and it lives here rather than in the
+     *  caller because `setEffectTime` takes one number. Default 0, so every
+     *  existing caller -- the builder's two auras, `mapfxAttach`'s torches --
+     *  is bit-for-bit unchanged. */
+    this.tOffset = +opts.tOffset || 0;
+    /** ONE-SHOT, OR ENDLESS? The channel's whole population used to be the
+     *  second kind -- torches, status auras, weapon glows -- and each of them
+     *  lives exactly as long as its owner does, so nothing ever had to leave
+     *  on its own. A hit spark is the opposite: it spawns at a point, plays
+     *  its authored length and must remove itself.
+     *
+     *  This flag is what `Viewer.setEffectTime` reaps on, and what
+     *  `Viewer.setEffects` refuses to replace. It is NOT the same question as
+     *  `def.endless`: that one is the SCENE's own loop flag out of
+     *  `3DEffect.ini`, and a non-endless scene attached as an endless
+     *  instance (an aura whose art happens to declare `loopTime 1`) must
+     *  still not be reaped. The instance's ROLE decides its lifecycle; the
+     *  scene decides its animation.
+     */
+    this.transient = !!opts.transient;
+    /** When this instance was spawned, on the CALLER'S clock, in ms.
+     *
+     *  Opaque here -- gl.js never reads a wall clock -- and stored so that a
+     *  transient can be re-phased when the shared clock restarts under it.
+     *  See `Viewer.rebaseTransients`. Meaningless for an endless instance,
+     *  whose phase its composer recomputes on every attach. */
+    this.spawnAt = +opts.spawnAt || 0;
     this.anchor = opts.anchor ? Float32Array.from(opts.anchor) : Float32Array.from(FX.IDENT);
     this.textureKeys = opts.textureKeys || {};   // layer index -> texture key
     this.spawn = 0;
@@ -222,10 +359,25 @@ class EffectInstance {
             vbo: gl.createBuffer(), tbo: gl.createBuffer(),
             count: 0, capacity: 0,
           });
+        } else if (p.kind === 'particle' && p.decoded && p.frames &&
+                   p.frames.length) {
+          // Two dynamic buffers, like a ribbon: the quads are rebuilt every
+          // frame because they face the camera, so they change when the
+          // camera moves and not only when the clock does. Sized once for the
+          // system's peak so the common frame does no allocation.
+          const cap = Math.max(1, p.peakParticles || p.maxParticles || 1);
+          parts.push({
+            kind: 'particle', src: p,
+            vbo: gl.createBuffer(), tbo: gl.createBuffer(),
+            count: 0, capacity: cap, alpha: 1,
+          });
+          gl.bindBuffer(gl.ARRAY_BUFFER, parts[parts.length - 1].vbo);
+          gl.bufferData(gl.ARRAY_BUFFER, cap * 18 * 4, gl.DYNAMIC_DRAW);
+          gl.bindBuffer(gl.ARRAY_BUFFER, parts[parts.length - 1].tbo);
+          gl.bufferData(gl.ARRAY_BUFFER, cap * 12 * 4, gl.DYNAMIC_DRAW);
         }
-        // particle parts are carried in the payload but not drawn -- PTCL /
-        // PTC3 are undecoded (docs/effects.md §6.6) and faking them would be
-        // worse than the honest gap.
+        // A particle chunk that did not decode still arrives in the payload
+        // with `decoded: false`; it is skipped rather than faked.
       }
       this.layers.push({ src: lay, parts });
     }
@@ -286,6 +438,29 @@ class EffectInstance {
         this._uploadRibbon(p, hist);
       }
     }
+  }
+
+  /** Rebuild one particle part's quads for `frame` and upload them.
+   *
+   *  Returns the vertex count to draw (0 for an empty frame, which is the
+   *  common case). Called from the draw pass rather than from `tick()`,
+   *  because a billboard depends on where the camera is and the camera can
+   *  move without the clock advancing -- ribbons are the opposite and are
+   *  advanced in `tick()`. */
+  uploadParticles(p, frame, world, right, up) {
+    const gl = this.gl;
+    const q = FX.particleQuads(p.src, frame, world, right, up);
+    p.alpha = q.alpha;
+    p.count = q.n * 6;
+    if (!q.n) return 0;
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.vbo);
+    if (q.n > p.capacity) gl.bufferData(gl.ARRAY_BUFFER, q.pos, gl.DYNAMIC_DRAW);
+    else gl.bufferSubData(gl.ARRAY_BUFFER, 0, q.pos);
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.tbo);
+    if (q.n > p.capacity) gl.bufferData(gl.ARRAY_BUFFER, q.uv, gl.DYNAMIC_DRAW);
+    else gl.bufferSubData(gl.ARRAY_BUFFER, 0, q.uv);
+    if (q.n > p.capacity) p.capacity = q.n;
+    return p.count;
   }
 
   /** A ribbon is a triangle strip through the pair list: U runs along the

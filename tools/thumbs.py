@@ -97,7 +97,8 @@ import c3phy                                                    # noqa: E402
 import dds                                                      # noqa: E402
 import effects as fx                                            # noqa: E402
 import attach                                                   # noqa: E402
-import coroot                                                   # noqa: E402
+import coroot
+import provenance                                                   # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot                    # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -108,16 +109,23 @@ OUT_DIR = coroot.derived_path("out/thumbs")
 _LIB_SRV: tuple[str, str] = ("", "")
 
 
-def _apply_output(server: str) -> None:
+def _apply_output(server: str = "", root=None) -> None:
     """Per-server output tree: out/thumbs/servers/<name>/ with its own
     manifest, so a community client's renders never mix with the base
-    install's (same logical path, different bytes)."""
+    install's (same logical path, different bytes).
+
+    **Call this unconditionally, and pass the root.** It used to be called
+    only `if server:`, so the *base-install* path -- the common one -- kept the
+    values `OUT_DIR`/`MANIFEST`/`MESH_MANIFEST` were given at import, naming
+    whichever install was configured then. `--root <other client>` therefore
+    rendered into the configured client's namespace. Same shape as C21; the
+    server path was correct only because it happened to re-resolve. C55.
+    """
     global OUT_DIR, MANIFEST, MESH_MANIFEST
-    base = coroot.derived_path("out/thumbs")
+    base = coroot.derived_path("out/thumbs", root)
     OUT_DIR = (base / "servers" / server) if server else base
     MANIFEST = OUT_DIR / "manifest.json"
     MESH_MANIFEST = OUT_DIR / "manifest_meshes.json"
-COVERAGE = coroot.derived_path("out/meshtex/coverage.json")
 
 #: Bump when a change alters pixels.  It is part of every cache key, so a bump
 #: makes `--resume` re-render everything instead of silently mixing versions.
@@ -703,8 +711,15 @@ def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]
     """
     if idx_path is None:
         import coroot
-        idx_path = coroot.find_derived("out/meshtex/coverage.json") or COVERAGE
-    if idx_path.is_file():
+        # NO FALLBACK to a module-level constant. `derived_path` resolved at
+        # import names whichever install was configured *then*, so a base with
+        # no coverage file of its own would silently load ANOTHER install's
+        # index -- measured on exactly this pattern in `unify`, where 6090 and
+        # 5517 both reported the same 5042 meshes. `docs/CORRECTIONS.md` C21.
+        # `find_derived` returning None is the honest answer, and it lands on
+        # the live rebuild this function's own docstring promises.
+        idx_path = coroot.find_derived("out/meshtex/coverage.json")
+    if idx_path is not None and idx_path.is_file():
         doc = json.loads(idx_path.read_text("utf-8"))
         jobs, unmatched = [], []
         for logical, rec in doc["meshes"].items():
@@ -832,8 +847,8 @@ _W: dict = {}
 
 def _init_worker(root: str, opts: dict, library: str = "",
                  server: str = "") -> None:
+    _apply_output(server, root)
     if server:
-        _apply_output(server)
         from colibrary import ServerView
         _W["assets"] = ServerView(library, server, root)
     else:
@@ -1073,6 +1088,17 @@ def write_manifest(doc: dict) -> None:
     tmp = MESH_MANIFEST.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(slim, indent=1, sort_keys=True), "utf-8")
     tmp.replace(MESH_MANIFEST)
+
+    # Sidecars rather than envelopes: eleven modules read this manifest's
+    # shape. `out/thumbs/` is per-base, and the entries are additionally
+    # content-addressed (the key hashes the mesh and texture bytes), which is
+    # why a foreign manifest was safe by accident rather than by design --
+    # the stamp makes it safe on purpose.
+    for path in (MANIFEST, MESH_MANIFEST):
+        try:
+            provenance.stamp_file(path, tool="thumbs.py")
+        except Exception:                                # pragma: no cover
+            pass
 
 
 # ===========================================================================
@@ -1340,8 +1366,7 @@ def main(argv: list[str]) -> int:
         ap.error("--server needs --library")
     global _LIB_SRV
     _LIB_SRV = (a.library, a.server)
-    if a.server:
-        _apply_output(a.server)
+    _apply_output(a.server or "", a.root)
     view = None
     if a.server:
         from colibrary import ServerView

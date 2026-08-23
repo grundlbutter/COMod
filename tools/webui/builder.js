@@ -81,7 +81,18 @@ const B = {
    *  playback walks a sequence, not a single clip. */
   anim: { action: '100', frame: 0, seqAt: 0, playing: false, data: null,
           seq: [], raf: null, t0: 0, cache: {}, speed: 41, actions: [] },
-  superfx: { on: false, rec: null },
+  /** The Super aura, **per weapon hand**. A character can hold a weapon in
+   *  each hand and each one's aura is its own control: both on, either alone,
+   *  or neither. This used to be a single `{on, rec}` for a single hand --
+   *  `equippedWeapon()` picked the right hand and fell back to the left -- so
+   *  the left-hand weapon could only ever glow while the right hand was empty.
+   *  Nothing below the UI had that limit: `/api/superfx?slot=` already
+   *  resolves and anchors either hand, and returns different matrices for
+   *  them (measured on body 003131090 with 480139 in both hands: right
+   *  x=-24.6, left x=+23.4). `raf` is shared because one rAF drives both. */
+  superfx: { hands: { r_weapon: { on: false, rec: null, anchor: null },
+                      l_weapon: { on: false, rec: null, anchor: null } },
+             raf: null },
   /** the model mode. `zoom` is monster.json's zoomPercent when a row has been
    *  paired, 100 otherwise; `row` is that paired row, which is the USER's
    *  assertion because monster.json carries no link to the art at all. */
@@ -101,6 +112,12 @@ const B = {
   /** `${slot}:${id}` -> the quality ladder of that weapon's family. Cached
    *  because arrowing through a picker asks for it on every keypress. */
   qualityCache: {},
+  /** The slot the **Colour & variants** panel is currently drawn for, which is
+   *  the slot you last touched: opening its picker, arrowing inside one, or
+   *  picking a quality all route through `renderLookPanel`. It is what `Q` /
+   *  shift-`Q` step, so this is not hidden state -- it is the panel on screen,
+   *  with that slot named at the top of it and the ladder underneath. */
+  lookSlot: null,
   collapsed: {},
   loadToken: 0,
   status: null,
@@ -290,8 +307,7 @@ async function boot() {
     if (saved && saved.speed) B.anim.speed = saved.speed;
   } catch (e) { /* ignore */ }
   B.anim.speed = B.anim.speed || B.config.defaultFrameMs || 41;
-  try { B.superfx.on = localStorage.getItem(AURA_KEY) === '1'; }
-  catch (e) { /* ignore */ }
+  restoreAura();
   if (!restored || !restored.body) await applyDefaultLoadout();
   else await refreshLoadoutNames();
   restoreModelState();
@@ -603,7 +619,8 @@ async function resetAll() {
     return;
   }
   B.loadout = {};
-  B.superfx.rec = null;          // the aura *intent* is a setting, not a character
+  // the aura *intent* is a setting, not a character -- per hand, both cleared
+  for (const s of AURA_HANDS) { aura(s).rec = null; aura(s).anchor = null; }
   await applyDefaultLoadout();
   B.bodyType = (B.loadout.body && B.loadout.body.id || '002').slice(0, 3);
   renderSlots();
@@ -639,6 +656,14 @@ function toggleAllPanels() { CardPanels.toggleAll(); }
 // One slot, one window: search, the chips that apply to that slot, and a list of
 // ITEMS with their COLOURS underneath. Arrowing previews on the character behind
 // it, so choosing is looking rather than reading ids.
+
+/** Slot -> the number key that opens its picker. One table rather than four
+ *  `case` labels, because `stepQuality` tells the user which key moves the
+ *  Colour & variants panel onto the hand they meant, and a hand-written second
+ *  copy of that mapping is a copy that goes stale. */
+const PICKER_KEYS = { body: '1', armet: '2', r_weapon: '3', l_weapon: '4' };
+const SLOT_FOR_PICKER_KEY = Object.fromEntries(
+  Object.entries(PICKER_KEYS).map(([slot, k]) => [k, slot]));
 
 function openPicker(slot) {
   if (B.mode === 'model') return;      // no slots to fill on a monster
@@ -864,6 +889,9 @@ function renderLookPanel(slot, variants, index, override) {
   const b = $('#look-body');
   b.innerHTML = '';
   const info = B.slotById[slot];
+  // Every path that changes what this panel shows comes through here, so this
+  // is the one place that can record it. `Q` reads it -- see `stepQuality`.
+  B.lookSlot = slot;
   // While arrowing, the equip is still debounced, so show what is being
   // previewed rather than what was equipped a moment ago.
   const cur = override || B.loadout[slot];
@@ -930,8 +958,14 @@ function renderLookPanel(slot, variants, index, override) {
 // `410009` out of a list of 5,384 is not a way to find that out.
 
 const WEAPON_SLOTS = ['r_weapon', 'l_weapon', 'shield'];
-const isWeaponSlot = s =>
-  ((B.config && B.config.weaponSlots) || WEAPON_SLOTS).includes(s);
+const weaponSlots = () => (B.config && B.config.weaponSlots) || WEAPON_SLOTS;
+const isWeaponSlot = s => weaponSlots().includes(s);
+/** A slot's own name for itself, from the server's slot list. Falls back to
+ *  the raw slot so a slot the config has not described still reads. */
+const slotLabel = s => (B.slotById[s] && B.slotById[s].label) || s;
+/** Weapon slots with something in them, in the order the UI lists them. */
+const armedWeaponSlots = () =>
+  weaponSlots().filter(s => B.loadout[s] && B.loadout[s].id);
 
 const qualityKey = (slot, id) => `${slot}:${id}`;
 const qualityRec = (slot, id) => B.qualityCache[qualityKey(slot, id)] || null;
@@ -964,7 +998,13 @@ function renderQualityInto(host, slot, id) {
   }
   if (!rec.isWeapon) return;
 
-  host.appendChild(el('div', 'axis-name', 'Quality'));
+  // Name the hand in the heading. Two hands can hold two weapons at two
+  // qualities, and "Quality" on its own does not say which one you are
+  // looking at -- nor, therefore, which one `Q` is about to step.
+  const head = el('div', 'axis-name', `Quality — ${slotLabel(slot)}`);
+  head.title = `Q steps this ladder up, shift+Q down. It follows this panel, ` +
+               `so it always means the ${slotLabel(slot).toLowerCase()}.`;
+  host.appendChild(head);
   const row = el('div', 'qrow');
   for (const q of rec.qualities) {
     const on = q.available && q.id === id;
@@ -988,6 +1028,11 @@ function renderQualityInto(host, slot, id) {
     row.appendChild(b);
   }
   host.appendChild(row);
+  // Say what the shortcut acts on, next to the thing it acts on. `Q` used to
+  // be the right hand whatever this panel showed, and there was nothing on
+  // screen that would have told you so.
+  host.appendChild(el('div', 'small mut',
+    'Q / shift-Q step this ladder — whichever slot this panel is showing.'));
 
   // What actually changed, stated rather than implied.
   const bits = [];
@@ -1014,33 +1059,103 @@ function renderQualityInto(host, slot, id) {
 }
 
 /** Equip the same weapon at a different quality. The mesh does not change, so
- *  the camera and the pose stay exactly where they were. */
-async function setQuality(slot, q) {
+ *  the camera and the pose stay exactly where they were.
+ *
+ *  `where` prefixes the toast with the slot. Clicking a button in the ladder
+ *  needs no such thing -- you clicked the ladder, so you know which one it was
+ *  -- but a keystroke does, which is what `stepQuality` passes it for. */
+async function setQuality(slot, q, { where = '' } = {}) {
   if (!q || !q.id) return;
   await equip(slot, q.id, { silent: true });
-  toast(q.quality
+  toast((where ? `${where}: ` : '') + (q.quality
     ? `${q.label} — ${q.id}${q.aura ? ' · carries the aura' : ''}`
-    : `${q.id}`);
+    : `${q.id}`));
   showLookFor(slot);
 }
 
-/** Step the equipped weapon up or down its quality ladder. */
+/** Which weapon `Q` steps.
+ *
+ *  ONE KEY, TWO HANDS. This used to read
+ *
+ *      B.loadout.r_weapon ? 'r_weapon' : (B.loadout.l_weapon ? 'l_weapon' : null)
+ *
+ *  which is the same collapsed one-weapon assumption the Super aura had before
+ *  it was split per hand: with both hands full the left one was unreachable
+ *  from the keyboard, and stepping it meant the picker or the per-hand *Switch
+ *  to Super* button. `Q` and shift-`Q` are already up and down, so it cannot
+ *  grow a second key the way the aura's `A` / shift-`A` did.
+ *
+ *  So it takes its hand from the **Colour & variants** panel instead, which is
+ *  the slot you last touched and the one whose ladder is on screen with its
+ *  name over it. No new mode, no new persisted state, and no invisible target:
+ *  the panel IS the selector, `3` / `4` / a click on a slot move it, and the
+ *  ladder says so under the buttons.
+ *
+ *  When that panel is on something with no ladder (the body, a helmet, an
+ *  empty slot) the answer has to come from the loadout, and there it either
+ *  is or is not ambiguous. Exactly one weapon equipped -> that one, because
+ *  there is nothing to get wrong. More than one -> say so and name the way to
+ *  choose, rather than quietly preferring a hand, which is the behaviour being
+ *  removed. Returns `{slot}` or `{ask}`. */
+function qualityStepTarget() {
+  const shown = B.lookSlot;
+  if (shown && isWeaponSlot(shown) && B.loadout[shown] && B.loadout[shown].id) {
+    return { slot: shown };
+  }
+  const armed = armedWeaponSlots();
+  if (!armed.length) return { ask: 'no weapon equipped' };
+  if (armed.length === 1) return { slot: armed[0] };
+  // A shield counts, so this list is not always two long.
+  return { ask: `${andList(armed.map(slotLabel))} are ` +
+                `${armed.length === 2 ? 'both' : 'all'} holding something. ` +
+                `Q steps whichever one the Colour & variants panel is ` +
+                `showing, so point it at the one you mean first: ` +
+                `${armed.map(s => keyHintFor(s)).join('; ')}.` };
+}
+
+/** `a`, `a and b`, `a, b and c` — because a shield makes the list three long
+ *  and "a and b and c" is not a sentence anyone writes. */
+function andList(names) {
+  if (names.length < 2) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** How to point the panel at a slot, in prose. Read off the same table the
+ *  keys are bound from rather than spelled out twice -- and a slot with no
+ *  key of its own (a shield) still gets a usable instruction rather than its
+ *  bare name dropped into the middle of a sentence. */
+function keyHintFor(slot) {
+  const k = PICKER_KEYS[slot];
+  return k ? `${k} for the ${slotLabel(slot).toLowerCase()}`
+           : `click ${slotLabel(slot)} in the slot list`;
+}
+
+/** Step the weapon the Colour & variants panel is showing up or down its
+ *  quality ladder. See `qualityStepTarget` for how that slot is chosen. */
 async function stepQuality(delta) {
-  const slot = B.loadout.r_weapon ? 'r_weapon'
-             : (B.loadout.l_weapon ? 'l_weapon' : null);
-  if (!slot) { toast('no weapon equipped'); return; }
+  const target = qualityStepTarget();
+  if (target.ask) { toast(target.ask, 5000); return; }
+  const slot = target.slot;
   const id = B.loadout[slot].id;
   const rec = await ensureQuality(slot, id);
   const avail = (rec.qualities || []).filter(q => q.available);
   if (avail.length < 2) {
-    toast(rec.reason || 'this weapon has no quality ladder', 4000);
+    toast(`${slotLabel(slot)}: ` +
+          (rec.reason || 'this weapon has no quality ladder'), 4000);
     return;
   }
   let i = avail.findIndex(q => q.id === id);
   if (i < 0) i = delta > 0 ? -1 : avail.length;
   const next = avail[Math.max(0, Math.min(avail.length - 1, i + delta))];
-  if (!next || next.id === id) return;
-  await setQuality(slot, next);
+  if (!next || next.id === id) {
+    // Already at the end of the ladder. Silence here reads as a dropped
+    // keypress, and with two hands in play "which one did that?" is a real
+    // question, so name the hand and where it is.
+    toast(`${slotLabel(slot)}: already the ` +
+          `${avail[delta > 0 ? avail.length - 1 : 0].label}`, 3000);
+    return;
+  }
+  await setQuality(slot, next, { where: slotLabel(slot) });
 }
 
 /** Refresh the colour panel for whatever is equipped in a slot. */
@@ -1091,10 +1206,13 @@ async function rebuild({ reframe = false } = {}) {
     }
   }
   viewer.setMeshes(defs, { frameOn: fig.bodyBounds, keepFraming: !reframe });
-  await applyNamedTexture('body', fig.body.texture);
-  for (const part of fig.parts) {
-    await applyNamedTexture('slot:' + part.slot, part.texture);
-  }
+  // One /api/texbundle instead of 1 + N serial <img> loads, with the bytes
+  // staying DXT from the archive to the GPU. Falls back to the PNG route per
+  // texture -- see Viewer.applyTextureBundle in gl.js.
+  await viewer.applyTextureBundle(
+    [{ key: 'body', path: fig.body.texture }].concat(
+      fig.parts.map(p => ({ key: 'slot:' + p.slot, path: p.texture }))),
+    { pngUrl: texUrl, isCurrent: () => stillCurrent(tk) });
   if (!stillCurrent(tk)) return;
   $('#gl-msg').classList.add('hidden');
   $('#gl-stats').textContent = viewer.stats +
@@ -1104,22 +1222,22 @@ async function rebuild({ reframe = false } = {}) {
   await fillActions();
   await ensureAnim({ silent: true });
   await refreshWeaponPanel();
-  if (B.superfx.on) await applySuperFx();
+  if (anyAuraOn()) await applySuperFx();
   viewer.draw();
 }
 
+/** One texture, through the same DXT path a whole figure uses.
+ *
+ *  Delegating rather than keeping a second <img> loader means the model
+ *  viewer (a monster is one mesh and one texture) and the effect layers get
+ *  the compressed upload for free, and there is one fallback rule in the tree
+ *  instead of two that can drift. */
 function applyNamedTexture(key, texPath) {
   if (!texPath) return Promise.resolve(false);
   const tk = tokenNow();
-  return new Promise(resolve => {
-    const img = new Image();
-    img.onload = () => {
-      if (!stillCurrent(tk)) return resolve(false);
-      viewer.setTexture(key, img); viewer.draw(); resolve(true);
-    };
-    img.onerror = () => resolve(false);
-    img.src = texUrl(texPath);
-  });
+  return viewer.applyTextureBundle([{ key, path: texPath }],
+    { pngUrl: texUrl, isCurrent: () => stillCurrent(tk) })
+    .then(r => r.uploaded > 0 || r.fallback.length > 0);
 }
 
 function renderDetailPanel(fig) {
@@ -1286,7 +1404,7 @@ function showAnimFrame(f) {
   const positions = {};
   for (const ch of d.chunks) positions[ch.index] = ch.frames[f];
   viewer.setPose(positions, d.sockets[f] || {});
-  if (B.superfx.on) placeSuperFx(d.sockets[f] || {});
+  if (anyAuraOn()) placeSuperFx(d.sockets[f] || {});
   viewer.draw();
   $('#anim-frame').value = String(f);
   const part = B.anim.seq.length > 1
@@ -1349,22 +1467,58 @@ function animPause() {
 // 28.1 — buried inside the grip. The anchor comes back from the server as
 // M_offset x M_socket, already in render space, and rides the same socket the
 // weapon does.
+//
+// ONE AURA PER HAND, and they are independent.
+//
+// The second complaint was "I can only make one weapon super at a time".
+// That was this file and only this file. `superfx.SLOT_SOCKET` has always
+// mapped l_weapon -> v_l_weapon and r_weapon -> v_r_weapon, `SuperFxDB.anchor`
+// is a static method taking the slot, and `/api/superfx?slot=` returns a
+// different matrix for each hand. What did not exist was two states to hold
+// the two answers in: `B.superfx` was one `{on, rec}`, one localStorage flag
+// and one checkbox, and `equippedWeapon()` returned the right hand or, failing
+// that, the left. So the left-hand aura was only reachable with the right hand
+// empty, and it was never possible to have both.
+//
+// Everything below is keyed by hand. The one thing that must not be shared is
+// the anchor: `placeSuperFx` used to write a single matrix into EVERY live
+// effect instance, which with two auras would drag the left glow onto the
+// right hand. Each instance now carries its own `slot` and reads its own
+// hand's socket.
 
-/** The equipped weapon and which hand it is in, right hand first. */
-function equippedWeapon() {
-  if (B.loadout.r_weapon) return { slot: 'r_weapon', v: B.loadout.r_weapon };
-  if (B.loadout.l_weapon) return { slot: 'l_weapon', v: B.loadout.l_weapon };
-  return null;
+/** The two weapon hands, right first — the order the UI lists them in. */
+const AURA_HANDS = ['r_weapon', 'l_weapon'];
+/** Hand -> the `[Dumy]` socket its aura rides. Mirrors superfx.SLOT_SOCKET;
+ *  `tools/superfx.py` is the authority and the server does the maths. */
+const HAND_DUMY = { r_weapon: 'v_r_weapon', l_weapon: 'v_l_weapon' };
+const HAND_LABEL = { r_weapon: 'right hand', l_weapon: 'left hand' };
+
+/** This hand's aura state. Always an object, so callers never branch. */
+const aura = slot => B.superfx.hands[slot] ||
+                     (B.superfx.hands[slot] = { on: false, rec: null, anchor: null });
+
+/** Every equipped weapon, right hand first. Both hands, not the first one. */
+function equippedWeapons() {
+  return AURA_HANDS.filter(s => B.loadout[s] && B.loadout[s].id)
+                   .map(s => ({ slot: s, v: B.loadout[s] }));
 }
 
-const hasAura = () => !!(B.superfx.rec && B.superfx.rec.found);
+const hasAura = slot => !!(aura(slot).rec && aura(slot).rec.found);
+const anyAuraOn = () => AURA_HANDS.some(s => aura(s).on);
+/** Hands that are switched on AND have something to show. */
+const glowingHands = () =>
+  AURA_HANDS.filter(s => aura(s).on && hasAura(s) && aura(s).rec.effect);
 
-/** Why the aura toggle is greyed, in this weapon's own terms. Never a bare
- *  "disabled": the whole point of the quality selector is that the answer is
- *  "you are not wearing the Super one", and it names the id that is. */
-function auraWhyNot() {
-  const w = equippedWeapon();
-  if (!w) return 'Equip a weapon and its aura, if it has one, toggles here.';
+/** Why this hand's aura toggle is greyed, in that weapon's own terms. Never a
+ *  bare "disabled": the whole point of the quality selector is that the answer
+ *  is "you are not wearing the Super one", and it names the id that is. */
+function auraWhyNot(slot) {
+  const v = B.loadout[slot];
+  if (!v || !v.id) {
+    return `Put a weapon in the ${HAND_LABEL[slot]} and its aura, if it has ` +
+           `one, toggles here. Each hand has its own switch.`;
+  }
+  const w = { slot, v };
   const rec = qualityRec(w.slot, w.v.id);
   const glowing = rec ? (rec.qualities || []).filter(q => q.available && q.aura)
                       : [];
@@ -1379,124 +1533,132 @@ function auraWhyNot() {
          `lookup failure.`;
 }
 
-/** One toggle, two places: a checkbox in the viewport bar (always in sight)
- *  and the switch in the Weapon effects card. Both drive the same state. */
-function setAura(on) {
-  B.superfx.on = !!on;
-  try { localStorage.setItem(AURA_KEY, B.superfx.on ? '1' : '0'); }
-  catch (e) { /* ignore */ }
+/** Persist both hands. One JSON object rather than two keys, so a half-written
+ *  pair is impossible and the legacy scalar has somewhere to land. */
+function persistAura() {
+  try {
+    localStorage.setItem(AURA_KEY, JSON.stringify(
+      Object.fromEntries(AURA_HANDS.map(s => [s, !!aura(s).on]))));
+  } catch (e) { /* ignore */ }
+}
+
+/** Read the saved intent, migrating the pre-per-hand value.
+ *
+ *  The old key was the string '1' or '0' for the *one* aura there was. '1'
+ *  meant "show the aura on whichever hand is holding the weapon", and with
+ *  the fallback in the old `equippedWeapon()` that could be either hand — so
+ *  it restores to both hands on, which reproduces what that setting did in
+ *  both of the cases it could reach. */
+function restoreAura() {
+  let raw = null;
+  try { raw = localStorage.getItem(AURA_KEY); } catch (e) { return; }
+  if (raw === null) return;
+  if (raw === '1' || raw === '0') {
+    for (const s of AURA_HANDS) aura(s).on = raw === '1';
+    persistAura();
+    return;
+  }
+  let saved = null;
+  try { saved = JSON.parse(raw); } catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  for (const s of AURA_HANDS) aura(s).on = !!saved[s];
+}
+
+/** One toggle per hand, two places each: a checkbox in the viewport bar
+ *  (always in sight) and the switch in that hand's Weapon effects block. Both
+ *  drive the same per-hand state, and neither touches the other hand. */
+function setAura(slot, on) {
+  if (!HAND_DUMY[slot]) return;
+  aura(slot).on = !!on;
+  persistAura();
   applySuperFx();
   syncAuraControl();
   refreshWeaponPanel();
 }
 
-function toggleAura() {
-  if (!hasAura()) { toast(auraWhyNot(), 5000); syncAuraControl(); return; }
-  setAura(!B.superfx.on);
+function toggleAura(slot) {
+  if (!hasAura(slot)) { toast(auraWhyNot(slot), 5000); syncAuraControl(); return; }
+  setAura(slot, !aura(slot).on);
+}
+
+function auraControls(slot) {
+  return { lab: $(`#aura-label-${slot}`), box: $(`#chk-aura-${slot}`) };
 }
 
 function syncAuraControl() {
-  const lab = $('#aura-label');
-  const box = $('#chk-aura');
-  if (!lab || !box) return;
-  const w = equippedWeapon();
-  lab.classList.toggle('hidden', !w);
-  const ok = hasAura();
-  box.disabled = !ok;
-  box.checked = ok && B.superfx.on;
-  lab.classList.toggle('on', ok && B.superfx.on);
-  lab.classList.toggle('nofx', !ok);
-  lab.title = ok
-    ? (B.superfx.on
-        ? `The ${B.superfx.rec.name} aura is on the weapon. (A)`
-        : `This weapon carries the ${B.superfx.rec.name} aura — tick to show it. (A)`)
-    : auraWhyNot();
+  for (const slot of AURA_HANDS) {
+    const { lab, box } = auraControls(slot);
+    if (!lab || !box) continue;
+    const held = !!(B.loadout[slot] && B.loadout[slot].id);
+    // Only shown for a hand that is holding something: an empty hand has no
+    // aura to discuss and two permanent greyed boxes is noise.
+    lab.classList.toggle('hidden', !held || B.mode === 'model');
+    const ok = hasAura(slot);
+    const on = ok && aura(slot).on;
+    box.disabled = !ok;
+    box.checked = on;
+    lab.classList.toggle('on', on);
+    lab.classList.toggle('nofx', !ok);
+    const key = slot === 'l_weapon' ? 'Shift+A' : 'A';
+    lab.title = ok
+      ? (on
+          ? `The ${aura(slot).rec.name} aura is on the ${HAND_LABEL[slot]} `
+            + `weapon. (${key})`
+          : `The ${HAND_LABEL[slot]} weapon carries the ${aura(slot).rec.name} `
+            + `aura — tick to show it. (${key})`)
+      : auraWhyNot(slot);
+  }
 }
 
+/** Resolve one hand's aura against the server.
+ *
+ *  `weapon` / `offHand` are BOTH sent, and that matters for the left hand:
+ *  the motion set is a property of the loadout, not of the id being asked
+ *  about (`anim.AnimDB.weaponset(right, left)`), and the socket matrix comes
+ *  out of whichever clip is resolved. Sending only `id=` let the server treat
+ *  a left-hand weapon as the main hand and anchor the glow on a pose the body
+ *  is not in. */
+async function fetchAura(slot) {
+  const v = B.loadout[slot];
+  if (!v || !v.id) return null;
+  const p = new URLSearchParams({ id: v.id, slot, action: B.anim.action,
+                                  frame: String(B.anim.frame | 0) });
+  if (B.loadout.body) p.set('body', B.loadout.body.id);
+  if (B.loadout.r_weapon) p.set('weapon', B.loadout.r_weapon.id);
+  if (B.loadout.l_weapon) p.set('offHand', B.loadout.l_weapon.id);
+  try { return await api('/api/superfx?' + p.toString()); }
+  catch (e) { return null; }                          // non-fatal
+}
+
+/** One block per hand, each with its own switch. Both hands are resolved on
+ *  every refresh, so neither block can be showing the other's answer. */
 async function refreshWeaponPanel() {
   const b = $('#fx-body');
-  const w = equippedWeapon();
+  const held = equippedWeapons();
   b.innerHTML = '';
-  if (!w) {
+  if (!held.length) {
     b.appendChild(el('div', 'mut small', 'equip a weapon to see its effect'));
-    B.superfx.rec = null;
-    // The *intent* to show the aura is kept: re-equipping a Super weapon
-    // brings it straight back rather than making you find the switch again.
+    for (const s of AURA_HANDS) { aura(s).rec = null; aura(s).anchor = null; }
+    // The *intent* to show the aura is kept, per hand: re-equipping a Super
+    // weapon brings that hand's glow straight back rather than making you
+    // find the switch again.
     applySuperFx();
     syncAuraControl();
     return;
   }
-  const slot = w.slot;
   const tk = tokenNow();
   b.appendChild(el('div', 'mut small', 'resolving…'));
-  let sfx = null;
-  const p = new URLSearchParams({ id: w.v.id, slot, action: B.anim.action,
-                                  frame: String(B.anim.frame | 0) });
-  if (B.loadout.body) p.set('body', B.loadout.body.id);
-  try { sfx = await api('/api/superfx?' + p.toString()); }
-  catch (e) { /* non-fatal */ }
+  const recs = await Promise.all(held.map(w => fetchAura(w.slot)));
   if (!stillCurrent(tk)) return;
-  B.superfx.rec = sfx;
-  B.superfx.slot = slot;
-  const qrec = await ensureQuality(slot, w.v.id);
+  held.forEach((w, i) => { aura(w.slot).rec = recs[i]; });
+  for (const s of AURA_HANDS) {
+    if (!B.loadout[s] || !B.loadout[s].id) { aura(s).rec = null; aura(s).anchor = null; }
+  }
+  const qrecs = await Promise.all(held.map(w => ensureQuality(w.slot, w.v.id)));
   if (!stillCurrent(tk)) return;
 
   b.innerHTML = '';
-  const qname = qrec.current
-    ? (B.config.qualityLabels || {})[qrec.current] || qrec.current : '';
-  b.appendChild(kv([
-    ['weapon', `${w.v.name} (${w.v.id})`],
-    ['quality', qname || 'not a quality id'],
-  ]));
-
-  // ---- the switch, whatever the answer is
-  const sw = el('label', 'bigtoggle' + (hasAura() ? '' : ' nofx'));
-  const cb = el('input');
-  cb.type = 'checkbox';
-  cb.checked = hasAura() && B.superfx.on;
-  cb.disabled = !hasAura();
-  cb.addEventListener('change', () => setAura(cb.checked));
-  sw.appendChild(cb);
-  sw.appendChild(el('b', null, 'Super aura'));
-  sw.appendChild(el('span', 'small mut',
-    hasAura() ? (B.superfx.on ? 'showing on the weapon' : 'this weapon has one')
-              : 'not on this quality'));
-  b.appendChild(sw);
-
-  if (sfx && sfx.found) {
-    b.appendChild(kv([
-      ['effect', sfx.name],
-      ['family', sfx.family],
-      ['layers', sfx.layers.length],
-      ['timing', `${sfx.frameIntervalMs} ms/frame, ` +
-                 (sfx.endless ? 'endless' : `${sfx.loopTime}x`)],
-    ]));
-    b.appendChild(el('div', 'note',
-      (B.config && B.config.superAnchorNote) || ''));
-    if (sfx.anchorSource) b.appendChild(el('div', 'small mut', sfx.anchorSource));
-    const strip = el('div', 'relstrip');
-    for (const L of sfx.layers) {
-      if (L.texture) strip.appendChild(fxCell(L.texture, `L${L.index}`));
-    }
-    b.appendChild(strip);
-  } else {
-    // Say WHY there is nothing, and offer the one click that fixes it.
-    b.appendChild(el('div', 'pending', auraWhyNot()));
-    for (const q of (qrec.qualities || [])) {
-      if (!q.available || !q.aura) continue;
-      const jump = el('button', 'primary');
-      jump.textContent = `Switch to ${q.label} (${q.id})`;
-      jump.title = 'same weapon, same mesh — only the quality digit changes';
-      jump.addEventListener('click', async () => {
-        await setQuality(slot, q);
-        setAura(true);
-      });
-      b.appendChild(jump);
-    }
-    if (sfx && sfx.note) b.appendChild(el('div', 'small mut', sfx.note));
-  }
-  b.appendChild(el('div', 'note',
-    (B.config && B.config.auraQualityNote) || ''));
+  held.forEach((w, i) => renderHandFx(b, w, recs[i], qrecs[i]));
 
   // the per-attack trail and the impact spark are a different thing and the
   // browser page already resolves all three
@@ -1505,6 +1667,72 @@ async function refreshWeaponPanel() {
   a.textContent = 'attack trail and impact spark → asset browser';
   b.appendChild(a);
   syncAuraControl();
+}
+
+function renderHandFx(b, w, sfx, qrec) {
+  const slot = w.slot;
+  qrec = qrec || {};
+  const sec = el('div', 'handfx');
+  b.appendChild(sec);
+  sec.appendChild(el('h3', 'small', HAND_LABEL[slot]));
+  const qname = qrec.current
+    ? (B.config.qualityLabels || {})[qrec.current] || qrec.current : '';
+  sec.appendChild(kv([
+    ['weapon', `${w.v.name} (${w.v.id})`],
+    ['quality', qname || 'not a quality id'],
+  ]));
+
+  // ---- the switch, whatever the answer is. One per hand, and it names the
+  // hand: two identical "Super aura" switches would be a coin toss.
+  const ok = hasAura(slot);
+  const sw = el('label', 'bigtoggle' + (ok ? '' : ' nofx'));
+  const cb = el('input');
+  cb.type = 'checkbox';
+  cb.checked = ok && aura(slot).on;
+  cb.disabled = !ok;
+  cb.addEventListener('change', () => setAura(slot, cb.checked));
+  sw.appendChild(cb);
+  sw.appendChild(el('b', null, `Super aura — ${HAND_LABEL[slot]}`));
+  sw.appendChild(el('span', 'small mut',
+    ok ? (aura(slot).on ? 'showing on this weapon' : 'this weapon has one')
+       : 'not on this quality'));
+  sec.appendChild(sw);
+
+  if (sfx && sfx.found) {
+    sec.appendChild(kv([
+      ['effect', sfx.name],
+      ['family', sfx.family],
+      ['layers', sfx.layers.length],
+      ['socket', HAND_DUMY[slot]],
+      ['timing', `${sfx.frameIntervalMs} ms/frame, ` +
+                 (sfx.endless ? 'endless' : `${sfx.loopTime}x`)],
+    ]));
+    sec.appendChild(el('div', 'note',
+      (B.config && B.config.superAnchorNote) || ''));
+    if (sfx.anchorSource) sec.appendChild(el('div', 'small mut', sfx.anchorSource));
+    const strip = el('div', 'relstrip');
+    for (const L of sfx.layers) {
+      if (L.texture) strip.appendChild(fxCell(L.texture, `L${L.index}`));
+    }
+    sec.appendChild(strip);
+  } else {
+    // Say WHY there is nothing, and offer the one click that fixes it.
+    sec.appendChild(el('div', 'pending', auraWhyNot(slot)));
+    for (const q of (qrec.qualities || [])) {
+      if (!q.available || !q.aura) continue;
+      const jump = el('button', 'primary');
+      jump.textContent = `Switch to ${q.label} (${q.id})`;
+      jump.title = 'same weapon, same mesh — only the quality digit changes';
+      jump.addEventListener('click', async () => {
+        await setQuality(slot, q);
+        setAura(slot, true);
+      });
+      sec.appendChild(jump);
+    }
+    if (sfx && sfx.note) sec.appendChild(el('div', 'small mut', sfx.note));
+  }
+  sec.appendChild(el('div', 'note',
+    (B.config && B.config.auraQualityNote) || ''));
 }
 
 function fxCell(path, label) {
@@ -1516,70 +1744,102 @@ function fxCell(path, label) {
   return cell;
 }
 
-/** Attach (or detach) the weapon effect through fx.js -- the same playback the
- *  asset browser uses, so it is the tested path rather than a second one. */
+/** Attach (or detach) the weapon effects through fx.js -- the same playback the
+ *  asset browser uses, so it is the tested path rather than a second one.
+ *
+ *  One EffectInstance per glowing hand, each tagged with its `slot` and each
+ *  carrying its own anchor. The texture keys are namespaced by hand as well:
+ *  two auras whose layers both claimed `sfx:0` would fight over one entry in
+ *  the viewer's texture map and the second hand would repaint the first. */
 async function applySuperFx() {
   if (!viewer) return;
-  const rec = B.superfx.rec;
-  if (!B.superfx.on || !rec || !rec.found || !rec.effect) {
+  const hands = glowingHands();
+  if (!hands.length) {
     viewer.clearEffects();
     $('#fx-wrap').classList.add('hidden');
     cancelAnimationFrame(B.superfx.raf);
     viewer.draw();
     return;
   }
-  const keys = {};
-  for (const lay of rec.effect.layers || []) {
-    if (lay.texture) keys[lay.index] = `sfx:${lay.index}`;
+  const defs = [];
+  for (const slot of hands) {
+    const st = aura(slot);
+    const keys = {};
+    for (const lay of st.rec.effect.layers || []) {
+      if (lay.texture) keys[lay.index] = `sfx:${slot}:${lay.index}`;
+    }
+    st.anchor = (st.rec.anchor && st.rec.anchor.length === 16)
+      ? Array.from(st.rec.anchor) : FX.IDENT.slice();
+    defs.push({ def: st.rec.effect, role: 'aura', slot,
+                anchor: st.anchor, textureKeys: keys });
   }
-  B.superfx.anchor = (rec.anchor && rec.anchor.length === 16)
-    ? Array.from(rec.anchor) : FX.IDENT.slice();
-  const n = viewer.setEffects([{ def: rec.effect, role: 'aura',
-                                 anchor: B.superfx.anchor, textureKeys: keys }]);
-  for (const lay of rec.effect.layers || []) {
-    if (lay.texture) await applyNamedTexture(`sfx:${lay.index}`, lay.texture);
+  const n = viewer.setEffects(defs);
+  for (const d of defs) {
+    for (const lay of d.def.layers || []) {
+      if (lay.texture) await applyNamedTexture(d.textureKeys[lay.index], lay.texture);
+    }
   }
   // setEffects() clears the texture map, so the figure's skins go back on
   if (B.figure) {
-    await applyNamedTexture('body', B.figure.body.texture);
-    for (const p of B.figure.parts) await applyNamedTexture('slot:' + p.slot, p.texture);
+    await viewer.applyTextureBundle(
+      [{ key: 'body', path: B.figure.body.texture }].concat(
+        B.figure.parts.map(p => ({ key: 'slot:' + p.slot, path: p.texture }))),
+      { pngUrl: texUrl });
   }
   $('#fx-wrap').classList.toggle('hidden', !n);
   if (n) fxLoop();
 }
 
 /** Follow the hand: during playback the socket matrix changes every frame, and
- *  the effect is anchored to the socket, so it has to move with it. */
+ *  the effect is anchored to the socket, so it has to move with it.
+ *
+ *  Per hand, from that hand's own dummy. The old version read ONE socket and
+ *  wrote it into every live instance, which is fine with one aura and wrong
+ *  the moment there are two -- the left glow would be dragged onto the right
+ *  hand and the two would sit on top of each other. */
 function placeSuperFx(sockets) {
-  const rec = B.superfx.rec;
-  if (!rec || !rec.found) return;
-  const dumy = B.superfx.slot === 'l_weapon' ? 'v_l_weapon' : 'v_r_weapon';
-  const m = sockets && sockets[dumy];
-  if (!(m && m.length === 16)) return;
-  B.superfx.anchor = Array.from(m);
+  if (!sockets) return;
+  for (const slot of AURA_HANDS) {
+    const st = aura(slot);
+    if (!st.on || !hasAura(slot)) continue;
+    const m = sockets[HAND_DUMY[slot]];
+    if (!(m && m.length === 16)) continue;
+    st.anchor = Array.from(m);
+  }
   // Push it straight into the live instances. The effect's own rAF supplies
   // the anchor on every tick, but it is not running while the animation is
   // paused or being scrubbed — and a glow that only tracks the hand while
   // *both* loops happen to be running is exactly the class of bug this panel
   // exists to have fixed.
   for (const f of (viewer && viewer.fx) || []) {
-    if (f.anchor && f.anchor.length === 16) f.anchor.set(B.superfx.anchor);
+    const st = B.superfx.hands[f.slot];
+    if (st && st.anchor && f.anchor && f.anchor.length === 16) f.anchor.set(st.anchor);
   }
 }
 
 function fxLoop() {
   cancelAnimationFrame(B.superfx.raf);
   const t0 = performance.now();
-  const rec = B.superfx.rec;
-  const dur = Math.max(400, (rec.effect.effectiveFrames || rec.effect.frames || 1) *
-                            (rec.effect.frameIntervalMs || 41));
+  const hands = glowingHands();
+  if (!hands.length) return;
+  const durOf = st => Math.max(400,
+    (st.rec.effect.effectiveFrames || st.rec.effect.frames || 1) *
+    (st.rec.effect.frameIntervalMs || 41));
+  // Two auras share one clock and one slider. They are loops, not a timeline,
+  // so the longer of the two sets the period and the shorter simply repeats
+  // inside it -- which is what the endless flag means anyway.
+  const dur = Math.max(...hands.map(s => durOf(aura(s))));
+  const names = hands.map(s => `${HAND_LABEL[s]} ${aura(s).rec.name}`).join(' + ');
   const step = () => {
-    if (!B.superfx.on || !viewer.fx.length) return;
+    if (!anyAuraOn() || !viewer.fx.length) return;
     let t = performance.now() - t0;
     if (t > dur) { viewer.resetEffects(); }
-    viewer.setEffectTime(t % dur, () => B.superfx.anchor);
+    // Each instance rides ITS OWN hand's socket. One shared anchor here is
+    // the same bug placeSuperFx had, arriving through the playback loop.
+    viewer.setEffectTime(t % dur,
+                         f => (B.superfx.hands[f.slot] || {}).anchor || null);
     $('#fx-label').textContent =
-      `${Math.round(t % dur)} / ${Math.round(dur)} ms · ${rec.name}`;
+      `${Math.round(t % dur)} / ${Math.round(dur)} ms · ${names}`;
     $('#fx-slider').max = String(Math.round(dur));
     $('#fx-slider').value = String(Math.round(t % dur));
     viewer.draw();
@@ -1678,8 +1938,13 @@ function applyMode({ rebuild: doRebuild = true } = {}) {
   $('#card-monster').classList.toggle(
     'hidden', !(model && B.model.data && B.model.data.kind === 'monster'));
   if (model) {
-    $('#aura-label').classList.add('hidden');
-    if (B.superfx.rec) { B.superfx.rec = null; viewer && viewer.clearEffects(); }
+    let had = false;
+    for (const s of AURA_HANDS) {
+      const lab = $(`#aura-label-${s}`);
+      if (lab) lab.classList.add('hidden');
+      if (aura(s).rec) { aura(s).rec = null; aura(s).anchor = null; had = true; }
+    }
+    if (had) viewer && viewer.clearEffects();
   }
   document.body.classList.toggle('mode-model', model);
   saveModelState();
@@ -2554,12 +2819,16 @@ function stopModelEffect() {
 /** The bounds of an effect's own quads, so the camera has something to fit.
  *  Effects carry no body to frame on and their scale varies wildly (a 12-unit
  *  spark against a 400-unit aura), so without this the view keeps whatever the
- *  last model left it at and a small effect is an invisible dot. */
+ *  last model left it at and a small effect is an invisible dot.
+ *
+ *  A particle part carries the same `bboxRender` key (effectplay emits it from
+ *  the baked frames, half-extent included), which is what makes a PURE
+ *  particle effect framable at all -- it has no `geometry` to measure. */
 function effectBounds(def) {
   let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const lay of (def && def.layers) || []) {
     for (const p of lay.parts || []) {
-      const b = p.geometry && p.geometry.bboxRender;
+      const b = (p.geometry && p.geometry.bboxRender) || p.bboxRender;
       if (!b) continue;
       for (let i = 0; i < 3; i++) {
         lo[i] = Math.min(lo[i], b[0][i]);
@@ -2592,9 +2861,14 @@ async function showEffectModel(info, tk) {
   if (!stillCurrent(tk)) return;
   $('#gl-msg').classList.toggle('hidden', !!n);
   if (!n) {
+    // Particles are drawn now (docs/effects.md §6.6), so reaching here no
+    // longer means "pure particles" -- it means every layer failed to load or
+    // the effect really has nothing in it. Say that instead of naming a gap
+    // that is closed.
     $('#gl-msg').textContent =
-      'no drawable layer — this effect is pure PTCL/PTC3 particles, which are ' +
-      'not decoded (docs/effects.md §6.6)';
+      (info.effect.layers || []).length
+        ? 'no drawable layer — every layer of this effect failed to load'
+        : 'this effect declares no layers';
   }
   $('#gl-stats').textContent = `${info.ident || info.id} · ${n} layer(s)`;
   $('#fx-wrap').classList.toggle('hidden', !n);
@@ -3015,13 +3289,25 @@ function bindControls() {
   $('#help').addEventListener('click', e => {
     if (e.target.id === 'help') $('#help').classList.add('hidden');
   });
-  $('#chk-aura').addEventListener('change', e => setAura(e.target.checked));
-  $('#aura-label').addEventListener('click', e => {
-    // A disabled checkbox swallows the click, so the label explains instead of
-    // doing nothing — "why is this greyed" is the actual question here.
-    if ($('#chk-aura').disabled) { e.preventDefault(); toast(auraWhyNot(), 6000); }
+  for (const slot of AURA_HANDS) {
+    const { lab, box } = auraControls(slot);
+    if (!lab || !box) continue;
+    box.addEventListener('change', e => setAura(slot, e.target.checked));
+    lab.addEventListener('click', e => {
+      // A disabled checkbox swallows the click, so the label explains instead
+      // of doing nothing — "why is this greyed" is the actual question here.
+      if (box.disabled) { e.preventDefault(); toast(auraWhyNot(slot), 6000); }
+    });
+  }
+  // The ✕ stops the effect playback, which means both hands: it sits on the
+  // shared fx strip, not on either hand's switch.
+  $('#btn-fx-stop').addEventListener('click', () => {
+    for (const slot of AURA_HANDS) aura(slot).on = false;
+    persistAura();
+    applySuperFx();
+    syncAuraControl();
+    refreshWeaponPanel();
   });
-  $('#btn-fx-stop').addEventListener('click', () => setAura(false));
 }
 
 function focusHead() {
@@ -3068,6 +3354,20 @@ function bindKeys() {
         }
         case 'Escape': cancelPicker(); break;
         case '/': $('#picker-search').focus(); break;
+        // Q works in here too, and has to: opening a picker is the ONLY way
+        // to point the Colour & variants panel at a slot, and that panel is
+        // what Q reads. Without this, "press 4 for the left hand, then Q"
+        // would mean closing the picker again first.
+        //
+        // Not reachable straight after opening one, and that is correct: the
+        // search box takes focus, and `typingInAField()` above returns before
+        // this switch so `q` types a `q`. It goes live the moment you leave
+        // that box, which ArrowDown does on its way into the list -- i.e. as
+        // soon as you are browsing rather than searching. The panel is
+        // already showing this slot's ladder by then (openPicker calls
+        // showLookFor) and that ladder's own buttons are already live, so
+        // this is a key for an affordance that is on screen either way.
+        case 'Q': case 'q': stepQuality(e.shiftKey ? -1 : 1); break;
         default: return;
       }
       e.preventDefault();
@@ -3102,10 +3402,13 @@ function bindKeys() {
       case ' ': B.anim.playing ? animPause() : animPlay(); break;
       case 'Escape': $('#help').classList.add('hidden'); return;
       case '?': $('#help').classList.toggle('hidden'); break;
-      case '1': openPicker('body'); break;
-      case '2': openPicker('armet'); break;
-      case '3': openPicker('r_weapon'); break;
-      case '4': openPicker('l_weapon'); break;
+      // Bound off PICKER_KEYS, which stepQuality quotes back at the user when
+      // it needs to be told which hand it is talking about.
+      case '1': case '2': case '3': case '4':
+        openPicker(SLOT_FOR_PICKER_KEY[e.key]); break;
+      // Two hands, two keys. This case is on `e.key`, so it is reached only
+      // with Shift held; plain `a` falls through to the lowercase switch.
+      case 'A': toggleAura('l_weapon'); break;
       default:
         switch (e.key.toLowerCase()) {
           case 'b': openPicker('body'); break;
@@ -3116,7 +3419,7 @@ function bindKeys() {
           case 'g': $('#chk-grid').click(); break;
           case 'w': $('#chk-wire').click(); break;
           case 'c': toggleAllPanels(); break;
-          case 'a': toggleAura(); break;
+          case 'a': toggleAura('r_weapon'); break;
           default: return;
         }
     }

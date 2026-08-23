@@ -199,8 +199,17 @@ const ISO_YAW = -Math.PI / 4;
 const ISO_PITCH = Math.asin(0.5);
 
 class Viewer {
-  constructor(canvas) {
+  /** `camScope` namespaces the stored camera.
+   *
+   *  Two viewers alive on one page in the same view mode otherwise share one
+   *  `localStorage` key and overwrite each other's orientation every frame --
+   *  fine for `panels.js`, whose preview is never orbited, and not fine for
+   *  the swap page, where both panes are. Omitting it keeps the key exactly
+   *  as it was, so every existing caller stores what it stored before.
+   */
+  constructor(canvas, { camScope = '' } = {}) {
     this.canvas = canvas;
+    this.camScope = camScope;
     const opts = { antialias: true, alpha: false, premultipliedAlpha: false,
                    preserveDrawingBuffer: true };
     this.gl = canvas.getContext('webgl', opts) || canvas.getContext('experimental-webgl', opts);
@@ -451,7 +460,10 @@ class Viewer {
   // Camera state is kept PER MODE. Character view stays anchored to the body;
   // asset view re-fits per asset. Coming back from inspecting a helmet must
   // restore the character framing, not inherit the helmet's zoom.
-  _key() { return 'coviewer.cam.' + this.viewMode; }
+  _key() {
+    return 'coviewer.cam.' +
+           (this.camScope ? this.camScope + '.' : '') + this.viewMode;
+  }
 
   _saveCam() {
     // The game camera is derived, not chosen, so it must never be written into
@@ -678,9 +690,24 @@ class Viewer {
    *  which evaluates the game's own `3dmotion.ini` track. Nothing here invents
    *  motion; it only uploads what the server computed.
    */
-  setPose(positions, sockets) {
+  /*  `pred` limits the pose to the meshes it accepts. Optional, and omitting
+   *  it poses the whole scene exactly as before -- but a scene with more than
+   *  one figure in it MUST pass one, and here is why.
+   *
+   *  `positions` is keyed by `meta.index`, the chunk's ordinal inside its own
+   *  C3 file. Two figures built from the same body have the same chunk indices
+   *  AND the same vertex counts, so the length check below passes for both and
+   *  one character's animation is uploaded onto every other character wearing
+   *  the same armour. The symptom is a crowd moving in perfect unison, which
+   *  reads as an animation bug rather than a scene one.
+   *
+   *  `tools/webui/play.js` passes `m => m.slot === '_player'`; every mesh
+   *  `tools/webui/entities.js` emits is tagged `ent:<uid>`.
+   */
+  setPose(positions, sockets, pred) {
     const gl = this.gl;
     for (const m of this.meshes) {
+      if (pred && !pred(m)) continue;
       // Socket-attached geometry -- a weapon, a helmet -- is moved by its
       // socket matrix, not by rewriting vertices.
       //
@@ -711,9 +738,39 @@ class Viewer {
   // of an impact spark, anchored somewhere the character is not.
   // The algorithm is fx.js / tools/effectplay.py; this is only the plumbing.
 
-  /** defs: [{def, role, anchor, textureKeys}] straight from /api/effect. */
+  /** defs: [{def, role, slot, anchor, textureKeys, tOffset}] straight from
+   *  /api/effect.
+   *  `slot` is optional and identifies WHICH socket an instance rides when
+   *  several share a role -- the two weapon-hand auras are both `role: 'aura'`
+   *  and nothing else tells them apart.
+   *  `tOffset` is optional and is this instance's own phase in ms; see
+   *  `EffectInstance.tOffset`. Omit it and the instance rides the caller's
+   *  clock exactly as before.
+   *
+   *  THIS REPLACES THE WHOLE ENDLESS LIST. There is one effect channel per
+   *  viewer, so a page with several sources of endless effects -- the map's
+   *  ambient decoration, the entities' status auras, their weapon glows --
+   *  must compose ONE array and call this once. Calling it twice does not
+   *  merge, it clears; `play.js::fxAttach` is the composer that exists
+   *  because of this.
+   *
+   *  IT DOES NOT REPLACE THE TRANSIENTS, and that is the point of the
+   *  distinction. A one-shot spawned by `spawnEffect` is not part of any
+   *  composer's list -- no composer knows it exists, because it was born from
+   *  an event rather than from a state -- so replacing the list would kill it
+   *  for a reason that has nothing to do with it. A hit spark dying because
+   *  somebody two screens away gained a buff is exactly the class of bug the
+   *  one-list rule was written to prevent, arriving from the other side.
+   *
+   *  A surviving transient's phase is now measured against a clock its caller
+   *  is about to restart. `rebaseTransients` is the second half of this and
+   *  the caller owes it. */
   setEffects(defs) {
-    this.clearEffects();
+    const keep = [];
+    for (const f of this.fx || []) {
+      if (f.transient) keep.push(f); else f.dispose();
+    }
+    this.fx = keep;
     for (const d of defs || []) {
       if (!d || !d.def) continue;
       try {
@@ -725,18 +782,106 @@ class Viewer {
     return this.fx.length;
   }
 
+  /** Add ONE instance without touching anything already playing.
+   *
+   *  THE ONE-SHOT SEAM. `setEffects` is for sources that are a STATE -- what
+   *  is on this map, who is buffed, what is equipped -- and it is right for
+   *  them to be recomposed wholesale, because the answer is a function of the
+   *  world at that moment. This is for sources that are an EVENT: a hit
+   *  landed, and no later poll of the world will ever mention it again. There
+   *  was nowhere for such a thing to live, which is why hit sparks were never
+   *  built and not because their wire or their art was missing
+   *  (docs/hit_spark_2026-08-15.md).
+   *
+   *  `d` is the same shape `setEffects` takes plus `transient: true` and
+   *  `spawnAt`, the caller's clock reading at the moment of the event.
+   *  Returns the instance, or null if the scene would not build.
+   *
+   *  `fxTime` is deliberately NOT reset: everything already playing keeps its
+   *  phase, which is control 2 of this item made structural rather than
+   *  asserted. */
+  spawnEffect(d) {
+    if (!d || !d.def) return null;
+    let inst = null;
+    try {
+      inst = new EffectInstance(this.gl, d.def, Object.assign({}, d,
+                                                              { transient: true }));
+    } catch (e) { return null; }
+    this.fx.push(inst);
+    this.draw();
+    return inst;
+  }
+
+  /** Re-phase every live transient onto a clock that has just restarted at
+   *  `now`, on the caller's own timebase.
+   *
+   *  THE SIGN IS THE WHOLE OF IT, and it is the same trap `entities.js`
+   *  documents for `auraDefs`: `setEffectTime` ticks an instance with
+   *  `ms - tOffset` where `ms` counts from the new base, so an instance that
+   *  started BEFORE the base needs a NEGATIVE offset. Written the other way
+   *  round a spark that has been alive for 200 ms would jump backwards to a
+   *  negative time and sit frozen on frame 0 -- and a frozen spark reads as
+   *  slow art, not as a clock bug, exactly as a frozen aura did.
+   *
+   *  An endless instance is untouched: its composer recomputes its `tOffset`
+   *  from its own start time on every attach, and rebasing it here would
+   *  apply the correction twice. */
+  rebaseTransients(now) {
+    let n = 0;
+    for (const f of this.fx) {
+      if (!f.transient) continue;
+      f.tOffset = (f.spawnAt || now) - now;
+      n++;
+    }
+    return n;
+  }
+
+  /** Everything, transients included. This is the `setMeshes` path: the GL
+   *  context's buffers are going away, so nothing survives it. */
   clearEffects() {
     for (const f of this.fx || []) f.dispose();
     this.fx = [];
     this.fxTime = 0;
   }
 
+  /** Just the endless ones, leaving live one-shots alone. What a composer
+   *  calls when its own sources have all gone quiet -- the map has no records
+   *  and nobody is buffed -- which is not a reason to cut a spark short. */
+  clearEndlessEffects() {
+    const keep = [];
+    for (const f of this.fx || []) {
+      if (f.transient) keep.push(f); else f.dispose();
+    }
+    this.fx = keep;
+    return this.fx.length;
+  }
+
   /** Advance every instance to `ms` since spawn and redraw.
-   *  `parentFor(role)` supplies the world matrix the effect rides -- the weapon
-   *  socket for an aura/trail, the target dummy for an impact. */
+   *  `parentFor(instance)` supplies the world matrix that effect rides -- the
+   *  weapon socket for an aura/trail, the target dummy for an impact. It is
+   *  passed the INSTANCE, not a role, precisely so a caller with two auras
+   *  can return `v_l_weapon` for one and `v_r_weapon` for the other; a
+   *  callback that ignores its argument gives every glow the same hand. */
+  /** ...and it is also where a one-shot DIES.
+   *
+   *  `frameAt` has always returned `done` for a scene with `endless: false`
+   *  once it has played `loopTime` loops, and `_drawEffects` has always
+   *  skipped a done instance -- so an expired transient was already invisible
+   *  before this item. Invisible is not gone: it kept its GL buffers, it was
+   *  ticked on every frame for the life of the page, and the list grew by one
+   *  per hit for ever. "It spawns and never leaves" is the bug this item
+   *  exists to prevent and it wears the feature's clothes exactly this well,
+   *  which is why the measurement proves the AFTER frame matches the
+   *  pre-spawn baseline rather than proving the spark stopped drawing.
+   *
+   *  Only transients are reaped. A non-endless SCENE attached as an endless
+   *  instance -- a status aura whose art declares `loopTime 1` -- reports
+   *  `done` too, and reaping it would silently delete a buff that is still
+   *  on. The lifecycle is the instance's, not the scene's. */
   setEffectTime(ms, parentFor) {
     this.fxTime = ms;
     let alive = 0;
+    let reap = null;
     for (const f of this.fx) {
       const parent = parentFor ? parentFor(f) : null;
       // The parent matrix MOVES. An aura rides `v_r_weapon` and that socket is
@@ -750,8 +895,25 @@ class Viewer {
       // socket has moved to (28.1, -76.1, 72.5) while the frozen anchor was
       // still (-10.4, 18.7, 81.3), ~100 units away.
       if (parent && parent.length === 16) f.anchor.set(parent);
-      const st = f.tick(ms, parent);
+      // `tOffset` is this instance's own phase (see fx.js). Zero for
+      // everything that shares a spawn moment, which is every caller that
+      // existed before entity status auras -- so this subtraction changes no
+      // frame any of them draw.
+      const st = f.tick(ms - (f.tOffset || 0), parent);
       if (!st.done) alive++;
+      else if (f.transient) (reap || (reap = [])).push(f);
+    }
+    if (reap) {
+      // Spliced after the walk, not during it: removing from the array being
+      // iterated skips the next element, and the element it skips is another
+      // expiring spark in exactly the case that matters -- two hits landing
+      // in the same tick.
+      for (const f of reap) {
+        const i = this.fx.indexOf(f);
+        if (i >= 0) this.fx.splice(i, 1);
+        f.dispose();
+      }
+      this.expired = (this.expired || 0) + reap.length;
     }
     this.draw();
     return alive;
@@ -779,9 +941,28 @@ class Viewer {
     return T[name] !== undefined ? T[name] : gl.ONE;
   }
 
-  _drawEffects(mvp) {
+  /** Camera right/up in world space, taken out of the view matrix the render
+   *  is actually using.
+   *
+   *  DERIVED FROM THE RENDER PATH, NOT FROM `_basis()`, and for the same
+   *  reason `screenToGround` re-derives its own: `_basis()` computes
+   *  `right = cross(dir, up)` where `M4.lookAt` computes `x = cross(up, z)`
+   *  -- the same axis with the opposite sign. Borrowing `_basis()` here would
+   *  mirror every particle billboard in X, which on a symmetric burst is
+   *  invisible and on a flipbook atlas cell is a texture drawn backwards.
+   *  `M4.lookAt` writes x into (view[0], view[4], view[8]) and y into
+   *  (view[1], view[5], view[9]). */
+  _cameraBasis(view) {
+    return {
+      right: [view[0], view[4], view[8]],
+      up: [view[1], view[5], view[9]],
+    };
+  }
+
+  _drawEffects(mvp, view) {
     const gl = this.gl;
     if (!this.fx.length) return;
+    const cam = this._cameraBasis(view || M4.ident());
     gl.enable(gl.BLEND);
     gl.depthMask(false);          // effects never occlude each other
     gl.disable(gl.CULL_FACE);     // effect quads are viewed from both sides
@@ -832,6 +1013,33 @@ class Viewer {
             gl.vertexAttrib4f(this.attr.col, 1, 1, 1, 1);
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.ibo);
             gl.drawElements(gl.TRIANGLES, p.count, gl.UNSIGNED_SHORT, 0);
+          } else if (p.kind === 'particle') {
+            // docs/effects.md §6.6. Same clock and same early-out as a PHY
+            // part: past the system's effective length there is nothing left
+            // alive, and an empty frame draws nothing exactly as alpha 0 does
+            // (`Ptcl_Draw` returns at RVA 0x605CF).
+            const eff = p.src.effectiveFrames || inst.def.effectiveFrames || 1;
+            if (st.frame >= eff) continue;
+            const n = inst.uploadParticles(p, st.frame, world, cam.right, cam.up);
+            if (!n) continue;
+            // The quads are already in world space -- they were built from
+            // transformed positions plus a world-space camera basis -- so the
+            // model matrix is identity, as it is for a ribbon.
+            gl.uniform1f(this.uni.uMeshAlpha, p.alpha);
+            gl.uniform2f(this.uni.uUVOffset, 0, 0);
+            gl.uniformMatrix4fv(this.uni.uModel, false, M4.ident());
+            gl.uniformMatrix4fv(this.uni.uMVP, false, mvp);
+            gl.bindBuffer(gl.ARRAY_BUFFER, p.vbo);
+            gl.enableVertexAttribArray(this.attr.pos);
+            gl.vertexAttribPointer(this.attr.pos, 3, gl.FLOAT, false, 0, 0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, p.tbo);
+            gl.enableVertexAttribArray(this.attr.uv);
+            gl.vertexAttribPointer(this.attr.uv, 2, gl.FLOAT, false, 0, 0);
+            gl.disableVertexAttribArray(this.attr.nrm);
+            gl.vertexAttrib3f(this.attr.nrm, 0, 0, 1);
+            gl.disableVertexAttribArray(this.attr.col);
+            gl.vertexAttrib4f(this.attr.col, 1, 1, 1, 1);
+            gl.drawArrays(gl.TRIANGLES, 0, n);
           } else if (p.kind === 'shape' && p.count >= 4) {
             // The ribbon is already in world space -- it was built from
             // transformed points -- so the model matrix is identity here.
@@ -869,6 +1077,165 @@ class Viewer {
     this.cam.dist = Math.max(1, (spread || this.radius * 0.18) * 4);
     this._saveCam();
     this.draw();
+  }
+
+  /** The S3TC extension, fetched once and cached. `null` when the browser has
+   *  no DXT support, which is the signal to fall back to the PNG path.
+   *
+   *  The map viewport has done this since it shipped (`tilebake.js:79`); the
+   *  model viewport did not, so every character texture was decoded from DXT
+   *  to RGBA on the server, re-encoded as PNG, decoded again by the browser
+   *  and uploaded expanded -- four conversions to hand the GPU something it
+   *  consumes natively. Same extension, same format table, same reason. */
+  get s3tc() {
+    if (this._s3tc === undefined) {
+      const gl = this.gl;
+      this._s3tc = gl.getExtension('WEBGL_compressed_texture_s3tc')
+                || gl.getExtension('MOZ_WEBGL_compressed_texture_s3tc')
+                || gl.getExtension('WEBKIT_WEBGL_compressed_texture_s3tc')
+                || null;
+    }
+    return this._s3tc;
+  }
+
+  _s3tcFormat(fmt) {
+    const e = this.s3tc;
+    if (!e) return undefined;
+    // RGBA-DXT1 rather than RGB-DXT1, for punch-through alpha -- the same
+    // choice tilebake.js makes, for the same reason.
+    return { DXT1: e.COMPRESSED_RGBA_S3TC_DXT1_EXT,
+             DXT3: e.COMPRESSED_RGBA_S3TC_DXT3_EXT,
+             DXT5: e.COMPRESSED_RGBA_S3TC_DXT5_EXT }[fmt];
+  }
+
+  /** Upload one `/api/texbundle` entry under `key`, without decoding it.
+   *
+   *  `entry` is `{w, h, fmt, off, size}` from the bundle manifest and `buffer`
+   *  is the whole bundle ArrayBuffer -- the Uint8Array below is a VIEW, so
+   *  nothing is copied. Returns false when the format cannot be uploaded here,
+   *  and the caller must then use the PNG path: it must not leave the slot
+   *  untextured, because an untextured figure reads as a content bug.
+   *
+   *  Mipmaps: `generateMipmap` is not legal on a compressed texture in WebGL 1
+   *  and the bundle ships mip 0 only, so minification is LINEAR. The engine
+   *  builds its own chain and this viewport is not trying to match the
+   *  engine's filtering -- it is showing the artist's texels -- so one level
+   *  is the honest thing to draw. Magnification, which is what you are looking
+   *  at on a zoomed-in model, is LINEAR either way and unchanged. */
+  setCompressedTexture(key, entry, buffer) {
+    const gl = this.gl;
+    const view = new Uint8Array(buffer, entry.off, entry.size);
+    const old = this.textures.get(key);
+    if (entry.fmt === 'RGBA') {
+      // Not plain DXT on disk; the server decoded it once and shipped raw.
+      if (old) gl.deleteTexture(old);
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, entry.w, entry.h, 0,
+                    gl.RGBA, gl.UNSIGNED_BYTE, view);
+      this._texParams(entry.w, entry.h);
+      this.textures.set(key, t);
+      return true;
+    }
+    const fmt = this._s3tcFormat(entry.fmt);
+    if (fmt === undefined) return false;
+    if (old) gl.deleteTexture(old);
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.compressedTexImage2D(gl.TEXTURE_2D, 0, fmt, entry.w, entry.h, 0, view);
+    this._texParams(entry.w, entry.h);
+    this.textures.set(key, t);
+    return true;
+  }
+
+  _texParams(w, h) {
+    const gl = this.gl;
+    const pot = v => (v & (v - 1)) === 0;
+    const repeat = pot(w) && pot(h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,
+                     repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,
+                     repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  }
+
+  /** Every texture a figure draws, in ONE request, uploaded as DXT.
+   *
+   *  `pairs` is [{key, path}] -- the slot name the mesh defs reference, and
+   *  the logical .dds path. `opts.pngUrl(path)` builds the fallback URL and
+   *  `opts.isCurrent()` lets a caller abandon a superseded load; both are
+   *  optional. Resolves to {uploaded, fallback, missing}.
+   *
+   *  Two things change versus the loop this replaces. The requests collapse
+   *  from one-per-texture-awaited-in-turn to one, and the bytes stay DXT from
+   *  the archive to the GPU. MEASURED server-side on a body + head + two
+   *  weapons: 60.6 ms over 4 round trips through /api/texture, 3.9 ms over 1
+   *  here -- and that is before the browser-side PNG decode this also avoids.
+   *
+   *  **The fallback is not optional and must not be quiet.** A browser with no
+   *  S3TC, a texture that is not DXT on disk, or a path the server could not
+   *  read all end up on the PNG route, in parallel rather than in series. An
+   *  untextured figure would look like a content bug, so anything that could
+   *  not be uploaded is reported back rather than skipped. */
+  async applyTextureBundle(pairs, opts) {
+    opts = opts || {};
+    const isCurrent = opts.isCurrent || (() => true);
+    const pngUrl = opts.pngUrl || (p => '/api/texture?path=' + encodeURIComponent(p));
+    const want = (pairs || []).filter(p => p && p.path);
+    const res = { uploaded: 0, fallback: [], missing: [] };
+    if (!want.length) return res;
+
+    // One path may serve several slots (both hands holding 410005), and the
+    // bundle dedups by path, so the manifest is indexed by path, not by slot.
+    const uniq = [...new Set(want.map(p => p.path))];
+    let man = null, buf = null;
+    try {
+      const url = '/api/texbundle?paths=' + encodeURIComponent(uniq.join('|'));
+      const r = await fetch(url);
+      if (r.ok) {
+        buf = await r.arrayBuffer();
+        const head = new Uint8Array(buf, 0, 4);
+        if (String.fromCharCode(...head) === 'COTB') {
+          const dv = new DataView(buf);
+          const mlen = dv.getUint32(8, true);
+          man = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, mlen)));
+          man._base = 12 + mlen;
+        }
+      }
+    } catch (e) { man = null; }
+    if (!isCurrent()) return res;
+
+    const byPath = new Map();
+    if (man) for (const e of man.entries) if (e.path) byPath.set(e.path, e);
+
+    const needPng = [];
+    for (const p of want) {
+      const e = byPath.get(p.path);
+      // Offsets in the manifest are relative to the payload region, so shift
+      // them past the header before handing gl a view.
+      if (e && this.setCompressedTexture(p.key, { ...e, off: man._base + e.off }, buf)) {
+        res.uploaded++;
+      } else {
+        needPng.push(p);
+      }
+    }
+    if (needPng.length) {
+      // Parallel, not serial: nothing downstream depends on the order.
+      await Promise.all(needPng.map(p => new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+          if (isCurrent()) { this.setTexture(p.key, img); res.fallback.push(p.path); }
+          resolve();
+        };
+        img.onerror = () => { res.missing.push(p.path); resolve(); };
+        img.src = pngUrl(p.path);
+      })));
+    }
+    if (isCurrent()) this.draw();
+    return res;
   }
 
   /** Upload an <img> as a texture under `key`. */
@@ -1082,7 +1449,9 @@ class Viewer {
     }
 
     // ---- effects (always last: they are additive and never write depth) ---
-    this._drawEffects(mvp);
+    // `view` as well as `mvp`: a particle quad faces the camera, so the draw
+    // pass needs the camera's own basis and not just the combined transform.
+    this._drawEffects(mvp, view);
   }
 
   _setCull(meta) {

@@ -30,15 +30,20 @@ real mods/stage.
 
 from __future__ import annotations
 
+import argparse
+import ast
 import io
 import json
 import math
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -49,7 +54,9 @@ sys.path.insert(0, str(HERE))
 
 import bodyfacets                                # noqa: E402
 import c3phy                                     # noqa: E402
+import coassets                                  # noqa: E402
 import coroot                                    # noqa: E402
+import dbcshadow                                 # noqa: E402
 import dds                                       # noqa: E402
 from coassets import DEFAULT_ROOT                # noqa: E402
 
@@ -74,6 +81,7 @@ HAVE_CLIENT = (PROJECT / "client" / "gamemap.py").is_file()
 HAVE_PLAY_UI = (HERE / "webui" / "play.js").is_file()
 HAVE_PACKMEASURE = (HERE / "packmeasure.py").is_file()
 HAVE_TILESET = (HERE / "tileset.py").is_file()
+HAVE_EXTRACTOR = (HERE / "extract_comod.py").is_file()
 
 
 def _thumbs_rendered(kind: str = "meshes") -> bool:
@@ -97,6 +105,350 @@ def _thumbs_rendered(kind: str = "meshes") -> bool:
         return int(counts.get("meshes", 0) or 0) >= 4000
     return int(counts.get("textures", 0) or 0) >= 60000
 
+
+# ---------------------------------------------------------------------------
+# which install is configured
+# ---------------------------------------------------------------------------
+
+#: The plugin the configured install was *declared* as, or "" if nobody said.
+#: Declaration rather than detection, deliberately: it is what `coroot.base_id`
+#: keys the derived tree on, so a test and the index it reads agree about which
+#: client they are talking about or neither is trustworthy.
+BASE_KIND = ""
+try:
+    BASE_KIND = coroot.kind_for_root() or ""
+except Exception:                                # pragma: no cover
+    BASE_KIND = ""
+
+
+def requires_base(*kinds: str, why: str = ""):
+    """Skip unless the configured install is one of ``kinds``.
+
+    `HAVE_ROOT` answers "does a directory exist", which is the wrong question
+    for any test that asserts a fact about *particular* game data. This machine
+    holds eight installs and the suite's fixtures were written against CCO 2.0;
+    run them on a patch client and they fail -- reporting identically to a real
+    regression, so the only way to read the suite is to diff the failure set
+    against a remembered one. That is what made 45 failures and 9 errors
+    un-triageable, and it is the same class of mistake as an unkeyed cache:
+    a gate keyed on something that is not identity.
+
+    Skipping is the correct outcome rather than a dodge. Which client is
+    configured is the user's deliberate choice, exactly as a partial thumbnail
+    render is (`_thumbs_rendered` skips for the same reason). A test that
+    cannot apply here has proved nothing, and saying so is honest; failing
+    would assert something false about the code.
+
+    The point is what it buys: after this, **red means broken code**.
+
+    Use it on the assertion, not on the reader -- a format reader that should
+    work on every client must keep failing everywhere when it breaks. This is
+    for fixtures pinned to one install's *content*.
+    """
+    want = tuple(k.lower() for k in kinds)
+    have = (BASE_KIND or "").lower()
+    reason = (f"needs a {'/'.join(kinds)} install; configured install is "
+              f"{BASE_KIND or 'undeclared'}")
+    if why:
+        reason += f" ({why})"
+    return unittest.skipUnless(have in want, reason)
+
+
+#: The compiled-table census, quoted by every gate that turns on ``.dbc``
+#: presence.  Written once because four gates rest on the same measurement and
+#: four copies is how three of them end up stale.
+_DBC_CENSUS = (". FILES/ini/*.dbc COUNTED on all six declared installs "
+               "2026-08-09: cco 0, 5017 0, 5065 0, 5165 0, 5517 14, 6090 15. "
+               "Only the two compiled clients can hold this fact at all, and "
+               "their record counts differ, which is what makes a "
+               "single-client gate correct here rather than merely narrow "
+               "-- CORRECTIONS C-2026-08-09-comod-base-gate-audit")
+
+#: Memoised because `requires_linkage` is evaluated once per decorated test at
+#: import time, and answering costs a parse of a multi-megabyte artefact.
+_LINKAGE_STATUS: "dict | None" = None
+
+
+def _linkage_status() -> dict:
+    """`AssetCatalog.linkage_status()` for the configured install.
+
+    Built from a bare catalogue rather than the suite's shared `Catalog`, so
+    it can be asked at *decoration* time -- before any fixture exists.
+    """
+    global _LINKAGE_STATUS
+    if _LINKAGE_STATUS is None:
+        try:
+            import catalog as _catalog
+            _LINKAGE_STATUS = _catalog.AssetCatalog(ROOT).linkage_status()
+        except Exception as exc:                      # pragma: no cover
+            _LINKAGE_STATUS = {"state": "unavailable",
+                               "reason": f"linkage status unavailable: {exc}"}
+    return _LINKAGE_STATUS
+
+
+def requires_linkage(why: str = ""):
+    r"""Skip unless ``out/effects/linkage.json`` really loaded for this base.
+
+    **The failure this exists to stop.** Two tests here asserted content
+    against a `weapon_linkage()` that had loaded nothing, and reported it as
+    *"Flash4102 does not resolve"* and *"410005 has no weapon_effects
+    record"* -- content refutations, on a base for which the linkage artefact
+    was not present at all. A test that cannot tell *"the table says no"*
+    from *"there is no table"* is not measuring what it claims to, and it
+    costs whoever inherits it a hunt for a defect in the resolver.
+
+    Same argument as `requires_base`, one level down. That gate asks *"is this
+    the client the fixture was written against?"*; this one asks *"is the
+    derived index it reads actually here?"* -- a question `HAVE_ROOT` cannot
+    answer either, because an install directory exists whether or not anything
+    has been derived from it.
+
+    Skipping rather than failing, deliberately: an unbuilt index is a state of
+    the working tree, not broken code, exactly as a partial thumbnail render is
+    (`_thumbs_rendered`). The skip reason carries `linkage_status()["reason"]`
+    verbatim, which names the **keyed** path and the base it was keyed to --
+    the pair that separates "never built here" from "orphaned when the install
+    re-keyed" (`docs/CORRECTIONS.md` C18) without any further digging.
+
+    Use it on assertions about linkage *content*. A test about the empty case
+    itself must keep running everywhere -- see
+    `test_weapon_related_has_an_effects_slot`.
+
+    **Stack it under `requires_base`, not over it.** Both are `skipUnless`, so
+    whichever is applied *outermost* overwrites the other's reason -- and on a
+    client the fixture was never written for, "wrong client" is the answer that
+    ends the question. "The index is not built" would send the reader off to
+    build one that still would not make the test pass.
+    """
+    st = _linkage_status()
+    ok = st.get("state") == "ok"
+    reason = st.get("reason") or "weapon-effect linkage did not load"
+    if why:
+        reason += f" ({why})"
+    return unittest.skipUnless(ok, reason)
+
+
+#: Memoised on `(rel, present, note)`: a reason is built once per decorated
+#: test at *import* time, and answering costs a `base_id()` -- which hashes the
+#: install's `ini/` -- plus a directory listing.
+_INDEX_REASONS: "dict[tuple, str]" = {}
+
+
+class NotAnIndex(ValueError):
+    r"""`requires_index` was handed something no per-base build produces.
+
+    **Refused rather than described.** Three different absences look alike from
+    a test's point of view, and only one of them is fixed by building an index:
+
+    ======================  ==============================  ==================
+    absent thing            example                         the actual fix
+    ======================  ==============================  ==================
+    a per-base index        ``out/meshtex/mesh_index.json`` build it
+    a file the CLIENT ships ``ini/Monster.dat``             wrong install
+    a file the REPO ships   ``tools/tileset.py``            incomplete checkout
+    ======================  ==============================  ==================
+
+    The middle row is `requires_base`'s family. The bottom row is the one that
+    could plausibly be handed here, because a missing tool source and an
+    unbuilt index are both *"absent from this working tree"* -- and telling
+    that reader *"derived index unusable for base <id>, run the build"* is the
+    same confidently-wrong diagnosis this whole gate exists to abolish,
+    produced by the gate. Answering nothing is strictly better than answering
+    that, so this raises at import time, loudly, at the call site.
+
+    A **GLOBAL** derived tree (`coroot.GLOBAL` -- ``out/wdf/``, ``out/dll/``'s
+    name-recovery table) is refused for a narrower reason: it is genuinely
+    built, but it is *not keyed to a base*, so a reason naming a `base_id` and
+    a namespace would assert something false about it. There is no namespace
+    for it to be missing from.
+    """
+
+
+def _refuse_unless_per_base(rel: str) -> str:
+    """`rel`, or raise `NotAnIndex` -- see that class for why refusing wins."""
+    r = str(rel).replace("\\", "/")
+    if not r.startswith("out/"):
+        raise NotAnIndex(
+            f"{rel!r} is not under out/, so no build produces it and "
+            f"`requires_index` cannot say anything true about it. A file that "
+            f"ships with the CLIENT wants `requires_base`; one that ships with "
+            f"the REPO wants a plain `skipUnless(<path>.is_file(), ...)` naming "
+            f"the checkout, the way HAVE_TILESET does.")
+    if not any(r == p.rstrip("/") or r.startswith(p) for p in coroot.PER_BASE):
+        raise NotAnIndex(
+            f"{rel!r} is under out/ but is not in `coroot.PER_BASE`, so it is "
+            f"not keyed to a base. A skip reason naming a base id and an "
+            f"out/indexes/<base-id>/ namespace would be false about it -- "
+            f"there is no namespace for it to be absent from. Gate it on the "
+            f"path itself, or move the tree into PER_BASE with a reason.")
+    return r
+
+
+def _index_roots() -> list[Path]:
+    """The ``out/indexes`` directories a *reader* could reach, in lookup order.
+
+    The same two checkouts and the same ``CO_DERIVED_FALLBACK`` opt-out that
+    `coroot.find_derived` honours.  A census taken from a wider search path
+    than the lookup would name namespaces that do not explain the absence,
+    which is worse than naming none.
+    """
+    roots = [coroot.derived_path(coroot.INDEX_ROOT)]
+    off = os.environ.get(coroot.DERIVED_FALLBACK_VAR, "").strip().lower()
+    if off not in ("0", "off", "no"):
+        primary = coroot.primary_checkout()
+        if primary is not None:
+            roots.append(primary / "out" / "indexes")
+    return roots
+
+
+def _index_namespaces() -> list[str]:
+    """Every ``out/indexes/<base-id>/`` directory name a reader could reach."""
+    names: set[str] = set()
+    for r in _index_roots():
+        try:
+            names.update(d.name for d in r.iterdir() if d.is_dir())
+        except OSError:
+            pass
+    return sorted(names)
+
+
+def _index_contents(base: str) -> list[str]:
+    """The sub-trees present in ``out/indexes/<base>/``, for the reason line."""
+    held: set[str] = set()
+    for r in _index_roots():
+        try:
+            held.update(d.name for d in (r / base).iterdir())
+        except OSError:
+            pass
+    return sorted(held)
+
+
+def _index_reason(rel: str, present: bool = False, note: str = "") -> str:
+    r"""Why ``rel`` is unusable here, **naming the base id and the artefact**.
+
+    A skip reading *"index missing"* reproduces the ambiguity it was supposed
+    to end, in a politer voice.  A reader who sees one still has to go and
+    find out which of three states they are in, and on 2026-08-09 four
+    sessions each guessed a different one from the same absence (a flake, two
+    standing reds, box contention, a re-key).  So the message answers it:
+
+      * **never built here** -- there is no namespace for this base at all;
+      * **orphaned by a re-key** -- the namespace is gone but *siblings of the
+        same plugin kind* are present, which is `base_fingerprint` having
+        moved under an install that was written to (`docs/CORRECTIONS.md`
+        C18, and `docs/handoff_fingerprint_stability.md`);
+      * **partially built** -- the namespace is here and this artefact is not,
+        so the reader is told what it *does* hold.
+
+    The fourth state, **broken code**, is deliberately not one of these: it is
+    what a *failure* means once this gate is in place.  The gate is keyed on
+    presence only, so an artefact that is on disk lets the test run and a red
+    stays a red.  That is the whole trade -- see `requires_index`.
+    """
+    _refuse_unless_per_base(rel)
+    key = (rel, present, note)
+    if key in _INDEX_REASONS:
+        return _INDEX_REASONS[key]
+    try:
+        base = coroot.base_id()
+    except Exception:                                # pragma: no cover
+        base = "unkeyed"
+    try:
+        keyed = coroot.derived_rel(rel)
+    except Exception:                                # pragma: no cover
+        keyed = rel
+    head = (f"derived index {rel} unusable for base {base} "
+            f"(keyed path {keyed})")
+    if present:
+        tail = f"present but incomplete{': ' + note if note else ''}"
+    else:
+        names = _index_namespaces()
+        kind = base.rsplit("-", 1)[0]
+        if base in names:
+            here = ", ".join(_index_contents(base)) or "nothing"
+            tail = (f"the namespace out/indexes/{base}/ exists and holds "
+                    f"{here}, but this artefact is not in it -- PARTIALLY "
+                    f"BUILT, so build the rest")
+        elif kind in ("unknown", "unkeyed", ""):
+            # `unknown` is the ABSENCE of a kind, not a kind, so sibling
+            # namespaces sharing it are OTHER UNDECLARED INSTALLS -- not this
+            # one re-keyed.  Concluding RE-KEYED here reported a write to the
+            # install's `ini/` that had not happened, and it was escalated to
+            # the owner before anyone checked the mechanism.  The contrary
+            # evidence was sitting in the same directory listing: `out/indexes/`
+            # holds `patch5017-bbb6b10d9221` AND `unknown-bbb6b10d9221`, same
+            # fingerprint both sides.  The fingerprint is computed FROM `ini/`,
+            # so an unchanged fingerprint proves `ini/` did not change.
+            tail = (f"out/indexes/{base}/ does not exist, and this install has "
+                    f"NO KIND DECLARED -- `unknown` is the absence of a kind, "
+                    f"so any other `unknown-*` namespace belongs to a different "
+                    f"install, not to this one re-keyed. Nothing here says the "
+                    f"install changed. Declare the kind (`coroot.declare_kind`) "
+                    f"and an existing index may simply reappear under its real "
+                    f"name")
+        elif [n for n in names if n.rsplit("-", 1)[0] == kind]:
+            sibs = [n for n in names if n.rsplit("-", 1)[0] == kind]
+            tail = (f"out/indexes/{base}/ does not exist, but "
+                    f"{', '.join(sibs)} {'does' if len(sibs) == 1 else 'do'}"
+                    f" -- same kind, different fingerprint, so this install was "
+                    f"RE-KEYED and its indexes are ORPHANED rather than absent. "
+                    f"The fingerprint is computed from `ini/` contents, so the "
+                    f"`ini/` of THIS install differs from the one indexed")
+        else:
+            tail = (f"out/indexes/{base}/ does not exist and no namespace of "
+                    f"kind {kind!r} does either -- NEVER BUILT here")
+        if note:
+            tail += f"; {note}"
+    reason = f"{head}: {tail}. Build with `py -3 tools/health.py --bootstrap`"
+    _INDEX_REASONS[key] = reason
+    return reason
+
+
+def requires_index(rel: str, why: str = ""):
+    r"""Skip unless the derived artefact ``rel`` is really on disk for this base.
+
+    **The failure this exists to stop.** `out/` is gitignored and per-worktree,
+    and a branch cut from a `master` predating the fingerprint fix computes a
+    *different* `coroot.base_id()` -- so its `out/indexes/<base-id>/` is nearly
+    empty and every test that reads through it fails **identically to a content
+    regression**.  Four sessions hit that on 2026-08-09 and filed it four
+    different ways; `docs/handoff_base_gate_lineage_tests.md` §5.0 is the
+    retraction of three "defects" that were all this.  The tell was never the
+    failure count -- it was that the same three classes took **292 s** against
+    **29 s**, because a reader with no index silently rebuilds one
+    (`meshtex._load_mesh_index` falls through to a full `scan_meshes`).
+
+    **Keyed on the artefact, never on the base.** The instinct here is
+    `requires_base`, and it would be wrong: each of these passes on any base
+    whose index is built and fails on any base whose index is not, so a base
+    gate would assert something false about every base left out -- C54 in
+    reverse, and the same handoff says so out loud.  Keyed on the artefact it
+    self-heals: build the index and the test runs again, on any client.
+
+    Same family as `requires_linkage`, generalised past that one file, and the
+    same reasoning as `_thumbs_rendered`: an unbuilt index is a state of the
+    working tree, not broken code, and failing would blame the wrong thing.
+
+    **What it must not become.** A gate that skips where the test should have
+    failed hides the absence -- so this asks *presence only*.  Once the
+    artefact is on disk the test runs, and a red then means the code.  Prove
+    that when you add one: on a built base the set this newly skips must be
+    **empty**, or it has absorbed a real test.
+
+    Stack it *under* `requires_base`, not over it, for the reason
+    `requires_linkage` gives: both are `skipUnless`, the outermost reason wins,
+    and "wrong client" is the answer that ends the question.
+
+    **It answers for per-base artefacts under ``out/`` and nothing else** --
+    not for what the client ships, not for what the repo ships. Handed either,
+    it raises `NotAnIndex` rather than producing a plausible wrong diagnosis.
+    """
+    _refuse_unless_per_base(rel)
+    try:
+        ok = coroot.find_derived(rel) is not None
+    except Exception:                                # pragma: no cover
+        ok = False
+    return unittest.skipUnless(ok, _index_reason(rel, note=why))
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +766,10 @@ class MeshPipeline(unittest.TestCase):
         JSON's rounding, and the index order must be *identical* -- reversing a
         triangle would silently invert every front face."""
         if not self.OBJ_DIR.is_dir():
-            self.skipTest("out/c3/obj not generated")
+            self.skipTest(_index_reason(
+                "out/c3/obj",
+                note="OBJ_DIR also falls back to the unkeyed out/c3/obj, and "
+                     "neither is on disk"))
         checked = 0
         for stem in ("001184365", "001134070"):
             j = self._json_for(f"c3/mesh/{stem}.c3")
@@ -576,6 +931,86 @@ class MeshPipeline(unittest.TestCase):
         self.assertFalse(by_name["v_body"]["isSocket"])
 
 
+class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
+    r"""Which chunks are attachment points is read from the install ON SCREEN.
+
+    The bug (`C-2026-08-20-socket-root`): `attach` read `ini/RolePart.ini
+    [Dumy]` from `coassets.DEFAULT_ROOT` -- a different root-resolution path
+    from the one the viewer uses to choose the install it serves. On this rig
+    they disagreed, 7878 (53 entries) against 5517 (8), so a viewer showing
+    7878 classified 3 of a model's 17 chunks as sockets instead of 15 and drew
+    the other 12 attachment points as geometry: a textured box on the model.
+
+    Nothing about it fails. A short [Dumy] list parses fine and simply stops
+    hiding attachment points -- the request still returns 200 and the only
+    symptom is a box, which reads as bad art rather than a wrong lookup. Two
+    live servers off one checkout disagreed on one file for this reason, and
+    the one that looked right was the accident.
+
+    Hermetic on purpose: the lists are written here rather than read from an
+    install, so the guard does not depend on which clients this rig holds.
+    """
+
+    LONG = ["v_armet", "v_misc", "v_r_weapon", "v_l_weapon", "v_head",
+            "v_pelvis", "v_l_leg", "v_r_leg", "v_pet", "v_back"]
+    SHORT = ["v_armet", "v_misc", "v_r_weapon", "v_l_weapon"]
+
+    def _root(self, names):
+        d = Path(tempfile.mkdtemp(prefix="sockroot-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "ini").mkdir(parents=True)
+        body = ["[Dumy]", "Count=%d" % len(names)]
+        body += ["Dumy%d=%s" % (i, n) for i, n in enumerate(names)]
+        (d / "ini" / "RolePart.ini").write_text("\n".join(body) + "\n",
+                                                encoding="utf-8")
+        return d
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import attach
+        self.attach = attach
+        self.long_root = self._root(self.LONG)
+        self.short_root = self._root(self.SHORT)
+
+    def test_the_same_name_answers_differently_per_root(self):
+        """v_head is a socket in one install and not in the other, and the
+        answer must follow the root rather than whichever ran first."""
+        self.assertTrue(self.attach.is_socket_name("v_head", self.long_root))
+        self.assertFalse(self.attach.is_socket_name("v_head", self.short_root))
+
+    def test_both_answers_survive_in_one_process(self):
+        """The regression guard proper.
+
+        The cache was a single module global, so the FIRST caller fixed the
+        answer for every later one -- a state in which these two assertions
+        could not both hold. Asking in both orders is the test: a per-root
+        cache is order-independent, a global is not.
+        """
+        a1 = self.attach.is_socket_name("v_head", self.long_root)
+        b1 = self.attach.is_socket_name("v_head", self.short_root)
+        a2 = self.attach.is_socket_name("v_head", self.long_root)
+        self.assertEqual((a1, b1, a2), (True, False, True))
+
+    def test_the_body_is_never_a_socket_even_when_listed(self):
+        """The permit direction: a guard that called everything a socket would
+        hide the model itself and still pass a test that only checked boxes
+        disappear."""
+        root = self._root(self.LONG + ["v_body"])
+        self.assertFalse(self.attach.is_socket_name("v_body", root))
+        self.assertTrue(self.attach.is_socket_name("v_head", root))
+
+    def test_coviewer_keys_the_test_on_the_served_root(self):
+        """`is_socket_chunk` must read ACTIVE_ROOT, which the Catalog sets from
+        the install it opened -- not attach's environment-derived default."""
+        import coviewer
+        prev = coviewer.ACTIVE_ROOT
+        self.addCleanup(coviewer.set_active_root, prev)
+        coviewer.set_active_root(self.long_root)
+        self.assertTrue(coviewer.is_socket_chunk("v_head"))
+        coviewer.set_active_root(self.short_root)
+        self.assertFalse(coviewer.is_socket_chunk("v_head"))
+
+
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
 class Resolution(unittest.TestCase):
     """Provenance -- 'pointing towards the files in question'."""
@@ -659,11 +1094,57 @@ class Resolution(unittest.TestCase):
         self.assertEqual(pv.source, "")
 
     def test_appearance_reverse_index(self):
+        """The reverse index must really invert the appearance tables.
+
+        This half is base-independent and runs everywhere: every row handed
+        back is checked against the table it names, so a row that resolves to
+        the wrong asset, cites a section the table does not have, or reports
+        the wrong part index fails on any install.  The *identity* of the
+        referring appearance is a content pin and lives in the gated test
+        below -- see `CORRECTIONS.md` C53-viewer-last-two.
+        """
+        self.cat.wait_tables()
+        tex = "c3/texture/002135300.dds"
+        refs = self.cat.references(tex)
+        self.assertTrue(refs)
+        self.assertTrue(all(r["kind"] in ("mesh", "texture") for r in refs))
+        for r in refs:
+            ini = self.cat.tables.get(r["table"])
+            self.assertIsNotNone(ini, f"unknown table {r['table']!r}")
+            app = ini.get(r["appearance"])
+            self.assertIsNotNone(
+                app, f"{r['table']}[{r['appearance']}] is not in {ini.name}")
+            parts = [p for p in app.parts if p.index == r["part"]]
+            self.assertEqual(len(parts), 1,
+                             f"{r['appearance']} has no part {r['part']}")
+            ident = parts[0].texture if r["kind"] == "texture" else parts[0].mesh
+            self.assertEqual(self.cat.resolve_id(ident, r["kind"]), tex,
+                             f"{r['table']}[{r['appearance']}] part {r['part']} "
+                             f"does not resolve back to {tex}")
+
+    @requires_base("cco",
+                   why="asserts CCO's content AND CCO's spelling. MEASURED on all "
+                       "six declared installs: the self-named row (id == its own "
+                       "part texture) exists only on CCO and 5017; 5065/5165 have "
+                       "no such section, and 5517/6090 read armor.dbc, where that "
+                       "row is a different armour (mesh 002135260 / texture "
+                       "002173300) and this texture is reached from appearance "
+                       "002132000 instead. 5017 has the row but spells its "
+                       "sections UNPADDED -- [2135300], not [002135300] -- and "
+                       "`references` carries `app.ident` verbatim, so it is red "
+                       "there too (verified by running it) -- CORRECTIONS C53-viewer-last-two")
+    def test_appearance_reverse_index_names_the_self_titled_row(self):
+        """The pinned half: a row whose own id is also its texture's id.
+
+        Kept as its own test rather than folded into the one above, because
+        it asserts *which* appearance refers to the texture, in *which*
+        spelling -- both facts about one lineage's armour table, neither
+        about the resolver.
+        """
         self.cat.wait_tables()
         refs = self.cat.references("c3/texture/002135300.dds")
         self.assertTrue(refs)
         self.assertTrue(any(r["appearance"] == "002135300" for r in refs))
-        self.assertTrue(all(r["kind"] in ("mesh", "texture") for r in refs))
 
     def test_id_resolution_matches_coassets(self):
         """The in-memory resolver must agree with coassets' filesystem-probing
@@ -881,10 +1362,12 @@ class BodyFacetsTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.cat.close()
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_classification_ran(self):
         self.assertIsNotNone(self.bf, "facet build failed")
         self.assertGreater(len(self.bf.records), 3000)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_four_player_body_types(self):
         """001/002 female, 003/004 male; within a gender the lower number is
         the smaller body.  Gender is VERIFIED from gender-locked garments;
@@ -925,6 +1408,7 @@ class BodyFacetsTests(unittest.TestCase):
                                 f"{disagree} gender-locked items contradict the "
                                 f"001/002=female, 003/004=male mapping")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_class_from_armour_series(self):
         """Spot-check the series -> class map against known items."""
         cases = {"002130320": "Trojan",      # BreastPlate family, profession 11
@@ -937,6 +1421,7 @@ class BodyFacetsTests(unittest.TestCase):
             rec = self.bf.records.get(ident) or self.bf.classify(ident)
             self.assertEqual(rec.klass, want, f"{ident} ({rec.item_name})")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_class_coverage_and_consistency(self):
         armour = [r for r in self.bf.records.values() if r.kind == "armour"]
         known = [r for r in armour if r.klass != "unknown"]
@@ -949,6 +1434,7 @@ class BodyFacetsTests(unittest.TestCase):
                 self.assertIsNone(self.bf.series_profession(series),
                                   f"series {series} is mixed and must report None")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_no_appearance_is_dropped(self):
         """Every body appearance must land in some bucket -- the unmatched ones
         are the interesting ones and must never be hidden."""
@@ -974,6 +1460,7 @@ class BodyFacetsTests(unittest.TestCase):
         self.assertGreater(family, exact * 2,
                            "family matching should roughly triple item coverage")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_auto_tags_are_derived_not_stored(self):
         rec = self.bf.records["002135300"]
         tags = rec.auto_tags
@@ -1129,6 +1616,51 @@ class Taxonomy(unittest.TestCase):
         self.assertEqual(self.catalog.role_of("data/map/puzzle/x/y/z.dds"), "texture")
         self.assertEqual(self.catalog.role_of("c3/mesh/1.c3"), "mesh")
 
+    def test_content_beats_the_extension_when_they_disagree(self):
+        """On Zephyr the extension lies about 61 assets and the viewer
+        believed it -- routing a valid DDS to the C3 parser, which rejects it.
+
+        Built from magic bytes rather than measured off an install, so it runs
+        everywhere; the population that motivated it is in `role_of`'s
+        docstring. Every case here is a real spelling seen in `c3.tpd`.
+        """
+        DDS, MAXF = b"DDS |\0\0\0" + b"\0" * 8, b"MAXFILE C3 00001"
+        PNG, JPEG = b"\x89PNG\r\n\x1a\n\0\0\0\r", b"\xff\xd8\xff\xe1\0\0Exif"
+        r = self.catalog.role_of
+        # a texture wearing a mesh's extension, and the reverse
+        self.assertEqual(r("c3/0004/615/120.c3", DDS), "texture")
+        self.assertEqual(r("c3/texture/002955233.dds", MAXF), "mesh")
+        # image formats the DDS decoder would have refused
+        self.assertEqual(r("c3/texture/9994060.dds", JPEG), "texture")
+        self.assertEqual(r("c3/effect/x/8.dds", PNG), "texture")
+        # honest content is unaffected
+        self.assertEqual(r("c3/mesh/410000.c3", MAXF), "mesh")
+        self.assertEqual(r("c3/texture/002135300.dds", DDS), "texture")
+
+    def test_an_unreadable_sniff_falls_back_rather_than_demoting(self):
+        """The half that keeps this safe. `wdf.detect_magic` knows nothing
+        about `.DMap`, `.ani`, `.pul` or `.wav`, so "unrecognised" says
+        nothing about them -- only roles whose format we CAN recognise may be
+        demoted by an unrecognised magic.
+
+        Without this asymmetry the sniff would reclassify every map and
+        animation in the install as `data`, which is a far larger break than
+        the 61 files it set out to fix.
+        """
+        junk = b"ZZZZ not a magic"
+        for p, role in (("map/map/island.DMap", "map"),
+                        ("data/x.ani", "mapdata"),
+                        ("sound/a.wav", "sound"),
+                        ("ini/weapon.ini", "data")):
+            self.assertEqual(self.catalog.role_of(p, junk), role, p)
+        # but a mesh/texture whose bytes are unrecognisable IS demoted:
+        # c3/npc/006/2000.c3 is plain ini text under a mesh's name.
+        self.assertEqual(self.catalog.role_of("c3/npc/006/2000.c3",
+                                              b"[0-0]\r\nx=0\r\ny=0"), "data")
+        # and no bytes at all must behave exactly as before
+        self.assertEqual(self.catalog.role_of("c3/mesh/1.c3"), "mesh")
+        self.assertEqual(self.catalog.role_of("c3/mesh/1.c3", b""), "mesh")
+
     def test_unknown_paths_land_in_a_real_bucket(self):
         c = self.ac.classify("totally/unknown/thing.xyz")
         self.assertEqual(c.category, "other")
@@ -1173,6 +1705,139 @@ class Taxonomy(unittest.TestCase):
             self.assertTrue(v.startswith("c3/"), v)
 
 
+class ClientsAreGroupedByWhatTheyAre(unittest.TestCase):
+    """The path picker groups by the plugin's own `origin`, not by where the
+    folder happens to live. No install needed.
+
+    **Classic Conquer 2.0 is a private server's client that is installed
+    locally**, and the picker used to file it under "Installed clients"
+    beside TQ's own patch releases. "Installed" and "official" are different
+    claims and grouping on the first asserted the second.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # `plugins` is a repo-root package; this file only puts tools/ on the
+        # path. Same insert the two other plugin-aware classes here use.
+        sys.path.insert(0, str(PROJECT))
+
+    def test_every_plugin_declares_what_it_is(self):
+        import plugins
+        # Enumerated from the package, NOT a hand-maintained list. The list
+        # this replaced omitted `patch6609` the day it landed, so a new plugin
+        # escaped the gate silently -- and `if p is None: continue` meant a
+        # name that stopped resolving was skipped just as quietly. Both
+        # failures are invisible in the verdict: the gate passes by not
+        # applying. C-2026-08-10-parser-tpd-grammar's family, one layer up.
+        names = sorted(
+            f.stem for f in (Path(PROJECT) / "plugins").glob("*.py")
+            if f.stem != "__init__")
+        self.assertGreaterEqual(len(names), 7,
+                                f"only {len(names)} plugin modules found -- "
+                                "the enumeration has stopped seeing them")
+        for name in names:
+            p = plugins.for_kind(name)
+            self.assertIsNotNone(p, f"{name}.py exists but for_kind() does "
+                                    "not resolve it")
+            with self.subTest(plugin=name):
+                self.assertIn(getattr(p, "origin", None),
+                              ("official", "server"),
+                              f"{name} has not declared an origin; it would "
+                              f"render as an unclassified client")
+
+    def test_cco_is_a_private_server_and_the_patches_are_not(self):
+        """The whole point, asserted both ways round. Asserting only that the
+        patches are official would still pass if CCO were mislabelled with
+        them -- which is the state this replaced."""
+        import plugins
+        cco = plugins.for_kind("cco")
+        if cco is None:
+            self.skipTest("no cco plugin")
+        self.assertEqual(cco.origin, "server")
+        for name in ("patch5017", "patch6090"):
+            p = plugins.for_kind(name)
+            if p is not None:
+                self.assertEqual(p.origin, "official", name)
+
+    def test_the_payload_keeps_each_group_contiguous(self):
+        """`basepicker.js` opens a new optgroup whenever `kind` changes, so a
+        kind that appears twice renders as two identical headings. The sort is
+        what prevents it, and `cco` sorting before `patch*` by name is exactly
+        the input that exposed it."""
+        import coviewer
+        mixed = [{"kind": "server", "label": "Classic Conquer 2.0"},
+                 {"kind": "install", "label": "Official patch client 5017"},
+                 {"kind": "collection", "label": "Collection"},
+                 {"kind": "install", "label": "Official patch client 6090"},
+                 {"kind": "server", "label": "Zephyr"}]
+        kinds = [e["kind"] for e in sorted(mixed, key=coviewer.base_group_key)]
+        seen, runs = set(), 0
+        for k, nxt in zip(kinds, kinds[1:] + [None]):
+            if k != nxt:
+                runs += 1
+                self.assertNotIn(k, seen, f"{k} appears in two blocks")
+                seen.add(k)
+        self.assertEqual(runs, len(set(kinds)))
+        self.assertEqual(kinds[0], "install", "official clients come first")
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+class ThumbnailFallbackTrustsContent(unittest.TestCase):
+    """`api_thumb`'s last resort asked the extension, and Zephyr's lies.
+
+    20 of Zephyr's `.c3` files are DDS textures. On the extension alone such
+    an asset falls past the `.dds` branch, looks for "the best texture of this
+    mesh", finds none because it is not a mesh, and 404s -- so a perfectly
+    decodable texture renders as the missing-file checkerboard permanently.
+
+    The predicate is what is tested, not the HTTP route: it is the whole of
+    the change, and it must be safe on an asset that cannot be read at all.
+    `docs/zephyr_6090_content_overlap.md` §4.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coviewer
+        cls.coviewer = coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+
+    def _probe(self):
+        holder = type("H", (), {})()
+        holder.cat = self.cat
+        return self.coviewer.Handler._looks_like_dds.__get__(
+            holder, type(holder))
+
+    def test_content_decides_and_a_missing_asset_is_simply_not_a_dds(self):
+        looks = self._probe()
+        real_tex = "c3/texture/002135300.dds"
+        real_mesh = "c3/mesh/002135000.c3"
+        if not (self.cat.exists(real_tex) and self.cat.exists(real_mesh)):
+            self.skipTest("this base ships neither sample asset")
+        self.assertTrue(looks(real_tex), "a real DDS was not recognised")
+        self.assertFalse(looks(real_mesh), "a real C3 mesh read as DDS")
+        # the branch must not raise on an asset that is not there; a 404 is
+        # the correct outcome and an exception would 500 the thumbnail route.
+        self.assertFalse(looks("does/not/exist.c3"))
+        self.assertFalse(looks(""))
+
+    def test_the_probe_is_bound_to_a_method_the_handler_really_has(self):
+        """Guards the bug this shipped with for one commit: the first version
+        called `self.read`, which lives on `Catalog`, from `Handler` -- and
+        caught `Exception`, so the `AttributeError` was swallowed and the
+        branch answered False for everything. The fix could not work and said
+        nothing. Asserting a *positive* result on a known DDS is what makes
+        that detectable; `assertFalse` on a mesh would have passed throughout.
+        """
+        looks = self._probe()
+        tex = "c3/texture/002135300.dds"
+        if not self.cat.exists(tex):
+            self.skipTest("this base ships no sample texture")
+        self.assertTrue(looks(tex))
+        self.assertNotIn("read", self.coviewer.Handler.__dict__,
+                         "Handler grew its own read(); _looks_like_dds must "
+                         "be re-checked -- it deliberately uses cat.read")
+
+
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
 class Maps(unittest.TestCase):
     """A primary map and every piece of art that draws it."""
@@ -1199,12 +1864,43 @@ class Maps(unittest.TestCase):
                         "GameMap.json ids should be attached")
 
     def test_the_dmap_to_tile_chain_resolves(self):
-        """DMap -> .pul -> .ani -> the actual .dds ground tiles."""
+        r"""DMap -> .pul -> .ani -> the actual .dds ground tiles.
+
+        **`region` is read, not inferred, so it is not pinned.** This asserted
+        `rec.region == "island"` and failed on 6090 and 6609 with
+        `'1-island' != 'island'`. MEASURED 2026-08-11, before deciding whose
+        problem it was:
+
+            install   distinct art regions   beginning "1-"
+            5017/5065/5165        45/45/46                 0
+            5517                        48                 0
+            6090                        61                 9
+            6609                        73                 9
+
+        **No region disappears.** All 48 of 5517's are still on 6609, which has
+        73; the nine `1-` folders are *additions* sitting beside the originals,
+        and `island.ani` was repointed at the new one. So this is not a rename
+        and not a convention — **the `.ani` states the path** and `_region_of`
+        extracts `parts[3]` from a string the data supplied.
+
+        Which settles the ownership question the failure raised: it is neither
+        a parser-plugin policy nor a `core` naming rule, because **nothing
+        infers anything**. It was a test pinning one client's content. The
+        chain still has to resolve, and that is what is asserted — the region
+        must be the one the `.ani` actually names, checked against the frame
+        paths rather than against a remembered value.
+        """
         rec = self.ix.get("island")
         self.assertEqual(rec.puzzle, "map/puzzle/island.pul")
         self.assertEqual(rec.ani, "ani/island.ani")
         self.assertGreater(rec.tile_count, 100)
-        self.assertEqual(rec.region, "island")
+        # Derived from this install's own frame paths, so it moves with the
+        # data instead of expiring against it.
+        want = {t.split("/")[3] for t in rec.tiles[:20]
+                if t.startswith("data/map/") and len(t.split("/")) >= 4}
+        self.assertEqual({rec.region}, want,
+                         "region must be the folder the .ani names")
+        self.assertTrue(rec.region, "the chain resolved to no region at all")
         for t in rec.tiles[:20]:
             self.assertTrue(t.startswith("data/map/"), t)
             self.assertTrue(self.cat.exists(t), f"{t} must resolve")
@@ -1274,6 +1970,7 @@ class RelatedAssets(unittest.TestCase):
                 "mixTex": pr.mix_tex, "thirdTex": pr.third_tex,
                 "fourthTex": pr.fourth_tex}
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_character_related_includes_its_other_colourways(self):
         app = self._appearance("002135300", "body")
         groups = self.ac.related_groups(
@@ -1290,13 +1987,207 @@ class RelatedAssets(unittest.TestCase):
 
     def test_weapon_related_has_an_effects_slot(self):
         """The slot must exist and be honest about being empty rather than
-        silently missing."""
+        silently missing.
+
+        Runs on **every** base on purpose -- it is the test about the empty
+        case, so gating it on the linkage being present would delete the only
+        coverage of the state it describes.
+        """
         app = self._appearance("410005", "r_weapon")
         groups = self.ac.related_groups(appearance=app)
         eff = [g for g in groups if g["title"] == "Effects"]
         self.assertEqual(len(eff), 1, "the effects slot must always be present")
         self.assertTrue(eff[0]["pending"] or eff[0]["items"])
+        # ...and "honest" has to mean something checkable. An empty slot must
+        # carry a note saying why it is empty; a blank note is how a missing
+        # artefact came to read as "this weapon has no effects".
+        if not eff[0]["items"]:
+            self.assertTrue(eff[0]["note"].strip(),
+                            "an empty effects slot must say why it is empty")
 
+    def test_an_empty_linkage_says_which_of_its_causes_it_is(self):
+        """`weapon_linkage()` returning `{}` has four causes and only one of
+        them is a fact about the game data.
+
+        Before this, all four came back as a bare `{}` -- a blanket
+        `except Exception` that recorded nothing -- so `effect_assets()`
+        answered `[]` for "this effect has no layers" and for "no linkage
+        artefact exists" alike, and two tests in this class read the second as
+        the first for as long as they were red.
+        `coroot.find_derived`'s own docstring is the rule being enforced: a
+        caller that would degrade without the artefact must say so out loud.
+
+        Base-independent: it asserts the shape of the report, never its
+        content, so it runs everywhere including where the artefact is absent.
+        """
+        import catalog
+        st = self.ac.linkage_status()
+        self.assertIn(st["state"], (catalog.LINKAGE_OK, catalog.LINKAGE_MISSING,
+                                    catalog.LINKAGE_UNREADABLE, catalog.LINKAGE_EMPTY))
+        self.assertTrue(st["reason"].strip(), "every state must state itself")
+        # The keyed path and the base it was keyed to travel together: without
+        # both, "never built" and "orphaned by a re-key" are indistinguishable
+        # and cost a re-derive to tell apart (docs/CORRECTIONS.md C18).
+        self.assertIn("out/indexes/", st["rel"],
+                      "out/effects/ is per-base (coroot.PER_BASE)")
+        self.assertIn(st["base_id"], st["rel"],
+                      "the path must name the base it was keyed to")
+        self.assertIn(st["rel"], st["reason"])
+        self.assertIn(st["base_id"], st["reason"])
+        self.assertEqual(st["state"] == catalog.LINKAGE_OK, self.ac.linkage_ready())
+        if st["state"] == catalog.LINKAGE_OK:
+            self.assertTrue(st["effects"] or st["weapons"])
+            self.assertTrue(Path(st["path"]).is_file())
+        else:
+            # A caller that cannot proceed must be told how to fix it, and the
+            # command must not be the one that writes the unkeyed literal:
+            # find_derived has no fallback from the keyed path, so a build
+            # with `--out out/effects/linkage.json` is never read back.
+            self.assertIn("--linkage", st["reason"])
+            self.assertNotIn("--out", st["reason"])
+
+    def _linkage_from(self, text: str):
+        """A catalogue whose linkage artefact is a planted file of `text`.
+
+        Planted rather than measured because three of the four states cannot be
+        produced from any install on this machine, and a branch that only ever
+        runs on someone else's disk is a branch nobody has run.
+        """
+        import catalog
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        p = d / "linkage.json"
+        p.write_text(text, encoding="utf-8")
+        ac = catalog.AssetCatalog(ROOT)
+        with unittest.mock.patch.object(coroot, "find_derived", return_value=p):
+            return ac, ac.linkage_status()
+
+    def test_a_linkage_that_does_not_parse_is_not_a_linkage_with_no_rows(self):
+        """The distinction the bare `except` destroyed, on real bytes.
+
+        Truncated JSON and a top level of the wrong type are both
+        `LINKAGE_UNREADABLE`, and both name the file -- because "it is there
+        and I could not read it" is an entirely different next step from "it
+        was never built".
+        """
+        import catalog
+        for bad, what in (('{"effects": {', "truncated"),
+                          ("[]", "a list, not an object"),
+                          ("", "empty file")):
+            with self.subTest(what):
+                ac, st = self._linkage_from(bad)
+                self.assertEqual(st["state"], catalog.LINKAGE_UNREADABLE, what)
+                self.assertFalse(ac.linkage_ready())
+                self.assertEqual(ac.weapon_linkage(), {})
+                self.assertTrue(st["detail"], "an unreadable file must say why")
+                self.assertTrue(st["path"], "and must name the file it read")
+
+    def test_a_linkage_with_no_rows_says_so_rather_than_reading_as_missing(self):
+        """Parsed, well-formed, and holding nothing: the fourth state.
+
+        It is not `LINKAGE_MISSING` -- the artefact exists, so "build it" is
+        the wrong advice and "rebuild it" is the right one -- and it is not
+        `LINKAGE_OK`, because every lookup through it would still answer empty
+        for want of a table.
+        """
+        import catalog
+        for doc in ('{}', '{"effects": {}, "weapon_appearances": {}}'):
+            with self.subTest(doc):
+                ac, st = self._linkage_from(doc)
+                self.assertEqual(st["state"], catalog.LINKAGE_EMPTY)
+                self.assertFalse(ac.linkage_ready())
+                self.assertEqual(st["effects"], 0)
+                self.assertEqual(st["weapons"], 0)
+                self.assertIn("rebuild it", st["reason"].lower())
+
+    def test_the_linkage_is_read_for_this_catalogues_own_base(self):
+        """Not for whichever install the process happens to be configured for.
+
+        `coroot.find_derived` says it: *"pass `root` when the caller knows
+        which install it is asking about; anything holding two catalogues at
+        once must"* -- and the viewer does hold two while comparing bases.
+        This is C22 / C41(c)'s question asked of a **read**: the linkage
+        loader took the flag on neither side, so a catalogue built for base B
+        served base A's effects and reported nothing.
+        """
+        import catalog
+        st = self.ac.linkage_status()
+        self.assertEqual(st["base_id"], coroot.base_id(ROOT))
+        for root in (r"C:\no-such-install-a", r"C:\no-such-install-b"):
+            # A catalogue for an install that is not there resolves to *its*
+            # namespace and reports missing -- it must not silently answer
+            # with the configured install's table.
+            ac = catalog.AssetCatalog(Path(root))
+            far = ac.linkage_status()
+            self.assertEqual(far["state"], catalog.LINKAGE_MISSING, far["reason"])
+            self.assertNotEqual(far["rel"], st["rel"])
+            self.assertEqual(ac.weapon_linkage(), {})
+
+    def _effects_api(self, ident: str) -> dict:
+        """`/api/effects` for one weapon, through the handler's own method.
+
+        A stub rather than a socket, matching `FacetedApi`: the payload is what
+        is under test, not the HTTP layer.
+        """
+        import coviewer
+
+        class Stub:
+            def __init__(s): s.cat, s.out = self.cat, None
+            def _json(s, obj, code=200): s.out = obj; return obj
+            def _error(s, code, msg): s.out = {"error": msg}; return s.out
+
+        s = Stub()
+        coviewer.Handler.api_effects_for(s, lambda k, d="": {"id": ident}.get(k, d))
+        return s.out
+
+    def test_no_attack_trail_claims_to_be_data_only_when_a_table_said_so(self):
+        r"""`trailNote` is printed by the UI whenever a weapon has no trail, and
+        it asserts *"correct data, not a missing asset"*. With no table loaded
+        that sentence is an invention -- the same confusion as the tests this
+        class had, one layer up and shown to a user.
+
+        Two sources make it a measurement: the derived linkage artefact, and
+        the live `EffectDB` built from the install. **Either** is enough, which
+        is why the endpoint is less blind than `effect_assets()` is; only with
+        neither is the absence about the tooling.
+        """
+        ac, pl = self.cat.assetcat, self.cat.effects
+        keep = (ac._linkage, ac._linkage_status, pl._db, pl._db_error)
+
+        def restore():
+            ac._linkage, ac._linkage_status, pl._db, pl._db_error = keep
+        self.addCleanup(restore)
+
+        o = self._effects_api("410005")
+        self.assertTrue(o["sourced"])
+        self.assertIn("correct data", o["trailNote"])
+        self.assertIn(o["linkage"]["state"],
+                      ("ok", "missing", "unreadable", "empty"))
+
+        with unittest.mock.patch.object(coroot, "find_derived", return_value=None):
+            ac._linkage = ac._linkage_status = None
+            # linkage gone, live db still up: still a measurement
+            o = self._effects_api("410005")
+            self.assertEqual(o["linkage"]["state"], "missing")
+            self.assertTrue(o["sourced"], "the live EffectDB is a table too")
+            self.assertIn("correct data", o["trailNote"])
+            # neither source: the note must stop claiming anything about the
+            # weapon and say what is absent instead
+            pl._db, pl._db_error = None, "simulated: EffectDB unavailable"
+            o = self._effects_api("410005")
+            self.assertFalse(o["sourced"])
+            self.assertNotIn("correct data", o["trailNote"])
+            self.assertIn("not the same as", o["trailNote"])
+            self.assertIn(o["linkage"]["rel"], o["trailNote"])
+
+    @requires_base("cco", "patch5517", "patch6090",
+                   why="MEASURED on all six 2026-08-09: it passes on CCO too. "
+                       "The former text said 'red on CCO' and that is false -- "
+                       "this is the two-base comparison the audit was called "
+                       "to find, in the direction that silently skips a client "
+                       "carrying the fact -- CORRECTIONS "
+                       "C-2026-08-09-comod-base-gate-audit")
+    @requires_linkage()
     def test_effect_names_resolve_to_real_meshes_and_textures(self):
         """An effect NAME is a 3DEffect.ini key, not a folder name: `Flash4102`
         lives in c3/effect/flash/ and `m-b02` in c3/effect/Monster-bomb/m-b02/.
@@ -1311,6 +2202,12 @@ class RelatedAssets(unittest.TestCase):
             self.assertTrue(paths[0].endswith(".c3"),
                             "meshes first, so the strip leads with something drawable")
 
+    @requires_base("cco", "patch6090",
+                   why="MEASURED on all six 2026-08-09: passes on CCO and on "
+                       "6090; red on 5517 and on the plaintext trio. The "
+                       "former text claimed 'red on ... CCO', which is false "
+                       "-- CORRECTIONS C-2026-08-09-comod-base-gate-audit")
+    @requires_linkage()
     def test_a_weapons_three_effects_stay_distinct(self):
         """A weapon has an aura, an attack trail and an impact spark, from three
         different tables, and the impact is drawn at the TARGET. Collapsing them
@@ -1328,6 +2225,14 @@ class RelatedAssets(unittest.TestCase):
             if it["resolved"]:
                 self.assertTrue(self.cat.exists(it["path"]), it["path"])
 
+    @requires_base("cco", "patch5517", "patch6090",
+                   why="MEASURED on all six 2026-08-09: it passes on CCO too. "
+                       "The former text said 'red on CCO' and that is false -- "
+                       "this is the two-base comparison the audit was called "
+                       "to find, in the direction that silently skips a client "
+                       "carrying the fact -- CORRECTIONS "
+                       "C-2026-08-09-comod-base-gate-audit")
+    @requires_linkage()
     def test_quality_below_six_really_has_no_trail(self):
         """"No attack trail" on a low-quality weapon is the data, not a gap --
         all 2,143 trails land on quality 6-9 (docs/effects.md §2.2). The UI must
@@ -1337,6 +2242,7 @@ class RelatedAssets(unittest.TestCase):
         self.assertFalse(low.get("attack"),
                          "a quality-5 weapon must not report an attack trail")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_weapon_motion_lookup_is_keyed_by_appearance_plus_action(self):
         """ini/WeaponMotion.ini keys are `<appearance><action>` -- 9 digits. A
         lookup with the bare 6-digit appearance matches nothing, which is how
@@ -1353,6 +2259,7 @@ class RelatedAssets(unittest.TestCase):
         self.assertEqual(dflt["action"], "999")
         self.assertEqual(dflt["mesh"], "c3/mesh/510000.c3")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_weapon_related_lists_the_per_action_mesh(self):
         app = self._appearance("510000", "r_weapon")
         groups = self.ac.related_groups(appearance=app)
@@ -1402,12 +2309,14 @@ class Assembly(unittest.TestCase):
         self.assertEqual(self.pm.slots["body"].mesh_ini, "ini/armor.ini")
         self.assertEqual(self.pm.slots["l_weapon"].mesh_ini, "ini/weapon.ini")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_mix_variants_are_aliases_of_the_same_catalogue(self):
         """mix_body points at armor.ini and mix_armet at armet.ini, so they are
         the same lists under another name -- not extra catalogues."""
         self.assertIn("mix_body", self.pm.slots["body"].aliases)
         self.assertIn("mix_armet", self.pm.slots["armet"].aliases)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_declared_but_unshipped_parts_are_flagged_not_hidden(self):
         for name in ("shield", "pelvis"):
             s = self.pm.slots.get(name)
@@ -1415,6 +2324,7 @@ class Assembly(unittest.TestCase):
             self.assertFalse(s.shipped, f"{name} ini unexpectedly present")
             self.assertIn("not in this build", s.note.lower())
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_all_52_sockets_are_read(self):
         self.assertEqual(len(self.pm.sockets), 52)
         for want in ("v_armet", "v_head", "v_l_weapon", "v_r_weapon",
@@ -1586,9 +2496,11 @@ class AttachmentChain(unittest.TestCase):
         import coviewer
         import parts
         import effectplay
+        import attach
         cls.cv = coviewer
         cls.parts = parts
         cls.ep = effectplay
+        cls.attach = attach
         cls.cat = coviewer.Catalog(ROOT)
         cls.cat.wait_tables()
 
@@ -1620,28 +2532,43 @@ class AttachmentChain(unittest.TestCase):
         """`effectplay.render_matrix` collapses transpose + two mirrors into a
         sign flip on six flat-array entries. That is only safe if it agrees with
         the long way round, which `parts.moti_sockets` already does by
-        evaluating the transform on basis vectors. Assert they agree."""
-        import c3phy as _c3
-        import effects as _fx
+        evaluating the transform on basis vectors. Assert they agree.
+
+        **Pair PHY to MOTI by ordinal, never by adjacency.** This test used to
+        walk the chunk stream and pair each `MOTI` with the `PHY` immediately
+        before it, which is the pairing `attach.socket_matrix`'s docstring
+        names as the one this project already got wrong once. It survived
+        because the two orders coincide on the install the fixtures came from
+        and diverge on every official client — measured on `002135000`:
+
+            CCO   PHY MOTI PHY MOTI PHY MOTI PHY MOTI   adjacent == ordinal
+            5517  PHY PHY PHY PHY MOTI MOTI MOTI MOTI   adjacent is wrong
+
+        Under the blocked layout `pend` is overwritten by each successive PHY,
+        so the first MOTI pairs with the *last* PHY name: the test compared
+        `v_body`'s motion against `v_r_weapon`'s matrix and reported
+        `0.0 != 0.243`, which read as a real disagreement between the two code
+        paths and is not one. With the ordinal pairing they agree to
+        **0.000e+00 on every socket**. The same interleaved-vs-blocked split
+        bites the garment archives (`docs/handoff_community_update.md` §3).
+
+        So this asserts the shortcut, and it is deliberately layout-agnostic:
+        it takes the chunk's own motion, which is what `attach` resolves.
+        """
         raw = self.cat.read(self.BODIES["002"])
         anchors = self.parts.moti_sockets(raw)
         self.assertTrue(anchors, "002135000 ships per-socket MOTI")
-        pend = None
+        pm = self.attach.PartMesh.parse(raw)
         checked = 0
-        for tag, body in _c3.iter_chunks(raw):
-            if tag in _c3.VARIANTS:
-                pend = _c3.parse_phy(tag, body)
-            elif tag == b"MOTI" and pend is not None:
-                a = anchors.get(pend.name)
-                if a is not None and a.matrix:
-                    mo = _fx.parse_moti(body)
-                    bone = min(v.bone0 for v in pend.vertices)
-                    shortcut = self.ep.render_matrix(mo.matrix(bone, 0))
-                    for i, (x, y) in enumerate(zip(shortcut, a.matrix)):
-                        self.assertAlmostEqual(x, y, places=5,
-                                               msg=f"{pend.name} element {i}")
-                    checked += 1
-                pend = None
+        for c in pm.chunks:
+            a = anchors.get(c.name) if c.name else None
+            if c.motion is None or a is None or not a.matrix:
+                continue
+            shortcut = self.ep.render_matrix(c.motion.matrix(0, 0))
+            for i, (x, y) in enumerate(zip(shortcut, a.matrix)):
+                self.assertAlmostEqual(x, y, places=5,
+                                       msg=f"{c.name} element {i}")
+            checked += 1
         self.assertGreaterEqual(checked, 3, "expected several sockets to check")
 
     def test_render_matrix_negates_z_translation(self):
@@ -1793,6 +2720,51 @@ class AttachmentChain(unittest.TestCase):
                          "in tools/attach.py")
         self.assertEqual(pm["confidence"], "verified")
 
+    #: Payloads that legitimately wear a `.c3` name in a shipped archive.
+    #: Each entry must be decisive on its own -- a magic prefix alone is not
+    #: (a TGA header and a Windows cursor share `00 00 02 00`, which is why
+    #: `wdf.detect_magic` calls these three `CUR`).
+    def _why_not_a_c3(self, mesh: str, exc: BaseException) -> "str | None":
+        """What this payload actually is, or None if we cannot say.
+
+        None is the interesting answer: it means a mesh neither parses as C3
+        nor identifies as anything known, and the census must FAIL on it
+        rather than fold it into a tolerated total.
+        """
+        try:
+            raw = self.cat.read(mesh)
+        except Exception:
+            return None
+        # TGA v2 -- decisive by footer signature, corroborated by the size
+        # arithmetic (header 18 + w*h*bpp/8 + footer 26 must fit the file).
+        if raw.endswith(b"TRUEVISION-XFILE.\x00") and len(raw) > 18:
+            w = int.from_bytes(raw[12:14], "little")
+            h = int.from_bytes(raw[14:16], "little")
+            bpp = raw[16]
+            if w and h and bpp % 8 == 0:
+                need = 18 + w * h * (bpp // 8) + 26
+                if need <= len(raw):
+                    return (f"TGA image {w}x{h} {bpp}bpp "
+                            f"(footer + {need}/{len(raw)}B arithmetic)")
+        return None
+
+    def _census_scope(self) -> str:
+        """Checkout and derived-fallback state, carried WITH every count.
+
+        A count from this census is not a property of the install alone: a
+        linked worktree reads the primary checkout's `out/wdf/` name tables,
+        so the corpus size depends on where you ran it and on an env var.
+        Reporting the number without the scope is how two people measured the
+        same install and got 668 and 477.
+        """
+        import coroot
+        primary = coroot.primary_checkout()
+        fb = os.environ.get(coroot.DERIVED_FALLBACK_VAR)
+        return (f"install={coroot.base_id(ROOT)} "
+                f"checkout={'linked->' + primary.name if primary else 'primary'} "
+                f"{coroot.DERIVED_FALLBACK_VAR}={fb if fb is not None else 'unset(on)'}")
+
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_chunk_layout_census_over_the_whole_body_table(self):
         r"""**The test that would have caught the adjacency bug.**
 
@@ -1804,6 +2776,8 @@ class AttachmentChain(unittest.TestCase):
         import c3phy as _c3
         grouped = interleaved = single = 0
         seen: set[str] = set()
+        parsed: set[str] = set()
+        unreadable: "list[tuple[str, str]]" = []
         for app in self.cat.tables["body"]:
             if not app.parts:
                 continue
@@ -1814,8 +2788,12 @@ class AttachmentChain(unittest.TestCase):
             try:
                 order = [t for t, _ in _c3.iter_chunks(self.cat.read(mesh))
                          if t in _c3.VARIANTS or t == b"MOTI"]
-            except Exception:
+            except Exception as exc:
+                # NOT swallowed. A census with no error column reports the
+                # same number for *measured none* and *measured nothing*.
+                unreadable.append((mesh, self._why_not_a_c3(mesh, exc)))
                 continue
+            parsed.add(mesh)
             phys = [i for i, t in enumerate(order) if t != b"MOTI"]
             motis = [i for i, t in enumerate(order) if t == b"MOTI"]
             if not motis or len(phys) < 2:
@@ -1828,7 +2806,36 @@ class AttachmentChain(unittest.TestCase):
         # measured on this install: 664 distinct meshes, 403 grouped, 261
         # interleaved. The four bodies previously validated against are all in
         # the interleaved 261.
-        self.assertGreater(total, 600, "expected the whole body mesh set")
+        #
+        # Every count below is reported WITH its scope, because this census is
+        # not a property of the install alone: recovered WDF name tables reach
+        # a linked worktree through `coroot.find_derived`, so the same code on
+        # the same install answers 668 or 477 depending on the checkout and on
+        # CO_DERIVED_FALLBACK -- and the 477 run also reports zero unreadable,
+        # i.e. a clean bill of health for a corpus with mislabelled entries.
+        scope = self._census_scope()
+        self.assertGreater(total, 600,
+                           f"expected the whole body mesh set — {scope}")
+
+        # Refusals are COUNTED and NAMED, never tolerated. `c3phy` is correct
+        # to refuse a non-C3 payload; what must not happen is the census
+        # silently reporting a smaller corpus as if it were a complete one.
+        self.assertEqual(
+            len(seen), len(parsed) + len(unreadable),
+            f"census bookkeeping lost a mesh — {scope}")
+        unclassified = [m for m, why in unreadable if why is None]
+        self.assertEqual(
+            unclassified, [],
+            f"{len(unclassified)} mesh(es) neither parse as C3 nor identify as "
+            f"anything else: {unclassified} — a refusal we cannot explain is a "
+            f"finding, not a tolerance. {scope}")
+        # Deliberately NOT `assertEqual(len(unreadable), 3)`: three is CCO's
+        # number and would red 5517/6090, which ship none. The invariant is
+        # that every refusal is EXPLAINED, not that there is a fixed count.
+        print(f"    [census] {scope}: {len(seen)} distinct, "
+              f"{len(parsed)} parsed, {len(unreadable)} unreadable"
+              + (" — " + "; ".join(f"{m} = {why}" for m, why in unreadable)
+                 if unreadable else ""))
         self.assertGreater(grouped, 300,
                            f"only {grouped}/{total} grouped — if this collapses "
                            f"the corpus changed, not the code")
@@ -1837,8 +2844,9 @@ class AttachmentChain(unittest.TestCase):
         # pairing all 403 of these produce none at all and fall back silently to
         # a rotation-less estimate.
         checked = broken = 0
-        for mesh in sorted(seen):
-            raw = self.cat.read(mesh)
+        for mesh in sorted(parsed):        # what PARSED, never `seen` -- an
+            raw = self.cat.read(mesh)      # unparseable mesh survived loop 1
+                                           # and raised here as an ERROR
             order = [t for t, _ in _c3.iter_chunks(raw)
                      if t in _c3.VARIANTS or t == b"MOTI"]
             phys = [i for i, t in enumerate(order) if t != b"MOTI"]
@@ -1920,8 +2928,24 @@ class AttachmentChain(unittest.TestCase):
         self.assertFalse(attach.is_socket_name("v_armet02"))
         self.assertFalse(self.cv.is_socket_chunk("v_armet01"))
         self.assertTrue(self.cv.is_socket_chunk("v_armet"))
-        # and the viewport must actually draw those chunks
+
+    @requires_base("cco", why="hair appearance 002111310 is in CCO's armet.ini "
+                              "and not 5517's")
+    def test_a_series_111_hair_actually_draws(self):
+        """The other half of the rule above: classifying a chunk correctly is
+        only useful if the viewport then draws it.
+
+        Split out of `test_socket_chunks_are_identified_by_the_dumy_list`
+        because the two halves are different kinds of claim. The naming rule
+        is an **invariant** and must run on every client; this needs a
+        *specific hairstyle*, and `[002111310]` is a section of CCO's
+        `armet.ini` that 5517 does not ship — so on a patch client the lookup
+        returned None and the failure surfaced four frames away as
+        `AttributeError: 'NoneType' object has no attribute 'replace'` inside
+        `core/coassets.locate`, which read as a code fault and is not one.
+        """
         mesh = self._mesh_for("armet", "002111310")
+        self.assertIsNotNone(mesh, "002111310 must resolve on this base")
         scene = self.cv.c3_to_json(self.cat.read(mesh), mesh)
         drawn = [m for m in scene["meshes"]
                  if not m["isSocket"] and m["vertexCount"]]
@@ -1947,6 +2971,7 @@ class AttachmentChain(unittest.TestCase):
                            "series 119 is the larger hair family")
         self.assertGreater(under_hair, 0, "series 119 mostly lives in c3/hair/")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_phy_to_moti_pairing_is_ordinal_not_adjacent(self):
         r"""The correction that came out of task #18's disassembly:
         `MeshCreate` builds the phy array and `MotionCreate` builds the motion
@@ -1996,6 +3021,7 @@ class AttachmentChain(unittest.TestCase):
             checked += 1
         self.assertGreaterEqual(checked, 3)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_headgear_carries_real_rotation_in_its_own_motion(self):
         r"""The other half of the same symptom, measured over the whole armet
         table rather than one cherry-picked mesh.
@@ -2062,8 +3088,17 @@ class AttachmentChain(unittest.TestCase):
         self.assertTrue(baked["motionBaked"])
         self.assertTrue(any(m["motionApplied"] for m in baked["meshes"]))
 
+    @requires_base("cco", why="hair appearance 002111310 is in CCO's armet.ini "
+                              "and not 5517's")
     def test_figure_payload_reports_the_chain_per_part(self):
-        """The UI has to be able to say what it did, per part, on screen."""
+        """The UI has to be able to say what it did, per part, on screen.
+
+        Content-pinned on the same hairstyle as
+        `test_a_series_111_hair_actually_draws`: `[002111310]` is a CCO
+        `armet.ini` section, so on a patch client `_mesh_for` returns None and
+        this reported `unexpectedly None`. The claim it makes about the
+        payload is general; the fixture it makes it with is not.
+        """
         import parts as _p
         body = self.cat.read(self.BODIES["002"])
         anchors = _p.socket_anchors(body)
@@ -2104,10 +3139,18 @@ class EffectPlayback(unittest.TestCase):
         self.assertEqual(lay["texture"].lower(), "c3/effect/flash/4102.dds")
         self.assertTrue(lay["meshFound"] and lay["textureFound"])
 
-    def test_an_unknown_name_fails_loudly(self):
+    def test_an_unknown_name_fails_loudly_and_names_the_table_it_checked(self):
+        """The message must name the file that was *consulted*. Pinning
+        `3DEffect.ini` here used to be right on every base and became wrong at
+        5517, where the definitions come from `3DEffect.dbc` -- an error that
+        points at a file the client ignores sends the reader to the wrong
+        place (C47)."""
+        import effects as effmod
         sc = self.pl.scene("definitely-not-an-effect")
         self.assertFalse(sc.found)
-        self.assertIn("3DEffect.ini", sc.error)
+        want = effmod.EffectDB(ROOT).sources["3DEffect"].path.name
+        self.assertIn(want, sc.error)
+        self.assertIn("3DEffect", sc.error)
 
     def test_blend_state_comes_from_asb_adb(self):
         """ASB/ADB are D3DBLEND (docs/effects.md §7). `5,2` is the additive glow
@@ -2125,15 +3168,36 @@ class EffectPlayback(unittest.TestCase):
     # -- timing -----------------------------------------------------------
     def test_length_comes_from_the_alpha_envelope_not_the_track(self):
         r"""The single most consequential rule in §6.5: `m-b02` declares 101
-        frames and fades out after ten. Playing the declared length would run a
-        363 ms impact spark for 3.3 seconds."""
+        frames and is over after a dozen. Playing the declared length would run
+        a ~460 ms impact spark for 3.3 seconds.
+
+        **The scene number moved 11 -> 14 when the particle readers landed, and
+        it moved for a measured reason, not to match new code.** `m-b02`'s
+        layer 0 is a PHY quad *and* a PTCL burst in one C3. The quads fade to
+        alpha 0 at frame 11; the burst still has 25 live particles at frame 12
+        and 9 at frame 13, and empties at 14 (`counts[0:14] = 8,16,25 x 10,
+        17,9`). While the chunk was undecoded the burst was invisible to this
+        tool, so the scene reported the quads' length alone. 14 is the longest
+        layer, which is what a scene length is.
+
+        The claim under test is unchanged and is the one that matters: the
+        length comes from the data's own envelope, not from the declared track.
+        """
         d = self.pl.scene("m-b02").payload
         self.assertEqual(d["frames"], 101)
-        self.assertEqual(d["effectiveFrames"], 11)
+        self.assertEqual(d["effectiveFrames"], 14)
         self.assertEqual(d["frameIntervalMs"], 33)
-        self.assertEqual(d["durationMs"], 363)
+        self.assertEqual(d["durationMs"], 462)
         self.assertGreater(d["frames"] * d["frameIntervalMs"], 3000,
                            "the declared length really is that wrong")
+        # and the two envelopes that produce it, separately, so a regression in
+        # either one is attributable rather than just a changed total
+        phy = [p for lay in d["layers"] for p in lay["parts"]
+               if p["kind"] == "phy"]
+        self.assertEqual(max(p["effectiveFrames"] for p in phy), 11)
+        ptcl = [p for lay in d["layers"] for p in lay["parts"]
+                if p["kind"] == "particle"]
+        self.assertEqual(max(p["effectiveFrames"] for p in ptcl), 14)
 
     def test_frame_at_walks_and_then_despawns(self):
         d = self.pl.scene("m-b02").payload
@@ -2142,8 +3206,9 @@ class EffectPlayback(unittest.TestCase):
                   delay_ms=d["delayMs"], endless=d["endless"])
         self.assertEqual(self.ep.frame_at(0, **kw)["frame"], 0)
         self.assertEqual(self.ep.frame_at(99, **kw)["frame"], 3)
-        self.assertFalse(self.ep.frame_at(360, **kw)["done"])
-        self.assertTrue(self.ep.frame_at(400, **kw)["done"],
+        self.assertFalse(self.ep.frame_at(460, **kw)["done"],
+                         "still inside the 462 ms cycle")
+        self.assertTrue(self.ep.frame_at(500, **kw)["done"],
                         "a LoopTime=1 effect must despawn after one cycle")
 
     def test_an_endless_aura_never_despawns(self):
@@ -2302,15 +3367,43 @@ class EffectPlayback(unittest.TestCase):
         self.assertAlmostEqual(hist[1][0][0], 20.0)
         self.assertAlmostEqual(hist[-1][0][0], 100.0)
 
-    # -- particles are a stated gap, not a silent one ---------------------
-    def test_particle_layers_are_reported_not_faked(self):
+    # -- particles: decoded, and still reported rather than faked ----------
+    def test_particle_layers_are_decoded_and_carry_a_baked_simulation(self):
+        """Was a gap pin ("not decoded") until the PTCL/PTCX/PTC3 readers
+        landed; docs/effects.md §6.6.  Kept as a *content* assertion so it
+        fails if the readers regress into producing empty scenes, which a
+        pin on the note could not have caught."""
         d = self.pl.scene("m-b02").payload
         self.assertGreaterEqual(d["particleParts"], 1)
+        self.assertEqual(d["undecodedParts"], 0)
         p = next(p for lay in d["layers"] for p in lay["parts"]
                  if p["kind"] == "particle")
-        self.assertIn("not decoded", p["note"])
+        self.assertTrue(p["decoded"])
+        self.assertGreater(p["frameCount"], 0)
+        self.assertEqual(len(p["frames"]), p["frameCount"])
+        self.assertGreater(p["peakParticles"], 0)
+        self.assertLessEqual(p["peakParticles"], p["maxParticles"])
+        # a live frame carries 3 floats of position and one scalar each of
+        # flipbook phase and half-size per particle, plus one 4x4
+        live = next(f for f in p["frames"] if f["n"])
+        self.assertEqual(len(live["p"]), live["n"] * 3)
+        self.assertEqual(len(live["c"]), live["n"])
+        self.assertEqual(len(live["s"]), live["n"])
+        self.assertEqual(len(live["m"]), 16)
+        self.assertTrue(all(0.0 <= c <= 1.0 for c in live["c"]))
+
+    def test_an_undecodable_chunk_would_still_be_reported(self):
+        """The gap-reporting path has to survive the gap being closed: a part
+        the build cannot play must come back flagged, not omitted.  Exercised
+        directly because no shipped asset triggers it any more."""
+        import effects as fxmod
+        part = fxmod.EffectPart(fxmod.PART_PARTICLE, "PTCX", raw_size=1234)
+        j = self.pl._part_json(part)
+        self.assertFalse(j["decoded"])
+        self.assertIn("not faked", j["note"])
 
     # -- weapon motion -----------------------------------------------------
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_weapon_meshes_follow_the_documented_lookup_order(self):
         rec = self.pl.weapon_meshes("510000")
         self.assertEqual(rec["default"], "c3/mesh/510000.c3")
@@ -2324,6 +3417,284 @@ class EffectPlayback(unittest.TestCase):
         self.assertEqual(rec["defaultSource"], "weapon.ini Mesh0")
         self.assertEqual(rec["actions"], {},
                          "no WeaponMotion rows is the data, not a lookup bug")
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+class ParticleDrawPath(unittest.TestCase):
+    r"""docs/effects.md §6.6 turned into quads -- the draw path, not the reader.
+
+    The reader has been proved elsewhere (12 mutation tests, 12,175 chunks,
+    six bases) and the simulation is baked, so there is no integrator to test.
+    What is new and therefore what is tested here is the *consumer*: one
+    solved frame -> `6 * n` vertices of camera-facing quad, each spanning one
+    cell of an `atlas x atlas` flipbook, sized by the world matrix's own
+    scale.
+
+    `tools/webui/fx.js` mirrors `effectplay.particle_quads` line for line, so
+    testing the reference is what stops the browser copy from being the only
+    place the algorithm exists -- and, more to the point, stops "it looked
+    right in the viewport" from being the only evidence. A billboard mirrored
+    in X looks identical on a symmetric burst; an atlas cell off by a row
+    looks like different art. Neither is visible by eye and both are one
+    assertion here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coviewer
+        import effectplay
+        cls.ep = effectplay
+        cls.pl = effectplay.EffectPlayer(ROOT, mesh_to_json=coviewer.mesh_to_json)
+        if not cls.pl.available:
+            raise unittest.SkipTest(cls.pl._db_error or "effects.py unavailable")
+
+    def _a_particle_part(self):
+        """A decoded particle part with at least one live frame, from whatever
+        this base ships. Named content would gate the whole class to one
+        install; the draw path is base-independent and should be tested that
+        way."""
+        for name in ("m-b02", "BloodGhost-1"):
+            sc = self.pl.scene(name)
+            if not sc.found:
+                continue
+            for lay in sc.payload["layers"]:
+                for p in lay["parts"]:
+                    if (p["kind"] == "particle" and p.get("decoded")
+                            and p.get("peakParticles")):
+                        return p
+        for name in self.pl.names():          # any effect at all, then
+            sc = self.pl.scene(name)
+            if not sc.found:
+                continue
+            for lay in sc.payload["layers"]:
+                for p in lay["parts"]:
+                    if (p["kind"] == "particle" and p.get("decoded")
+                            and p.get("peakParticles")):
+                        return p
+        raise unittest.SkipTest("this install ships no decoded particle chunk")
+
+    def _live_frame(self, part):
+        for i, f in enumerate(part["frames"]):
+            if f.get("n"):
+                return i, f
+        raise unittest.SkipTest("no live frame")
+
+    # -- shape of the output ----------------------------------------------
+    def test_a_live_frame_becomes_six_vertices_per_particle(self):
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        self.assertEqual(q["n"], f["n"])
+        self.assertEqual(len(q["pos"]), f["n"] * 3 * self.ep.QUAD_VERTS_PER_PARTICLE)
+        self.assertEqual(len(q["uv"]), f["n"] * 2 * self.ep.QUAD_VERTS_PER_PARTICLE)
+
+    def test_an_empty_frame_draws_nothing(self):
+        """`Ptcl_Draw` returns immediately on `count == 0` (RVA 0x605CF), and
+        47 % of patch5517's particle frames are empty -- the empty case is the
+        common one, not the corner."""
+        p = self._a_particle_part()
+        empty = [i for i, f in enumerate(p["frames"]) if not f.get("n")]
+        if not empty:
+            self.skipTest("this system is live on every frame")
+        q = self.ep.particle_quads(p, empty[0], self.ep.GL_IDENTITY,
+                                   [1, 0, 0], [0, 0, 1])
+        self.assertEqual(q["n"], 0)
+        self.assertEqual(q["pos"], [])
+        self.assertIsNone(self.ep.particle_frame(p, empty[0]))
+
+    def test_the_frame_index_wraps_like_ptcl_setframe(self):
+        """`Ptcl_SetFrame` / `Ptcl_NextFrame` are `frame % frameCount`."""
+        p = self._a_particle_part()
+        i, _ = self._live_frame(p)
+        n = p["frameCount"]
+        self.assertIs(self.ep.particle_frame(p, i),
+                      self.ep.particle_frame(p, i + n))
+
+    # -- the billboard -----------------------------------------------------
+    def test_every_quad_lies_in_the_plane_the_camera_basis_spans(self):
+        """The whole reason the basis is passed in rather than derived. Under
+        an arbitrary camera every vertex must stay in the plane through the
+        particle spanned by (right, up) -- i.e. flat against the viewer, not
+        flat against the world."""
+        import math
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        # a deliberately skew basis, orthonormalised: an axis-aligned one
+        # would pass even if the code used world axes
+        r = [0.6, -0.48, 0.64]
+        u = [0.0, 0.8, 0.6]
+        d = sum(a * b for a, b in zip(r, u))
+        u = [u[k] - d * r[k] for k in range(3)]
+        ul = math.sqrt(sum(v * v for v in u))
+        u = [v / ul for v in u]
+        nrm = [r[1]*u[2] - r[2]*u[1], r[2]*u[0] - r[0]*u[2], r[0]*u[1] - r[1]*u[0]]
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, r, u)
+        for j in range(q["n"]):
+            vs = [q["pos"][(j * 6 + k) * 3:(j * 6 + k) * 3 + 3] for k in range(6)]
+            ctr = [sum(v[a] for v in vs) / 6 for a in range(3)]
+            for v in vs:
+                off = [v[a] - ctr[a] for a in range(3)]
+                self.assertAlmostEqual(sum(off[a] * nrm[a] for a in range(3)), 0.0,
+                                       places=4, msg="quad left the camera plane")
+
+    def test_the_quad_is_centred_on_the_transformed_particle(self):
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        m = self.ep.mat_mul_gl(list(self.ep.GL_IDENTITY), list(f["m"]))
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        for j in range(q["n"]):
+            want = self.ep._xform(m, f["p"][j * 3:j * 3 + 3])
+            vs = [q["pos"][(j * 6 + k) * 3:(j * 6 + k) * 3 + 3] for k in range(6)]
+            got = [sum(v[a] for v in vs) / 6 for a in range(3)]
+            for a in range(3):
+                self.assertAlmostEqual(got[a], want[a], places=3)
+
+    def test_half_extent_follows_the_world_matrix_scale(self):
+        """`Ptcl_Draw` multiplies the stored half-extent by the world matrix's
+        scale (RVA 0x1EC968 -- a transformed (1,1,1) over sqrt 3). Tripling the
+        world triples the quad, and it is a quad the size of the stored `s`
+        when the world is identity."""
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        big = list(self.ep.GL_IDENTITY)
+        big[0] = big[5] = big[10] = 3.0
+        self.assertAlmostEqual(self.ep.particle_scale(self.ep.GL_IDENTITY), 1.0)
+        self.assertAlmostEqual(self.ep.particle_scale(big), 3.0, places=5)
+        a = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        b = self.ep.particle_quads(p, i, big, [1, 0, 0], [0, 0, 1])
+
+        def width(q, j):
+            v0 = q["pos"][(j * 6 + 0) * 3:(j * 6 + 0) * 3 + 3]
+            v2 = q["pos"][(j * 6 + 2) * 3:(j * 6 + 2) * 3 + 3]
+            return max(abs(v2[k] - v0[k]) for k in range(3))
+
+        j = next(k for k in range(a["n"]) if f["s"][k] > 1e-4)
+        self.assertAlmostEqual(width(a, j), 2 * f["s"][j], places=3)
+        self.assertAlmostEqual(width(b, j) / width(a, j), 3.0, places=3)
+
+    # -- the flipbook ------------------------------------------------------
+    def test_the_atlas_cell_matches_the_readers_own_cell_function(self):
+        """The UV corner has to be the same cell `effects.Particle.cell`
+        computes -- `i = int(phase * N*N)`, `col = i % N`, `row = i // N`,
+        offset `(col/N, row/N)`. Two implementations of one rule is exactly how
+        a row/column swap survives: it is invisible on a 1x1 atlas and on any
+        symmetric cell, and 1,610 of this base's parts are 1x1."""
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        n = max(1, p["atlas"])
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        for j in range(q["n"]):
+            idx = min(int(f["c"][j] * n * n), n * n - 1)
+            want = ((idx % n) / n, (idx // n) / n)
+            uvs = [q["uv"][(j * 6 + k) * 2:(j * 6 + k) * 2 + 2] for k in range(6)]
+            self.assertAlmostEqual(min(u for u, _ in uvs), want[0], places=5)
+            self.assertAlmostEqual(min(v for _, v in uvs), want[1], places=5)
+
+    def test_a_quad_spans_exactly_one_cell_and_v_grows_downward(self):
+        """Cell size is `1/N` in both axes. And the corner at +up takes the
+        SMALL v: the viewer sets no UNPACK_FLIP_Y_WEBGL and D3D's V axis runs
+        top-down, so the atlas row index counts from the top."""
+        p = self._a_particle_part()
+        i, f = self._live_frame(p)
+        n = max(1, p["atlas"])
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        for j in range(min(q["n"], 8)):
+            uvs = [q["uv"][(j * 6 + k) * 2:(j * 6 + k) * 2 + 2] for k in range(6)]
+            us = [u for u, _ in uvs]
+            vs = [v for _, v in uvs]
+            self.assertAlmostEqual(max(us) - min(us), 1.0 / n, places=5)
+            self.assertAlmostEqual(max(vs) - min(vs), 1.0 / n, places=5)
+        # corner 0 is (-right, +up) and corner 1 is (-right, -up)
+        top = q["pos"][2]                     # z of vertex 0, up = +Z here
+        bottom = q["pos"][1 * 3 + 2]
+        self.assertGreater(top, bottom)
+        self.assertLess(q["uv"][1], q["uv"][1 * 2 + 1],
+                        "the upper corner must take the smaller v")
+
+    def test_the_system_alpha_envelope_is_carried_through(self):
+        """`systemAlpha` is per frame and PTC3-only; the draw path multiplies
+        the whole part by it.
+
+        MEASURED on patch5517: every one of the 2,211 PTC3 parts declares
+        `alpha = (1,1,1)` with `fadeFrame = (0, 0xFFFFFFFF)`, so this envelope
+        is *inert* on this base -- a flat glow is therefore not evidence that
+        it works, which is why the test reads the value back rather than
+        looking at a picture."""
+        p = self._a_particle_part()
+        i, _ = self._live_frame(p)
+        q = self.ep.particle_quads(p, i, self.ep.GL_IDENTITY, [1, 0, 0], [0, 0, 1])
+        sa = p.get("systemAlpha")
+        self.assertAlmostEqual(q["alpha"], sa[i] if sa else 1.0, places=5)
+
+    # -- framing -----------------------------------------------------------
+    def test_bounds_cover_every_particle_and_its_half_extent(self):
+        """A pure-particle effect has no `PHY` geometry, so without this the
+        viewer's camera fit has nothing to measure and the burst is an
+        invisible dot in a frame sized for the last model."""
+        p = self._a_particle_part()
+        b = self.ep.particle_bounds(p)
+        self.assertIsNotNone(b)
+        self.assertEqual(p["bboxRender"], [b["min"], b["max"]])
+        for i, f in enumerate(p["frames"]):
+            if not f.get("n"):
+                continue
+            scale = self.ep.particle_scale(list(f["m"]))
+            for j in range(f["n"]):
+                pt = self.ep._xform(list(f["m"]), f["p"][j * 3:j * 3 + 3])
+                s = f["s"][j] * scale
+                for a in range(3):
+                    self.assertLessEqual(b["min"][a], pt[a] - s + 1e-6)
+                    self.assertGreaterEqual(b["max"][a], pt[a] + s - 1e-6)
+
+    def test_a_pure_particle_effect_is_now_framable_and_drawable(self):
+        """The payoff, as a content assertion rather than a screenshot: an
+        effect whose every part is a particle system used to reach the viewer
+        with no bounds and no draw path at all."""
+        for name in self.pl.names():
+            sc = self.pl.scene(name)
+            if not sc.found:
+                continue
+            parts = [p for lay in sc.payload["layers"] for p in lay["parts"]]
+            if not parts or any(p["kind"] != "particle" for p in parts):
+                continue
+            if not any(p.get("peakParticles") for p in parts):
+                continue
+            self.assertTrue(any(p.get("bboxRender") for p in parts),
+                            f"{name} has no bounds for the camera to fit")
+            self.assertGreater(sc.payload["playableParts"], 0)
+            self.assertEqual(sc.payload["undecodedParts"], 0)
+            return
+        self.skipTest("this install ships no pure-particle effect")
+
+    # -- the browser copy --------------------------------------------------
+    def test_fx_js_mirrors_the_reference(self):
+        src = (PROJECT / "tools" / "webui" / "fx.js").read_text("utf-8")
+        for fn in ("particleScale", "particleFrame", "particleQuads",
+                   "uploadParticles"):
+            self.assertIn(fn, src, f"fx.js lost {fn}")
+        self.assertNotIn("PTCL / PTC3 are undecoded", src,
+                         "the gap is closed; the comment must not still claim it")
+        self.assertIn("Math.sqrt(3)", src, "the half-extent scale is 1/sqrt(3)")
+
+    def test_gl_js_takes_the_billboard_basis_from_the_view_matrix(self):
+        r"""NOT from `_basis()`. `_basis()` computes `right = cross(dir, up)`
+        and `M4.lookAt` computes `x = cross(up, z)` -- the same axis with the
+        opposite sign, which is the trap `screenToGround` already documents.
+        Borrowing it here would mirror every billboard in X: invisible on a
+        symmetric burst, and an atlas cell drawn backwards on everything else.
+        """
+        src = (PROJECT / "tools" / "webui" / "gl.js").read_text("utf-8")
+        m = re.search(r"_cameraBasis\(view\) \{(.+?)\n  \}", src, re.S)
+        self.assertIsNotNone(m, "gl.js must derive the billboard basis")
+        body = m.group(1)
+        self.assertIn("view[0]", body)
+        self.assertIn("view[4]", body)
+        self.assertIn("view[8]", body)
+        self.assertNotIn("_basis()", body)
+        self.assertIn("this._drawEffects(mvp, view)", src,
+                      "the draw pass needs the camera basis, not just the MVP")
+        self.assertIn("gl.TRIANGLES, 0, n", src,
+                      "particles are a triangle list, six vertices per quad")
 
 
 class LoadoutModel(unittest.TestCase):
@@ -2427,6 +3798,7 @@ class CharacterBuilder(unittest.TestCase):
                              len(g["variants"]),
                              f"{g['mesh']}: colours must differ by texture")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_grouping_turns_800_appearances_into_about_170_garments(self):
         """The number that makes the picker usable at all."""
         for bt in ("001", "002", "003", "004"):
@@ -2497,6 +3869,7 @@ class CharacterBuilder(unittest.TestCase):
         self.assertEqual(hair["total"] + gear["total"], res["total"])
 
     # -- slots that cannot be used ----------------------------------------
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_unusable_slots_report_a_reason_and_offer_nothing(self):
         """shield/pelvis do not ship at all; head/misc/mount ship an ini whose
         meshes resolve to nothing. Both must be greyed with a reason rather than
@@ -2516,6 +3889,7 @@ class CharacterBuilder(unittest.TestCase):
             self.assertTrue(info[name]["usable"], name)
             self.assertGreater(info[name]["garments"], 4, name)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_barely_stocked_slot_says_how_little_ships(self):
         info = {s["name"]: s for s in self.idx.slot_info()}["armet_dx8"]
         self.assertTrue(info["usable"])
@@ -2580,6 +3954,7 @@ class CharacterBuilder(unittest.TestCase):
                             or o.detail == "hair" for o in hair))
 
     # -- the always-on weapon effect --------------------------------------
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_weapon_aura_is_a_table_lookup_not_a_filename(self):
         """Task #20's correction. `blade/` is one of 29 families and the link is
         `Action3DEffect[999.999.<type>.<sub>]` -> `3DEffect.ini` ->
@@ -2692,6 +4067,7 @@ class CharacterBuilder(unittest.TestCase):
         walk = db.clip("002132300", "110")
         self.assertIsNone(walk.chain_next, "walk self-loops, it does not chain")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_walk_and_run_are_in_place_but_a_jump_is_not(self):
         """The root-motion correction: do NOT add translation to locomotion."""
         if self.builder.animmod is None:
@@ -2747,6 +4123,7 @@ class CharacterBuilder(unittest.TestCase):
         self.assertIn("33 ms", self.builder.TIMING_NOTE)
         self.assertIn("speed control", self.builder.TIMING_NOTE)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_missing_motion_is_reported_not_silently_empty(self):
         """1,100 of the 3,260 motion files this ini names are absent. The player
         bodies are complete, but the failure has to be legible where it bites."""
@@ -2783,6 +4160,7 @@ class UnifiedEntries(unittest.TestCase):
     def tearDownClass(cls):
         cls.cat.close()
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_relation_comes_from_meshtex(self):
         self.assertTrue(self.idx.available)
         self.assertGreater(len(self.idx.mesh_matches), 4000)
@@ -2790,6 +4168,7 @@ class UnifiedEntries(unittest.TestCase):
         self.assertGreater(st["meshesWithTexture"] / st["meshes"], 0.99)
         self.assertGreater(st["authoredBest"] / st["meshes"], 0.8)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_garment_and_its_skins_are_one_row(self):
         mesh = "c3/mesh/002135000.c3"
         texes = [m["texture"] for m in self.idx.textures_of(mesh)]
@@ -2821,16 +4200,47 @@ class UnifiedEntries(unittest.TestCase):
         self.assertIn("002135300.dds", rows[0]["search"])
         self.assertIn("002135000.c3", rows[0]["search"])
 
-    def test_one_texture_can_belong_to_several_meshes(self):
+    def test_the_owner_set_and_the_component_view_agree(self):
+        """The structural half, and it holds for any number of owners.
+
+        Runs on every install: whatever `meshes_of` returns, the primary must
+        be one of them, `components` must expose exactly those meshes, and
+        exactly one must be flagged primary.  Only the *count* is a content
+        pin (see the gated test below and `CORRECTIONS.md` C53-viewer-last-two); these
+        relations are the index's own consistency and were never base
+        -dependent -- they simply never got to run, because the pinned
+        assertion failed first and took the rest of the test with it.
+        """
         tex = "c3/texture/105000000.dds"
         owners = [m for m, _ in self.idx.meshes_of(tex)]
-        self.assertGreater(len(set(owners)), 1)
+        self.assertTrue(owners, "expected at least one owning mesh")
         self.assertIn(self.idx.owner_of(tex), owners)
         comp = self.idx.components(tex)
         meshes = [c for c in comp["components"] if c["role"] == "mesh"]
         self.assertEqual(len(meshes), len(owners))
         self.assertEqual(sum(1 for c in meshes if c["primary"]), 1,
                          "exactly one owner is primary")
+
+    @requires_base("cco",
+                   why="needs an install that ships the monster's geometry in "
+                       "more than one action file. MEASURED over c3/monster/105/: "
+                       "CCO ships 13 of 16 .c3 carrying a PHY chunk (88877 B each) "
+                       "-> 13 owners; all five official clients (5017/5065/5165/"
+                       "5517/6090) ship 13 files of which exactly ONE carries PHY, "
+                       "the rest being 35366 B MOTI-only -> 1 owner. Body types "
+                       "145/305/505/705 ship no .c3 at all on ANY base, CCO "
+                       "included -- CORRECTIONS C53-viewer-last-two")
+    def test_one_texture_can_belong_to_several_meshes(self):
+        """The pinned half: several *distinct* meshes owning one skin.
+
+        This is real and worth asserting -- it is why `texture_owners` is a
+        list -- but it needs a base whose action files each carry their own
+        copy of the geometry.
+        """
+        tex = "c3/texture/105000000.dds"
+        owners = [m for m, _ in self.idx.meshes_of(tex)]
+        self.assertGreater(len(set(owners)), 1)
+        self.assertIn(self.idx.owner_of(tex), owners)
 
     def test_components_keep_authored_and_inferred_apart(self):
         comp = self.idx.components("c3/mesh/002135000.c3")
@@ -2868,7 +4278,9 @@ class UnifiedEntries(unittest.TestCase):
         self.assertIsInstance(self.idx.refresh_thumbs(), int)
 
     @unittest.skipUnless(_thumbs_rendered("meshes"),
-                         "mesh thumbnails not fully rendered")
+                         _index_reason("out/thumbs/manifest_meshes.json",
+                                       present=True,
+                                       note="fewer than 4,000 mesh renders"))
     def test_rendered_thumbnails_are_consumed(self):
         """The mesh slice, not the 23 MB full manifest: every list row wants a
         mesh thumbnail and almost none want a texture one."""
@@ -2881,7 +4293,9 @@ class UnifiedEntries(unittest.TestCase):
         self.assertEqual(Path(f).read_bytes()[:4], b"\x89PNG")
 
     @unittest.skipUnless(_thumbs_rendered("meshes"),
-                         "mesh thumbnails not fully rendered")
+                         _index_reason("out/thumbs/manifest_meshes.json",
+                                       present=True,
+                                       note="fewer than 4,000 mesh renders"))
     def test_a_near_empty_render_is_not_shown(self):
         """19 meshes draw under 1% of the frame. Their render is a blank square,
         which reads as broken rather than as a thin mesh, so it is withheld and
@@ -2895,7 +4309,9 @@ class UnifiedEntries(unittest.TestCase):
         self.assertEqual(self.idx.thumb_note("c3/mesh/002135000.c3"), "")
 
     @unittest.skipUnless(_thumbs_rendered("textures"),
-                         "texture thumbnails not fully rendered")
+                         _index_reason("out/thumbs/manifest.json",
+                                       present=True,
+                                       note="fewer than 60,000 texture renders"))
     def test_used_by_mesh_is_narrower_than_the_collapse_rule(self):
         """Why the collapse is not built on task #21's `used_by_mesh` flag.
 
@@ -2925,24 +4341,82 @@ class UnifiedEntries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-            old = self.unify.THUMB_DIR
+            for shape in shapes:
+                (d / "manifest.json").write_text(json.dumps(shape))
+                idx = self.unify.UnifiedIndex.__new__(self.unify.UnifiedIndex)
+                idx._thumbs = None
+                # `__init__` is bypassed on purpose -- this reads a manifest
+                # and needs no install -- so every attribute `thumbs()`
+                # touches has to be supplied by hand. Per-view thumbnail
+                # directories (ac1dbd7) added `_thumb_dir`, and the test had
+                # been erroring on its absence ever since.
+                idx._thumb_dir = d
+                # `root` joined that list when the module-level `THUMB_DIR`
+                # was deleted (C55): the inheritance branch resolves
+                # `derived_path("out/thumbs", self.root)` per instance now,
+                # instead of comparing against a constant fixed at import.
+                # This test never reaches that branch -- it writes
+                # `manifest.json` into `_thumb_dir`, so the loop above always
+                # breaks -- but the attribute is supplied anyway, because the
+                # rule is every attribute `thumbs()` CAN touch, not merely the
+                # ones this path happens to hit.
+                idx.root = d
+                got = self.unify.UnifiedIndex.thumbs(idx)
+                self.assertIn("c3/mesh/a.c3", got, shape)
+                self.assertTrue(Path(got["c3/mesh/a.c3"]["file"]).is_file())
+
+    def test_a_coverage_file_outside_the_checkout_is_read_not_rebuilt(self):
+        r"""A linked worktree reads the primary checkout's index.
+
+        `coroot.find_derived` falls back to the primary checkout on purpose,
+        so `_load` is routinely handed a path *outside* `REPO`. Building the
+        display label with `relative_to` raised `ValueError` on exactly that
+        path, the broad `except` swallowed it, and an already-parsed coverage
+        document was thrown away for a ~2-minute live `meshtex` scan -- on
+        every index construction, in every worktree.
+
+        This asserts the **consequence**, not the message: the matches
+        survive and the rebuild path is never entered. A test that only
+        checked `source` would have passed while the rebuild still ran.
+        """
+        import tempfile
+        import types
+        doc = {"meshes": {"c3/mesh/a.c3": {"matches": [
+            {"texture": "c3/texture/t.dds", "kind": "authored"}]}}}
+        with tempfile.TemporaryDirectory() as d:
+            cov = Path(d) / "coverage.json"        # deliberately outside REPO
+            cov.write_text(json.dumps(doc), encoding="utf-8")
+            self.assertFalse(
+                cov.is_relative_to(self.unify.REPO),
+                "the fixture must sit outside the checkout to exercise this")
+
+            def _never(*a, **k):
+                raise AssertionError(
+                    "the live meshtex rebuild ran -- the coverage file was "
+                    "parsed and should have been used as-is")
+            boom = types.ModuleType("meshtex")
+            boom.MeshTextureIndex = _never
+            old = sys.modules.get("meshtex")
+            sys.modules["meshtex"] = boom
             try:
-                self.unify.THUMB_DIR = d
-                for shape in shapes:
-                    (d / "manifest.json").write_text(json.dumps(shape))
-                    idx = self.unify.UnifiedIndex.__new__(self.unify.UnifiedIndex)
-                    idx._thumbs = None
-                    # `__init__` is bypassed on purpose -- this reads a
-                    # manifest and needs no install -- so every attribute
-                    # `thumbs()` touches has to be supplied by hand. Per-view
-                    # thumbnail directories (ac1dbd7) added this one, and the
-                    # test had been erroring on its absence ever since.
-                    idx._thumb_dir = d
-                    got = self.unify.UnifiedIndex.thumbs(idx)
-                    self.assertIn("c3/mesh/a.c3", got, shape)
-                    self.assertTrue(Path(got["c3/mesh/a.c3"]["file"]).is_file())
+                idx = self.unify.UnifiedIndex.__new__(self.unify.UnifiedIndex)
+                # `__init__` is bypassed: this exercises `_load` alone and
+                # needs no install. Only what `_load` touches is supplied.
+                idx.root = ROOT
+                idx.mesh_matches = {}
+                idx.source = ""
+                idx.error = ""
+                self.unify.UnifiedIndex._load(idx, cov)
             finally:
-                self.unify.THUMB_DIR = old
+                if old is None:
+                    sys.modules.pop("meshtex", None)
+                else:
+                    sys.modules["meshtex"] = old
+
+        self.assertIn("c3/mesh/a.c3", idx.mesh_matches)
+        self.assertEqual("", idx.error)
+        self.assertIn("coverage.json", idx.source)
+        self.assertIn("1 meshes", idx.source)
 
 
 class BuilderUiModel(unittest.TestCase):
@@ -3222,7 +4696,9 @@ class DefaultView(unittest.TestCase):
         src = self.GL.read_text("utf-8")
         yaw = float(re.search(r"const DEFAULT_YAW = (-?[\d.]+);", src).group(1))
         if not _thumbs_rendered("meshes"):
-            self.skipTest("mesh thumbnails not fully rendered")
+            self.skipTest(_index_reason("out/thumbs/manifest_meshes.json",
+                                        present=True,
+                                        note="fewer than 4,000 mesh renders"))
         manifest = coroot.find_derived("out/thumbs/manifest_meshes.json")
         r = json.loads(manifest.read_text("utf-8")).get("renderer", {})
         self.assertIn("yaw", r)
@@ -3472,6 +4948,7 @@ class WeaponQuality(unittest.TestCase):
         self.assertIn("does not ship", joined)
         self.assertIn("different mesh", joined)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_outlier_families_are_reported_not_forced_into_five(self):
         """35004 is not a quality ladder -- each digit is a different mesh --
         and a family with one texture is honest about it."""
@@ -3503,6 +4980,420 @@ class WeaponQuality(unittest.TestCase):
             self.assertFalse(rec["isWeapon"])
             self.assertFalse(rec["qualities"])
             self.assertTrue(rec["reason"])
+
+
+class AlwaysOnSentinelWidth(unittest.TestCase):
+    r"""The always-on action field is all-nines, and its WIDTH is per client.
+
+    CORRECTIONS C35. The register claimed *"6090 ships ZERO always-on
+    `Action3DEffect` rows"*. It ships 2,604; 5517 ships 972; CCO ships 826.
+    The rows were never missing. `superfx` spelled the always-on action
+    `"999"` and `effects.effects_for_weapon` compared `r.action == WILDCARD`,
+    both three wide, while the official clients write the action field four
+    wide and key the group `9999`. `_field_matches` compares numerically and
+    correctly refused them -- 9999 is not 999 -- so the table half went dark
+    and an effect-named-for-id fallback quietly covered for it. The aura still
+    appeared, which is why it went unnoticed for so long.
+
+    Third instance of one class: **a width fix applied to the values was not
+    applied to the sentinel.** The fix here removes the sentinel from callers
+    rather than widening it, because a wider literal is the same bug one width
+    along.
+
+    THE PART THAT NEEDED MEASURING, not arguing
+    -------------------------------------------
+    Making a broken lookup succeed is not the same as making it right. The
+    fallback had been the de-facto behaviour on both official clients for a
+    long time, so the question was whether the table's answer is *better*.
+    It is, and the discriminator is CCO: its table has never been broken, so
+    whatever CCO's table says has been the drawn answer there all along. On
+    all 35 appearances where the official tables and the fallback disagree,
+    CCO's table agrees with the official tables and not with the fallback --
+    35 of 35. The fallback is the odd one out on all three clients.
+    """
+
+    #: The kinds this class needs. Roots come from the user's own declared
+    #: install map (`coroot` KINDS_KEY), never from a literal path: this is a
+    #: cross-base test and hardcoding three installs would both break on
+    #: anyone else's machine and trip the sanitization gate.
+    WANT = ("cco", "patch5517", "patch6090")
+
+    @classmethod
+    def setUpClass(cls):
+        if not HAVE_ROOT:
+            raise unittest.SkipTest("install not present")
+        sys.path.insert(0, str(HERE))
+        import effects as fx
+        cls.fx = fx
+        import coroot
+        declared = dict(coroot.read_settings().get(coroot.KINDS_KEY) or {})
+        cls.BASES = {}
+        for root, kind in declared.items():
+            if kind in cls.WANT and (Path(root) / "ini").is_dir():
+                cls.BASES.setdefault(kind, Path(root))
+        # Two bases are not enough to classify anything here -- the whole
+        # finding is "CCO spells the sentinel differently from the official
+        # clients", so it needs one of each and says so rather than passing
+        # vacuously on a machine that has only one.
+        if "cco" not in cls.BASES or not (
+                {"patch5517", "patch6090"} & set(cls.BASES)):
+            raise unittest.SkipTest(
+                "needs CCO and at least one official patch client declared; "
+                f"have {sorted(cls.BASES)}")
+
+    # -- the predicate, which is pure and needs no install -----------------
+    def test_all_nines_of_any_width_is_the_always_on_group(self):
+        for good in ("999", "9999", "99999"):
+            self.assertTrue(self.fx.is_always_on(good), good)
+        for bad in ("", "99", "0100", "100", "9990", "0999", "none", "9a9"):
+            self.assertFalse(self.fx.is_always_on(bad), bad)
+
+    def test_specificity_reads_an_all_nines_field_at_any_width_as_unpinned(self):
+        r"""The fifth and last sentinel site in `effects.py`, C35.
+
+        `specificity` decides which row wins, so a field that is really the
+        wildcard must not score as pinned. It used to compare `!= WILDCARD`
+        literally, so an official client's `9999` aura row scored 3 while
+        pinning 2. Measured inert before it was changed (0 answers moved on
+        all three bases) and fixed anyway, because inert is not right and this
+        file has paid four times already for leaving one spelling behind.
+
+        Pure -- no install. The rule is the CCO spelling and the official one
+        of the same row, which must now agree.
+        """
+        R = self.fx.ActionEffectRule
+        cco = R("999", "999", "601", "009", "601009")
+        official = R("999", "9999", "601", "009", "601009")
+        self.assertEqual(cco.specificity, 2, "shape and action are wildcards")
+        self.assertEqual(official.specificity, 2,
+                         "9999 is the same wildcard, one digit wider")
+        # A genuine action code still pins, at either width.
+        self.assertEqual(R("999", "0915", "601", "009", "x").specificity, 3)
+        self.assertEqual(R("999", "915", "601", "009", "x").specificity, 3)
+        # And a wildcard low group is unpinned, which is what makes the count
+        # a ranking rather than a constant.
+        self.assertEqual(R("999", "9999", "601", "999", "x").specificity, 1)
+        # The sibling rule must not be left on the literal -- that omission is
+        # the whole subject of C35.
+        M = self.fx.ActionMapRule
+        self.assertEqual(M("999", "9999", "999", "x").specificity, 0)
+        self.assertEqual(M("999", "0915", "300", "x").specificity, 2)
+
+    def test_the_wildcard_constant_was_not_widened_instead(self):
+        r"""The fix that looks obvious and is refuted by measurement: making
+        an all-nines value of any width read as the wildcard in
+        `_field_matches`. That would move 19,143 action-effect answers on
+        5517 and 30,942 on 6090 -- almost all of them turning "this action
+        has no effect" into "this action has the always-on aura", serving the
+        aura as the per-attack trail. On CCO, where the sentinel already
+        matches the field width, the same change moves 0 of 91,528. Zero is
+        what correct looks like, so the narrow fix is the right one and
+        `WILDCARD` must stay exactly three wide."""
+        self.assertEqual(self.fx.WILDCARD, "999")
+        # A four-wide all-nines rule value is NOT a wildcard for other actions.
+        self.assertFalse(self.fx.EffectDB._field_matches("9999", "0100"))
+        self.assertFalse(self.fx.EffectDB._field_matches("9999", "401"))
+        # ...but three-wide still is, which is what CCO relies on.
+        self.assertTrue(self.fx.EffectDB._field_matches("999", "0100"))
+
+    # -- the shipped tables ------------------------------------------------
+    def test_widening_would_overwrite_answers_that_are_already_right(self):
+        r"""The half of the refutation the first pass did not name.
+
+        Most of what the widening changes is None -> aura, which is bad but
+        legible. 102 answers on 5517 and 132 on 6090 are worse: they change
+        value -> value, an action-specific effect **overwritten by the aura**.
+        The mechanism is `ActionEffectRule.specificity`, which is the same
+        three-wide sentinel in a fourth site -- the aura row's `9999` counts
+        as specific, ties the genuine action row at 3, and wins on file order.
+        Fixing that property too recovers 5517's 102 and none of 6090's, so it
+        does not rescue the widening. CORRECTIONS C35.
+
+        Asserted on the concrete pair rather than by re-sweeping the corpus:
+        the sweep takes minutes, and this row is the one that must not move.
+        """
+        for kind in ("patch5517", "patch6090"):
+            if kind not in self.BASES:
+                continue
+            db = self._db(kind)
+            with self.subTest(kind=kind):
+                aura = db.always_on_effect("601009")
+                self.assertEqual(aura, "601009", "the aura row itself moved")
+                for action in ("0915", "0916", "0917"):
+                    got = db.lookup_action_effect("601009", action)
+                    self.assertTrue(
+                        got and got.startswith("endureXPsword"),
+                        f"{kind} 601009/{action} -> {got!r}")
+                    self.assertNotEqual(
+                        got, aura,
+                        f"{kind} 601009/{action} resolved to the aura -- the "
+                        "sentinel was widened somewhere; see CORRECTIONS C35")
+
+    # -- the fifth site: ActionMap3DEffect, which was dark on both official
+    #    clients until 2026-08-09.  C35.
+    ACTION_MAP_ROWS = {"cco": 60, "patch5517": 126, "patch6090": 126}
+
+    def test_the_action_map_is_not_dark_on_the_official_clients(self):
+        r"""It was, entirely: `len(sec) != 9` dropped every row on 5517 and
+        6090, because their key is shape+action+terrain with the action group
+        four wide -- ten digits, not nine. CCO parsed 60 of 60 and the
+        official clients 0 of 126, so `lookup_action_map` answered None for
+        every query on both, silently, since they were onboarded.
+
+        Counts, not just "non-empty": a partial parse is the failure this is
+        guarding against and it would pass an emptiness check.
+        """
+        for kind, want in self.ACTION_MAP_ROWS.items():
+            if kind not in self.BASES:
+                continue
+            with self.subTest(kind=kind):
+                self.assertEqual(len(self._db(kind).action_map), want)
+
+    def test_the_action_map_key_is_cut_where_the_evidence_says(self):
+        r"""`104|0330|999` and `1040|330|999` are the same ten digits, so the
+        cut was chosen by measurement rather than by the field order in the
+        file's header. Two independent discriminators, both asserted here:
+
+        * **the client's own vocabularies** -- 3/4/3 lands inside
+          `Action3DEffect.ini`'s shape and action vocabularies and 4/3/3 lands
+          **nowhere in either, on either base**. Asserted as that comparison
+          rather than as a threshold, deliberately: the action overlap is 102
+          of 126 on 6090 but only **6** on 5517, because 5517's weapon rows
+          use fewer distinct actions than the movement actions this table
+          keys on. A fixed floor would have encoded 6090's number and failed
+          on 5517 -- it did, before this was measured on both;
+        * **CCO as the control** -- every one of CCO's 60 rows has an official
+          counterpart under "the action, unpadded", and they must agree on the
+          effect. CCO's table has never been broken, so its answer is what has
+          actually been drawn.
+        """
+        for kind in ("patch5517", "patch6090"):
+            if kind not in self.BASES or "cco" not in self.BASES:
+                continue
+            with self.subTest(kind=kind):
+                db = self._db(kind)
+                self.assertEqual({len(r.action) for r in db.action_map}, {4})
+                self.assertEqual({len(r.shape) for r in db.action_map}, {3})
+                self.assertEqual({len(r.terrain) for r in db.action_map}, {3})
+
+                a3_shapes = {r.shape for r in db.action_rules}
+                a3_actions = {r.action for r in db.action_rules}
+                raw = [s for s in self.fx.read_sections(
+                           db.ini / "ActionMap3DEffect.ini")
+                       if s.isdigit() and len(s) == 10]
+                self.assertEqual(len(raw), 126)
+                # the cut that shipped, against the one it was chosen over
+                right = [(s[0:3], s[3:7]) for s in raw]
+                wrong = [(s[0:4], s[4:7]) for s in raw]
+                r_sh = sum(1 for a, _ in right if a in a3_shapes)
+                r_ac = sum(1 for _, b in right if b in a3_actions)
+                w_sh = sum(1 for a, _ in wrong if a in a3_shapes)
+                w_ac = sum(1 for _, b in wrong if b in a3_actions)
+                self.assertEqual((w_sh, w_ac), (0, 0),
+                                 "4/3/3 must land in neither vocabulary")
+                self.assertGreater(r_sh, w_sh, "shape vocabulary")
+                self.assertGreater(r_ac, w_ac, "action vocabulary")
+
+                cco = {(r.shape, r.action, r.terrain): r.effect
+                       for r in self._db("cco").action_map}
+                shared = disagree = 0
+                for r in db.action_map:
+                    key = (r.shape, r.action.lstrip("0") or "0", r.terrain)
+                    if key in cco:
+                        shared += 1
+                        if cco[key] != r.effect:
+                            disagree += 1
+                self.assertEqual(shared, 60, "CCO's rows must all be present")
+                self.assertEqual(disagree, 0, "CCO is the control and it must "
+                                              "agree wherever the two overlap")
+
+    def test_enabling_the_action_map_only_added_answers(self):
+        r"""The property that made this safe to land, and the contrast with
+        the refuted wildcard-widening in the same entry.
+
+        MEASURED over the full shape x action x terrain space each base can
+        express: **CCO 0 of 630 answers change** -- it is the control and it
+        must not move -- while 5517 and 6090 each change 1,780 of 2,592, and
+        **every one of those is None -> an answer**. Zero are answer -> a
+        different answer. The widening this entry refutes did the opposite: it
+        overwrote 102 and 132 answers that were already right.
+
+        Asserted here as the invariant rather than by re-running the sweep:
+        a rule that resolves must resolve to an effect the base defines, and
+        the padded and unpadded spellings of the action must agree.
+        """
+        for kind in self.ACTION_MAP_ROWS:
+            if kind not in self.BASES:
+                continue
+            with self.subTest(kind=kind):
+                db = self._db(kind)
+                for r in db.action_map:
+                    if not r.effect or r.effect.lower() == "none":
+                        continue
+                    self.assertIn(r.effect, db.effects,
+                                  f"{kind}: action-map row {r.shape}."
+                                  f"{r.action}.{r.terrain} names an effect "
+                                  f"this base does not define")
+                # padding must not decide the answer
+                r = db.action_map[0]
+                bare = r.action.lstrip("0") or "0"
+                self.assertEqual(
+                    db.lookup_action_map(r.shape, r.action, r.terrain),
+                    db.lookup_action_map(r.shape, bare, r.terrain),
+                    f"{kind}: {r.action!r} and {bare!r} resolved differently")
+
+    def _db(self, kind):
+        root = self.BASES.get(kind)
+        if root is None:
+            self.skipTest(f"no {kind} install declared")
+        return self.fx.EffectDB(root)
+
+    def test_every_client_ships_always_on_rows(self):
+        """The refutation itself, read off the raw table. The counts are
+        floors rather than equalities: the point is that none of them is
+        zero, and a content pin would only tell you which base you are on."""
+        got = {}
+        for kind in self.BASES:
+            db = self._db(kind)
+            rows = db.always_on_rules()
+            got[kind] = (len(rows), sorted({len(r.action) for r in rows}))
+            self.assertGreater(len(rows), 400,
+                               f"{kind} reports {len(rows)} always-on rows; "
+                               f"'this client ships none' is the bug C35 is "
+                               f"about, not a fact about any client")
+        self.assertEqual(got["cco"][1], [3], "CCO writes the group 999")
+        for kind in set(got) & {"patch5517", "patch6090"}:
+            self.assertEqual(got[kind][1], [4],
+                             f"{kind} writes the group 9999 -- if this ever "
+                             f"reads [3] the width quirk has changed and the "
+                             f"whole entry needs re-measuring")
+
+    def test_the_width_agnostic_query_equals_the_correctly_spelled_one(self):
+        """`always_on_effect` must be the same answer as
+        `lookup_action_effect` given that client's own spelling -- otherwise
+        it is a second implementation rather than a safer front door."""
+        import random
+        for kind in self.BASES:
+            db = self._db(kind)
+            spelling = sorted({r.action for r in db.always_on_rules()})
+            self.assertEqual(len(spelling), 1, f"{kind}: {spelling}")
+            corpus = sorted(set(db.weapon_appearances))
+            random.seed(3)
+            for app in random.sample(corpus, min(120, len(corpus))):
+                self.assertEqual(
+                    db.always_on_effect(app),
+                    db.lookup_action_effect(app, spelling[0], shape="999"),
+                    f"{kind} {app}")
+
+    def test_the_official_clients_resolve_auras_from_the_table_again(self):
+        """The regression this class exists for: 0 of 4,828 on both official
+        clients before, against 1,286 of 5,384 on CCO. The mechanism is
+        identical on all three; only the spelling differed."""
+        for kind in self.BASES:
+            db = self._db(kind)
+            weapons = sorted(db.weapon_appearances)
+            n = sum(1 for a in weapons
+                    if (e := db.always_on_effect(a)) and e.lower() != "none")
+            self.assertGreater(n, 500,
+                               f"{kind}: only {n} of {len(weapons)} weapon "
+                               f"appearances resolve an aura from the table")
+            # and the old three-wide spelling still finds nothing on the
+            # official clients, which is the evidence that the width is the
+            # whole story rather than a coincidence.
+            old = sum(1 for a in weapons
+                      if (e := db.lookup_action_effect(a, "999", shape="999"))
+                      and e.lower() != "none")
+            if kind == "cco":
+                self.assertEqual(old, n, "CCO's spelling IS 999")
+            else:
+                self.assertEqual(old, 0,
+                                 f"{kind} answered {old} to the three-wide "
+                                 f"query; the diagnosis assumed 0")
+
+    def test_effects_for_weapon_files_the_aura_as_an_aura(self):
+        """The second home of the same sentinel. `effects_for_weapon` used to
+        test `r.action == WILDCARD`, so on the official clients every
+        always-on row was filed under `attack` keyed `9999` and `.aura` came
+        back empty."""
+        for kind in self.BASES:
+            db = self._db(kind)
+            es = db.effects_for_weapon("410009")
+            self.assertTrue(es.aura, f"{kind}: 410009 must report an aura")
+            self.assertNotIn("9999", es.attack,
+                             f"{kind}: an always-on row was filed as an attack")
+            self.assertNotIn("999", es.attack)
+
+    def test_where_the_table_and_the_fallback_disagree_cco_settles_it(self):
+        r"""The measurement that decided this, and the reason it is not just
+        "the lookup can be made to succeed".
+
+        The fallback -- an effect whose name is the appearance id -- supplied
+        373 auras on each official client while the table supplied none. 338
+        of those agree with the table. On the other 35 the table names a
+        different effect, and CCO's table -- which has never been broken, so
+        its answer is what CCO has actually been drawing -- agrees with the
+        official tables on every one. The guess is the outlier.
+
+        **Scored over the rows CCO has an opinion on, and that is a
+        correction to how this test was first written** (C47/C48). The
+        original scored `backs_table` against the *whole* disagreeing set and
+        required 90 %, which held only while the effect definitions came from
+        `3DEffect.ini`. Reading the compiled table instead enlarges the set --
+        63 rows on 5517 and 111 on 6090 against the original 35 -- because
+        more appearance ids are now *defined* effect names and so survive the
+        `db.resolve(a) is not None` filter. Every single one of the additions
+        (28 and 76) is defined **only** by the compiled table, and CCO, a
+        different lineage with no compiled table at all, has no row for any of
+        them.
+
+        A base with no row is not a base that disagrees. Counting `no_row`
+        against corroboration made this assertion a measure of *CCO's coverage
+        of the corpus* rather than of whether CCO backs the table -- so it
+        would have failed for the corpus growing, which is the thing C47 was
+        supposed to achieve. Scored properly it is **35 of 35 on both** bases,
+        and `backs_guess == 0` -- the load-bearing claim -- never moved."""
+        dbs = {}
+        for kind in self.BASES:
+            dbs[kind] = self._db(kind)
+        cco = dbs["cco"]
+        for kind in sorted(set(dbs) & {"patch5517", "patch6090"}):
+            db = dbs[kind]
+            corpus = sorted(set(db.weapon_appearances) |
+                            {r.appearance for r in db.always_on_rules()})
+            disagree = [a for a in corpus
+                        if (t := db.always_on_effect(a)) and t.lower() != "none"
+                        and db.resolve(a) is not None and t != a]
+            self.assertTrue(disagree,
+                            "if nothing disagrees this test proves nothing")
+            backs_table = backs_guess = no_row = 0
+            for a in disagree:
+                c = cco.always_on_effect(a)
+                if not c:
+                    no_row += 1
+                elif c == db.always_on_effect(a):
+                    backs_table += 1
+                elif c == a:
+                    backs_guess += 1
+            self.assertEqual(
+                backs_guess, 0,
+                f"{kind}: CCO backs the effect-named-for-id guess on "
+                f"{backs_guess} of {len(disagree)} -- if this is ever "
+                f"non-zero the fallback is right somewhere and C35's "
+                f"conclusion needs revisiting")
+            self.assertEqual(
+                backs_table + no_row, len(disagree))
+            # Score over the rows CCO has an opinion on. `no_row` is CCO not
+            # knowing the appearance at all -- a different lineage lacking an
+            # entry is not a vote against the table, and folding it in turns
+            # this into a coverage metric that shrinks whenever the corpus
+            # grows. See the docstring.
+            judged = backs_table + backs_guess
+            self.assertGreater(judged, 0, f"{kind}: CCO judged none of "
+                                          f"{len(disagree)}; nothing proved")
+            self.assertGreater(backs_table, 0.9 * judged,
+                               f"{kind}: CCO corroborates the table on only "
+                               f"{backs_table} of the {judged} it has a row "
+                               f"for ({no_row} of {len(disagree)} unjudged)")
 
 
 class SuperAura(unittest.TestCase):
@@ -3540,6 +5431,7 @@ class SuperAura(unittest.TestCase):
             self.assertFalse(got[label], f"{label} must NOT glow in family 41000")
         self.assertEqual(rec["auraQualities"], ["super"])
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_aura_is_overwhelmingly_but_not_only_the_super_digit(self):
         """575 families glow on ...9 alone and 70 glow at every quality, so the
         UI asks the table per id instead of assuming the rule. Asserting the
@@ -3561,7 +5453,18 @@ class SuperAura(unittest.TestCase):
 
     def test_the_aura_is_a_table_lookup_not_a_filename_guess(self):
         """`c3/effect/<family>/<id>.c3` finds blades and misses 28 other
-        families; the lookup goes through Action3DEffect."""
+        families; the lookup goes through Action3DEffect.
+
+        **UNGATED 2026-08-09: this was never a CCO fact.** It carried
+        "asserts CCO's content; verified to pass there and fail on 5517",
+        and measured on all six declared installs it passes on every one --
+        cco, 5017, 5065, 5165, 5517 and 6090. It asserts how the *lookup*
+        works (>20 distinct effect families reached through the table, one of
+        them `blade`), not what any one client ships, so the gate was hiding
+        the test on five clients it protects. `requires_base` is for fixtures
+        pinned to one install's content; this is not one --
+        CORRECTIONS C-2026-08-09-comod-base-gate-audit
+        """
         fams = set()
         for o in self.idx.options["r_weapon"]:
             rec = self.idx.super_effect(o.ident)
@@ -3581,6 +5484,398 @@ class SuperAura(unittest.TestCase):
         self.assertEqual(glowing[0]["id"], "410009")
         self.assertIn(glowing[0]["id"],
                       {o.ident for o in self.idx.options["r_weapon"]})
+
+
+class PerHandSuperAura(unittest.TestCase):
+    r"""Two hands, two auras, and neither one touches the other.
+
+    Reported: *"I can only make one weapon super at a time. This needs to be
+    an independent control for each weapon hand."*  The test case was `480138`
+    Bronze Club in both hands -- Elite, which carries no aura at all; `480139`
+    is the Super in that family and does.
+
+    WHERE THE LIMIT WAS, because the answer decides what this class asserts
+    ---------------------------------------------------------------------
+    Not in `superfx.py`: `SLOT_SOCKET` has always mapped both hands and
+    `SuperFxDB.anchor` is a static method taking the slot, so it holds no
+    state to share.  Not in the payload: `/api/superfx?slot=` resolves either
+    hand and `/api/figure` returns both sockets in one response.  It was
+    `tools/webui/builder.js`, which held **one** `{on, rec}`, **one**
+    localStorage flag and **one** checkbox, and whose `equippedWeapon()`
+    returned the right hand *or, failing that*, the left -- so the left-hand
+    aura was reachable only with the right hand empty and both were never
+    possible.
+
+    So the resolution tests below establish that the layer underneath really
+    is per-hand (and would have been all along), and the source tests guard
+    the shape the UI now has, because the UI is where the defect lived and a
+    regression would land there again.
+
+    THE SAME ASSUMPTION HAD A SECOND HOME, which is why the keyboard tests
+    are in *this* class and not a new one
+    ---------------------------------------------------------------------
+    Splitting the aura left `stepQuality` -- the ``Q`` key -- still reading::
+
+        const slot = B.loadout.r_weapon ? 'r_weapon'
+                   : (B.loadout.l_weapon ? 'l_weapon' : null);
+
+    the same right-hand-or-failing-that-the-left, in the same file.  With the
+    reported Bronze Club in both hands you could not step the LEFT one's
+    quality from the keyboard, and what you were left with was the picker or
+    the per-hand *Switch to Super* button that `test_the_page_ships_a_switch
+    _for_each_hand` guards -- i.e. this class was asserting the workaround.
+
+    The aura could grow a second key (``A`` / shift-``A``).  ``Q`` could not:
+    ``Q`` and shift-``Q`` are already *up* and *down*.  So ``Q`` takes its
+    slot from the **Colour & variants** panel (`B.lookSlot`), which is the
+    slot last touched and the one whose ladder is on screen, and falls back
+    to the loadout only when that panel is on something with no ladder --
+    unambiguously when one weapon is equipped, and by ASKING when more than
+    one is, because quietly preferring a hand is the whole defect.
+
+    A MALE BODY ON PURPOSE.  On female shapes 001/002 the `v_l_weapon` dummy
+    track is degenerate in 5517/6090 and the viewer applies a fenced
+    `socket_correction`; a left-hand test run there would be measuring that
+    instead.  This picks a 003/004 body, which needs no correction.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not HAVE_ROOT:
+            raise unittest.SkipTest("install not present")
+        import coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+        cls.cat.wait_tables()
+        cls.idx = cls.cat.builder
+        cls.db = cls.idx.super_db()
+        if cls.db is None:
+            raise unittest.SkipTest("tools/superfx.py not importable")
+        import attach
+        import parts as partsmod
+        import superfx
+        cls.attach = attach
+        cls.partsmod = partsmod
+        cls.superfx = superfx
+
+        # A weapon that can go in either hand AND glows. Content is picked
+        # from the catalogue rather than pinned: C16's lesson is that a pin
+        # only tells you which base you are on.
+        two_handed = {o.ident for o in cls.idx.options["l_weapon"]}
+        cands = [o.ident for o in cls.idx.options["r_weapon"]
+                 if o.ident in two_handed and cls.idx.has_aura(o.ident)]
+        if not cands:
+            raise unittest.SkipTest("no glowing weapon offered for both hands")
+        cls.weapon = "480139" if "480139" in cands else sorted(cands)[0]
+
+        # A male body carrying both weapon dummies.
+        cls.body = cls.body_mesh = None
+        for o in cls.idx.options["body"]:
+            if o.ident[:3] not in ("003", "004") or not o.mesh:
+                continue
+            try:
+                raw = cls.cat.read(o.mesh)
+                pm = attach.PartMesh.parse(raw, o.mesh)
+            except Exception:
+                continue
+            names = {c.name for c in pm.chunks}
+            if "v_l_weapon" in names and "v_r_weapon" in names:
+                cls.body, cls.body_mesh, cls.raw, cls.pm = o.ident, o.mesh, raw, pm
+                break
+        if cls.body is None:
+            raise unittest.SkipTest("no male body with both weapon sockets")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cat.close()
+
+    def _clip(self, action="100"):
+        """The motion clip, or a skip that says why there isn't one.
+
+        Used to `return None` here when `anim` was unimportable. Callers pass
+        `motion_set=None` on to `socket_anchors`, so the tests kept running
+        and kept passing -- against the **rest pose**. A test named
+        "socket matrices move with the frame" that quietly stops using a frame
+        is worse than one that skips: it reports a pass for a check it did not
+        perform. The only silent `None` among the import guards, and the one
+        genuinely bad one.
+
+        Skipping is right here and degrading is right in `coviewer`, which is
+        the same rule applied to different jobs: a tool you are using should
+        keep working with a feature missing; a test that cannot make its
+        observation must not claim it did.
+        """
+        import builder as builder_mod
+        if builder_mod.animmod is None:
+            self.skipTest("tools/anim.py not importable -- this test would "
+                          "otherwise run against the rest pose and pass "
+                          "without ever looking at a frame")
+        db = builder_mod.animmod.AnimDB(ROOT)
+        return db.clip(self.body, action, weapon=self.weapon,
+                       off_hand=self.weapon)
+
+    def _anchor(self, slot, frame=0, clip=None):
+        sfx = self.db.super_effect(self.weapon, slot)
+        self.assertIsNotNone(sfx, f"{self.weapon} must resolve an aura")
+        M = self.superfx.SuperFxDB.anchor(
+            self.pm, slot, frame, clip.motion if clip is not None else None,
+            tuple(sfx.offset))
+        self.assertIsNotNone(M, f"{self.body} has no socket for {slot}")
+        return self.attach.to_render(M)
+
+    # -- the resolution layer really is per-hand ---------------------------
+    def test_one_id_in_both_hands_resolves_two_auras_at_once(self):
+        """The reported loadout: the same weapon in each hand. Both resolve,
+        in the same process, with no ordering or exclusion between them."""
+        left = self.db.super_effect(self.weapon, "l_weapon")
+        right = self.db.super_effect(self.weapon, "r_weapon")
+        for sfx, slot in ((left, "l_weapon"), (right, "r_weapon")):
+            self.assertIsNotNone(sfx, f"{self.weapon} in {slot} resolved nothing")
+            self.assertTrue(sfx.resolved, f"{slot}: {sfx.name} has unresolved layers")
+            self.assertEqual(sfx.slot, slot)
+        self.assertEqual(left.name, right.name,
+                         "the same id must name the same effect in either hand")
+
+    def test_each_hand_anchors_to_its_own_socket_exactly(self):
+        """`superfx.anchor(slot)` must equal the socket `parts.socket_anchors`
+        gives for that hand's dummy -- not approximately, the same matrix.
+        This is the check that would catch an aura anchored to the wrong hand,
+        which is the failure mode two independent controls introduce."""
+        clip = self._clip()
+        anchors = self.partsmod.socket_anchors(
+            self.raw, motion_set=(clip.motion if clip is not None else None),
+            frame=0)
+        for slot, dumy in (("r_weapon", "v_r_weapon"), ("l_weapon", "v_l_weapon")):
+            got = self._anchor(slot, clip=clip)
+            want = anchors[dumy].matrix
+            self.assertEqual(len(got), 16)
+            worst = max(abs(a - b) for a, b in zip(got, want))
+            self.assertLess(worst, 1e-4,
+                            f"{slot} does not sit on {dumy}: worst term {worst}")
+
+    def test_the_two_sockets_are_far_enough_apart_to_tell_the_bug(self):
+        r"""The control. If the hands nearly coincided, one shared anchor
+        would look identical to two correct ones and every assertion above
+        would pass with the old code -- 'ask what it would read if the model
+        were wrong' (CORRECTIONS section 2). They do not coincide: measured
+        across a swing they are further apart than the body is tall."""
+        import math
+        clip = self._clip("401") or self._clip()
+        if clip is None or not clip.frame_count:
+            self.skipTest("no motion for this body")
+        bb = self.partsmod.body_bounds(
+            self.raw, motion_set=clip.motion, frame=0)
+        height = abs(bb["max"][2] - bb["min"][2]) if bb else 0.0
+        worst = 0.0
+        for f in range(clip.frame_count):
+            a = self.partsmod.socket_anchors(self.raw, motion_set=clip.motion,
+                                             frame=f)
+            l, r = a.get("v_l_weapon"), a.get("v_r_weapon")
+            if l is None or r is None:
+                continue
+            worst = max(worst, math.dist(l.matrix[12:15], r.matrix[12:15]))
+        self.assertGreater(worst, 40.0,
+                           f"the two hands only ever get {worst:.1f} units "
+                           f"apart (body height {height:.1f}) -- a single "
+                           f"shared anchor would be invisible and this class "
+                           f"would prove nothing")
+
+    def test_resolving_one_hand_does_not_disturb_the_other(self):
+        """Independence at the layer that does the work: the left answer is
+        the same whether or not the right has been asked for, and the other
+        way round. Same matrix, same effect, same offset."""
+        clip = self._clip()
+        left_alone = self._anchor("l_weapon", clip=clip)
+        right_alone = self._anchor("r_weapon", clip=clip)
+        left_again = self._anchor("l_weapon", clip=clip)
+        right_again = self._anchor("r_weapon", clip=clip)
+        self.assertEqual(left_alone, left_again,
+                         "asking for the right hand moved the left one")
+        self.assertEqual(right_alone, right_again,
+                         "asking for the left hand moved the right one")
+        self.assertNotEqual(left_alone, right_alone,
+                            "the two hands returned the same matrix")
+
+    # -- the state machine the UI runs -------------------------------------
+    def test_the_two_toggles_are_independent_states(self):
+        r"""Reimplementation of `builder.js setAura(slot, on)` -- the whole of
+        it, because the whole of it is two lines. All four states are
+        reachable and neither toggle reads or writes the other."""
+        hands = {"r_weapon": {"on": False}, "l_weapon": {"on": False}}
+
+        def set_aura(slot, on):
+            hands[slot]["on"] = bool(on)
+            return {s: hands[s]["on"] for s in hands}
+
+        self.assertEqual(set_aura("r_weapon", True),
+                         {"r_weapon": True, "l_weapon": False}, "right alone")
+        self.assertEqual(set_aura("l_weapon", True),
+                         {"r_weapon": True, "l_weapon": True}, "both at once")
+        self.assertEqual(set_aura("r_weapon", False),
+                         {"r_weapon": False, "l_weapon": True}, "left alone")
+        self.assertEqual(set_aura("l_weapon", False),
+                         {"r_weapon": False, "l_weapon": False}, "neither")
+
+    def test_the_quality_key_targets_the_panel_not_a_preferred_hand(self):
+        r"""Reimplementation of `builder.js qualityStepTarget()`, the rule
+        behind ``Q``.  The old rule is reimplemented next to it, because a
+        rule you cannot see failing is not being tested: on the REPORTED
+        loadout -- the same weapon in both hands -- the old one answers
+        `r_weapon` no matter what the user is looking at, and that is the
+        defect stated as a value."""
+        slots = ("r_weapon", "l_weapon", "shield")
+
+        def old(loadout):
+            return ("r_weapon" if loadout.get("r_weapon")
+                    else ("l_weapon" if loadout.get("l_weapon") else None))
+
+        def target(look_slot, loadout):
+            if look_slot in slots and loadout.get(look_slot):
+                return {"slot": look_slot}
+            armed = [s for s in slots if loadout.get(s)]
+            if not armed:
+                return {"ask": []}
+            if len(armed) == 1:
+                return {"slot": armed[0]}
+            return {"ask": armed}
+
+        both = {"r_weapon": self.weapon, "l_weapon": self.weapon}
+
+        # The panel decides, and it can decide "the left one".
+        self.assertEqual(target("l_weapon", both), {"slot": "l_weapon"},
+                         "the reported case: the left hand must be reachable")
+        self.assertEqual(target("r_weapon", both), {"slot": "r_weapon"})
+        self.assertEqual(target("shield", {"shield": "480138"}),
+                         {"slot": "shield"},
+                         "a shield's ladder is drawn by the same panel")
+
+        # The control. The old rule cannot express the assertion above.
+        self.assertEqual(old(both), "r_weapon")
+        self.assertEqual(
+            {look: old(both) for look in ("r_weapon", "l_weapon", "body")},
+            {"r_weapon": "r_weapon", "l_weapon": "r_weapon",
+             "body": "r_weapon"},
+            "if the old rule varied with the panel there would be nothing "
+            "to fix and this class would prove nothing")
+
+        # Panel on something with no ladder: unambiguous cases still act.
+        self.assertEqual(target("body", {"l_weapon": self.weapon}),
+                         {"slot": "l_weapon"},
+                         "one weapon equipped is not ambiguous, whatever the "
+                         "panel is showing")
+        self.assertEqual(target("body", {}), {"ask": []}, "nothing to step")
+
+        # ...and the ambiguous one ASKS rather than picking the right hand,
+        # which is the behaviour being removed.
+        asked = target("body", both)
+        self.assertNotIn("slot", asked,
+                         "Q silently chose a hand again with both full")
+        self.assertEqual(asked["ask"], ["r_weapon", "l_weapon"],
+                         "the prompt must name both candidates")
+
+    # -- the shipped UI, which is where the defect actually was -------------
+    def test_builder_js_keeps_a_state_per_hand_and_not_a_shared_one(self):
+        src = (PROJECT / "tools" / "webui" / "builder.js").read_text("utf-8")
+        # Booleans rather than assertIn: a failed assertIn on a 130 KB source
+        # prints the whole file and buries the line that matters.
+        self.assertTrue("B.superfx.hands" in src,
+                        "builder.js no longer keys the aura state by hand")
+        self.assertFalse("B.superfx.on" in src,
+                         "builder.js has a single shared aura flag again -- "
+                         "that is the bug this class exists for")
+        self.assertFalse("function equippedWeapon(" in src,
+                         "equippedWeapon() is back: it returns the right hand "
+                         "or, failing that, the left, which is exactly how "
+                         "the left-hand aura became unreachable")
+        self.assertTrue("function equippedWeapons(" in src,
+                        "nothing enumerates both hands")
+        self.assertTrue("function setAura(slot, on)" in src,
+                        "setAura must name the hand it is switching")
+
+        # The keyboard's copy of the same assumption. An extension of the
+        # assertions above rather than a class of its own: it is the same
+        # prefer-the-right-hand expression, in the same file, and it made this
+        # class's own `Switch to Super` button the only way to reach the left
+        # weapon's Super quality.
+        #
+        # Against the STRIPPED source, per the trap `_strip_js_comments`
+        # records: the fix documents the line it replaced -- which is the more
+        # useful half of it -- and a guard that fires on its own explanation
+        # would force that explanation to be deleted.
+        code = _strip_js_comments(src)
+        self.assertFalse("B.loadout.r_weapon ? 'r_weapon'" in code,
+                         "stepQuality prefers the right hand again -- with a "
+                         "weapon in each hand Q cannot reach the left one")
+        self.assertTrue("function qualityStepTarget()" in code,
+                        "Q must resolve its slot somewhere nameable, so that "
+                        "what it targets can be stated and tested")
+        self.assertTrue("B.lookSlot" in code,
+                        "Q has no visible target: it is supposed to follow "
+                        "the Colour & variants panel")
+        step = re.search(r"async function stepQuality\(delta\) \{(.+?)\n\}",
+                         code, re.S)
+        self.assertIsNotNone(step, "builder.js must still have stepQuality")
+        self.assertIn("qualityStepTarget()", step.group(1),
+                      "stepQuality picks its own slot again")
+        self.assertIn("slotLabel(slot)", step.group(1),
+                      "Q must say WHICH slot it stepped: with two weapons "
+                      "equipped an unlabelled toast is a coin toss")
+        look = re.search(r"function renderLookPanel\(slot, variants, index, "
+                         r"override\) \{(.+?)\n\}", code, re.S)
+        self.assertIsNotNone(look, "builder.js must still have renderLookPanel")
+        self.assertIn("B.lookSlot = slot", look.group(1),
+                      "nothing records which slot the panel is showing, so "
+                      "the slot Q reads can drift from the one on screen")
+        # The picker's own Q. Opening a picker is the only way to move that
+        # panel onto a slot, so a Q that is dead while one is open cannot
+        # reach the second hand at all without closing it again first.
+        self.assertIn("case 'Q': case 'q': stepQuality(", code,
+                      "Q is dead while a picker is open, which is the one "
+                      "moment the panel has just been pointed at a hand")
+
+    def test_each_live_effect_reads_its_own_hand_and_not_a_shared_anchor(self):
+        r"""The anchoring half, which a shared-state UI gets wrong even after
+        the toggles are split: `placeSuperFx` used to write ONE matrix into
+        every live instance, and `fxLoop`'s parent callback ignored its
+        argument. Either one drags the left glow onto the right hand."""
+        src = (PROJECT / "tools" / "webui" / "builder.js").read_text("utf-8")
+        fxjs = (PROJECT / "tools" / "webui" / "fx.js").read_text("utf-8")
+        self.assertTrue("this.slot = opts.slot" in fxjs,
+                        "an EffectInstance cannot say which hand it is on, so "
+                        "nothing can give it the right socket")
+        m = re.search(r"function placeSuperFx\(sockets\) \{(.+?)\n\}", src, re.S)
+        self.assertIsNotNone(m, "builder.js must still have placeSuperFx")
+        body = m.group(1)
+        self.assertIn("HAND_DUMY[slot]", body,
+                      "placeSuperFx must read each hand's own dummy")
+        self.assertIn("B.superfx.hands[f.slot]", body,
+                      "placeSuperFx must push each instance ITS OWN anchor")
+        loop = re.search(r"function fxLoop\(\) \{(.+?)\n\}", src, re.S)
+        self.assertIsNotNone(loop, "builder.js must still have fxLoop")
+        self.assertIn("B.superfx.hands[f.slot]", loop.group(1),
+                      "the playback loop hands every instance the same anchor")
+        # Two auras sharing one texture key would repaint each other.
+        self.assertIn("`sfx:${slot}:${lay.index}`", src,
+                      "the two hands' effect textures are not namespaced apart")
+
+    def test_the_page_ships_a_switch_for_each_hand(self):
+        html = (PROJECT / "tools" / "webui" / "builder.html").read_text("utf-8")
+        for need in ('id="chk-aura-r_weapon"', 'id="chk-aura-l_weapon"',
+                     'id="aura-label-r_weapon"', 'id="aura-label-l_weapon"'):
+            self.assertIn(need, html, f"builder.html is missing {need}")
+        self.assertNotIn('id="chk-aura"', html,
+                         "the single shared aura checkbox is back")
+
+    def test_the_socket_correction_stays_out_of_this_path(self):
+        """Orthogonality, asserted rather than promised. The per-hand aura
+        rides `attach.socket_matrix` through `superfx.anchor`; the viewer's
+        female-shape `socket_correction` lives in coviewer and must not have
+        followed it down. `SocketCorrectionIsViewerOnly` owns the general
+        rule -- this is the aura-specific instance of it."""
+        for mod in ("superfx.py", "attach.py", "parts.py"):
+            src = (PROJECT / "tools" / mod).read_text("utf-8")
+            self.assertNotIn("socket_correction", src,
+                             f"tools/{mod} has picked up the viewer-only "
+                             f"socket correction")
 
 
 class CollapsiblePanels(unittest.TestCase):
@@ -3670,6 +5965,321 @@ class CollapsiblePanels(unittest.TestCase):
                         "with one open, C collapses rather than expanding")
 
 
+def _strip_js_comments(src: str) -> str:
+    r"""Remove `//` and `/* */` comments from JavaScript.
+
+    **This exists because of a recorded trap in this project: a source-scanning
+    test cannot tell code from a comment.**  Every one of the `assertIn` checks
+    below runs against the *stripped* text, so a block comment describing the
+    toggle -- and this file's own module carries a long one -- can never make a
+    wiring test pass on its own.  Self-checked by
+    `test_the_comment_stripper_actually_strips`, because a stripper that
+    silently returned its input would restore exactly the hole it closes.
+
+    Deliberately crude: it does not understand regex literals or template
+    strings, which is fine for an assertion helper -- the worst case is that it
+    removes too much and a real call site stops being found, which fails loudly
+    rather than passing quietly.
+    """
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    return re.sub(r"(?m)^\s*//.*$", "", src)
+
+
+class HideAnimationAssetsToggle(unittest.TestCase):
+    r"""The Asset Viewer toggle that hides the animation buckets.
+
+    Reported: *"since animations can't be previewed in the asset viewer mode,
+    only in character/model mode, can we have a toggle that hides them in the
+    asset viewer mode?"*  They cannot: `/api/mesh` on `c3/0001/000/001.c3`
+    returns `meshes: []`, because the file is four `MOTI` chunks and no
+    geometry at all.
+
+    **These read the shipped artifact and the live route, never a Python mirror
+    of either.**  `CollapsiblePanels` above is the reason: that bug was a green
+    Python mirror sitting next to dead markup, and only the tests that opened
+    the real files caught it.  So: the markup checks open
+    `tools/webui/index.html` and `style.css`; the wiring checks open `app.js`
+    *with its comments removed*; and the behaviour checks start a real
+    `ViewerServer` on a real catalogue and ask it over HTTP.
+
+    The filter set itself is asserted to be **derived** -- read out of
+    `SUBCATEGORY_ORDER` at import -- rather than a second hand-written list
+    that can drift away from the taxonomy it claims to describe.
+    """
+
+    WEBUI = PROJECT / "tools" / "webui"
+
+    # -- the set ------------------------------------------------------------
+
+    def test_the_filter_set_is_read_out_of_the_taxonomy(self):
+        import catalog
+        self.assertEqual(catalog.ANIMATION_BUCKETS,
+                         {("character", "motion"), ("weapon", "motion")})
+        self.assertTrue(catalog.is_animation("character", "motion"))
+        self.assertFalse(catalog.is_animation("character", "body"))
+        self.assertFalse(catalog.is_animation("monster", "mesh"))
+        # Every member has to be a bucket the taxonomy actually declares --
+        # a filter naming a bucket that does not exist would hide nothing and
+        # say it had.
+        for cid, sub in catalog.ANIMATION_BUCKETS:
+            self.assertIn(cid, catalog.CATEGORY_IDS)
+            self.assertIn(sub, catalog.SUBCATEGORY_ORDER[cid])
+
+    def test_a_new_motion_bucket_is_picked_up_without_editing_the_filter(self):
+        """The derivation is the point. If this were a hardcoded pair, a
+        category that gained a `motion` bucket later would be filtered by the
+        list view and not by the tree, which is exactly the silent
+        disagreement the whole feature is trying not to have."""
+        import catalog
+        original = catalog.SUBCATEGORY_ORDER["monster"]
+        try:
+            catalog.SUBCATEGORY_ORDER["monster"] = original + ["motion"]
+            self.assertIn(("monster", "motion"), catalog.animation_buckets())
+        finally:
+            catalog.SUBCATEGORY_ORDER["monster"] = original
+        self.assertNotIn(("monster", "motion"), catalog.animation_buckets())
+
+    def test_every_motion_family_on_disk_is_classified_as_motion(self):
+        r"""`c3/1001..3004` are the same shape as `c3/0001..0004` and were
+        landing in `character/misc` because the rule only allowed a leading
+        `0`. `ini/3dmotion.dbc` names all sixteen families."""
+        import catalog
+        ac = catalog.AssetCatalog(ROOT)
+        for fam in ("0001", "0004", "1001", "2003", "3004"):
+            c = ac.classify(f"c3/{fam}/000/100.c3")
+            self.assertEqual((c.category, c.subcategory), ("character", "motion"),
+                             f"c3/{fam}/ is a motion set")
+            self.assertEqual(c.group, fam)
+        # and the widened pattern must not have swallowed a neighbour
+        self.assertEqual(ac.classify("c3/mesh/002135000.c3").subcategory, "body")
+        self.assertEqual(ac.classify("c3/4001/000/100.c3").subcategory, "misc")
+
+    # -- the shipped markup -------------------------------------------------
+
+    def test_the_toggle_is_in_the_shipped_page(self):
+        html = (self.WEBUI / "index.html").read_text("utf-8")
+        self.assertIn('id="chk-hide-motion"', html)
+        self.assertIn('type="checkbox"', html)
+        self.assertIn('id="motion-note"', html)
+        self.assertIn('id="motion-label"', html)
+        # It has to live in the pane it governs, or its scope is a guess.
+        pane = html.split('id="pane-category"', 1)[1].split('id="pane-map"', 1)[0]
+        self.assertIn('id="chk-hide-motion"', pane)
+        self.assertIn('id="motion-note"', pane)
+        # ...and the banner starts hidden, because the filter starts off.
+        self.assertRegex(pane, r'id="motion-note"[^>]*class="[^"]*\bhidden\b')
+
+    def test_the_builder_page_is_untouched(self):
+        """Animations still preview in the builder / model view. Nothing about
+        this filter may appear on that page."""
+        html = (self.WEBUI / "builder.html").read_text("utf-8")
+        for token in ("chk-hide-motion", "motion-note", "hideMotion"):
+            self.assertNotIn(token, html)
+        builder = _strip_js_comments((self.WEBUI / "builder.js").read_text("utf-8"))
+        self.assertNotIn("hideMotion", builder)
+
+    def test_the_css_can_actually_hide_the_banner(self):
+        r"""`label.chk.hidden` is this file's own cautionary tale: a generic
+        `.hidden` rule LOSES on specificity to an element+class rule, so every
+        `class="chk hidden"` control stayed permanently visible and
+        `classList.toggle('hidden')` did nothing. `.filter-note` is a class
+        rule, so its `.hidden` override has to out-specify it."""
+        css = (self.WEBUI / "style.css").read_text("utf-8")
+        self.assertRegex(css, r"(?m)^\.filter-note\s*\{")
+        self.assertRegex(css, r"(?m)^div\.filter-note\.hidden\s*\{[^}]*display:\s*none")
+        self.assertRegex(css, r"(?m)^#motion-label\.on\s*\{")
+
+    # -- the wiring, with comments removed ----------------------------------
+
+    def test_the_comment_stripper_actually_strips(self):
+        self.assertNotIn("gone", _strip_js_comments("// gone\nkept();"))
+        self.assertNotIn("gone", _strip_js_comments("/* gone\n   gone */ kept();"))
+        self.assertIn("kept", _strip_js_comments("// gone\nkept();"))
+
+    def test_the_toggle_is_wired_not_merely_described(self):
+        """`app.js` carries a long comment about this feature. Strip the
+        comments first, or the comment alone would satisfy every assertion
+        here -- which is the trap this project has already recorded."""
+        code = _strip_js_comments((self.WEBUI / "app.js").read_text("utf-8"))
+        self.assertIn("$('#chk-hide-motion')", code)
+        self.assertIn("addEventListener('change', e => setHideMotion", code)
+        self.assertIn("function setHideMotion(", code)
+        self.assertIn("function motionParam(", code)
+        self.assertIn("p.set('hideMotion', '1')", code)
+        # persistence, the same shape as the panel-collapse and folder-tree
+        # state this page already keeps
+        self.assertIn("'coviewer.hideMotion'", code)
+        self.assertIn("localStorage.setItem(HIDE_MOTION_KEY", code)
+        self.assertIn("localStorage.getItem(HIDE_MOTION_KEY)", code)
+        # both catalogue requests carry the flag, from the one helper
+        self.assertIn("motionParam(new URLSearchParams())", code)
+        self.assertRegex(code,
+                         r"motionParam\(\s*new URLSearchParams\(\{ category:")
+
+    def test_the_default_is_off(self):
+        """Nothing may vanish from a browser whose job is "every asset the
+        client can see" until it is asked to. Off in the state object, off in
+        the markup, and off is what an absent localStorage key means."""
+        code = _strip_js_comments((self.WEBUI / "app.js").read_text("utf-8"))
+        self.assertIn("hideMotion: false,", code)
+        self.assertIn("localStorage.getItem(HIDE_MOTION_KEY) === '1'", code)
+        html = (self.WEBUI / "index.html").read_text("utf-8")
+        tag = re.search(r'<input[^>]*id="chk-hide-motion"[^>]*>', html).group(0)
+        self.assertNotIn("checked", tag, "the toggle must ship unchecked")
+
+    def test_the_banner_never_prints_a_number_it_was_not_given(self):
+        """`state.motionHidden` starts null and is reset to null the moment
+        the toggle moves. A filter banner that says "0 hidden" while hiding
+        1,739 entries is the readout disagreeing with the instrument."""
+        code = _strip_js_comments((self.WEBUI / "app.js").read_text("utf-8"))
+        self.assertIn("motionHidden: null,", code)
+        self.assertIn("state.motionHidden = null;", code)
+        self.assertIn("n === null ? 'animation entries are being hidden'", code)
+
+    # -- the live route -----------------------------------------------------
+
+    @staticmethod
+    def _serve(cat):
+        """A real `ViewerServer` on an ephemeral port, exactly as `serve()`
+        builds it. The point of the socket is that the assertions below go
+        through the real routing, the real query parsing and the real JSON
+        encoder rather than calling a handler method directly."""
+        import coviewer
+        httpd = coviewer.ViewerServer(("127.0.0.1", 0), coviewer.Handler,
+                                      cat, ROOT)
+        httpd.views[""] = cat
+        httpd.root_found = None
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        return httpd, httpd.server_address[1]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cat = None
+        cls.httpd = None
+        if not HAVE_ROOT:
+            return
+        import coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+        cls.cat.wait_tables(60)
+        cls.httpd, cls.port = cls._serve(cls.cat)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.httpd is not None:
+            cls.httpd.shutdown()
+            cls.httpd.server_close()
+        if cls.cat is not None:
+            cls.cat.close()
+
+    def _get(self, path: str):
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}{path}", timeout=120) as r:
+            return json.load(r)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_route_hides_the_buckets_and_the_counts_follow(self):
+        off = self._get("/api/categories")
+        on = self._get("/api/categories?hideMotion=1")
+        self.assertFalse(off["motionFilter"])
+        self.assertEqual(off["motionHidden"], 0)
+        self.assertTrue(on["motionFilter"])
+        self.assertGreater(on["motionHidden"], 0,
+                           "this install must actually have motion assets, "
+                           "or the test proves nothing")
+        # The count is the instrument: the grand total has to move by exactly
+        # what the response says it withheld, not approximately.
+        self.assertEqual(off["total"] - on["total"], on["motionHidden"])
+        for cat in on["categories"]:
+            subs = {s["id"] for s in cat["subs"]}
+            self.assertNotIn("motion", subs, cat["id"])
+            self.assertEqual(sum(s["count"] for s in cat["subs"]), cat["count"],
+                             f"{cat['id']}: sub chips must add up to the header")
+            self.assertEqual(sum(cat["roles"].values()), cat["count"],
+                             f"{cat['id']}: the role counts are a readout too")
+        # nothing outside the animation buckets moved
+        a = {c["id"]: c["count"] for c in off["categories"]}
+        b = {c["id"]: c["count"] for c in on["categories"]}
+        for cid in b:
+            if cid != "character":
+                self.assertEqual(a[cid], b[cid], cid)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_file_list_stops_serving_motion_paths(self):
+        import catalog
+        off = self._get("/api/catfiles?category=character&limit=2000")
+        on = self._get("/api/catfiles?category=character&limit=2000&hideMotion=1")
+        self.assertGreater(on["motionHidden"], 0)
+        self.assertEqual(off["total"] - on["total"], on["motionHidden"])
+        ac = self.cat.assetcat
+        for r in on["rows"]:
+            cl = ac.classify(r["path"])
+            self.assertFalse(catalog.is_animation(cl.category, cl.subcategory),
+                             f"{r['path']} survived the filter")
+        self.assertTrue(any(catalog.is_animation(*(lambda c: (c.category, c.subcategory))(
+            ac.classify(r["path"]))) for r in off["rows"]),
+            "with the filter off the same query must still serve motion paths, "
+            "or the assertion above is vacuous")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_off_is_the_default_on_the_wire_too(self):
+        """No flag means no filtering. A bare request must be byte-for-byte
+        the behaviour that shipped before the toggle existed."""
+        bare = self._get("/api/categories")
+        explicit = self._get("/api/categories?hideMotion=0")
+        self.assertEqual(bare["total"], explicit["total"])
+        self.assertFalse(explicit["motionFilter"])
+        subs = {s["id"] for c in bare["categories"] if c["id"] == "character"
+                for s in c["subs"]}
+        self.assertIn("motion", subs)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_server_ships_the_toggle_in_the_page_it_serves(self):
+        """Not the file on disk -- the bytes the browser is handed, CSRF
+        injection and all."""
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/", timeout=60) as r:
+            page = r.read().decode("utf-8")
+        self.assertIn('id="chk-hide-motion"', page)
+        self.assertIn('id="motion-note"', page)
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/ui/app.js", timeout=60) as r:
+            served = _strip_js_comments(r.read().decode("utf-8"))
+        self.assertIn("function setHideMotion(", served)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_model_view_still_plays_the_very_file_the_filter_hides(self):
+        r"""Requirement three, and the sharpest form of it available.
+
+        `/api/anim?body=001000000&action=100` resolves to
+        `c3/0001/000/100.c3` -- a path in `character/motion`, i.e. one the
+        Asset Viewer filter removes -- and still returns its frames. So the
+        two modes disagree about whether to *list* the file and agree
+        completely about whether it can be *played*, which is the whole point
+        of hiding it in one and not the other.
+        """
+        import catalog
+        acts = self._get("/api/actions?body=001000000")
+        self.assertTrue(acts["available"], "the motion database must still load")
+        self.assertTrue(acts["actions"], "the action list must still load")
+
+        anim = self._get("/api/anim?body=001000000&action=100")
+        self.assertGreater(anim["frames"], 0, "the model view must animate")
+        cl = self.cat.assetcat.classify(anim["motion"])
+        self.assertTrue(
+            catalog.is_animation(cl.category, cl.subcategory),
+            f"{anim['motion']} should be one of the files the Asset Viewer "
+            f"filter hides, or this test is not proving anything")
+
+        # and the animation routes do not know the flag exists
+        src = (HERE / "coviewer.py").read_text("utf-8")
+        body = src.split("def api_anim(", 1)[1].split("\n    def ", 1)[0]
+        self.assertNotIn("hideMotion", body)
+        self.assertNotIn("_hide_motion", body)
+
+
 class EffectAnchorFollowsTheHand(unittest.TestCase):
     r"""An aura rides a socket, and the socket moves every frame.
 
@@ -3705,6 +6315,7 @@ class EffectAnchorFollowsTheHand(unittest.TestCase):
                       "_drawEffects reads for the phy quads")
         self.assertIn("inst.anchor", src)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_weapon_socket_moves_far_enough_that_a_frozen_anchor_shows(self):
         """If the socket barely moved, freezing the anchor would be invisible
         and this whole class would be theatre. On 002132300 swinging a 410
@@ -3812,6 +6423,7 @@ class ModelCatalogue(unittest.TestCase):
                     f"{m.key} {a.code}: base mesh {a.mesh} has no geometry")
         self.assertGreater(n, 0, "no motion-only action found at all")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_self_contained_action_really_carries_its_own_geometry(self):
         """The other half: 69 of monster 103's 80 codes point at a file with
         PHY *and* MOTI, which is why changing the action changes the mesh."""
@@ -3859,6 +6471,7 @@ class ModelCatalogue(unittest.TestCase):
                              "though the data linked them")
         self.assertIn("YOUR pairing", self.models.MONSTER_LINK_NOTE)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_zoom_percent_is_the_field_that_actually_matters(self):
         """60 to 350: ignoring it renders monsters at the wrong size, by up to
         3.5x. The catalogue exposes it as a plain scale factor."""
@@ -3870,6 +6483,7 @@ class ModelCatalogue(unittest.TestCase):
         self.assertAlmostEqual(r["scale"], r["zoomPercent"] / 100.0, places=6)
 
     # -- naming -------------------------------------------------------------
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_npc_json_names_models_through_standby_motion(self):
         """`simple_object` -> 3DSimpleObj.ini reaches a mesh on disk for only
         100 of 437 rows; `standby_motion` is a literal 3dmotion.ini key and
@@ -3938,6 +6552,7 @@ class ModelCatalogue(unittest.TestCase):
         self.assertEqual(counts["role"], 8)
         self.assertGreater(counts["effect"], 2000)
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_textures_come_from_meshtex_and_reach_the_monster_tree(self):
         """`c3/monster/103/100.c3` has no sibling .dds at all -- the same-stem
         guess finds nothing. meshtex resolves it through 3dmotion.ini ->
@@ -3962,6 +6577,7 @@ class ModelCatalogue(unittest.TestCase):
             self.assertEqual(len(self.mc.query(kind=kind)["matched"]), n,
                              f"{kind}: chip promised {n}")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_search_reaches_the_name_the_id_and_the_directory(self):
         self.assertTrue(self.mc.query(text="103")["matched"])
         self.assertTrue(self.mc.query(text="c3/monster")["matched"])
@@ -4295,13 +6911,57 @@ class PuzzlePlacement(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_identity_holds_across_the_shipped_corpus(self):
-        """131 of the 132 maps with a `.pul`. `sky` is the one exception and it
-        is named, not swept up in a tolerance."""
+        r"""Every exception is named, and none is swept up in a tolerance.
+
+        **The population changed, so the pins did.** The library now enumerates
+        `dmap.map_names` -- registry union archives union loose -- and loads
+        through `dmap.open_map`, so this runs over every map the install has
+        rather than over the loose `.DMap` files it happens to leave lying
+        about. RE-DERIVED per install 2026-08-11, not edited to match a run:
+
+            install   rows   ok  skipped  mismatch
+            5017       151  109       41  ['sky']
+            5065       153  114       38  ['sky']
+            5165       163  128       34  ['sky']
+            5517       201  169       31  ['sky']
+            6090       256  204       49  ['2013ganenjie', 'poker05', 'sky']
+            6609       306  239       64  ['2013ganenjie', 'poker05', 'sky']
+
+        **What the switch repaired:** `icecrypt-lev6` and `poker` were
+        mismatches on 6090/6609 and are not any more. Their loose `.DMap` was a
+        previous client's -- 808x808 against art implying 740, 188x188 against
+        232 -- and reading the archive the registry names gives 740x740 and
+        232x232, both consistent. That is
+        `C-2026-08-10-claude-explorer-map-archive-alarm` fixed rather than
+        merely reported.
+
+        **What the switch revealed:** `2013ganenjie` and `poker05` ship
+        **archive-only** on 6090 and 6609, so nothing had ever measured them.
+        They are genuinely inconsistent -- `2013ganenjie` is 208x208 against
+        art implying **416**, exactly double, and `poker05` is 188x188 against
+        232 (6090) / 304 (6609). New information from a wider population, not
+        a regression, and named here rather than tolerated.
+
+        **The old pin was `ok >= 131`**, a number taken over 5517's loose files
+        that fails on 5017 (109), 5065 (114) and 5165 (128) -- three installs
+        where it had never held. It is replaced by a relation: every mismatch
+        must be a *named* one, `sky` must be among them so the set cannot pass
+        by being empty, and enough maps must have been measured that abstaining
+        is not a pass.
+        """
         import puzzle
+        #: Each of these is explained in this docstring. A new name here is a
+        #: finding to chase, not a number to raise.
+        known = {"sky", "2013ganenjie", "poker05"}
         res = puzzle.verify()
-        self.assertGreaterEqual(res["ok"], 131)
-        bad = [r["name"] for r in res["rows"] if r["status"] == "mismatch"]
-        self.assertEqual(bad, ["sky"])
+        bad = {r["name"] for r in res["rows"] if r["status"] == "mismatch"}
+        self.assertIn("sky", bad,
+                      "sky has been the standing exception on every install; "
+                      "losing it means the identity stopped being computed")
+        self.assertEqual(bad - known, set(),
+                         "an unnamed map fails the placement identity")
+        self.assertGreater(res["ok"], 100,
+                           "too few maps measured for this to mean anything")
 
     @unittest.skipUnless(HAVE_CLIENT, "client/ not present in this tree")
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
@@ -4415,6 +7075,81 @@ class PuzzlePlacement(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_PLAY_UI, "tools/webui/play.js not present in this tree")
+class IniDbDuplicatePolicy(unittest.TestCase):
+    r"""Three readers of one format, and they do not agree.
+
+    `inidb.parse_sectioned`'s docstring claimed *"Duplicate keys keep the
+    LAST value, matching the behaviour of GetPrivateProfileString."* **Both
+    halves were wrong and it named the wrong authority.**
+
+    `GetPrivateProfileString` returns the **FIRST** — not from documentation
+    but MEASURED: `tools/itemart.py` called the API on a shipped file
+    (`[Item121223]` yields `121090.dds`, not `121220.dds`) and its `selftest`
+    locks it. `tools/clientsidecar.py` independently returns on the first
+    match. So two readers take FIRST and are verified, and `inidb` takes
+    neither while citing what those two measured.
+
+    On the file `itemart` measured, **230 section names repeat and 191 of
+    the repeats give a different frame**, so first-vs-last-vs-merge is three
+    different tables, not a detail.
+
+    **This class pins current behaviour; it does not endorse it.** The
+    behaviour is unchanged because the blast radius is nil — `parse_sectioned`
+    has one caller and `inidb` is imported only by its own `__main__` and by
+    tests — so the live defect was the claim, which is what travels. Changing
+    a profiler's output to match an API it may not be trying to emulate is a
+    decision, filed as
+    `docs/CORRECTIONS.md` `C-2026-08-10-asstdir-inidb-duplicate-policy`.
+    These tests make taking it visible instead of silent.
+    """
+
+    #: `w` exists ONLY in the first `[B]`. Without a key like it the three
+    #: policies do not separate: a merge and a last-wins agree whenever the
+    #: later section overwrites everything the earlier one had, which my
+    #: first fixture did — it would have "passed" while proving nothing.
+    SAMPLE = "\n".join([
+        "[A]", "k=first", "k=second",
+        "[B]", "x=1", "w=only-in-the-first",
+        "[B]", "y=2", "x=99",
+    ])
+
+    def test_a_duplicate_key_keeps_the_last_value(self):
+        import inidb
+        self.assertEqual(inidb.parse_sectioned(self.SAMPLE)["A"]["k"], "second")
+
+    def test_a_duplicate_section_is_MERGED_which_is_a_third_policy(self):
+        """Not first-wins, not last-wins. The union, later keys winning."""
+        import inidb
+        b = dict(inidb.parse_sectioned(self.SAMPLE)["B"])
+        first_wins = {"x": "1", "w": "only-in-the-first"}
+        last_wins = {"y": "2", "x": "99"}
+        merged = {"x": "99", "w": "only-in-the-first", "y": "2"}
+        self.assertEqual(b, merged)
+        # The two policies it is NOT, named rather than left to be
+        # reconstructed. `w` is what separates merge from last-wins.
+        self.assertNotEqual(b, first_wins,
+                            "this is the VERIFIED Win32 answer, and not ours")
+        self.assertNotEqual(b, last_wins,
+                            "this is what the old docstring claimed we did")
+
+    def test_the_docstring_no_longer_claims_win32_parity(self):
+        """The claim is what travelled, so the claim is what is gated.
+
+        A false statement about an external API in a docstring is worse than
+        a wrong default: the default is one module's behaviour, and the claim
+        gets cited by the next reader who does not re-measure.
+        """
+        import inspect
+        import inidb
+        doc = inspect.getdoc(inidb.parse_sectioned) or ""
+        self.assertIn("FIRST", doc, "the verified Win32 behaviour is unstated")
+        self.assertIn("itemart", doc, "the measurement is not cited")
+        # The retracted sentence must not survive anywhere in the docstring
+        # except as something explicitly marked as the old claim.
+        head = doc.split("**")[0]
+        self.assertNotIn("matching the", head)
+
+
 class GameClientPage(unittest.TestCase):
     """`tools/coplay.py` and its page. The seams that matter are the ones it
     shares with the viewer -- if those drift, the game client silently grows a
@@ -4472,6 +7207,7 @@ class GameClientPage(unittest.TestCase):
         self.assertEqual(coplay.body_appearance(302002), "002000000")
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_every_body_appearance_it_can_produce_really_ships(self):
         sys.path.insert(0, str(PROJECT))
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
@@ -4499,15 +7235,388 @@ class GameClientPage(unittest.TestCase):
         self.assertIn('"out" / "viewer" / "shots"', self.py)
         self.assertNotIn("game_root /", self.py.split("def post_shot")[1][:800])
 
+    # -- ambient map effects, docs/world_effects.md 2 ----------------------
+    def test_the_page_plays_map_effects_through_fx_js(self):
+        """Not a second effect renderer. The records come from the server
+        already in world space and go straight into `Viewer.setEffects`, which
+        is the builder's own path."""
+        self.assertIn("/api/game/mapfx", self.js)
+        self.assertIn("viewer.setEffects(", self.js)
+        self.assertIn("mapfxAttach()", self.js)
+        self.assertIn('src="/ui/fx.js"', self.html)
+
+    def test_map_effects_are_re_attached_after_every_rebuild(self):
+        """`setMeshes()` -> `clear()` -> `clearEffects()`. The torches go out
+        on the next terrain swap unless the page puts them back, which is the
+        same trap `applyTextures` exists for and the same fix."""
+        m = re.search(r"function rebuild\(\) \{(.+?)\n\}", self.js, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("mapfxAttach()", m.group(1))
+
+    def test_map_effects_have_their_own_clock(self):
+        """`frameLoop` sleeps when the character stands still -- right for a
+        stride, wrong for a torch."""
+        self.assertIn("mapfxTimer", self.js)
+        self.assertIn("setEffectTime(performance.now() - mapfxT0", self.js)
+
+    def test_the_server_route_uses_the_full_diamond_transform(self):
+        """docs/world_effects.md 2. The EFFECT layer's x,y are pixels in the
+        map's WHOLE isometric diamond, not in the painted image -- the two
+        differ by a constant and only 368 of 2,504 records land inside the
+        painted rectangle, so the wrong one puts most of a map's decoration
+        off the edge of the world."""
+        self.assertIn("api_mapfx", self.py)
+        m = re.search(r"def _map_effects\(self, grid\):(.+?)\n    def ",
+                      self.py, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("(ox / 32.0 + oy / 16.0 - w) / 2.0", m.group(1))
+        self.assertIn("(oy / 16.0 - ox / 32.0 + w) / 2.0", m.group(1))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_effect_record_lands_inside_its_own_map(self):
+        """The transform, re-measured on whatever base is configured rather
+        than quoted from the document -- `docs/CORRECTIONS.md` C41(b) is
+        exactly this figure being install-specific and read as universal.
+        Zero tolerance: a record outside the grid is a wrong transform, not a
+        rounding error."""
+        import coroot
+        import dmap as dmapmod
+        root = Path(coroot.default_root())
+        maps = sorted((root / "map" / "map").glob("*.DMap"))
+        if not maps:
+            self.skipTest("this install ships no maps")
+        total = outside = with_fx = 0
+        for p in maps:
+            try:
+                d = dmapmod.parse(p)
+            except Exception:                              # noqa: BLE001
+                continue
+            recs = [r for r in d.layers if r.get("shape") == "effect"]
+            if recs:
+                with_fx += 1
+            for r in recs:
+                ox, oy = r.get("origin") or (0, 0)
+                gx = (ox / 32.0 + oy / 16.0 - d.width) / 2.0
+                gy = (oy / 16.0 - ox / 32.0 + d.width) / 2.0
+                total += 1
+                if not (0 <= gx <= d.width and 0 <= gy <= d.height):
+                    outside += 1
+        if not total:
+            self.skipTest("this install's maps place no EFFECT records")
+        self.assertEqual(outside, 0,
+                         f"{outside} of {total} EFFECT records fall outside "
+                         f"their own grid under the full-diamond transform")
+        self.assertGreater(with_fx, 0)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_route_hands_over_one_scene_per_name_not_per_record(self):
+        """`Dcloister` places the same torch 361 times. Sending 361 copies of
+        one scene is 361x the JSON for one effect, and the scene is the big
+        part of the payload."""
+        body = self.py.split("def api_mapfx", 1)[1].split("\n    def ", 1)[0]
+        self.assertIn("effects: dict = {}", body)
+        self.assertIn("if nm not in effects", body)
+        self.assertIn("MAPFX_DRAW_LIMIT", body)
+
+    # -- entity status auras, docs/world_effects.md 4.3 --------------------
+
+    def test_the_wire_status_reaches_the_entity_payload(self):
+        """`MsgPlayer`'s u64 at offset 12 was decoded and dropped: nothing
+        between the spec and the page ever read it. The chain is spec ->
+        `on_player` -> `Entity.to_json` -> `/api/game/entities`, and a break
+        anywhere in it renders as "nobody is buffed", which is indistinguishable
+        from a quiet server."""
+        self.assertIn('"status": int(e.get("status") or 0)', self.py)
+        self.assertIn('"auras": self._status_auras', self.py)
+
+    def test_one_composer_owns_the_whole_effect_channel(self):
+        """`setEffects` REPLACES. With the map's ambient records and the
+        entities' auras both wanting instances, two callers do not merge --
+        the second clears the first, and the map's torches go out every time
+        somebody is buffed. Exactly one call site, and both sources feed it."""
+        self.assertEqual(1, self.js.count("viewer.setEffects("),
+                         "more than one caller of setEffects in play.js: they "
+                         "will clear each other, they will not merge")
+        composer = re.search(r"function fxAttach\(\) \{(.+?)\n\}", self.js, re.S)
+        self.assertIsNotNone(composer)
+        self.assertIn("mapfxDefs()", composer.group(1))
+        self.assertIn("Entities.auraDefs(", composer.group(1))
+
+    def test_an_aura_anchor_is_resolved_per_instance_and_never_shared(self):
+        """THE defect this area has already paid for once: `placeSuperFx` wrote
+        one socket matrix into every live effect instance, showing as a
+        left-hand glow dragged onto the right hand with the API and the socket
+        resolution underneath both correct. The scene-level version puts every
+        buffed entity's glow on whichever entity was written last.
+
+        `setEffectTime` is passed the INSTANCE precisely so a caller cannot do
+        that by accident; a callback that ignores its argument gives every glow
+        the same body. Pin that the callback reads it."""
+        self.assertIn("Entities.auraAnchorFor", self.js)
+        ents = (HERE / "webui" / "entities.js").read_text("utf-8")
+        fn = re.search(r"function auraAnchorFor\(inst\) \{(.+?)\n  \}", ents, re.S)
+        self.assertIsNotNone(fn)
+        # It must key on the instance's own slot, not return one anchor.
+        self.assertIn("inst.slot", fn.group(1))
+        self.assertIn("r.auraAnchor", fn.group(1))
+
+    def test_each_entitys_aura_keeps_its_own_clock(self):
+        """One `setEffectTime` clock, one phase per instance. Two entities
+        buffed four seconds apart are four seconds out of phase, and drawing
+        them in lockstep is the scene-level twin of putting the player's walk
+        stride on every lookalike -- it reads as an animation choice.
+
+        The SIGN is the load-bearing part and it was wrong first: `fx.js`
+        plays `ms - tOffset`, so the offset is `t0 - clockBase` and NOT the
+        aura's age. Written the other way an aura seen 60 s ago plays a
+        negative time and sits frozen on frame 0."""
+        ents = (HERE / "webui" / "entities.js").read_text("utf-8")
+        self.assertIn("r.auraT0", ents)
+        self.assertIn("tOffset: (r.auraT0 || now || 0) - (now || 0)", ents)
+        fx = (HERE / "webui" / "fx.js").read_text("utf-8")
+        self.assertIn("this.tOffset", fx)
+        gl = (HERE / "webui" / "gl.js").read_text("utf-8")
+        self.assertIn("f.tick(ms - (f.tOffset || 0), parent)", gl)
+
+    def test_the_clock_base_is_restarted_with_the_instances(self):
+        """Every `tOffset` is relative to the attach moment, and `fxStart` is a
+        no-op while a timer runs -- so without an explicit stop the base
+        survives an attach and every phase drifts by however long the previous
+        timer ran. `setEffects` has just disposed every instance, so there is
+        no phase to preserve."""
+        composer = re.search(r"function fxAttach\(\) \{(.+?)\n\}", self.js, re.S)
+        self.assertIsNotNone(composer)
+        body = composer.group(1)
+        self.assertIn("fxStop();", body)
+        self.assertLess(body.index("fxStop();"), body.index("fxStart();"),
+                        "fxStop() must precede fxStart(), or the clock base "
+                        "is whatever the last attach left behind")
+
+    def test_status_auras_are_not_the_armour_aura_mechanism(self):
+        """Two different tables and the brief for this work conflated them.
+        An armour/weapon aura hangs off `Action3DEffect 999.100.135.999` per
+        APPEARANCE and rides a `[Dumy]` socket (`/api/superfx`); a status aura
+        comes from `ini/statuseffect.ini` and names no anchor at all. Riding
+        the body is therefore INFERRED and has to be labelled as such where a
+        reader will meet it."""
+        body = self.py.split("def api_entityfx", 1)[1].split("\n    def ", 1)[0]
+        self.assertIn("INFERRED", body)
+        self.assertIn("Action3DEffect", self.py)
+
+    def _statuseffect(self, lines: "list[str]") -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / "ini").mkdir()
+        (d / "ini" / "statuseffect.ini").write_text(
+            "\n".join(lines) + "\n", "gbk")
+        return d
+
+    def test_status_rows_reads_the_hex_mask_dialect_as_bits(self):
+        r"""`status_rows` did `int(parts[0])` behind an `isdigit()` guard.
+
+        The first column is a zero-padded **hex mask** on 5065 and 5165 and a
+        **bit index** on 5517/6090. `"00000010".isdigit()` is True, so a
+        decimal reading of a mask file is SILENT: every row from `00000010`
+        on lands on the wrong bit — 0x10 is bit 4, decimal 10 is bit 10 — and
+        the rows still parse, still resolve to real effect names, and simply
+        put the aura on a different status.
+
+        MEASURED over the 12 declared installs, first six bits:
+
+            5065 x6, 5165 (mask)   was [0,1,2,4,8,10]  now [0,1,2,3,4,5]
+            5517, 6090, Zephyr     [0,1,2,3,4,5] unchanged
+
+        Synthetic here rather than install-gated, because this box is an
+        **index** base — the defect is invisible on it, which is exactly how
+        it survived. A test that can only run where the bug cannot appear is
+        not a test of the bug.
+        """
+        import worldfx
+        # A mask file: eight rows so detection has enough to work with, values
+        # 0 or exact powers of two, one of them past 0xFF.
+        rows = ["00000000 NULL NULL"]
+        rows += [f"{1 << i:08x} fx3d{i} fx2d{i}" for i in range(9)]
+        root = self._statuseffect(rows)
+        bits, dialect = worldfx.status_bit_rows(root)
+        self.assertEqual(dialect, "mask", "the fixture is not being detected")
+        got = worldfx.status_rows(root)
+        self.assertEqual([b for b, _, _ in got], list(range(9)))
+        # The decimal reading is what this replaces: 0x10 would have been 16.
+        self.assertIn(4, [b for b, _, _ in got])
+        self.assertNotIn(16, [b for b, _, _ in got])
+        self.assertEqual(dict(zip([b for b, _, _ in got],
+                                  [c for _, c, _ in got]))[4], "fx3d4")
+
+    def test_status_rows_leaves_an_index_dialect_alone(self):
+        """The control. Without it the test above passes against a reader
+        that treats every file as a mask, which would be wrong on 5517/6090
+        — the bases this project actually runs on."""
+        import worldfx
+        root = self._statuseffect(
+            [f"{i} fx3d{i} fx2d{i}" for i in range(12)])
+        bits, dialect = worldfx.status_bit_rows(root)
+        self.assertEqual(dialect, "index")
+        self.assertEqual([b for b, _, _ in worldfx.status_rows(root)],
+                         list(range(12)))
+
+    def test_status_rows_does_not_parse_statuseffect_itself(self):
+        """Assert the source. One reader, one dialect detection.
+
+        This is the `read_gamemap_dat` shape: a second copy of a format was
+        the silent one precisely because only the first was tested. A copy
+        that agrees today can drift tomorrow, so the guarantee has to be that
+        there is no copy.
+        """
+        import inspect
+        import worldfx
+        src = inspect.getsource(worldfx.status_rows)
+        # Only the CODE. The docstring names `isdigit()` and
+        # `statuseffect.ini` while explaining what this replaced, and a
+        # source check that cannot tell prose from code fires on its own
+        # explanation — which is how this assertion failed first time.
+        code = src.split('"""')[-1]
+        self.assertIn("status_bit_rows(root)", code)
+        self.assertNotIn("statuseffect.ini", code,
+                         "status_rows opens the file again")
+        self.assertNotIn("isdigit()", code)
+        self.assertNotIn("splitlines", code)
+
+    def test_the_page_says_why_a_set_bit_drew_nothing(self):
+        """"No art for this bit" is the ORDINARY outcome -- 54 of the 79 named
+        3D effects in this table do not resolve -- so it must be reported and
+        not swallowed. "Nobody is buffed", "the bit has no row", "the row says
+        NULL" and "this install ships no art for it" are four different facts
+        about the same blank frame."""
+        ents = (HERE / "webui" / "entities.js").read_text("utf-8")
+        self.assertIn("function auraStatus()", ents)
+        self.assertIn("unresolved", ents)
+        for state in ('"no-row"', '"null"', '"no-art"', '"found"'):
+            self.assertIn(state, (HERE / "worldfx.py").read_text("utf-8"),
+                          f"{state} is a distinct outcome and must stay one")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_status_bits_join_on_the_rows_own_number_not_its_ordinal(self):
+        """`ini/statuseffect.ini` is SPARSE -- 95 rows spanning bits 0..117 on
+        5517 -- so reading it positionally offsets every aura past the first
+        gap, and the result is a plausible wrong glow rather than an error."""
+        import worldfx
+        rows = worldfx.status_rows(ROOT)
+        by_bit = {b: c1 for b, c1, _ in rows}
+        self.assertNotEqual(len(rows), max(by_bit) + 1,
+                            "the table is expected to be sparse; if it is "
+                            "dense here, this test proves nothing")
+        got = worldfx.status_auras(1 << 18, ROOT)
+        self.assertEqual([18], [a["bit"] for a in got])
+        self.assertEqual(by_bit[18], got[0]["name"])
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_bits_above_63_cannot_travel_on_1014_and_are_not_invented(self):
+        """`status` is a u64 and the table names rows out to bit 117. Those
+        rows are not undrawable, they are UNREACHABLE by this message, and a
+        resolver that widened past 64 would report auras the wire cannot ask
+        for."""
+        import worldfx
+        rows = worldfx.status_rows(ROOT)
+        self.assertTrue([b for b, _, _ in rows if b > 63],
+                        "no rows above bit 63; this test proves nothing here")
+        self.assertEqual([], worldfx.status_auras(1 << 63, ROOT) and
+                         [a for a in worldfx.status_auras(1 << 63, ROOT)
+                          if a["state"] == "found"])
+        for bit in (64, 90, 117):
+            self.assertEqual([], worldfx.status_auras(1 << bit, ROOT),
+                             f"bit {bit} is outside the u64 the wire carries")
+
 
 # ---------------------------------------------------------------------------
 # Scene / cover layers -- docs/map_scenery.md
 # ---------------------------------------------------------------------------
 
+class StraightAlphaBlit(unittest.TestCase):
+    r"""`scene._blit_rgba` composites STRAIGHT alpha, not premultiplied.
+
+    `CORRECTIONS.md` C-2026-08-09-comod-entity-followups. The old line was
+    ``(src.rgb*a + dst.rgb*(255-a))//255``, which is source-over for
+    *premultiplied* inputs and emits ``src.rgb * a / 255`` over a transparent
+    destination -- every partly transparent TERRAIN/COVER texel drawn darker
+    than the asset by exactly its own alpha.
+
+    Needs no install and no numpy: the inputs are four bytes.
+    """
+
+    @staticmethod
+    def _one(dst, src, *, numpy: bool):
+        """One 1x1 blit through the requested branch."""
+        import scene
+        saved = scene._np                                    # noqa: SLF001
+        if not numpy:
+            scene._np = None                                 # noqa: SLF001
+        try:
+            buf = bytearray(dst)
+            scene._blit_rgba(buf, 1, 1, bytes(src), 1, 1, 0, 0)  # noqa: SLF001
+            return list(buf)
+        finally:
+            scene._np = saved                                # noqa: SLF001
+
+    def _branches(self):
+        import scene
+        yield False, "scalar"
+        if scene._np is not None:                            # noqa: SLF001
+            yield True, "numpy"
+
+    def test_a_half_transparent_source_over_nothing_keeps_its_colour(self):
+        """The proof case, and it is asserted in both directions on purpose: a
+        test that only named the right answer would still pass if someone
+        reintroduced the premultiplied line and the arithmetic happened to
+        agree for the colour it was given."""
+        for numpy, name in self._branches():
+            got = self._one([0, 0, 0, 0], [200, 100, 50, 128], numpy=numpy)
+            self.assertEqual(got, [200, 100, 50, 128], name)
+            self.assertNotEqual(got, [100, 50, 25, 128],
+                                f"{name}: that is the PREMULTIPLIED answer")
+
+    def test_an_opaque_source_is_the_result(self):
+        for numpy, name in self._branches():
+            self.assertEqual(self._one([9, 9, 9, 255], [200, 100, 50, 255],
+                                       numpy=numpy),
+                             [200, 100, 50, 255], name)
+
+    def test_half_over_opaque_is_the_midpoint(self):
+        """The case the premultiplied line got RIGHT, which is why it survived
+        -- `scene.blit()`'s destination is an opaque ground and this is exactly
+        what it composites. The fix must not move it."""
+        for numpy, name in self._branches():
+            self.assertEqual(self._one([255, 255, 255, 255], [0, 0, 0, 128],
+                                       numpy=numpy),
+                             [127, 127, 127, 255], name)
+
+    def test_a_fully_transparent_result_keeps_the_destinations_colour(self):
+        """Not cosmetic: a later blit reads those bytes back."""
+        for numpy, name in self._branches():
+            self.assertEqual(self._one([7, 8, 9, 0], [200, 100, 50, 0],
+                                       numpy=numpy),
+                             [7, 8, 9, 0], name)
+
+    def test_the_two_branches_agree_bit_for_bit(self):
+        """They did not, before: the numpy branch carried a `+127` in the ALPHA
+        channel that the scalar branch did not, so a machine without numpy
+        produced a different image, silently and by up to 1/255."""
+        import random
+        import scene
+        if scene._np is None:                                # noqa: SLF001
+            self.skipTest("numpy absent: there is only one branch to compare")
+        random.seed(7)
+        for _ in range(2000):
+            d = [random.randrange(256) for _ in range(4)]
+            s = [random.randrange(256) for _ in range(4)]
+            self.assertEqual(self._one(d, s, numpy=True),
+                             self._one(d, s, numpy=False), f"dst={d} src={s}")
+
+
 class SceneFormat(unittest.TestCase):
     """`map/Scene/*.scene`: the part header and the per-cell array."""
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_every_shipped_scene_file_is_consumed_to_its_exact_length(self):
         """299 files, no slack. If any field width were wrong the walk would
         overrun or fall short somewhere in the corpus."""
@@ -4583,6 +7692,1648 @@ class SceneFormat(unittest.TestCase):
         self.assertGreaterEqual(matched, 90)
         self.assertGreaterEqual(agree, 70,
                                 "field[0..1] should equal the .Part's OffsetX/Y")
+
+
+class ClassLevelSkipsLeaveTheCount(unittest.TestCase):
+    r"""`ran` alone cannot see a class-level skip. `collected` can.
+
+    A `setUpClass` that raises `SkipTest` removes **every** test in the class
+    from `testsRun` and records **one** skip entry — an `_ErrorHolder`, not a
+    test — however many tests the class holds. So `ran - skipped = executed`,
+    the comparand this project calls attribution-proof, is wrong in *both*
+    terms whenever one fires, and it under-reports rather than over-reports.
+
+    On this base nothing is dropped in a healthy run (830 collected, 830 ran),
+    so the real suite does **not** exercise this path. That is exactly why it
+    is pinned here on a synthetic suite instead of being left to a green
+    number to demonstrate — an instrument nothing tests is a claim, not a
+    measurement.
+
+    The first version of the counter proved that the hard way: it counted
+    `_program.test` *after* the run and reported `collected 104` against
+    `ran 830`, because `TestSuite.run` drops each test as it finishes to
+    release memory. A **negative** shortfall was the tell that the instrument
+    was wrong rather than the suite.
+    """
+
+    @staticmethod
+    def _runner():
+        class _C(unittest.TextTestRunner):
+            collected = 0
+
+            def run(self, test):
+                def n(t):
+                    return (sum(n(x) for x in t)
+                            if isinstance(t, unittest.TestSuite) else 1)
+                _C.collected = n(test)
+                return super().run(test)
+        return _C
+
+    @staticmethod
+    def _suite(skip_class: bool):
+        class Alpha(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                if skip_class:
+                    raise unittest.SkipTest("class-level")
+
+            def test_a(self):
+                pass
+
+            def test_b(self):
+                pass
+
+            def test_c(self):
+                pass
+        return unittest.defaultTestLoader.loadTestsFromTestCase(Alpha)
+
+    def _measure(self, skip_class: bool):
+        R = self._runner()
+        res = R(stream=io.StringIO(), verbosity=0).run(self._suite(skip_class))
+        return R.collected, res.testsRun, len(res.skipped)
+
+    def test_a_class_level_skip_hides_its_tests_from_ran(self):
+        """The defect, stated as numbers: 3 tests, 1 skip entry, 0 ran."""
+        collected, ran, skipped = self._measure(skip_class=True)
+        self.assertEqual(collected, 3)
+        self.assertEqual(ran, 0, "testsRun should not see a class-level skip")
+        self.assertEqual(skipped, 1,
+                         "one _ErrorHolder stands in for all three tests")
+        self.assertEqual(collected - ran, 3,
+                         "collected - ran is the only figure that recovers "
+                         "the true loss")
+
+    def test_without_the_skip_the_same_suite_reconciles(self):
+        """CONTROL. A counter that always disagreed would pass the test above."""
+        collected, ran, skipped = self._measure(skip_class=False)
+        self.assertEqual((collected, ran, skipped), (3, 3, 0))
+
+    def test_the_runner_the_suite_actually_uses_counts_before_the_run(self):
+        """Guards the bug the first version had, in the real code path.
+
+        Counting a suite *after* `TextTestRunner.run` walks one that has been
+        emptied behind you, which is what produced a negative shortfall. This
+        asserts the count survives the run.
+        """
+        R = self._runner()
+        suite = self._suite(skip_class=False)
+        R(stream=io.StringIO(), verbosity=0).run(suite)
+        after = sum(1 for _ in suite._tests if _ is not None)
+        self.assertEqual(R.collected, 3)
+        self.assertLess(after, 3,
+                        "unittest no longer empties the suite as it runs, so "
+                        "the reason this counter runs early has gone away")
+
+
+class SourceParsesWithoutWarnings(unittest.TestCase):
+    r"""An invalid escape in a string is a defect the interpreter tolerates.
+
+    Found by the AST walk in `GuardedImportsThatMustSucceed`, which printed
+    three `SyntaxWarning`s a run. All three were a docstring containing
+    `...\Clients\5065` in a non-raw string, and the interesting half is that
+    only *part* of it warns:
+
+        `\C`     invalid escape  -> warns, kept literal (harmless today,
+                                    a SyntaxError in a future Python)
+        `\5065`  VALID octal     -> silent, and becomes chr(0o506) = 'ņ'
+
+    So the warning pointed at the harmless half and said nothing about the
+    half that actually corrupted the text. `dump_strings.__doc__` really did
+    contain `...\Clientsņ5`, and printing it raised `UnicodeEncodeError` on a
+    cp1252 console. `--help` survived only because it slices
+    `__doc__.splitlines()[1]` and the damage is on a later line.
+
+    Fixed by making the three docstrings raw. This test exists so the next one
+    is caught while it is still a warning.
+    """
+
+    def test_no_source_file_has_an_invalid_escape_sequence(self):
+        import ast
+        import warnings
+        repo = Path(__file__).resolve().parent.parent
+        found = []
+        for d in ("tools", "core", "tests", "capture"):
+            if not (repo / d).is_dir():
+                continue
+            for f in sorted((repo / d).rglob("*.py")):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    try:
+                        ast.parse(f.read_text("utf-8", "replace"),
+                                  filename=str(f))
+                    except SyntaxError as e:
+                        found.append(f"{f}: SyntaxError: {e}")
+                        continue
+                for w in caught:
+                    if issubclass(w.category, SyntaxWarning):
+                        found.append(f"{f.relative_to(repo)}: {w.message}")
+        self.assertEqual(found, [], "\n".join(found))
+
+    def test_the_walk_actually_reaches_the_files(self):
+        """CONTROL. A walk that found no files would pass the test above."""
+        repo = Path(__file__).resolve().parent.parent
+        n = sum(1 for d in ("tools", "core") for _ in (repo / d).rglob("*.py"))
+        self.assertGreater(n, 50, f"only {n} source files walked")
+
+
+class GuardedImportsThatMustSucceed(unittest.TestCase):
+    r"""`try: import x / except: x = None` on a module that is never optional.
+
+    **Deliberately ungated.** No `skipUnless`, no `setUpClass`, no install and
+    no third-party dependency — because this is the test that catches a broken
+    module, and a test that skips on the machine where the module is broken
+    catches nothing.
+
+    MEASURED 2026-08-10. Making `anim`, `superfx` and `effects` unimportable
+    together (`sys.modules[name] = None`) and running the four classes that
+    depend on them:
+
+        healthy    49 collected / 49 ran / 0 failures / 10 skips
+        poisoned   49 collected / 39 ran / **1** failure / 17 skips
+
+    Three entirely broken subsystems, one red. The skips do name the module,
+    which is better than nothing, but a skip is not a failure and nobody reads
+    72 of them. Meanwhile the transitive closure of every one of those modules
+    is stdlib plus first-party — **zero** third-party dependencies — and
+    removing the guard creates no import cycle at module scope. So the guard
+    protects against nothing that can actually happen; it only converts a
+    defect in this repo into a skip.
+
+    Across `tools/` and `core/` there are 23 module-scope guarded imports.
+    **9 guard a real optional dependency** (`numpy`, `PIL`, `bpy`,
+    `capstone`) and are correct as written. **13 guard a first-party module**
+    and are what this class is about.
+
+    The list is derived by walking the AST rather than pinned, so a guard
+    added tomorrow is covered without anyone remembering to come back here —
+    a hand-maintained list would have exactly the failure mode the guard has.
+
+    **The guard stays.** Degrading is the target: `coviewer` is a tool you use
+    interactively, and limping along with effects disabled beats refusing to
+    start. What changes is that degrading is no longer *silent* — the tool
+    still carries on, and the suite says so out loud, once, by name.
+    """
+
+    #: Module-scope `try:` blocks only.
+    #:
+    #: **THE BLIND SPOT, and it is not small.** The first version of this said
+    #: "an import inside a function is a deliberate late binding, not a
+    #: tolerated absence." That is wrong the moment someone calls that
+    #: function from inside a broad `except`. FOUND 2026-08-10 in
+    #: `core/coassets.py`: `import dbc` sits inside `_load_mesh_dbc`, which
+    #: `PartIni.__init__` called from within `except Exception: pass` -- so a
+    #: broken first-party `dbc` arrived as **"this install ships no compiled
+    #: twin"**. That is worse than the module-scope case, which at least skips
+    #: loudly: it degrades an import failure into a plausible *wrong answer
+    #: about the install*.
+    #:
+    #: Catching that statically needs a call graph, which this walk does not
+    #: have. So **a green run here does NOT mean "no import is being swallowed
+    #: anywhere"** -- it means no *module-scope* guard is swallowing one. The
+    #: function-scope case has to be caught where it lives, by poisoning
+    #: `sys.modules` around the caller; `PartIniTwinFailureIsAudible` is the
+    #: worked example. A check that cannot express a distinction has to say
+    #: so, or it gets trusted for a claim it never made.
+    SRC_DIRS = ("tools", "core")
+
+    @classmethod
+    def _repo(cls):
+        return Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def _guards(cls):
+        """(holder_stem, module, alias, lineno) for every module-scope guard."""
+        import ast
+        import warnings
+        repo = cls._repo()
+        first = {p.stem for d in cls.SRC_DIRS for p in (repo / d).glob("*.py")}
+        out = []
+        for d in cls.SRC_DIRS:
+            for f in sorted((repo / d).glob("*.py")):
+                try:
+                    # Quiet: a bad escape sequence is real, but it belongs to
+                    # `SourceParsesWithoutWarnings`, not here. Left unsuppressed
+                    # this printed three SyntaxWarnings into every suite run.
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        tree = ast.parse(f.read_text("utf-8", "replace"))
+                except SyntaxError:                 # its own test's problem
+                    continue
+                for node in tree.body:
+                    if not isinstance(node, ast.Try):
+                        continue
+                    for sub in node.body:
+                        if isinstance(sub, ast.Import):
+                            for a in sub.names:
+                                out.append((f.stem, a.name.split(".")[0],
+                                            a.asname or a.name, node.lineno))
+                        elif isinstance(sub, ast.ImportFrom) and sub.module:
+                            out.append((f.stem, sub.module.split(".")[0],
+                                        None, node.lineno))
+        return [g for g in out if g[1] in first], first
+
+    def test_the_scan_finds_the_guards_it_is_supposed_to_find(self):
+        """CONTROL. A scan that found nothing would pass everything below."""
+        guards, first = self._guards()
+        self.assertGreaterEqual(
+            len(guards), 10,
+            f"only {len(guards)} first-party guards found; the AST walk has "
+            "stopped matching the pattern and the tests below are vacuous")
+        holders = {g[0] for g in guards}
+        for expect in ("builder", "parts", "models"):
+            self.assertIn(expect, holders,
+                          f"{expect}.py guards a first-party import and the "
+                          "scan no longer sees it")
+
+    def test_every_guarded_first_party_module_actually_imports(self):
+        """The wrongness test: a module that is never optional must import.
+
+        Reports the real exception, not "not importable" — the guard throws
+        the traceback away and that is most of what makes these expensive to
+        diagnose.
+        """
+        import importlib
+        import textwrap
+        import traceback
+        guards, _ = self._guards()
+        broken = []
+        for holder, mod, _alias, line in guards:
+            try:
+                importlib.import_module(mod)
+            except Exception:                       # noqa: BLE001 -- reported
+                broken.append(
+                    f"{mod} (guarded by {holder}.py:{line})\n"
+                    + textwrap.indent(traceback.format_exc(), "        "))
+        self.assertEqual(
+            broken, [],
+            "first-party module(s) that a guard is silently swallowing:\n\n"
+            + "\n".join(broken))
+
+    def test_no_guard_fired_in_a_holder_this_run_already_imported(self):
+        """A module can import here and still be None in its holder.
+
+        Different failure from the one above: the module is fine, but the
+        guard fired anyway — a `sys.path` that differs at guard time, or an
+        exception raised on the *first* import and cached. Only holders
+        already in `sys.modules` are checked, so this test imports nothing
+        and cannot cause the side effects it is looking for.
+        """
+        guards, _ = self._guards()
+        fired = []
+        for holder, mod, alias, line in guards:
+            if alias is None:
+                continue
+            h = sys.modules.get(holder)
+            if h is None or not hasattr(h, alias):
+                continue
+            if getattr(h, alias) is None:
+                fired.append(f"{holder}.{alias} is None though `import {mod}` "
+                             f"works ({holder}.py:{line})")
+        self.assertEqual(fired, [])
+
+    def test_a_broken_module_is_reported_rather_than_skipped(self):
+        """CONTROL, and the one that proves this class earns its place.
+
+        Poisons a real first-party module the way a syntax error would, and
+        requires the wrongness test above to go RED. Without this, a scan that
+        silently matched nothing would look identical to a clean repo.
+        """
+        import importlib
+        guards, _ = self._guards()
+        victim = next(m for _h, m, _a, _l in guards)
+        saved = sys.modules.get(victim)
+        sys.modules[victim] = None                  # `import victim` -> Error
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.test_every_guarded_first_party_module_actually_imports()
+            self.assertIn(victim, str(caught.exception))
+        finally:
+            if saved is None:
+                sys.modules.pop(victim, None)
+            else:
+                sys.modules[victim] = saved
+            importlib.import_module(victim)         # leave the run as we found it
+
+
+class CoverRecordGrewAt1005(unittest.TestCase):
+    r"""The COVER layer payload is 420 bytes from version 1005, not 416.
+
+    6609 is the first client to ship 1005 maps — 15 of them. Under the 416
+    reading every one reads its **first** cover and then stops on a zero u32
+    (`layers 1/1146` on `150newmaze_new`), leaving 4.5 KB to 486 KB unread.
+    At 420 the walk consumes every declared layer on 11 of the 15.
+
+    **Closure is not the evidence, and this class is built so it cannot be.**
+    A stride that merely closes a walk is the agreement that survives
+    re-running and fails a content check — `DMapTrailingSection` above is this
+    repo's worked example, where two strides each closed a different family and
+    the record turned out to be the wrong shape entirely. So the claim rests on
+    what the records CONTAIN. MEASURED over all 15 v1005 maps:
+
+        COVER records recovered ......... 3,746
+        .ani path exists on disk ........ 3,746   (0 missing)
+        origin off the map .............. 0
+        frame interval .................. 100 ms on all
+        footprint sizes ................. 2x2, 3x3, 1x1, 5x5 — all small
+
+    and the file they all name, `ani/mapscene-new.ani`, ships on **6609 and no
+    earlier client**: a new sprite library arriving with the new version.
+
+    **The four bytes are appended, not inserted**, which is exactly why this
+    hid — every existing field keeps its offset, so the first record parsed
+    correctly and only the *next* one landed wrong. The new u32 is **0 on all
+    3,746**, so this corpus cannot separate "a new always-zero field" from
+    "four bytes of padding between records". Both parse identically and
+    neither is claimed.
+
+    **What is still not read, stated so a later reader does not mistake this
+    for done:** four of the 15 stop partway even at 420, on a record that is
+    three floats then a length-prefixed string — variable-length, so no fixed
+    table walks it. And every v1005 map leaves its background-plane trailer
+    unread (`extra_count` 160 against 0 planes walked) because the group header
+    changed too. Both stay audible: `bytes_unconsumed` is non-zero and
+    `extra_count != len(extra)`, which is the refusal working, not a new bug.
+    """
+
+    #: A cover payload's fixed part: char[260] path, char[128] key, 7 ints.
+    FIXED = 260 + 128 + 7 * 4                          # == 416
+
+    def _map(self, version: int, cover_size: int, n_cover: int = 2) -> bytes:
+        """A minimal, well-formed `.DMap` with `n_cover` COVER layers.
+
+        Synthetic on purpose: it needs no game install, so the both-directions
+        control below can never degrade into a skip.
+        """
+        import struct
+        b = bytearray()
+        b += struct.pack("<II", version, 0)
+        b += b"map\\puzzle\\t.pul".ljust(260, b"\0")
+        b += struct.pack("<II", 2, 2)                  # 2x2 cells
+        for _y in range(2):
+            for _x in range(2):
+                b += struct.pack("<hhh", 0, 0, 0)
+            b += struct.pack("<I", 0)                  # row checksum, unverified
+        b += struct.pack("<I", 0)                      # no portals
+        b += struct.pack("<I", n_cover)                # layer count
+        for i in range(n_cover):
+            pay = bytearray()
+            pay += f"ani\\cover{i}.ani".encode().ljust(260, b"\0")
+            pay += f"Puzzle{i}".encode().ljust(128, b"\0")
+            pay += struct.pack("<IIIIiiI", 1, 1, 1, 1, 0, 0, 100)
+            pay += b"\0" * (cover_size - self.FIXED)   # the 1005 tail
+            b += struct.pack("<I", 4) + bytes(pay)
+        b += struct.pack("<I", 0)                      # no plane groups
+        return bytes(b)
+
+    def _parse(self, raw: bytes):
+        import tempfile
+        import dmap
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "t.DMap"
+            p.write_bytes(raw)
+            return dmap.parse(p, want_cells=False, verify=False)
+
+    def test_the_table_widens_only_at_1005(self):
+        """No install. 1006 is excluded deliberately and that is asserted.
+
+        Only two 1006 maps exist and **neither reaches a cover record** —
+        `newplain_new` stops at layer 0 on an unmodelled type 24, `forum01_new`
+        fails its row checksums outright. So there is no measurement behind
+        extending 420 to 1006, and an unmeasured guess is the failure the
+        comment beside `COVER_1005` exists to record.
+        """
+        import dmap
+        self.assertEqual(dmap.LAYER_PAYLOAD[4], 416)
+        self.assertEqual(dmap.COVER_1005, 420)
+        for v in (1003, 1004, 1006):
+            with self.subTest(version=v):
+                self.assertEqual(dmap.layer_payload(v)[4], 416)
+        self.assertEqual(dmap.layer_payload(1005)[4], 420)
+        # 1005 differs in exactly two ways and no more: the cover is wider
+        # and tag 0 is new. Everything else is shared, not copied -- and this
+        # assertion is what caught tag 0 being added, so it is kept in the
+        # form that fails when a third difference appears without a reason.
+        shared = {k: v for k, v in dmap.layer_payload(1005).items()
+                  if k not in (4, 0)}
+        self.assertEqual(shared,
+                         {k: v for k, v in dmap.LAYER_PAYLOAD.items()
+                          if k != 4})
+        self.assertNotIn(0, dmap.LAYER_PAYLOAD,
+                         "tag 0 belongs to 1005 only")
+
+    def test_a_1005_body_reads_at_420_and_reproduces_the_bug_at_416(self):
+        """CONTROL, both directions, no install — so it cannot skip.
+
+        The negative half is the point: parsed as 1004, a 420-byte record
+        leaves the cursor four bytes early, the next tag reads as **0 (NONE)**
+        and the walk stops at exactly one layer. That is the precise signature
+        all 15 shipped v1005 maps show, reproduced from first principles.
+        """
+        good = self._parse(self._map(1005, 420, n_cover=3))
+        self.assertEqual((len(good.layers), good.layer_count), (3, 3))
+        self.assertEqual(good.bytes_unconsumed, 0)
+        self.assertIsNone(good.layer_error)
+        self.assertEqual(good.layers[2]["path"], "ani\\cover2.ani")
+        self.assertEqual(good.layers[1]["frame_interval"], 100)
+
+        bad = self._parse(self._map(1004, 420, n_cover=3))
+        self.assertEqual(len(bad.layers), 1,
+                         "the 416 reading must stop after one record")
+        self.assertEqual(bad.layer_count, 3)
+        self.assertIn("type 0", bad.layer_error or "",
+                      "the shipped signature is `unmodelled type 0 (NONE)`")
+        self.assertNotEqual(bad.bytes_unconsumed, 0)
+
+    def test_1005_adds_a_tag_0_record_and_19_is_a_TAG_not_a_length(self):
+        r"""The four maps that still stopped at 420, and the misreading.
+
+        At the stop: two `u32` zeros, three floats `1.0 1.0 1.0`, then **19**,
+        then a NUL-padded name. I read `19` as a length prefix because a string
+        followed it. **It is the next record's tag** — `EFFECT3D`, in
+        `LAYER_PAYLOAD` at 72 bytes since the table was written and annotated
+        "tag not observed in the shipped maps". A structure described as
+        unobserved, sitting in the table, is exactly where a plausible wrong
+        reading gets built.
+
+        So 1005 adds `tag 0` with a 20-byte payload. MEASURED:
+
+            family06-01_new   83/149 -> 149/149
+            family06-02_new   75/173 -> 173/173
+            refine_new       285/349 -> 349/349
+            tsm_fb1_new       89/148 -> 148/148
+            6609 corpus       296 of 297 read every declared layer
+
+        **Closure is not the evidence**, by `CoverRecordGrewAt1005`'s own
+        standard. The content is the tag-19 records this unblocks: **3,111 of
+        3,157 name a real row in `ini/3DEffect.dbc`**, and the 28 distinct
+        names that do not are one family (`mj_ei_*`, `mj_hhdc_*`), which is not
+        what a wrong stride produces.
+
+        The first content check said **zero of 2,599** — against
+        `ini/3DEffect.ini`, the stale plaintext decoy on a compiled-table
+        client, which `patch6090.QUIRKS` already names. An empty grep looked
+        exactly like a fact.
+        """
+        import dmap
+        self.assertEqual(dmap.LAYER_TAG0_1005, 20)
+        self.assertNotIn(0, dmap.layer_payload(1004),
+                         "tag 0 must not leak into pre-1005 maps")
+        self.assertEqual(dmap.layer_payload(1005)[0], 20)
+        self.assertEqual(dmap.LAYER_PAYLOAD.get(19), 72,
+                         "19 is EFFECT3D and its size is unchanged; if this "
+                         "moved, the 'length prefix' reading has come back")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_1005_map_reads_every_declared_layer(self):
+        """The whole point, on real data. Skips where the install has no 1005
+        maps -- 5517 has one and 6609 has fifteen."""
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        seen = bad = 0
+        for name in dmap.map_names(root):
+            d, _why = dmap.parse_map(root, name, want_cells=False,
+                                     verify=False)
+            if d is None or d.version != 1005:
+                continue
+            seen += 1
+            if len(d.layers) != d.layer_count:
+                bad += 1
+        if not seen:
+            self.skipTest("this install ships no version-1005 maps")
+        self.assertEqual(bad, 0,
+                         f"{bad} of {seen} v1005 maps stop short of their "
+                         f"declared layer count")
+
+    def test_1006_renumbers_the_cover_tag_to_24(self):
+        r"""1006 keeps 1005's 420-byte cover and calls it 24 instead of 4.
+
+        Under the shipped table **every 1006 map that declares layers read
+        zero of them**, because the walk met tag 24 and refused.
+
+        **The population is far larger than "the two 1006 maps on 6609",
+        which is what I told a director.** MEASURED over every install on this
+        machine: 6609 has 2, Zephyr 1, CCO 6, and **7878 has 162** — 171 map
+        rows. 1006 is overwhelmingly a 7878 format.
+
+            v1006 maps declaring layers, reading every declared layer
+                as shipped    0 of 136
+                with 24=420   136 of 136     129,779 records, all tag 24
+
+        **Two readings fitted the first record and only the stride separated
+        them.** The section opens `18 00 00 00` then `ani\mapscene-new.ani` —
+        equally a **length** (20 chars + NUL, padded to 4 = 24) or a **tag**
+        before the old `char[260]`. On a map with many records the gaps between
+        occurrences of `"ani"` alternate **17** and **407**, and 17 is the
+        distance between the two `"ani"` substrings *inside* the one string —
+        so one string per record, stride 17 + 407 = **424** = 4 + 420. Fixed
+        record, new tag.
+
+        **Content, because closure is not evidence:** 125,232 of 125,232 cover
+        records on 7878 and 375 of 375 on 6609 name an `.ani` that exists; 17
+        of ~125,000 origins fall off their map; the frame interval is 100 ms on
+        all but three. On CCO the same check reports 0 of 4,172 and that is the
+        instrument — `ani/MapScene.ani`, the classic file that must exist, does
+        not resolve there either.
+
+        **This does NOT touch the row checksums.** 104 of the 171 v1006 rows
+        fail them partway down the grid, and 37 maps have a 100% clean grid AND
+        declared layers AND read none — so the two symptoms are independent and
+        only one is fixed here. The `"653 failures … still unexplained"` line
+        in this module's header is about the checksums and **stays**.
+        """
+        import dmap
+        self.assertEqual(dmap.COVER_TAG_1006, 24)
+        self.assertEqual(dmap.layer_payload(1006)[24], dmap.COVER_1005)
+        self.assertEqual(dmap.LAYER_SHAPE[24], "cover")
+        # 1006 is built on the BASE table, not on 1005's: carrying unmeasured
+        # entries across a version is the guess the comment refuses.
+        self.assertNotIn(0, dmap.layer_payload(1006),
+                         "1005's tag 0 must not be inherited by 1006")
+        self.assertEqual(dmap.layer_payload(1006)[4], 416,
+                         "1005's widened tag 4 must not be inherited either")
+        self.assertNotIn(24, dmap.LAYER_PAYLOAD,
+                         "tag 24 belongs to 1006 only")
+        self.assertNotIn(24, dmap.layer_payload(1005))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_1006_map_reads_every_declared_layer(self):
+        """On real data, and it skips where the install has no 1006 maps —
+        5517, 6090 and the 5000-series have none; 6609 has 2 and 7878 has
+        162."""
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        seen = bad = 0
+        for name in dmap.map_names(root):
+            d, _why = dmap.parse_map(root, name, want_cells=False,
+                                     verify=False)
+            if d is None or d.version != 1006 or d.layer_count == 0:
+                continue
+            seen += 1
+            if len(d.layers) != d.layer_count:
+                bad += 1
+        if not seen:
+            self.skipTest("this install ships no version-1006 maps that "
+                          "declare layers")
+        self.assertEqual(bad, 0,
+                         f"{bad} of {seen} v1006 maps stop short of their "
+                         f"declared layer count")
+
+    def test_the_older_versions_are_untouched(self):
+        """The regression control. A 416-byte body must still read at 1003/1004
+        — and must NOT read at 1005, or `layer_payload` would be a no-op that
+        happens to pass the test above."""
+        for v in (1003, 1004):
+            with self.subTest(version=v):
+                d = self._parse(self._map(v, 416, n_cover=3))
+                self.assertEqual((len(d.layers), d.bytes_unconsumed), (3, 0))
+        misread = self._parse(self._map(1005, 416, n_cover=3))
+        self.assertLess(len(misread.layers), 3,
+                        "a 416 body read as 1005 must NOT come out clean; if "
+                        "it does, the width is not actually being applied")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_no_shipped_map_on_this_install_regressed(self):
+        """Every loose map here is <= 1004, so this change must be invisible.
+
+        MEASURED on 5517: 181 loose maps, **0** stop closing cleanly. Stated as
+        a within-tree property rather than a count, so it does not expire when
+        the configured install changes.
+        """
+        import dmap
+        d = Path(__import__("coroot").default_root()) / "map" / "map"
+        if not d.is_dir():
+            self.skipTest("no map/map on the configured install")
+        broke = []
+        for f in sorted(d.glob("*.DMap")):
+            m = dmap.parse(f, want_cells=False, verify=False)
+            if m.version in (1005, 1006):
+                continue                               # not what this asserts
+            if not (len(m.layers) == m.layer_count and m.bytes_unconsumed == 0
+                    and len(m.extra) == m.extra_count):
+                broke.append((f.stem, m.version, len(m.layers), m.layer_count,
+                              m.bytes_unconsumed))
+        self.assertEqual(broke, [],
+                         "a pre-1005 map stopped closing; the version gate is "
+                         "leaking the wider cover into older files")
+
+
+class MapsOpenFromTheArchive(unittest.TestCase):
+    r"""A map is opened by the path its registry names, and the `.7z` is read
+    with stdlib.
+
+    `LooseMapVsArchive` shipped the alarm: from 5517 on the loose `.DMap` is a
+    leftover that drifts, and on 6609 **77 of 184 disagree with the archive
+    beside them while 113 more maps ship archive-only.** This is the cure.
+
+    **The registry decides, and that is measured rather than chosen.**
+    `GameMap.dat`'s `FileName` names `.7z` on every install that ships
+    archives and `.DMap` on every install that does not — 100% of rows on
+    seven installs, private-server repack included. `docs/map_twin_precedence.md`
+    records why that makes the rule `core`'s rather than a parser plugin's,
+    and refutes two proposals for a hook along the way.
+
+    **No external tool.** MEASURED 2026-08-11 over **736** archives on 5517,
+    6090 and 6609: 293 of 6609's 297 are LZMA1 and 4 are LZMA2, both raw
+    `lzma` filters, **736 read with zero refusals**, every one reproducing its
+    stored CRC32. Shelling out to `7z.exe` was the alternative and it is not
+    one: `colibrary.materialize_maproot` already has to probe three paths for
+    it and report failure when it finds none.
+    """
+
+    def _root(self):
+        r = Path(__import__("coroot").default_root())
+        if not (r / "map" / "map").is_dir():
+            self.skipTest("no map/map on the configured install")
+        return r
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_archive_reads_and_reproduces_its_own_crc(self):
+        """The decode is checked against the archive's own claim, not eyeballed.
+
+        A 7z header states the unpacked CRC32. `read_archive` returns None
+        rather than bytes when the decode does not reproduce it, so this
+        asserts the whole corpus round-trips.
+        """
+        import dmap
+        d = self._root() / "map" / "map"
+        archives = sorted(d.glob("*.7z"))
+        if not archives:
+            self.skipTest("this install ships no map archives")
+        bad = [a.name for a in archives if dmap.read_archive(a) is None]
+        self.assertEqual(bad, [], "archives this reader refuses or misdecodes")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_stdlib_decode_matches_7_zip_byte_for_byte(self):
+        """CONTROL — an independent implementation, not this one twice.
+
+        Skips where 7-Zip is absent, which is exactly why the CRC assertion
+        above exists and does not skip: the corpus check stands alone and this
+        strengthens it where it can run.
+        """
+        import subprocess
+        import dmap
+        seven = next((c for c in (r"C:\Program Files\7-Zip\7z.exe",
+                                  r"C:\Program Files (x86)\7-Zip\7z.exe")
+                      if Path(c).is_file()), None)
+        if seven is None:
+            self.skipTest("7-Zip not installed")
+        d = self._root() / "map" / "map"
+        archives = sorted(d.glob("*.7z"))[:12]
+        if not archives:
+            self.skipTest("this install ships no map archives")
+        for a in archives:
+            with self.subTest(a.name):
+                got = subprocess.run([seven, "e", "-so", str(a)],
+                                     capture_output=True)
+                self.assertEqual(dmap.read_archive(a), got.stdout)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_map_names_sees_the_maps_a_dmap_glob_cannot(self):
+        """The number this whole line of work is about.
+
+        A `*.DMap` walk is not the map list. On 6609 it misses 113 of 306.
+        Asserted as a relation rather than a count, so it holds on an install
+        that ships no archives (where the two are equal) as well as on one
+        that does.
+        """
+        import dmap
+        r = self._root()
+        names = {n.lower() for n in dmap.map_names(r)}
+        loose = {p.stem.lower() for p in (r / "map" / "map").glob("*.DMap")}
+        self.assertTrue(loose <= names, "a loose map fell out of the union")
+        arch = {p.stem.lower() for p in (r / "map" / "map").glob("*.7z")}
+        self.assertTrue(arch <= names, "an archived map is not in the union")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_registered_map_opens_from_the_file_the_registry_names(self):
+        """The rule itself, and the label that makes the default visible.
+
+        Where a row exists the source phrase must say the registry named it;
+        where none does, it must say the choice was a default. A default that
+        does not announce itself is the thing `map_twin_precedence.md` refuses.
+        """
+        import dmap
+        r = self._root()
+        _rel, rows = dmap.load_gamemap(r)
+        if not rows:
+            self.skipTest("this install ships no map registry")
+        registered = named = defaulted = 0
+        for name in dmap.map_names(r):
+            raw, why = dmap.open_map(r, name)
+            if raw is None:
+                continue
+            registered += 1
+            if "named by the registry" in why:
+                named += 1
+            elif "default" in why:
+                defaulted += 1
+            else:
+                self.fail(f"{name}: unlabelled source {why!r}")
+        self.assertGreater(named, 0)
+        self.assertEqual(named + defaulted, registered,
+                         "every opened map must say which rule opened it")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_opening_a_stale_map_gets_the_archive_not_the_leftover(self):
+        """The point of the exercise, on the maps that actually differ.
+
+        For every loose file the alarm calls `stale`, `open_map` must return
+        content that is NOT the loose file — otherwise the cure resolves to the
+        disease. Skips where the install has none, and 5517 has three.
+        """
+        import dmap
+        r = self._root()
+        t = dmap.stale_loose_maps(r)
+        if not t["stale"]:
+            self.skipTest("no stale loose maps on this install")
+        for name in t["stale"][:6]:
+            with self.subTest(name):
+                loose = (r / "map" / "map" / f"{name}.DMap").read_bytes()
+                raw, why = dmap.open_map(r, name)
+                self.assertIsNotNone(raw, why)
+                self.assertNotEqual(raw, loose,
+                                    "open_map returned the stale leftover")
+                self.assertEqual(raw, dmap.read_archive(
+                    r / "map" / "map" / f"{name}.7z"))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_decode_that_disagrees_with_the_stored_crc_is_refused(self):
+        """Written because the first version of this class could NOT see it.
+
+        Removing the CRC comparison from `read_archive` left every test here
+        green — the mutant reproduced the defect and survived, which is the
+        only real evidence a test is insufficient. It survived because every
+        archive in the corpus decodes correctly, so a check that never fires is
+        indistinguishable from one that is absent.
+
+        The discriminator is an archive whose stored CRC does not match its own
+        body: the decode succeeds and the claim disagrees. Built by copying a
+        real archive and flipping one bit of the CRC in its header, so the
+        bytes are genuine and only the claim is wrong.
+        """
+        import shutil
+        import struct
+        import tempfile
+        import dmap
+        d = self._root() / "map" / "map"
+        src = next(iter(sorted(d.glob("*.7z"))), None)
+        if src is None:
+            self.skipTest("this install ships no map archives")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / src.name
+            shutil.copy2(src, p)
+            self.assertIsNotNone(dmap.read_archive(p), "the copy must read")
+
+            size, crc = dmap.archive_entry(p)
+            raw = bytearray(p.read_bytes())
+            want = struct.pack("<I", crc)
+            at = raw.rfind(want)
+            self.assertNotEqual(at, -1, "could not find the stored CRC")
+            raw[at] ^= 0x01                      # one bit of the CLAIM, not the body
+            p.write_bytes(bytes(raw))
+
+            self.assertEqual(dmap.archive_entry(p)[0], size,
+                             "only the CRC should have moved")
+            self.assertIsNone(
+                dmap.read_archive(p),
+                "a body that does not match the archive's own CRC must be "
+                "refused; returning it is 'it decompressed, ship it'")
+
+    def test_a_coder_we_do_not_read_is_refused_rather_than_guessed(self):
+        """CONTROL, no install, so it cannot skip.
+
+        `_lzma_filter` must return None for anything outside the two coders
+        measured in the corpus. A wrong filter does not raise — it produces
+        plausible wrong bytes, and a wrong decode here is a wrong *map*.
+        """
+        import dmap
+        self.assertIsNone(dmap._lzma_filter(b"\x04\x01\x08", b"\x00" * 5),
+                          "BCJ/other coders must refuse")
+        self.assertIsNone(dmap._lzma_filter(b"\x03\x01\x01", b"\x00" * 4),
+                          "LZMA1 with the wrong property length must refuse")
+        self.assertIsNone(dmap._lzma_filter(b"\x21", b""),
+                          "LZMA2 with no dictionary byte must refuse")
+        self.assertEqual(dmap._lzma_filter(b"\x21", b"\x10")["dict_size"],
+                         1 << 20, "0x10 is the 1 MiB dictionary code")
+        f = dmap._lzma_filter(b"\x03\x01\x01", b"\x5d\x00\x00\x10\x00")
+        self.assertEqual((f["lc"], f["lp"], f["pb"]), (3, 0, 2),
+                         "0x5d is the classic lc=3 lp=0 pb=2")
+
+
+class RowChecksumUsesTheRawMask(unittest.TestCase):
+    r"""`mask` is not a boolean, and the note that said so is why this was found.
+
+    `row_checksum` carried, since it was written:
+
+        The `0 if mask == 0 else 1` normalisation is UNFALSIFIABLE on every map
+        we ship ... a map with `mask > 1` would be the first evidence either
+        way. **Do not read the 100% as validating it.**
+
+    **Version 1006 is that map** — masks of **4 and 5**. MEASURED 2026-08-11
+    over 13,368 rows on 32 maps, with the normalised form:
+
+        rows that FAIL and contain mask>1   6,640
+        rows that FAIL and do NOT               0
+        rows that PASS and contain mask>1       0
+        rows that PASS and do NOT           6,728
+
+    A partition, zero exceptions either way. Whole-install agreement moves
+    7878 **86.496% → 100%**, CCO 97.531% → 100%, Zephyr 99.700% → 100%, and
+    every 0/1-only client stays at 100%.
+
+    **Safe because it is strictly more general**, which is arithmetic and not
+    optimism: `mask * k` equals `(0 if mask == 0 else 1) * k` for every
+    `mask ∈ {0,1}`, so no row that passed before can fail now.
+
+    **And it is checksum-only.** Every consumer tests `== 0`/`!= 0` and always
+    saw the raw value, so `walkable_count` is unchanged — asserted below
+    rather than assumed, because "nothing downstream moved" is exactly the
+    kind of claim that is easier to state than to check.
+    """
+
+    def test_the_two_forms_agree_wherever_mask_is_0_or_1(self):
+        """No install. The safety property, as arithmetic.
+
+        This is why 5,000-plus maps could never separate them, and why nothing
+        that passed before can break.
+        """
+        import dmap
+        for mask in (0, 1):
+            for surface in (0, 7, 34):
+                for elev in (-3, 0, 5):
+                    cells = [(mask, surface, elev)] * 12   # 3 rows of 4
+                    got = dmap.row_checksum(cells, 2, 4)
+                    want = 0
+                    for x in range(4):
+                        want += ((0 if mask == 0 else 1) * (surface + 2 + 1)
+                                 + (elev + 2) * (surface + x + 1))
+                    self.assertEqual(got, want & 0xFFFFFFFF,
+                                     f"mask={mask} surface={surface} e={elev}")
+
+    def test_a_mask_of_4_is_not_a_mask_of_1(self):
+        """The discriminating case, synthetic, so it cannot skip.
+
+        The whole finding in one assertion: the two forms must DIFFER once a
+        mask exceeds 1, or the fix is a no-op wearing a measurement.
+        """
+        import dmap
+        cells = [(4, 0, 0)] * 4
+        raw = dmap.row_checksum(cells, 0, 4)
+        normalised = 0
+        for x in range(4):
+            normalised += (1 * (0 + 0 + 1)) + (0 + 2) * (0 + x + 1)
+        self.assertNotEqual(raw, normalised & 0xFFFFFFFF)
+        expect = 0
+        for x in range(4):
+            expect += (4 * (0 + 0 + 1)) + (0 + 2) * (0 + x + 1)
+        self.assertEqual(raw, expect & 0xFFFFFFFF)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_row_of_every_map_on_this_install_checksums(self):
+        """The corpus claim. 100% on every install measured, and the reason
+        the old form could not be tested is that this install may have no
+        `mask > 1` at all — which is asserted as a fact about the install
+        rather than glossed over."""
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        names = dmap.map_names(root)
+        if not names:
+            self.skipTest("no maps on the configured install")
+        tot = ok = 0
+        hi = 0
+        for name in names[:60]:
+            d, _why = dmap.parse_map(root, name, want_cells=True, verify=True)
+            if d is None or not d.cells:
+                continue
+            tot += d.height
+            ok += d.checksum_ok
+            hi += sum(1 for c in d.cells if c[0] > 1)
+        self.assertGreater(tot, 1000, "too few rows to mean anything")
+        self.assertEqual(ok, tot,
+                         f"{tot - ok} of {tot} rows fail the row checksum")
+        # Not an assertion about the value -- a record of what this install
+        # could and could not have tested.
+        self.assertGreaterEqual(hi, 0)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_fix_is_checksum_only_and_walkability_is_untouched(self):
+        """`mask > 1` cells were always parsed and always read as blocked.
+
+        Recomputes the walkable count directly from the cells and requires it
+        to equal `walkable_count`, so a later change that quietly folded the
+        raw mask into passability would fail here rather than in a map.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        checked = 0
+        for name in dmap.map_names(root)[:25]:
+            d, _why = dmap.parse_map(root, name, want_cells=True, verify=False)
+            if d is None or not d.cells:
+                continue
+            checked += 1
+            self.assertEqual(d.walkable_count,
+                             sum(1 for c in d.cells if c[0] == 0),
+                             f"{name}: walkability is not `mask == 0`")
+        if not checked:
+            self.skipTest("no readable maps on the configured install")
+
+
+class ParseRefusesANameAndStillTakesAPath(unittest.TestCase):
+    r"""`dmap.parse` takes a PATH; `map_names` yields NAMES. Say so.
+
+    **The third instance of one shape**, which is why the guard exists rather
+    than a third caller being told to check: a value from one entry point handed
+    to another that cannot consume it. `PuzzleLibrary.get()`'s ``None`` used
+    unchecked; `open_map()`'s ``(bytes|None, reason)`` unpacked and the bytes
+    used; and `parse(name)`, which produced **470 `FileNotFoundError` in one
+    loop** and said nothing about `parse_map` being the by-name form.
+
+    **Both directions, because a refusal that has not been watched to permit is
+    half a measurement** -- and the half that fails is the one that makes a
+    guard inert. This is the same defect the author of this class landed in
+    `MeshUniverseIsPerBase` the same day and had to demonstrate out of.
+    """
+
+    def test_a_bare_name_is_refused_by_name(self):
+        import dmap
+        with self.assertRaises(ValueError) as cm:
+            dmap.parse("desert")
+        msg = str(cm.exception)
+        self.assertIn("parse_map", msg,
+                      "the refusal must name the function to use instead; a "
+                      "message that only says 'wrong' costs the reader the "
+                      "same search the guard was meant to save")
+        self.assertIn("desert", msg)
+
+    def test_a_real_path_still_parses(self):
+        """The permitting direction. If this ever fails the guard is inert."""
+        import dmap
+        base = coroot.game_root()
+        maps = sorted((Path(base) / "map" / "map").glob("*.DMap"))
+        if not maps:
+            raise unittest.SkipTest(
+                f"{base} ships no loose map/map/*.DMap (base "
+                f"{coroot.base_id()}); 7878 and CCO are legitimately like this")
+        d = dmap.parse(maps[0], want_cells=False, verify=False)
+        self.assertGreater(d.width, 0)
+
+    def test_a_relative_path_with_a_suffix_is_not_refused(self):
+        """A suffix means the caller meant a path -- the guard must let it by.
+
+        It reaches the reader and fails there on a missing file, which is a
+        different and correct error. Without this the guard could be widened to
+        'anything that does not exist' and would start eating real paths.
+        """
+        import dmap
+        with self.assertRaises(FileNotFoundError):
+            dmap.parse("no_such_map.DMap")
+
+
+class PuxHeaderAndItsGrid(unittest.TestCase):
+    r"""`map/PuzzleSave/*.pux` is TqTerrain. Its header decodes; its payload
+    does not; and its tile is 256 px whatever the registry says.
+
+    **Scope first, because every `.pux` number I had was 6609's.** MEASURED
+    2026-08-11 over every install: **237 files** — 6609 20 (in *two*
+    directories), **7878 136**, Zephyr 13, CCO 68 — and **160 maps** name one
+    as their puzzle path. All 237 carry the magic. `map_scenery.md` §10's
+    "used by 4 maps" was CCO's figure, and CCO is the only install where it is
+    still true.
+
+    **The grid size is SOLVED, not assumed.** `ground_art.md`'s identity ties a
+    puzzle's tile dimensions to the map's own cell grid, so `G` can be computed
+    rather than looked up:
+
+        G = W_cells / (pux_w/64 + pux_h/32)   ->   256.0 on all 160, no spread
+
+    **And `GameMap.dat` disagrees.** The registry says `PuzzleGridSize` 128 for
+    **113** of those maps and 256 for 3; forcing 256 satisfies the identity on
+    **160 of 160**, and every registry-128 failure was out by exactly **2×** —
+    never anything else, which is what a wrong constant looks like and a wrong
+    parse does not.
+
+    **The payload is deliberately not decoded**, and the reason is measured
+    rather than asserted: over 14 files on 7878 the size is **20.8 to 172.2
+    bytes per tile**, and a linear fit of size against tile count is out by
+    **17,725 bytes** at worst. A flat index cannot do that. `PuzzleSave` is an
+    editor save, not a compiled `.pul`.
+    """
+
+    def test_the_header_refuses_anything_that_is_not_tqterrain(self):
+        """CONTROL, no install. A reader that accepts anything is the failure
+        mode; `read_pux` must return None rather than a plausible shape."""
+        import struct
+        import tempfile
+        import dmap
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "x.pux"
+            p.write_bytes(b"NotTqTerr\0" + struct.pack("<4I", 1000, 8, 8, 1000))
+            self.assertIsNone(dmap.read_pux(p), "wrong magic must refuse")
+            p.write_bytes(dmap.PUX_MAGIC + b"\0" * 4)
+            self.assertIsNone(dmap.read_pux(p), "too short must refuse")
+            # right magic, implausible dimensions
+            p.write_bytes(dmap.PUX_MAGIC + b"\0" * 6
+                          + struct.pack("<4I", 1000, 0, 8, 1000))
+            self.assertIsNone(dmap.read_pux(p), "a zero dimension must refuse")
+            # and the honest case reads
+            p.write_bytes(dmap.PUX_MAGIC + b"\0" * 6
+                          + struct.pack("<4I", 1000, 15, 11, 1000))
+            got = dmap.read_pux(p)
+            self.assertEqual((got["width"], got["height"]), (15, 11))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_pux_on_this_install_reads(self):
+        """237 of 237 across the corpus; here, all of whatever ships."""
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        files = sorted(set(list(root.rglob("*.pux")) + list(root.rglob("*.PUX"))))
+        if not files:
+            self.skipTest("this install ships no .pux")
+        bad = [f.name for f in files if dmap.read_pux(f) is None]
+        self.assertEqual(bad, [], "a .pux this reader cannot decode")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_grid_is_256_and_the_identity_says_so(self):
+        """The load-bearing one, and it is the identity rather than a lookup.
+
+        For every map naming a `.pux`, the puzzle's tile dimensions and the
+        map's own cell grid must satisfy `ground_art.md`'s identity at
+        `PUX_GRID` — which is what makes 256 a measurement rather than a
+        preference. Skips where the install names no `.pux`.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        checked = 0
+        for name in dmap.map_names(root):
+            raw, _why = dmap.open_map(root, name)
+            if raw is None or len(raw) < 300:
+                continue
+            rel = raw[8:8 + 260].split(b"\0")[0].decode("latin-1", "replace")
+            if not rel.lower().endswith(".pux"):
+                continue
+            f = root / rel.replace("\\", "/")
+            hdr = dmap.read_pux(f)
+            if hdr is None:
+                continue
+            d, _ = dmap.parse_map(root, name, want_cells=False, verify=False)
+            if d is None:
+                continue
+            checked += 1
+            implied = ((hdr["width"] * dmap.PUX_GRID) / 64
+                       + (hdr["height"] * dmap.PUX_GRID) / 32)
+            with self.subTest(name):
+                self.assertEqual(implied, d.width,
+                                 f"{name}: {hdr['width']}x{hdr['height']} at "
+                                 f"{dmap.PUX_GRID} implies {implied:g}, the "
+                                 f".DMap says {d.width}")
+        if not checked:
+            self.skipTest("no map on this install names a .pux")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_registry_grid_size_would_fail_and_that_is_the_point(self):
+        """The discriminator. If `PuzzleGridSize` agreed with the data there
+        would be nothing to record; it disagrees on 113 of 160 and is wrong by
+        exactly 2x each time. This asserts the disagreement exists, so the
+        entry cannot quietly become false if the registry is ever re-read."""
+        import dmap
+        import puzzle as puz
+        root = Path(__import__("coroot").default_root())
+        lib = puz.PuzzleLibrary(root)
+        disagree = agree = 0
+        for name in dmap.map_names(root):
+            raw, _why = dmap.open_map(root, name)
+            if raw is None or len(raw) < 300:
+                continue
+            rel = raw[8:8 + 260].split(b"\0")[0].decode("latin-1", "replace")
+            if not rel.lower().endswith(".pux"):
+                continue
+            g = lib._grid_size.get(name.lower())
+            if not g:
+                continue
+            if g == dmap.PUX_GRID:
+                agree += 1
+            else:
+                disagree += 1
+                self.assertEqual(dmap.PUX_GRID, g * 2,
+                                 f"{name}: registry {g}, and the data wants "
+                                 f"{dmap.PUX_GRID} -- the gap has always been "
+                                 f"exactly 2x")
+        if not (agree or disagree):
+            self.skipTest("no registered .pux map on this install")
+
+
+class DMapTrailingSection(unittest.TestCase):
+    r"""`dmap.parse` leaves a tail unread on 10 maps, and nothing said so.
+
+    `d.bytes_unconsumed` is the parser's own audible channel and **no test in
+    this suite reads it for `dmap`** — the one `bytes_unconsumed` assertion in
+    the file is for `scene.parse_scene`. So this was recorded on every parse
+    and never looked at.
+
+    MEASURED over all 181 maps on 5517:
+
+        parsed                       181, 0 raised
+        extra_count != len(extra)      0
+        layers_complete False          0
+        bytes_unconsumed != 0         10   <- star01..star10, and only those
+
+    The tail is not padding. It tiles **exactly** at 264 bytes with no
+    remainder on all ten, every record is `u32` + NUL-padded path, and every
+    path is a `.pul` that exists on disk (`map/puzzle/starbg01.pul`, 424
+    bytes). On `star01` the parser reads **1** background plane and drops
+    **6**; the count grows one per map to 15 dropped on `star10`.
+
+    So these are the scrolling background planes the parser's own comment
+    guesses at — *"most plausibly the scrolling sky/background planes"* — and
+    most of them are being dropped.
+
+    **This class does NOT change `EXTRA_RECORD`, and the reason is the
+    interesting half.** The obvious reading is that 284 is simply wrong and
+    the record is 264 — `docs/map_scenery.md` §5 says `values[5]` is
+    "constant 4 and 8 on every record", and every star tail record begins
+    with 8, which looks exactly like a stride 20 bytes too long landing
+    mid-record. I had that written down as the answer. **Measuring it
+    refuted it**, over every map carrying a trailer:
+
+        stride   paths that are a REAL .pul   records walked
+           264                          178              181
+           284                           75              170
+
+    which favours 264 — until you split out the 12 maps with more than one
+    record, where the stride actually matters:
+
+        2009-7x, icecrypt-lev5   284: 2/2 real, remainder 0   264: 1/2, rem 40
+        star01 .. star10         264: N/N real, remainder 20  284: 1/N
+
+    **284 is right for the two maps §5 validated the model on, and cannot be
+    right for the star family; 264 is the reverse.** A single fixed stride
+    does not fit both, so this is either a variable-length record or the star
+    family's section does not begin where the parser thinks it does — note
+    `n_extra` reads **1** on `star01` while ≥7 records follow, which is a
+    misplaced *start*, not a wrong stride. `CORRECTIONS.md`'s MESH entry is
+    the cautionary twin: a fixed 24-byte model tiled four of five tables and
+    looked verified until `mount.dbc` divided them.
+
+    So this class makes the fact **named and pinned** instead of silent, and
+    `test_the_declared_stride_is_still_right_where_it_was_validated` exists
+    specifically to fail the tempting wrong fix.
+
+    ── RESOLVED 2026-08-10 ────────────────────────────────────────────────
+
+    **It was the start, and the class above said so without believing it.**
+    The section is not a flat run of records at all — it is *groups*:
+
+        u32 n_groups
+        per group:  u32 v0, v1, v2, v3      <- shared draw index + parallax
+                    u32 n_planes
+                    n_planes x { u32 flag(8); char[260] path }
+
+    `20 + 264 == 284`, and **that identity is the whole illusion**: a group
+    holding exactly one plane is byte-for-byte indistinguishable from one
+    284-byte record. So the flat model was right on 171 of 181 maps, and its
+    two "refuting" maps — `2009-7x`, `icecrypt-lev5` — are simply two groups
+    of one plane each. Neither stride was wrong. The *record* was.
+
+    The clincher is in the table this class already printed and read past:
+    the flat model's `values[4]` is **1** on all 66 single-plane records and
+    **7, 8, … 16** on exactly `star01`..`star10`. It was the plane count,
+    sitting in the header the old comment called "INFERRED at best".
+
+    MEASURED over all 181 maps with a trailer, 5517:
+
+        group walk ends exactly at EOF ...... 181 / 181   (0 misfits)
+        bytes_unconsumed != 0 ................ 0          (was 10)
+        extra_count != len(extra) ............ 0
+        recovered paths that are not .pul .... 0
+        maps whose output is unchanged ..... 171
+        maps that gain planes ............... 10          (7..16, one per map)
+
+    The lesson is the one the class was already carrying and applied to the
+    stride instead of to itself: **it had measured `n_extra == 1` beside
+    seven following records and named that "a misplaced start", then went on
+    testing strides.** Two readouts of one structure disagreed, and the
+    disagreement was the finding.
+    """
+
+    REC = 264
+
+    def _maps(self):
+        import coroot
+        return sorted((Path(coroot.default_root()) / "map" / "map").glob("*.DMap"))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_extra_count_agrees_with_the_rows_actually_read(self):
+        """The parser holds proof of its own miss in two fields.
+
+        `d.extra_count = n_extra` is set unconditionally at `dmap.py:317`;
+        `d.extra` is only filled if `o + n_extra * EXTRA_RECORD <= len(b)`.
+        A wrong stride therefore yields a count of N beside an empty list,
+        and nothing compared them. Holds on all 181 today — this is the
+        assertion, not the defect.
+        """
+        import dmap
+        bad = [(f.name, d.extra_count, len(d.extra))
+               for f in self._maps()
+               for d in (dmap.parse(f, verify=False),)
+               if d.extra_count != len(d.extra)]
+        self.assertEqual(bad, [])
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_no_map_leaves_a_byte_of_its_trailer_unread(self):
+        """The wrongness test. Ten maps failed this before the group model."""
+        import dmap
+        left = {f.name: d.bytes_unconsumed for f in self._maps()
+                for d in (dmap.parse(f, verify=False),)
+                if d.bytes_unconsumed}
+        self.assertEqual(left, {},
+                         "maps leaving bytes unread: the group walk no longer "
+                         "lands on EOF, so the trailer model has drifted")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_star_family_recovers_every_plane_it_used_to_drop(self):
+        """The size of the recovery, as numbers so it cannot drift quietly.
+
+        `star01` carries 7 planes in one group and used to yield 1; the count
+        grows by one per map to 16 on `star10`.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        for i in range(1, 11):
+            name = f"star{i:02d}.DMap"
+            with self.subTest(name):
+                d = dmap.parse(root / "map" / "map" / name, verify=False)
+                self.assertEqual(d.extra_groups, 1, "one group, many planes")
+                self.assertEqual(len(d.extra), i + 6)
+                self.assertEqual(d.extra_count, len(d.extra))
+                self.assertEqual(d.bytes_unconsumed, 0)
+
+    #: `hq.DMap` names a backdrop that is on no install — not loose and not
+    #: in any archive on 5017, 5517 or 6090. Shipped-content rot, not a parse
+    #: error: it read identically before the group model (single-plane group)
+    #: and `puzzle.py` already drops a record whose `.pul` does not exist.
+    #: Pinned rather than tolerated, so a *second* one is a failure.
+    KNOWN_DANGLING = {("hq.DMap", "map\\puzzle\\hqbg.pul")}
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_recovered_path_is_a_pul_and_all_but_one_resolve(self):
+        """Recovered CONTENT, not slack space read as if it were content.
+
+        Two claims, kept apart because they fail for different reasons: the
+        paths are structurally `.pul` (the parser walked real records), and
+        they resolve to real assets (the records are real content). Only the
+        second has an exception, and it is enumerated.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        not_pul, missing = [], set()
+        for f in self._maps():
+            for e in dmap.parse(f, verify=False).extra:
+                p = str(e["path"])
+                if not p.lower().endswith(".pul"):
+                    not_pul.append((f.name, p))
+                elif not (root / p.replace("\\", "/")).is_file():
+                    missing.add((f.name, p))
+        self.assertEqual(not_pul, [], "a recovered record is not a .pul path")
+        self.assertEqual(missing, self.KNOWN_DANGLING,
+                         "the set of backdrops referenced but not shipped has "
+                         "changed; a new one is content rot worth chasing, and "
+                         "a vanished one means KNOWN_DANGLING is stale")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_single_plane_group_reads_exactly_as_the_old_record_did(self):
+        """CONTROL. 171 of 181 maps must be untouched by this change.
+
+        The old flat model read `6 x u32` then `char[260]` at stride 284. A
+        one-plane group is those same 284 bytes, so `values` and `path` have
+        to come out identical — that is the claim that lets the other 171
+        maps go unre-verified, and it is checked here rather than asserted.
+        """
+        import dmap
+        import struct
+        self.assertEqual(dmap.GROUP_HEADER + dmap.PLANE_RECORD,
+                         dmap.EXTRA_RECORD)
+        checked = 0
+        for f in self._maps():
+            d = dmap.parse(f, verify=False)
+            if not d.extra or len(d.extra) != d.extra_groups:
+                continue                       # multi-plane group, not this case
+            b = f.read_bytes()
+            o = len(b) - 4 - len(d.extra) * dmap.EXTRA_RECORD
+            for i, e in enumerate(d.extra):
+                base = o + 4 + i * dmap.EXTRA_RECORD
+                with self.subTest(f"{f.name}#{i}"):
+                    self.assertEqual(list(struct.unpack_from("<6I", b, base)),
+                                     e["values"])
+                    self.assertEqual(
+                        b[base + 24:base + dmap.EXTRA_RECORD]
+                        .split(b"\0")[0].decode("latin-1"), e["path"])
+                    checked += 1
+        self.assertGreater(checked, 60,
+                           "too few single-plane groups to be a real control")
+
+    def test_a_truncated_group_leaves_the_tail_unread_rather_than_half_read(self):
+        """CONTROL, and it needs no install.
+
+        The failure mode being guarded is a parser that reads what it can and
+        calls it a parse. A group promising more planes than the file holds
+        must yield no planes, keep the declared count, and report every
+        trailing byte as unconsumed — so `extra_count != len(extra)` stays the
+        audible signal the class above was built on.
+        """
+        import dmap
+        import struct
+        plane = struct.pack("<I", 8) + b"map\\puzzle\\x.pul".ljust(260, b"\0")
+        head = struct.pack("<4I", 0, 4, 30, 30)
+
+        # A group that promises 9 planes and supplies 1.
+        lying = struct.pack("<I", 1) + head + struct.pack("<I", 9) + plane
+        groups, planes, declared, end = dmap.parse_trailer(lying, 0)
+        self.assertEqual(groups, 1)
+        self.assertEqual(declared, 9, "the file's own claim must survive")
+        self.assertEqual(planes, [], "a short group must yield NO planes")
+        self.assertEqual(end, 4, "every trailing byte stays unconsumed")
+
+        # The honest version of the same body still parses, or the test
+        # above would pass for the wrong reason.
+        honest = struct.pack("<I", 1) + head + struct.pack("<I", 1) + plane
+        groups, planes, declared, end = dmap.parse_trailer(honest, 0)
+        self.assertEqual((groups, declared, len(planes)), (1, 1, 1))
+        self.assertEqual(end, len(honest))
+        self.assertEqual(planes[0]["path"], "map\\puzzle\\x.pul")
+        self.assertEqual(planes[0]["values"], [0, 4, 30, 30, 1, 8])
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_declared_stride_is_still_right_where_it_was_validated(self):
+        r"""Guards the tempting wrong fix — which I nearly made.
+
+        Seeing the star tails tile at 264, the obvious move is
+        `EXTRA_RECORD = 264`. That **breaks the two maps `map_scenery.md` §5
+        built the model on.** `2009-7x` and `icecrypt-lev5` each carry two
+        records; at 284 both paths are real `.pul` files and the section ends
+        exactly at EOF, and at 264 only the first is real with 40 bytes left
+        over.
+
+        So whatever explains the star family, it is not "the stride is 20 too
+        big". This test fails if someone changes `EXTRA_RECORD` on that
+        theory.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        self.assertEqual(dmap.EXTRA_RECORD, 284)
+        for name in ("2009-7x.DMap", "icecrypt-lev5.DMap"):
+            with self.subTest(name):
+                d = dmap.parse(root / "map" / "map" / name, verify=False)
+                self.assertEqual(d.bytes_unconsumed, 0,
+                                 "the section no longer ends at EOF")
+                self.assertEqual(len(d.extra), 2)
+                for r in d.extra:
+                    p = root / str(r["path"]).replace("\\", "/")
+                    self.assertTrue(p.is_file(), r["path"])
+
+
+class LooseMapVsArchive(unittest.TestCase):
+    r"""A loose `.DMap` can be a *valid* map and not the map the client reads.
+
+    From 5517 on, a map ships as `map/map/<stem>.7z` holding one `<stem>.DMap`
+    — that is the file `GameMap.dat` names (`map/map/desert.7z`) — and the
+    loose `<stem>.DMap` beside it is a leftover that drifts.
+
+    MEASURED 2026-08-10, each loose file against the `.DMap` inside its OWN
+    archive (stdlib header read + CRC32; cross-checked against 7-Zip below):
+
+        5517   181 loose, 192 archives,  11 archive-only,   3 stale
+        6090   184 loose, 247 archives,  63 archive-only,  74 stale
+        6609   184 loose, 297 archives, 113 archive-only,  77 stale
+
+    and every one of 6609's 184 loose files is byte-for-byte 6090's.
+
+    **No audible channel in `dmap.parse` can see this, and that is the point
+    of the class.** A stale map checksums 100%, walks its layers to completion,
+    reconciles its plane groups and consumes every byte — `island`'s loose file
+    reports 31 portals where its archive has 1, and `newwoods`'s is a whole
+    format version behind (1003 against 1004, 2,231 layers short). Every
+    existing channel answers *did these bytes parse*; none can answer *are
+    these the bytes the client reads*, and no amount of the first implies the
+    second.
+
+    **Why it went unseen is the transferable half.** 5517 — the configured
+    install, and the one every measurement in this repo was taken on — is
+    98.3% honest. 6090 was already 40% wrong before 6609 existed. The strategy
+    of walking `map/map/*.DMap` did not break with a new client; it expired,
+    and the instrument was pointed at the one install where it still nearly
+    worked. That is a measurement-vantage failure, not a format failure.
+
+    `dmap.archive_state` is the alarm and this class is its control. Reading
+    maps *out of* the archives is the larger change and is deliberately not
+    done yet: until then, a number taken from a loose `.DMap` on 6090 or 6609
+    is unattributable, and now it says so.
+    """
+
+    def _pair(self):
+        """A `(.DMap, .7z)` on this install whose loose file IS current.
+
+        Skips rather than fails where the install ships no archives at all
+        (5017/5065/5165 ship none), because "nothing to disagree with" is a
+        correct state, not a missing fixture.
+        """
+        import dmap
+        d = Path(__import__("coroot").default_root()) / "map" / "map"
+        if not d.is_dir():
+            self.skipTest("no map/map on the configured install")
+        for p in sorted(d.glob("*.DMap")):
+            if dmap.archive_state(p) == "current":
+                return p, p.with_suffix(".7z")
+        self.skipTest("this install ships no archive twins")
+
+    # -- the instrument, against an independent one -------------------------
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_our_header_reader_agrees_with_7_zip_itself(self):
+        r"""CONTROL, and the whole reason `archive_entry` is trusted.
+
+        `archive_entry` parses the 7z header with stdlib only, which is fast
+        enough to run on every parse (0.01 s over all 181 maps of 5517) but is
+        a hand-rolled reader of a format with many shapes. The control is
+        therefore an **independent implementation** — 7-Zip's own `l -slt` —
+        not this reader run twice.
+
+        MEASURED 2026-08-10 over 736 archives (5517 192, 6090 247, 6609 297):
+        identical size and CRC on **736**, zero disagreements, zero refusals.
+
+        Skips where 7z.exe is absent. That is a real gap in the control and it
+        is why the *refusal* tests below are synthetic and never skip.
+        """
+        import re
+        import subprocess
+        import dmap
+        seven = next((c for c in (r"C:\Program Files\7-Zip\7z.exe",
+                                  r"C:\Program Files (x86)\7-Zip\7z.exe")
+                      if Path(c).is_file()), None)
+        if seven is None:
+            self.skipTest("7-Zip not installed; the independent control "
+                          "cannot run here")
+        d = Path(__import__("coroot").default_root()) / "map" / "map"
+        archives = sorted(d.glob("*.7z"))[:40]
+        if not archives:
+            self.skipTest("this install ships no map archives")
+        for a in archives:
+            with self.subTest(a.name):
+                out = subprocess.run([seven, "l", "-slt", str(a)],
+                                     capture_output=True, text=True,
+                                     errors="replace").stdout
+                size = re.search(r"^Size = (\d+)$", out, re.M)
+                crc = re.search(r"^CRC = ([0-9A-F]+)$", out, re.M)
+                self.assertIsNotNone(size, "7-Zip named no unpacked size")
+                self.assertIsNotNone(crc, "7-Zip named no CRC")
+                self.assertEqual(dmap.archive_entry(a),
+                                 (int(size.group(1)), int(crc.group(1), 16)))
+
+    # -- both directions, on real data, with no external tool ---------------
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_one_flipped_byte_turns_current_into_stale(self):
+        """The discrimination itself, both ways, on a real archive.
+
+        A positive check alone is satisfied by a function that answers
+        `"current"` unconditionally, so the negative half is the test: copy a
+        pair that IS current, change one byte of the loose file, and the same
+        call must say `stale`. Nothing here needs 7z.exe — the archive is
+        never decompressed.
+        """
+        import shutil
+        import tempfile
+        import dmap
+        loose, arch = self._pair()
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            shutil.copy2(arch, t / arch.name)
+            shutil.copy2(loose, t / loose.name)
+            copy = t / loose.name
+            self.assertEqual(dmap.archive_state(copy), "current",
+                             "a byte-for-byte copy of a current pair")
+
+            b = bytearray(copy.read_bytes())
+            b[GRID_OFF_FOR_TEST] ^= 0xFF          # one cell, mid-grid
+            copy.write_bytes(bytes(b))
+            self.assertEqual(dmap.archive_state(copy), "stale",
+                             "same length, one byte different: the CRC is the "
+                             "only thing that can see this")
+
+            b = bytearray(copy.read_bytes())[:-1]  # and a length change
+            copy.write_bytes(bytes(b))
+            self.assertEqual(dmap.archive_state(copy), "stale")
+
+    def test_unchecked_is_never_spelled_the_same_as_clean(self):
+        """CONTROL, no install needed.
+
+        Three states that are all "not stale" and must stay distinguishable:
+        no archive at all, an archive this reader cannot understand, and a
+        real match. Collapsing the middle one into `"current"` is the failure
+        this is here to prevent — an unchecked thing reported as a clean one
+        is how a silent gap survives, and it is exactly what the loose-file
+        walk did for years.
+        """
+        import tempfile
+        import dmap
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            lone = t / "lone.DMap"
+            lone.write_bytes(b"\x00" * 64)
+            self.assertEqual(dmap.archive_state(lone), "none",
+                             "no .7z beside it is not a finding")
+
+            (t / "lone.7z").write_bytes(b"not a 7z at all")
+            self.assertEqual(dmap.archive_state(lone), "unreadable")
+
+            # A real signature with a header we refuse: still unreadable,
+            # never current.
+            (t / "lone.7z").write_bytes(
+                dmap.SZ_SIG + b"\x00" * 26)
+            self.assertEqual(dmap.archive_state(lone), "unreadable")
+
+    def test_archive_entry_refuses_a_header_it_does_not_understand(self):
+        """`archive_entry` returns None rather than a guess. No install.
+
+        The corpus is uniformly one file, one folder, one coder, plain header
+        — 736 of 736. An LZMA-encoded header (`kEncodedHeader`, 0x17) is the
+        obvious next shape and must refuse, because a half-understood header
+        yields a plausible wrong CRC, and a wrong CRC on this path prints
+        `stale` at a user for a file that is fine. **A gate that fires on
+        correct behaviour gets widened until it is inert.**
+        """
+        import struct
+        import tempfile
+        import dmap
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "x.7z"
+            for name, body in (("encoded header", b"\x17\x06\x00"),
+                               ("no streams info", b"\x01\x05\x00"),
+                               ("empty header", b"")):
+                with self.subTest(name):
+                    p.write_bytes(dmap.SZ_SIG + b"\x00" * 6
+                                  + struct.pack("<QQI", 0, len(body), 0)
+                                  + body)
+                    self.assertIsNone(dmap.archive_entry(p))
+
+    # -- the corpus, and the shape of what it says --------------------------
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_every_loose_map_lands_in_exactly_one_state(self):
+        """`stale_loose_maps` accounts for every file, and agrees with `parse`.
+
+        Two readers of one fact — the corpus walk and the per-file field
+        `dmap.parse` sets — must not drift apart. That is the disagreement
+        this repo keeps finding after the fact.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        t = dmap.stale_loose_maps(root)
+        d = root / "map" / "map"
+        if not d.is_dir():
+            self.skipTest("no map/map on the configured install")
+        loose = sorted(d.glob("*.DMap"))
+        self.assertEqual(
+            len(t["stale"]) + t["current"] + t["none"] + t["unreadable"],
+            len(loose), "a file fell out of the census")
+        for name in t["stale"]:
+            with self.subTest(name):
+                self.assertEqual(
+                    dmap.parse(d / f"{name}.DMap", want_cells=False,
+                               verify=False).archive, "stale",
+                    "the corpus walk and dmap.parse disagree about one map")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_stale_map_still_passes_every_other_audible_channel(self):
+        """The claim that makes this class necessary, asserted rather than said.
+
+        If a stale map tripped `bytes_unconsumed` or the row checksums, the
+        existing channels would already have caught it and none of this would
+        be needed. Measured on 5517's three, and on 6090/6609's dozens: they
+        parse **perfectly**. Skips where the configured install has none.
+        """
+        import dmap
+        root = Path(__import__("coroot").default_root())
+        t = dmap.stale_loose_maps(root)
+        if not t["stale"]:
+            self.skipTest("this install has no stale loose maps (5517 has 3, "
+                          "6090 74, 6609 77) -- nothing to assert on")
+        for name in t["stale"][:5]:
+            with self.subTest(name):
+                d = dmap.parse(root / "map" / "map" / f"{name}.DMap",
+                               want_cells=True, verify=True)
+                self.assertEqual(d.checksum_ok, d.height,
+                                 "a stale map that fails its checksums would "
+                                 "have been caught without this class")
+                self.assertEqual(d.bytes_unconsumed, 0)
+                self.assertTrue(d.layers_complete)
+                self.assertEqual(len(d.extra), d.extra_count)
+                self.assertEqual(d.archive, "stale")
+
+
+#: Offset of the first cell of the grid, used by the mutation control above.
+#: Named rather than inlined so the test reads as "one cell, mid-grid" instead
+#: of as a magic number.
+GRID_OFF_FOR_TEST = 276 + 6 * 100
 
 
 class ScenePassability(unittest.TestCase):
@@ -4697,7 +9448,23 @@ class SceneSprites(unittest.TestCase):
         covers on four maps the sprite's opaque bounding box is horizontally
         centred on its declared footprint and its bottom edge sits on the
         footprint's bottom corner. Getting the sign wrong moves the median
-        error from a couple of pixels to over a hundred."""
+        error from a couple of pixels to over a hundred.
+
+        **A map with no ground art is a refusal, not a crash.** On 6090 and
+        6609 `newplain` has no row in the map registry in any form -- one of
+        the nine such maps `docs/map_twin_precedence.md` names -- so
+        `PuzzleLibrary.get` correctly returns None *and says why*. This test
+        used to walk straight into `pm.cell_px` and raise `AttributeError:
+        'NoneType' object has no attribute 'cell_px'` four frames from the
+        decision, which threw away the one piece of information the library
+        had produced. It now consumes the refusal, requires it to carry a
+        reason, and keeps a floor so that skipping every map cannot pass as
+        measuring them.
+
+        Every *production* caller of `PuzzleLibrary.get` already guards this
+        -- `mapedit`, `pulmem`, `scene`, `terrain`, `tileset` and `puzzle`'s
+        own `verify` all check for None and surface `lib.reason`. The test was
+        the only place discarding it."""
         import puzzle
         import scene
         import dmap
@@ -4708,8 +9475,18 @@ class SceneSprites(unittest.TestCase):
         slib = scene.SceneLibrary(root)
         cache = scene.SpriteCache(root)
         dxs, dys, n = [], [], 0
+        measured, refused = [], []
         for name in ("newbie", "newplain", "desert", "arena"):
             pm = plib.get(name)
+            if pm is None:
+                # The library said no and said why. Record the refusal instead
+                # of walking into it; an empty `reason` would be the real
+                # defect, because then the "no" carries nothing.
+                self.assertTrue(plib.reason,
+                                f"{name}: refused with no reason given")
+                refused.append((name, plib.reason))
+                continue
+            measured.append(name)
             d = dmap.parse(root / "map" / "map" / f"{name}.DMap", verify=False)
             for p in scene.gather(d.layers, slib).covers:
                 fr = cache.frames(p.ani, p.title)
@@ -4728,7 +9505,14 @@ class SceneSprites(unittest.TestCase):
                 dxs.append(sx + (bx0 + bx1) / 2 - (left + right) / 2)
                 dys.append(sy + by1 - bottom)
                 n += 1
-        self.assertGreater(n, 1000)
+        # The floor is what stops a refusal turning into a pass: if every map
+        # were skipped, `n` would be 0 and the medians would raise. Stated as a
+        # count of maps as well as of covers, because three of the four
+        # dropping out is a different fact from a thin corpus.
+        self.assertGreaterEqual(len(measured), 2,
+                                f"only {measured} had ground art; refused: "
+                                f"{refused}")
+        self.assertGreater(n, 1000, f"measured maps: {measured}")
         self.assertLess(abs(statistics.median(dxs)), 12)
         self.assertLess(abs(statistics.median(dys)), 12)
 
@@ -4810,6 +9594,243 @@ class SceneSprites(unittest.TestCase):
                 self.assertTrue(cache.frames(p.ani, p.title), p.title)
 
 
+class SceneryExport(unittest.TestCase):
+    """`routeb/export_scenery.py` -- the TERRAIN layers, packed for the DX11
+    renderer as GPU-ready DXT plus a destination rectangle and a draw order.
+
+    Measured on install **5517**, 2026-08-15.
+    """
+
+    @staticmethod
+    def _mod(name):
+        import importlib
+        rb = str(Path(__file__).resolve().parent.parent / "routeb")
+        if rb not in sys.path:
+            sys.path.insert(0, rb)
+        return importlib.import_module(name)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_export_round_trips_and_keeps_the_texture_compressed(self):
+        """The file re-parses exactly, and the sprite payload is the shipped
+        `.dds` rather than decoded RGBA.
+
+        The size assertion is the one that matters: `bridge05` is 262,272 bytes
+        as DXT3 and 1,048,576 as RGBA, so a payload at least as large as the
+        decoded form would mean someone had quietly added a decode step and
+        thrown away the 4x the format exists for."""
+        E = self._mod("export_scenery")
+        _pm, meta, sprites, pls, dang = E.gather_region("newbie", 69, 90, 24)
+        got = E.parse(E.serialise(meta, sprites, pls, dang))
+        self.assertEqual(got["bytesUnconsumed"], 0)
+        self.assertEqual(len(got["placements"]), 20)
+        self.assertEqual(len(got["sprites"]), 6)
+        self.assertEqual(got["cellRect"], (45, 66, 93, 114))
+        for s in got["sprites"]:
+            with self.subTest(sprite=s["path"]):
+                self.assertEqual(s["dds"][:4], b"DDS ")
+                hdr = dds.parse_header(s["dds"])
+                self.assertEqual((int(hdr.width), int(hdr.height)),
+                                 (s["w"], s["h"]))
+                self.assertEqual(hdr.fourcc, "DXT3")
+                self.assertLess(len(s["dds"]), s["w"] * s["h"] * 4,
+                                "payload is as big as RGBA -- decoded?")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_placement_table_is_in_painters_order(self):
+        """`docs/map_scenery.md` §7: anchor x+y ascending is screen depth in a
+        2:1 view, so a renderer that walks the table in order composites
+        correctly without sorting."""
+        E = self._mod("export_scenery")
+        for name, cx, cy, r in (("newbie", 69, 90, 24),
+                                ("p-arena", 131, 103, 90),
+                                ("newplain", 168, 544, 18)):
+            with self.subTest(map=name):
+                _pm, meta, sprites, pls, dang = E.gather_region(name, cx, cy, r)
+                got = E.parse(E.serialise(meta, sprites, pls, dang))
+                depths = [p["depth"] for p in got["placements"]]
+                self.assertTrue(depths)
+                self.assertEqual(depths, sorted(depths))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_exported_sprites_sit_on_the_cells_their_parts_open(self):
+        """THE KNOWN-POSITIVE CONTROL, and the negative that gives it meaning.
+
+        `SceneSprites.test_the_stepping_stone_art_sits_on_the_cells_it_opens`
+        makes this claim about `scene.py`'s own placement. This makes it about
+        what the EXPORTER wrote: the destination rectangle and the sprite
+        pixels are read back out of the serialised `.rbs`, while the set of
+        opened cells is derived independently from `tools/scene.py` and the
+        base `.DMap` grid. A wrong destination rectangle would break the
+        agreement between the two.
+
+        The second half is the part that makes the first half evidence. Under
+        the FORWARD footprint reading `part(i,j) -> (A.x+i, A.y+j)` -- the
+        plausible wrong rule `docs/map_scenery.md` §2 warns about -- the same
+        measurement must collapse. Measuring only the correct rule would be an
+        instrument that has never been shown to return a negative.
+
+        Install 5517, 2026-08-15: newbie 111/111 backward vs 95/111 forward;
+        p-arena 583/592 vs 22/601. The `farMisses` count is the sharper
+        discriminator -- 0 under the correct rule on both maps, 15 and 561
+        under the wrong one."""
+        E, V = self._mod("export_scenery"), self._mod("verify_scenery")
+        import puzzle
+        root = puzzle.PuzzleLibrary().root
+        for name, cx, cy, r, want in (("newbie", 69, 90, 24, 111),
+                                      ("p-arena", 131, 103, 90, 592)):
+            with self.subTest(map=name):
+                pm, meta, sprites, pls, dang = E.gather_region(name, cx, cy, r)
+                got = E.parse(E.serialise(meta, sprites, pls, dang))
+                cells = V.opened_cells(pm, root)
+                bh, bt, bfar = V.on_art(pm, got["placements"], got["sprites"],
+                                        cells, "back")
+                fh, ft, ffar = V.on_art(pm, got["placements"], got["sprites"],
+                                        cells, "fwd")
+                self.assertEqual(bt, want, "the opened-cell sample changed")
+                # 97% is the documented .msk/.dds alpha agreement (§4); the
+                # shortfall on p-arena is that soft edge, which is why every
+                # miss must still be within EDGE_PX of opaque art.
+                self.assertGreaterEqual(100.0 * bh / bt, 97.0)
+                self.assertEqual(bfar, 0,
+                                 "an opened cell landed far off its own art")
+                # ...and the control must fail on both counts.
+                self.assertLess(100.0 * fh / ft, 90.0,
+                                "the forward rule scored as well as the "
+                                "backward one -- this test cannot fail")
+                self.assertGreater(ffar, 0)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_twin_citys_rendered_region_carries_no_scenery(self):
+        """The measured negative, pinned so it cannot rot silently.
+
+        Map 1002 `newplain` places 15 TERRAIN parts and NONE of them fall in
+        the cell rect `[412..448] x [362..398]` that `routeb` currently draws.
+        Both of its scene objects are bridges, far to the south. If a future
+        install or a corrected placement rule puts scenery in that window this
+        test fails, which is the point -- `docs/routeb_scenery.md` records the
+        negative and this is what keeps it honest."""
+        E = self._mod("export_scenery")
+        _pm, meta, sprites, pls, dang = E.gather_region("newplain", 430, 380, 18)
+        self.assertEqual(meta["cellRect"], (412, 362, 448, 398))
+        self.assertEqual(meta["totalParts"], 15)
+        self.assertEqual(pls, [], "scenery appeared in the rendered region")
+        self.assertEqual(dang, [])
+        # ...but the same map DOES have scenery, at the same region size.
+        _pm2, _m2, spr2, pls2, _d2 = E.gather_region("newplain", 168, 544, 18)
+        self.assertEqual(len(pls2), 8)
+        self.assertEqual(len(spr2), 3)
+
+
+class _FakePlacement:
+    """The three attributes `scene.frame_index` reads, and nothing else."""
+
+    def __init__(self, title, frame_interval, depth=0):
+        self.ani, self.title = "ani/MapScene.ani", title
+        self.frame_interval, self._depth = frame_interval, depth
+
+    def depth(self):
+        return self._depth
+
+
+class _FakeSprites:
+    """A `SpriteCache` stand-in: title -> that many frames."""
+
+    def __init__(self, counts):
+        self.counts = counts
+
+    def frames(self, ani, title):
+        return [(1, 1, b"\0\0\0\0")] * self.counts[title]
+
+
+class CoverCacheKeyIsTheFrameNotTheClock(unittest.TestCase):
+    """A cover cache keyed on the raw clock cannot hit, ever.
+
+    `play.js` self-clocks: it requests the next cover frame only once the
+    previous one has ARRIVED, with `t = Date.now() - start`. That value is
+    strictly increasing and never quantised, so `coplay.api_cover`'s key
+    `("cover", map, cx, cy, radius, scale, t)` was distinct on every request
+    and `terrain_cache` had a 0% hit rate -- on the endpoint whose own caller
+    documents it as the expensive one (newplain's 1,083 covers, ~4.6 s each).
+
+    No install needed: the signature is a pure function of the placements.
+    """
+
+    def _covers(self):
+        # deliberately DISAGREEING clocks -- the reason a single global
+        # quantisation of `t` would be wrong.
+        return ([_FakePlacement("a.tga", 100, 0),
+                 _FakePlacement("b.tga", 200, 1),
+                 _FakePlacement("static.tga", 0, 2)],
+                _FakeSprites({"a.tga": 4, "b.tga": 3, "static.tga": 1}))
+
+    def test_the_signature_is_cyclic_so_the_cache_can_hit(self):
+        import scene
+        covers, sprites = self._covers()
+        # a.tga cycles every 4*100 = 400 ms, b.tga every 3*200 = 600 ms,
+        # so the pair repeats on lcm(400, 600) = 1200 ms. Computed, not
+        # eyeballed: my first pass wrote 250 ms for b and asserted a 3000 ms
+        # period, and the true one is lcm(400, 750) = 6000.
+        sigs = {scene.cover_frame_signature(covers, sprites, t)
+                for t in range(1, 1201, 10)}
+        self.assertLessEqual(len(sigs), 12, "more distinct keys than frames")
+        for t in range(1, 1200, 53):
+            self.assertEqual(scene.cover_frame_signature(covers, sprites, t),
+                             scene.cover_frame_signature(covers, sprites,
+                                                         t + 1200),
+                             "the signature did not repeat after one cycle")
+
+    def test_t_zero_is_the_deliberate_static_request(self):
+        """`time_ms == 0` is a special case, not the t=0 point of the cycle.
+
+        `play.js:736` asks for `url(0)` first -- no `&t=` at all -- to get a
+        still frame up before it starts self-clocking, and `frame_interval > 0
+        and frame_count > 1 and time_ms` makes 0 mean *frame 0* for every
+        placement. So the signature is NOT periodic through the origin, and a
+        cyclic assertion that includes t=0 fails on that alone. Pinned
+        because it is easy to "fix" by deleting the `and time_ms` guard, which
+        would change what the first paint shows.
+        """
+        import scene
+        covers, sprites = self._covers()
+        self.assertEqual(scene.cover_frame_signature(covers, sprites, 0),
+                         (0, 0, 0))
+        # 100 ms, not a multiple of the 1200 ms cycle -- at the cycle
+        # boundary the signature legitimately IS all-zeros, which would make
+        # this assertion pass for the wrong reason.
+        self.assertEqual(scene.cover_frame_signature(covers, sprites, 100),
+                         (1, 0, 0))
+
+    def test_the_raw_clock_would_have_been_a_distinct_key_every_time(self):
+        """The control. Without it, the test above passes on any key at all."""
+        ts = list(range(0, 3000, 10))
+        self.assertEqual(len({("cover", 1002, 0, 0, 12, 1, t) for t in ts}),
+                         len(ts), "the old key was not actually degenerate")
+
+    def test_a_placement_that_does_not_animate_never_moves(self):
+        import scene
+        covers, sprites = self._covers()
+        static = covers[2]
+        for t in (0, 1, 999, 10 ** 9):
+            self.assertEqual(scene.frame_index(static, 1, t), 0)
+
+    def test_the_renderer_and_the_key_agree_by_construction(self):
+        """They must call ONE rule, not two copies of it.
+
+        `read_ani` is the standing precedent: it was extracted to COre to
+        stop exactly this, and it did not help, because only the parser moved
+        and the callers kept choosing the file. So assert the source, not the
+        behaviour -- `cover_layer` must not carry its own copy of the
+        arithmetic.
+        """
+        import inspect
+        import scene
+        body = inspect.getsource(scene.cover_layer)
+        self.assertIn("frame_index(", body)
+        self.assertNotIn("time_ms // p.frame_interval", body,
+                         "cover_layer re-implements the frame rule instead of "
+                         "calling scene.frame_index -- the two can now drift")
+
+
 def _alpha_box(rgba: bytes, w: int, h: int):
     """Tight bounding box of the non-transparent pixels, or None."""
     x0, y0, x1, y1 = w, h, 0, 0
@@ -4847,6 +9868,7 @@ class MapBackdrops(unittest.TestCase):
         self.assertEqual(lib.get("newbie").pul_path, "map/puzzle/newbie.pul")
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_two_plane_map_orders_them_furthest_first(self):
         """`2009-7x` and `beach` each carry two backdrops, numbered 0 and 1 in
         the record's first integer. They are returned back to front."""
@@ -5058,12 +10080,29 @@ class IsometricCamera(unittest.TestCase):
 # task #30 -- the MapEditor
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(HAVE_ROOT, "game install not present")
+@requires_base("cco", why="integrity.json ships only with CCO 2.0. MEASURED on "
+                          "all six declared installs 2026-08-09: present at "
+                          "CCO, absent from 5017, 5065, 5165, 5517 and 6090. "
+                          "The gate is CORRECT and must not widen -- note that "
+                          "test_no_map_art_is_covered PASSES on 5517 for the "
+                          "wrong reason (no manifest -> no entries -> the "
+                          "negative holds vacuously), which is why a bare "
+                          "'it is green over there' is not evidence to widen "
+                          "anything -- CORRECTIONS C-2026-08-09-comod-base-gate-audit")
 class IntegrityManifest(unittest.TestCase):
     """What `integrity.json` actually covers -- measured, not assumed.
 
     Every "you may edit this" claim the MapEditor makes rests on this file, so
     it is checked against the install rather than against the brief.
+
+    **Gated to CCO, because the file is CCO's.** Verified across the corpus:
+    `integrity.json` is present in Classic Conquer 2.0 and absent from 5517
+    and 6090 both. Under `HAVE_ROOT` these five tests ran anyway on a patch
+    client and produced three failures and an error -- four entries in the
+    45/9 that say nothing about the code and cost a diff to dismiss every
+    time. The manifest is also the *only* integrity-checked area of the game
+    (`docs/STATUS.md`), so there is nothing to fall back to on a client that
+    ships none: the honest verdict is "does not apply here".
     """
 
     @classmethod
@@ -5167,6 +10206,7 @@ class MapEditorModel(unittest.TestCase):
         cls.lib = mapedit.MapEditor(ROOT)
         cls.art = cls.lib.get("newbie")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_picker_lists_every_gamemap_row_and_names_the_broken_ones(self):
         rows = self.lib.rows()
         self.assertEqual(len(rows), 156, "all 156 GameMap.json rows, including "
@@ -5187,6 +10227,7 @@ class MapEditorModel(unittest.TestCase):
                             for r, n in zip(rows, rows[1:])),
                         "largest first")
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_pux_map_reports_rather_than_raises(self):
         art = self.lib.get("2020love01_new")
         j = art.to_json()
@@ -5281,6 +10322,7 @@ class MapEditorModel(unittest.TestCase):
         self.assertTrue(hit["cell"]["inside"])
         self.assertFalse(hit["integrity"]["checked"])
 
+    @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_the_editable_report_puts_the_dmap_alone_on_the_checked_side(self):
         rep = self.art.editable_report()
         self.assertEqual([r["path"] for r in rep["checked"]],
@@ -5386,6 +10428,120 @@ class DMapPassabilityEdit(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
+class MapEditorWritesWhatTheRegistryNames(unittest.TestCase):
+    r"""The editor's write path had three defects, and two were invisible until
+    the registry rule reached it.
+
+    **1. It based every edit on the LOOSE `.DMap`.** From 5517 on the registry
+    names `map/map/<stem>.7z` and the loose file beside it is a previous
+    client's — 77 of 6609's 184 disagree, and **7878 ships none at all**. So an
+    edit landed on the wrong content before the client read anything. The base
+    is now `dmap.open_map`, and the result says which rule chose it.
+
+    **2. `dmap_logical` was derived from the loose file**, so it was the empty
+    string for any archive-only map and staging wrote to the stage *root*. That
+    was unreachable while the writer refused an absent loose file, and became
+    reachable the instant the writer stopped needing one. It is by name now.
+
+    **3. It wrote `0` or `1` over a mask that is not a boolean.** The corpus
+    carries **2, 4 and 5** (`core/dmap.row_checksum`), so unblocking a mask-4
+    cell silently discarded bit 2. There is no correct write here without
+    knowing what bit 2 means, and that is a hypothesis rather than a finding
+    (`docs/map_scenery.md` §10) — so the editor **refuses those cells and
+    reports them**. Declining costs an edit; guessing costs a value.
+    """
+
+    def _install_with(self, want_high):
+        """An install and a map that has (or lacks) mask>1 cells."""
+        import dmap
+        for name in ("6609", "7878", "5517"):
+            root = Path(r"C:\COMod\ConquerAssets\Clients") / name
+            if not (root / "map" / "map").is_dir():
+                continue
+            for m in dmap.map_names(root)[:40]:
+                d, _ = dmap.parse_map(root, m, want_cells=True, verify=False)
+                if d is None or not d.cells:
+                    continue
+                hi = [(i % d.width, i // d.width)
+                      for i, c in enumerate(d.cells) if c[0] > 1]
+                lo = [(i % d.width, i // d.width)
+                      for i, c in enumerate(d.cells) if c[0] == 1]
+                if bool(hi) == want_high and lo:
+                    return root, m, hi, lo
+        return None, None, None, None
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_edit_is_based_on_the_file_the_registry_names(self):
+        """Not the loose leftover. The `base` field says which, in words."""
+        import tempfile
+        import mapedit
+        root, name, _hi, lo = self._install_with(False)
+        if root is None:
+            self.skipTest("no suitable map on the installs present")
+        lib = mapedit.MapEditor(root)
+        with tempfile.TemporaryDirectory() as td:
+            r = mapedit.stage_passability(
+                lib.get(name), [{"x": lo[0][0], "y": lo[0][1], "blocked": False}],
+                ack=mapedit.ACK, stage=Path(td))
+        self.assertIn("base", r)
+        self.assertTrue(r["base"], "the base must name the file it came from")
+        self.assertTrue(
+            "registry" in r["base"] or "staged" in r["base"]
+            or "default" in r["base"] or "only form" in r["base"],
+            f"unlabelled base {r['base']!r}")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_cell_whose_mask_is_not_0_or_1_is_refused_and_reported(self):
+        """The load-bearing one. A silent clobber and a reported refusal look
+        identical to the caller unless the refusal is in the result."""
+        import tempfile
+        import mapedit
+        root, name, hi, lo = self._install_with(True)
+        if root is None:
+            self.skipTest("no install here carries a mask > 1")
+        lib = mapedit.MapEditor(root)
+        edits = ([{"x": x, "y": y, "blocked": False} for x, y in hi[:3]]
+                 + [{"x": x, "y": y, "blocked": False} for x, y in lo[:2]])
+        with tempfile.TemporaryDirectory() as td:
+            r = mapedit.stage_passability(lib.get(name), edits,
+                                          ack=mapedit.ACK, stage=Path(td))
+        self.assertEqual(r["refusedCount"], len(hi[:3]),
+                         "every non-boolean mask must be refused")
+        self.assertTrue(all(e["mask"] not in (0, 1)
+                            for e in r["refusedNonBooleanMask"]))
+        self.assertGreater(r["changedCount"], 0,
+                           "the 0/1 cells must still edit -- a refusal that "
+                           "refuses everything is not a refusal")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_an_archive_only_map_stages_to_its_own_logical_path(self):
+        """`dmap_logical` is by name, so a map with no loose file no longer
+        writes to the stage root."""
+        import tempfile
+        import mapedit
+        root, name, _hi, lo = self._install_with(False)
+        if root is None:
+            self.skipTest("no suitable map on the installs present")
+        lib = mapedit.MapEditor(root)
+        art = lib.get(name)
+        self.assertEqual(art.dmap_logical, f"map/map/{name}.DMap")
+        with tempfile.TemporaryDirectory() as td:
+            mapedit.stage_passability(
+                art, [{"x": lo[0][0], "y": lo[0][1], "blocked": False}],
+                ack=mapedit.ACK, stage=Path(td))
+            self.assertTrue((Path(td) / art.dmap_logical).is_file(),
+                            "the staged file must land at its logical path")
+
+    def test_the_logical_path_never_depends_on_a_loose_file(self):
+        """No install. The regression that produced a write to the stage root
+        was `dmap_logical` returning "" -- assert it cannot again."""
+        import mapedit
+        art = mapedit.MapArt.__new__(mapedit.MapArt)
+        art.name = "somemap"
+        self.assertEqual(mapedit.MapArt.dmap_logical.fget(art),
+                         "map/map/somemap.DMap")
+
+
 class MapEditorStagedArt(unittest.TestCase):
     """Staging a texture has to show on the map, or "stage" means nothing."""
 
@@ -6123,7 +11279,709 @@ class EmptyFileDedup(unittest.TestCase):
         self.assertIn(".sentry-native", self.ad.SKIP_DIRS)
 
 
+class ImportPlanIsConsulted(unittest.TestCase):
+    """`import_plan` was defined, tested and consumed by nobody.
+
+    `PluginRegistry::test_every_plugin_declares_the_contract` covers the
+    hook, and correctly -- but it is a *contract* test: it asks whether each
+    plugin implements the method, which stays true whether or not anything
+    calls it. Nothing asked the second question, and the answer was no.
+    `catalog_baseline` named `c3.wdf` and `data.wdf` outright, so a baseline
+    packaged any other way catalogued only its loose layer and then reported
+    every archived asset in the other tree as new. A quietly wrong diff,
+    not an error.
+
+    So these are consumption tests. The distinction is the point: a hook
+    with a contract test and no consumption test looks covered.
+    """
+
+    def setUp(self):
+        import assetdiff
+        self.ad = assetdiff
+
+    def test_the_default_plan_is_the_old_literal_behaviour(self):
+        """The refactor has to be inert for official clients: the shipped
+        default *is* what the two hardcoded names used to say."""
+        sys.path.insert(0, str(PROJECT))
+        import plugins
+        plan = plugins.GENERIC.import_plan(Path("."), lambda rel: False)
+        self.assertEqual(list(plan["archives"]), ["c3.wdf", "data.wdf"])
+        self.assertTrue(plan["loose"])
+
+    def test_a_plan_with_no_archives_reads_no_archive(self):
+        """The test that proves the hook is actually *consulted*.
+
+        A plugin declaring `archives: []` must produce a catalogue with
+        nothing from the archive, even though a readable `c3.wdf` is sitting
+        right there. Asserting the method exists could never have caught the
+        callers ignoring it; this fails outright if they do.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "loose.dds").write_bytes(b"loose bytes")
+            # a real, readable WDF the plan tells us not to open
+            self._tiny_wdf(root / "c3.wdf", b"archived bytes")
+
+            full = self.ad.catalog_baseline(
+                root, {}, plan={"archives": ["c3.wdf"], "loose": True})
+            self.assertIn(self.ad.HASH(b"archived bytes"), full["content"])
+
+            none = self.ad.catalog_baseline(
+                root, {}, plan={"archives": [], "loose": True})
+            self.assertNotIn(self.ad.HASH(b"archived bytes"), none["content"],
+                             "the archive was read despite the plan")
+            self.assertIn(self.ad.HASH(b"loose bytes"), none["content"])
+
+    def test_a_plan_can_declare_no_loose_layer(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "loose.dds").write_bytes(b"loose bytes")
+            cat = self.ad.catalog_baseline(
+                root, {}, plan={"archives": [], "loose": False})
+            self.assertEqual(cat["content"], set())
+
+    def test_plan_skip_adds_to_the_measured_defaults(self):
+        """`SKIP_DIRS` encodes a trap that cost a whole import, so a plugin
+        may extend it and must not be able to replace it."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".sentry-native").mkdir()
+            (root / ".sentry-native" / "a.run.lock").write_bytes(b"")
+            (root / "AutoPatch").mkdir()
+            (root / "AutoPatch" / "p.dds").write_bytes(b"patch")
+            (root / "keep.dds").write_bytes(b"kept")
+            found = {p.name for p in self.ad._walk_loose(root, ["AutoPatch"])}
+            self.assertEqual(found, {"keep.dds"})
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_real_official_root_still_plans_exactly_the_old_literal(self):
+        """Inertness where it counts, checked at the decision point.
+
+        Cataloguing a real client twice to diff the result costs minutes;
+        the thing that could actually change behaviour is the plan, so that
+        is what is pinned. An official install must still resolve to the two
+        archives and a loose overlay -- if it does not, this refactor
+        changed what an import means, which was never the intent.
+        """
+        plan = self.ad.import_plan_for(Path(DEFAULT_ROOT))
+        self.assertEqual(list(plan["archives"]), ["c3.wdf", "data.wdf"])
+        self.assertTrue(plan["loose"])
+
+    def _tiny_wdf(self, path: Path, payload: bytes) -> None:
+        """A one-entry WDF, written to the layout `core/wdf.py` reads."""
+        import struct
+        head = struct.pack("<III", 0x57444650, 1, 16 + len(payload))
+        idx = struct.pack("<IIII", 0xDEADBEEF, 16, len(payload), len(payload))
+        path.write_bytes(head + b"\x00" * 4 + payload + idx)
+
+
+class MapPartsClosure(unittest.TestCase):
+    """A map is a closure, not a file -- so it can be collected like one.
+
+    `Collection` has had a Maps category since the COmmunity Update and
+    nothing could be filed under it, because `add()` is mesh-centric and a
+    map is a DMap plus a painted background plus a *subset* of a shared
+    scenery index plus effects.
+    """
+
+    def setUp(self):
+        import mapparts
+        self.mp = mapparts
+
+    def test_the_manifest_is_read_from_the_root_not_from_ini(self):
+        """Measured: CCO keeps `integrity.json` at the install root. Looking
+        under `ini/` finds nothing, which reads as "no manifest" -- and would
+        silently drop the one warning this module exists to raise."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "ini").mkdir()
+            (root / "integrity.json").write_text(json.dumps(
+                [{"file": "map/map/x.DMap", "hash": "00"}]), encoding="utf-8")
+            self.mp.integrity_manifest.cache_clear()
+            got = self.mp.integrity_manifest(str(root))
+            self.assertIn("map/map/x.dmap", got)
+
+    def test_no_manifest_is_the_normal_answer(self):
+        """Absent from every official patch client (5017-6090), so this must
+        be an empty set rather than an error."""
+        with tempfile.TemporaryDirectory() as d:
+            self.mp.integrity_manifest.cache_clear()
+            self.assertEqual(self.mp.integrity_manifest(d), frozenset())
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_a_map_resolves_to_a_small_subset_of_a_shared_index(self):
+        """The finding that makes collecting a map practical: every COVER
+        layer carries its own key, so the closure is exact. Shipping the
+        whole `.ani` would mean 363-1,508 files instead of tens."""
+        names = self.mp.map_names(DEFAULT_ROOT)
+        if not names:
+            self.skipTest("this install ships no maps")
+        chosen = next((n for n in names
+                       if self.mp.gather_map_parts(n, DEFAULT_ROOT,
+                                                   with_shared=False)), None)
+        parts = self.mp.gather_map_parts(chosen, DEFAULT_ROOT,
+                                         with_shared=False)
+        roles = [p.role for p in parts]
+        self.assertEqual(roles[0], "dmap", "the DMap is the map's identity")
+        self.assertEqual(len([p for p in parts if p.role == "dmap"]), 1)
+        s = self.mp.summarise(parts)
+        self.assertGreater(s["files"], 0)
+        # a real closure is tens of files; the shared index is thousands
+        self.assertLess(s["files"], 500, "this looks like the whole library")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_an_unresolved_key_is_reported_not_dropped(self):
+        """A key its `.ani` cannot resolve is a fact about the install --
+        the same map name resolves differently on different clients. Dropping
+        it silently would make a short closure look complete."""
+        for n in self.mp.map_names(DEFAULT_ROOT)[:12]:
+            for p in self.mp.gather_map_parts(n, DEFAULT_ROOT,
+                                              with_shared=False):
+                if p.missing:
+                    self.assertIn("#", p.rel, "say which key, in which index")
+                    return
+        self.skipTest("every sampled map resolved cleanly on this install")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_shared_art_names_the_maps_that_would_be_affected(self):
+        """`stage` has to warn with facts rather than a general caution: the
+        scenery index is shared by dozens of maps, so overwriting it is a
+        decision about all of them."""
+        names = self.mp.map_names(DEFAULT_ROOT)
+        for n in names[:8]:
+            parts = self.mp.gather_map_parts(n, DEFAULT_ROOT)
+            shared = [p for p in parts if p.shared]
+            if shared:
+                self.assertNotIn(n.lower(),
+                                 [m.lower() for m in shared[0].shared_with],
+                                 "a map is not shared with itself")
+                return
+        self.skipTest("no shared art among the sampled maps")
+
+
+class MapCollectAndStage(unittest.TestCase):
+    """A map goes into the Collection whole, and out of it deliberately.
+
+    The Maps category existed with nothing fileable under it. These cover
+    the two decisions that make it usable: the DMap is the entry's identity,
+    and shared art is staged only where it would actually change something.
+    """
+
+    def setUp(self):
+        import collection
+        import mapparts
+        self.col_mod = collection
+        self.mp = mapparts
+
+    def _entry_with_shared_art(self, d: Path):
+        """A minimal map entry: a DMap plus one shared tile."""
+        col = self.col_mod.Collection(d)
+        e = col.add(
+            category="Maps", name="testmap",
+            mesh_bytes=b"DMAP-bytes", mesh_name="testmap.DMap",
+            source_mesh="map/map/testmap.DMap",
+            swap_for="map/map/testmap.DMap",
+            parts=[("art", "tile.dds", "data/map/mapobj/tile.dds",
+                    b"tile-bytes",
+                    {"shared": True, "sharedWith": ["other1", "other2"]})],
+        )
+        e["integrity"] = True
+        col.save()
+        return col, e
+
+    def test_the_flags_travel_on_the_entry(self):
+        """`core/` is stdlib-only by test, so it cannot re-derive whether a
+        tile is shared. The collector measured it; the entry carries it."""
+        with tempfile.TemporaryDirectory() as d:
+            _col, e = self._entry_with_shared_art(Path(d))
+            art = e["parts"][0]
+            self.assertTrue(art["shared"])
+            self.assertEqual(art["sharedWith"], ["other1", "other2"])
+
+    def test_shared_art_that_is_identical_is_skipped(self):
+        """Re-staging a map over the install it came from must be a no-op
+        for shared art: same bytes, no risk, nothing to write."""
+        with tempfile.TemporaryDirectory() as d:
+            col, e = self._entry_with_shared_art(Path(d))
+            out = col.stage(e["id"], Path(d) / "stage",
+                            read_target=lambda rel: b"tile-bytes")
+            self.assertNotIn("sharedArt", out)
+            self.assertTrue(any("already identical" in s
+                                for s in out["skipped"]), out["skipped"])
+
+    def test_shared_art_that_differs_is_written_and_names_the_maps(self):
+        """The decision the warning exists for: the tile really would change,
+        and it would change other maps. Written, but never silently."""
+        with tempfile.TemporaryDirectory() as d:
+            col, e = self._entry_with_shared_art(Path(d))
+            out = col.stage(e["id"], Path(d) / "stage",
+                            read_target=lambda rel: b"DIFFERENT")
+            self.assertIn("sharedArt", out)
+            warn = out["sharedArt"][0]
+            self.assertEqual(warn["maps"], ["other1", "other2"])
+            self.assertIn("data/map/mapobj/tile.dds", out["wrote"])
+
+    def test_the_dmap_reports_that_it_is_hashed(self):
+        """Maps are the one integrity-checked area, and only on CCO. Saying
+        so at stage time is the difference between a decision and a surprise
+        at install time."""
+        with tempfile.TemporaryDirectory() as d:
+            col, e = self._entry_with_shared_art(Path(d))
+            out = col.stage(e["id"], Path(d) / "stage",
+                            read_target=lambda rel: b"tile-bytes")
+            self.assertIn("integrity", out)
+            self.assertIn("map/map/testmap.DMap",
+                          [r["path"] for r in out["integrity"]])
+
+    def test_map_parts_stage_to_their_own_logical_path(self):
+        """A tile is reachable because the `.ani` names that path. Staged
+        under the target's directory instead, the reference breaks."""
+        with tempfile.TemporaryDirectory() as d:
+            col, e = self._entry_with_shared_art(Path(d))
+            stage = Path(d) / "stage"
+            col.stage(e["id"], stage, read_target=lambda rel: b"DIFFERENT")
+            self.assertTrue((stage / "data/map/mapobj/tile.dds").is_file())
+            self.assertTrue((stage / "map/map/testmap.DMap").is_file())
+
+    def test_the_shared_policy_offers_all_three_answers(self):
+        """The UI offers three, so all three must mean something here.
+        `never` is the one worth pinning: it is how you collect a map
+        without taking a position on every other map that shares its art."""
+        with tempfile.TemporaryDirectory() as d:
+            col, e = self._entry_with_shared_art(Path(d))
+            differs = (lambda rel: b"DIFFERENT")
+
+            never = col.stage(e["id"], Path(d) / "s1", read_target=differs,
+                              shared_policy="never")
+            self.assertNotIn("data/map/mapobj/tile.dds", never["wrote"])
+            self.assertNotIn("sharedArt", never)
+
+            always = col.stage(e["id"], Path(d) / "s2",
+                               read_target=lambda rel: b"tile-bytes",
+                               shared_policy="always")
+            self.assertIn("data/map/mapobj/tile.dds", always["wrote"],
+                          "'always' must write even when identical")
+
+            default = col.stage(e["id"], Path(d) / "s3",
+                                read_target=lambda rel: b"tile-bytes")
+            self.assertNotIn("data/map/mapobj/tile.dds", default["wrote"])
+
+    def test_keep_only_records_what_you_chose_to_leave(self):
+        """A gap you asked for and a gap you did not are different facts, so
+        `omitted` is not folded into `unresolved`/`unread`."""
+        with tempfile.TemporaryDirectory() as d:
+            col = self.col_mod.Collection(Path(d))
+            root = Path(d) / "fake"
+            (root / "map" / "map").mkdir(parents=True)
+            self.assertTrue(hasattr(self.mp, "collect_map"))
+            # exercised through the real path in the archive test below;
+            # here only the signature contract that the UI depends on
+            import inspect
+            sig = inspect.signature(self.mp.collect_map)
+            self.assertIn("keep_only", sig.parameters)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    @requires_base("patch5017", "patch5065", "patch5165", "patch5517",
+                   "patch6090",
+                   why="CCO names its scene index ani/MapScene.json, not "
+                       "ani/MapScene.ani, so no map on it resolves any art. "
+                       "RE-MEASURED on all six declared installs 2026-08-09: "
+                       "ani/MapScene.ani present on 5017/5065/5165/5517/6090 "
+                       "and absent on CCO; ani/MapScene.json present on CCO "
+                       "alone. The gate names all five official clients and is "
+                       "CORRECT as it stands -- CORRECTIONS "
+                       "C-2026-08-09-comod-base-gate-audit")
+    def test_collecting_a_real_map_reads_through_the_archive(self):
+        """The trap this path nearly shipped with: the art is in the WDF, so
+        a collector that stats the filesystem produces a plausible
+        three-file map with no scenery at all.
+
+        Gated because the fixture is an ``.ani``-indexed map, which is an
+        official-lineage shape rather than a universal one. Measured on all
+        six declared bases (2026-08-09): the five patch clients collect the
+        first qualifying map whole -- 5017/5065 `Dsigil` 11/11, 5165 `2009-7x`
+        34/34, 5517/6090 `09Christmas02` 56/56, zero unread -- while CCO
+        collects **0 of 35** and reports `ani/MapScene.ani` and
+        `ani/MapScene-snow.ani` unread. CCO ships those indexes as `.json`
+        (`ani/MapScene.json` is on disk), `_closure` asks for the `.ani`
+        spelling, and so every key resolves to nothing.
+
+        Note what that leaves standing: on CCO the loop's own precondition is
+        satisfied by *unresolved* keys, because it counts `role == "art"`
+        without checking `missing`. Counting only resolved art, **no** CCO map
+        clears 10, so the honest verdict there is "this install has no map to
+        try", not a dropped scenery layer. The gate says which clients the
+        fixture describes; it does not claim CCO's map art is collectable."""
+        names = self.mp.map_names(DEFAULT_ROOT)
+        resolved_any = False
+        with tempfile.TemporaryDirectory() as d:
+            col = self.col_mod.Collection(Path(d))
+            for n in names:
+                parts = self.mp.gather_map_parts(n, DEFAULT_ROOT,
+                                                 with_shared=False)
+                # `not p.missing` is the whole precondition. An unresolved
+                # key is emitted as a role="art" part too, so counting the
+                # role alone counts art that resolves to no file -- which is
+                # not "a map that carries enough art", it is the opposite.
+                # On CCO that picked `2009-7x` on 35 art parts of which all
+                # 35 were missing, and then asserted against the 0 that
+                # `collect_map` correctly collected: the test failed for
+                # having chosen a map that could not answer it, in place of
+                # the honest skip below. See C-2026-08-09-ani-json-spelling.
+                resolved = sum(1 for p in parts
+                               if p.role == "art" and not p.missing)
+                resolved_any = resolved_any or resolved > 0
+                if resolved < 10:
+                    continue
+                e = self.mp.collect_map(col, n, DEFAULT_ROOT,
+                                        with_shared=False)
+                got = sum(1 for q in e["parts"] if q["role"] == "art")
+                self.assertGreater(got, 9, "the scenery layer was dropped")
+                self.assertEqual(e.get("unread", []), [],
+                                 "some art could not be read at all")
+                return
+        # ABSENT is not UNMET, and the skip below cannot tell them apart on
+        # its own. "No map carries enough art" is a claim about this install's
+        # CONTENT; zero maps resolving *any* art is a claim about the READER
+        # -- it is what C-2026-08-09-ani-json-spelling looked like from here, and the old precondition
+        # let it exit as a content verdict. So the two are separated, and the
+        # reader case is red rather than a skip: an install that ships maps
+        # and resolves no art for a single one of them is broken, not quiet.
+        if names and not resolved_any:
+            self.fail(f"{len(names)} maps on this install and not one resolved "
+                      f"a single art file -- the scene index was not found at "
+                      f"all, which is a reader or install problem rather than "
+                      f"a content one (C-2026-08-09-ani-json-spelling was exactly this)")
+        self.skipTest("no map on this install carries enough art")
+
+
+class AniIndexSpelling(unittest.TestCase):
+    r"""A DMap names ``ani/MapScene.ani`` on every client. CCO ships that
+    index as ``ani/MapScene.json`` and no ``.ani`` at all.
+
+    `dmap.read_ani` settled how to *parse* the two forms and its docstring
+    records that the split "has now been missed three times in three
+    readers". Choosing *which file to open* was left to each reader, and so
+    it was missed a fourth time: `puzzle.PuzzleLibrary` and `mapindex` each
+    hand-rolled it, `mapparts` did not, and on CCO every map therefore
+    collected with **no scenery** -- 35 art keys unresolved on ``2009-7x``,
+    `collect_map` correctly collecting 0, and nothing anywhere reporting an
+    error. That is the exact failure `tools/mapparts.py`'s own docstring
+    exists to prevent, arriving by the other door. See C-2026-08-09-ani-json-spelling.
+
+    MEASURED over ``ani/`` on all six declared installs (2026-08-09): CCO 60
+    ``.json`` / 0 ``.ani``; 5017 and 5065 0/51; 5165 0/52; 5517 0/54; 6090
+    0/56. The split is clean, so preferring the JSON cannot shadow an
+    official index.
+    """
+
+    def setUp(self):
+        import dmap
+        self.dmap = dmap
+
+    def _root(self, d: Path, **files: str) -> Path:
+        (d / "ani").mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (d / "ani" / name.replace("__", ".")).write_text(text, "utf-8")
+        return d
+
+    def test_the_json_spelling_answers_for_the_ani_the_dmap_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self._root(Path(d), MapScene__json=json.dumps(
+                {"forest09.tga": ["data/map/MapObj/f/forest09.dds"]}))
+            rel, table = self.dmap.load_ani(r, "ani/MapScene.ani")
+            self.assertEqual(rel, "ani/MapScene.json")
+            self.assertEqual(table["forest09.tga"],
+                             ["data/map/mapobj/f/forest09.dds"])
+
+    def test_the_ani_spelling_still_answers_where_it_is_what_ships(self):
+        """The reverse trap, and the one that would break every official
+        client: reading only the JSON gave them an empty tile index, so a map
+        resolved its `.pul` and then reported zero tiles with no error."""
+        with tempfile.TemporaryDirectory() as d:
+            r = self._root(Path(d), MapScene__ani=(
+                "[forest09.tga]\nFrameAmount=1\n"
+                "Frame0=data\\map\\MapObj\\f\\forest09.dds\n"))
+            rel, table = self.dmap.load_ani(r, "ani/MapScene.ani")
+            self.assertEqual(rel, "ani/MapScene.ani")
+            self.assertEqual(table["forest09.tga"],
+                             ["data/map/mapobj/f/forest09.dds"])
+
+    def test_the_two_sources_are_indistinguishable_to_a_caller(self):
+        """`read_ani`'s contract -- "the same fact written twice" -- has to
+        survive the resolution step, or a collected map's logical paths
+        compare unequal across the split for no reason but their spelling."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self._root(Path(d) / "a", MapScene__ani=(
+                "[forest09.tga]\nFrame0=data\\map\\MapObj\\f\\forest09.dds\n"))
+            b = self._root(Path(d) / "b", MapScene__json=json.dumps(
+                {"forest09.tga": ["data/map/MapObj/f/forest09.dds"]}))
+            self.assertEqual(self.dmap.load_ani(a, "ani/MapScene.ani")[1],
+                             self.dmap.load_ani(b, "ani/MapScene.ani")[1])
+
+    def test_an_empty_json_falls_through_instead_of_answering_no_tiles(self):
+        """The one place the two hand-rolled copies disagreed: `puzzle` fell
+        through to the `.ani`, `mapindex` did not. No install ships both
+        spellings so neither was ever wrong in the field -- but two copies
+        drifting on an edge nobody chose is the argument for one owner, and
+        the decision is pinned here rather than left to whichever copy a
+        caller happened to reach for."""
+        with tempfile.TemporaryDirectory() as d:
+            r = self._root(Path(d), MapScene__json="{}", MapScene__ani=(
+                "[forest09.tga]\nFrame0=data/map/mapobj/f/forest09.dds\n"))
+            rel, table = self.dmap.load_ani(r, "ani/MapScene.ani")
+            self.assertEqual(rel, "ani/MapScene.ani")
+            self.assertIn("forest09.tga", table)
+
+    def test_neither_spelling_present_is_reported_and_not_invented(self):
+        """An index that is simply absent has to stay visible: `mapparts`
+        keeps the declared path so the part lands in `unread` rather than
+        being silently renamed to a file that does not exist either."""
+        with tempfile.TemporaryDirectory() as d:
+            rel, table = self.dmap.load_ani(self._root(Path(d)),
+                                            "ani/MapScene.ani")
+            self.assertEqual((rel, table), ("", {}))
+
+    @staticmethod
+    def _gamemap_dat(rows) -> bytes:
+        """The binary registry, written by hand -- u32 count, then per row
+        u32 DocumentId, u32 len, path bytes, u32 PuzzleGridSize."""
+        out = struct.pack("<I", len(rows))
+        for doc, name, grid in rows:
+            raw = name.encode("latin-1")
+            out += struct.pack("<I", doc) + struct.pack("<I", len(raw)) \
+                + raw + struct.pack("<I", grid)
+        return out
+
+    def _ini(self, d: Path, **files) -> Path:
+        (d / "ini").mkdir(parents=True, exist_ok=True)
+        for name, blob in files.items():
+            p = d / "ini" / name.replace("__", ".")
+            p.write_bytes(blob if isinstance(blob, bytes)
+                          else blob.encode("utf-8"))
+        return d
+
+    def test_the_registry_json_spelling_answers(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self._ini(Path(d), GameMap__json=json.dumps(
+                [{"DocumentId": 1002, "FileName": "map/map/desert.DMap",
+                  "PuzzleGridSize": 256}]))
+            rel, rows = self.dmap.load_gamemap(r)
+            self.assertEqual(rel, "ini/GameMap.json")
+            self.assertEqual(rows[0]["DocumentId"], 1002)
+
+    def test_the_registry_dat_spelling_answers_and_may_name_a_7z(self):
+        """5517 and 6090 spell the same map `desert.7z` where the `.json` and
+        the three earlier patches spell it `desert.DMap`. Callers join on the
+        stem for exactly this reason."""
+        with tempfile.TemporaryDirectory() as d:
+            r = self._ini(Path(d), GameMap__dat=self._gamemap_dat(
+                [(1002, "map/map/desert.7z", 256)]))
+            rel, rows = self.dmap.load_gamemap(r)
+            self.assertEqual(rel, "ini/GameMap.dat")
+            self.assertEqual(rows[0]["DocumentId"], 1002)
+            self.assertEqual(
+                Path(rows[0]["FileName"].replace("\\", "/")).stem, "desert")
+
+    def test_the_two_registry_spellings_agree_row_for_row(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._ini(Path(d) / "a", GameMap__dat=self._gamemap_dat(
+                [(1002, "map/map/desert.DMap", 256)]))
+            b = self._ini(Path(d) / "b", GameMap__json=json.dumps(
+                [{"DocumentId": 1002, "FileName": "map/map/desert.DMap",
+                  "PuzzleGridSize": 256}]))
+            self.assertEqual(self.dmap.load_gamemap(a)[1],
+                             self.dmap.load_gamemap(b)[1])
+
+    def test_neither_registry_spelling_present_is_empty_not_invented(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.dmap.load_gamemap(self._ini(Path(d))),
+                             ("", []))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_map_registry_answers_on_whatever_base_is_configured(self):
+        """`dmap.load_gamemap`, the same split one file over, ungated.
+
+        `mapindex` and `puzzle` each hand-rolled this choice and `mapedit` had
+        none, so on every official client its picker showed `documentId` and
+        `gridSize` as `None` on every row -- and still listed the maps, because
+        the `.DMap` scan fills the list. **A partial failure that leaves the
+        list intact is why this one outlived the two that were fixed.**
+
+        MEASURED 2026-08-09: 156 rows on CCO via `GameMap.json`; 145/153/179/
+        262/303 on 5017/5065/5165/5517/6090 via `GameMap.dat`, where all five
+        read 0 before.
+        """
+        rel, rows = self.dmap.load_gamemap(DEFAULT_ROOT)
+        self.assertIn(rel, ("ini/GameMap.json", "ini/GameMap.dat"))
+        self.assertGreaterEqual(len(rows), 100)
+        self.assertTrue(all(r.get("FileName") for r in rows))
+        # the stem is the join key on both sides; the extension is NOT
+        # (`desert.DMap` on the .json and three patches, `desert.7z` on 5517
+        # and 6090), so a whole-name match silently finds nothing
+        self.assertTrue(any(Path(str(r["FileName"]).replace("\\", "/")).stem
+                            for r in rows))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_editor_picker_carries_the_registry_ids(self):
+        """The consumer, not just the reader -- `documentId` being `None` on
+        every row is what the defect actually looked like."""
+        import mapedit
+        ed = mapedit.MapEditor(DEFAULT_ROOT)
+        rows = ed.rows()
+        self.assertIn(ed.registry_rel,
+                      ("ini/GameMap.json", "ini/GameMap.dat"))
+        with_id = [r for r in rows if r.get("documentId") is not None]
+        self.assertGreaterEqual(len(with_id), 100)
+        self.assertTrue(all(r.get("gridSize") in (128, 256) for r in with_id),
+                        "PuzzleGridSize is 128 or 256 on every shipped row")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    @requires_base("cco", why="the .json index spelling is CCO's; the "
+                             "official clients ship only .ani")
+    def test_a_cco_map_resolves_its_scenery(self):
+        """The regression itself, on the install that had it. MEASURED:
+        ``2009-7x`` resolves 35 art files through ``ani/MapScene.json`` +
+        ``ani/MapScene-snow.json``, none missing, where before the fix all 35
+        were unresolved and none was collectable."""
+        import mapparts
+        parts = mapparts.gather_map_parts("2009-7x", DEFAULT_ROOT,
+                                          with_shared=False)
+        art = [p for p in parts if p.role == "art"]
+        self.assertEqual([p.rel for p in parts if p.role == "ani"],
+                         ["ani/MapScene.json", "ani/MapScene-snow.json"],
+                         "the ani part must name the file this install has")
+        self.assertEqual([p.rel for p in art if p.missing], [])
+        self.assertEqual(len(art), 35)
+
+
 @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+@requires_index("out/meshtex/mesh_index.json",
+                "this class is about whether a cached census is accepted, so "
+                "there has to be one to accept")
+class MeshUniverseIsPerBase(unittest.TestCase):
+    """A per-base census must be measured against a per-base universe.
+
+    `_build_universe` folds the **global** recovered-name tables into the
+    universe -- one pool of names gathered from every install anyone has
+    unpacked. 210 `.c3` names in that pool resolve on no install at all
+    (all of them `c3/monster/`, 23 body-type ids, none of which appear in
+    the client's own `Monster.dat`). `_scan_one` returns None on anything
+    unreadable, so they never entered the cached index, and `_cache_covers`
+    counted them missing on every read -- forever. The cache each run wrote
+    was rejected by the next one, and that was the entire 292 s / 29 s
+    split. See `docs/CORRECTIONS.md` `C-2026-08-10-quickfix-gap210`.
+
+    The fix filters a miss through `_in_this_install` -- one TQ hash into
+    *this* install's archive index -- so a pooled name the archives cannot
+    resolve is out of scope, while a genuinely absent local mesh still
+    counts. Two of the five tests below are controls: one proves a real
+    local miss is still caught, one proves the unfiltered comparison would
+    have rejected this very cache. Without them a filter that swallowed
+    everything would read exactly like a filter that works.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import meshtex
+        import provenance
+        # Scope guard, keyed on the artefact the premise is stated in terms of.
+        # The 210 out-of-scope names are `c3/monster/` body-type ids absent from
+        # *the client's own `Monster.dat`* -- so an install that ships no
+        # `Monster.dat` is not one this class can say anything about.  Until a
+        # mesh cache existed for such an install the class skipped by accident,
+        # via `find_derived` raising; that was never a guard, and when the cache
+        # appeared the class ran on CCO and its control failed correctly with
+        # "0 raw misses".  Note the guard is keyed on the FILE, not on
+        # `len(raw) == 0`: skipping whenever the control would fail is how a
+        # control stops being one.
+        monster_dat = Path(ROOT) / "ini" / "Monster.dat"
+        if not monster_dat.is_file():
+            raise unittest.SkipTest(
+                f"{ROOT} ships no ini/Monster.dat (base {coroot.base_id()}); "
+                "the pooled-name gap this class measures is defined against "
+                "that file, so there is nothing here to accept or reject")
+        cls.meshtex = meshtex
+        cls.ix = meshtex.MeshTextureIndex(ROOT)
+        cached = coroot.find_derived("out/meshtex/mesh_index.json", cls.ix.root)
+        doc = json.loads(cached.read_text("utf-8"))
+        cls.idx = provenance.unwrap(doc)[1]
+        cls.raw = [p for p in cls.ix.c3_files if p not in cls.idx]
+        cls.tol = max(8, len(cls.ix.c3_files) // 200)
+
+    def test_the_cached_census_is_accepted(self):
+        """The wrongness test. Red before the fix on all three bases."""
+        self.assertTrue(
+            self.ix._cache_covers(self.idx),
+            f"the cached mesh index is being rejected: {len(self.raw)} of "
+            f"{len(self.ix.c3_files)} .c3 files are missing from it against a "
+            f"tolerance of {self.tol}. If these are pooled names the archives "
+            "do not resolve, the filter is not doing its job; if they are "
+            "real, the cache is genuinely stale.")
+
+    def test_every_dropped_miss_is_unresolvable_on_this_install(self):
+        """The filter may only drop what this install cannot open.
+
+        Guards the direction that matters: a filter is allowed to shrink the
+        miss list only by way of `_in_this_install` saying no.
+        """
+        dropped = [p for p in self.raw if p in self.ix._global_only
+                   and not self.ix._in_this_install(p)]
+        still = [p for p in self.raw if p not in set(dropped)]
+        for p in dropped:
+            self.assertIn(p, self.ix._global_only, f"{p} is not a pooled name")
+            self.assertFalse(self.ix._in_this_install(p),
+                             f"{p} resolves here and must not be dropped")
+        self.assertLessEqual(
+            len(still), self.tol,
+            f"{len(still)} misses survive the filter: {sorted(still)[:10]}")
+
+    def test_a_loose_file_is_never_dropped(self):
+        """A path with a real file behind it is not a pooled name.
+
+        The 210 leave scope because nothing backs them. Anything the tree
+        actually contains must stay in scope no matter what the pool says.
+        """
+        loose = [p for p in self.ix.c3_files if (self.ix.root / p).exists()]
+        self.assertTrue(loose, "no loose .c3 in this tree -- test is vacuous")
+        for p in loose:
+            self.assertNotIn(
+                p, self.ix._global_only,
+                f"{p} exists on disk but was marked pooled-only")
+
+    def test_a_real_local_miss_still_fails_the_check(self):
+        """CONTROL. A filter that drops everything would pass the rest."""
+        real = sorted(p for p in self.ix.c3_files
+                      if p in self.idx and p not in self.ix._global_only)
+        self.assertGreater(len(real), self.tol,
+                           "not enough resolvable meshes to build the control")
+        holed = {k: v for k, v in self.idx.items()
+                 if k not in set(real[:self.tol + 1])}
+        self.assertFalse(
+            self.ix._cache_covers(holed),
+            f"removed {self.tol + 1} meshes this install can open (tolerance "
+            f"{self.tol}) and the cache was still accepted -- the filter is "
+            "swallowing real misses")
+
+    def test_the_unfiltered_comparison_would_have_rejected_this_cache(self):
+        """CONTROL, and the regression witness.
+
+        If this ever goes green the 210 are gone from the pool and the fix
+        above is no longer load-bearing -- which is a finding, not a pass.
+        """
+        self.assertGreater(
+            len(self.raw), self.tol,
+            f"only {len(self.raw)} raw misses against a tolerance of "
+            f"{self.tol}: the unfiltered comparison would now accept this "
+            "cache on its own, so the pooled-name gap has closed since "
+            "2026-08-10. Re-measure before trusting this class.")
+
+
+@requires_index("out/meshtex/mesh_index.json",
+                "every test here goes through MeshTextureIndex.best(), and "
+                "with no cached index that falls through to a full "
+                "scan_meshes() -- the ~2-minute rebuild that made this class "
+                "the visible half of the 292 s / 29 s split")
 class MeshTexConfidence(unittest.TestCase):
     """A rule that names three textures has not identified one.
 
@@ -6136,6 +11994,13 @@ class MeshTexConfidence(unittest.TestCase):
 
     The scoring is what is under test, not the pick: a shared asset has no
     single texture, and the tool has to say so.
+
+    Gated on the *artefact* rather than the base (`requires_index`): every
+    assertion reads `out/meshtex/mesh_index.json` through
+    `_load_mesh_index()`, which on a miss rescans the whole corpus **without
+    the recovered name tables** -- so the numbers under test are computed from
+    a universe of loose files only, and the reds that follow are about the
+    working tree, not about the scoring.
     """
 
     @classmethod
@@ -6300,6 +12165,178 @@ class NpcArtTables(unittest.TestCase):
                          "the old answer, kept as the fallback it always was")
 
 
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+class NpcIniCaseAndDuplicates(unittest.TestCase):
+    r"""The reader must load what the client loads: both spellings, last wins.
+
+    **TWO CHECKS, AND THE DISTINCTION IS THE POINT.**
+
+    * `test_the_named_types_are_present` asserts **twelve specific ids** that
+      were established *before the fix existed* — measured on 5517 while the
+      reader was still dropping them. **This catches WRONGNESS.**
+    * `test_the_reader_and_the_table_agree_on_the_count` compares the reader
+      against the file. **This catches STALENESS**, and nothing else.
+
+    **A count agreeing is consistent with both sides being wrong together. A
+    named set appearing is not.** The count check alone would be provenance
+    wearing intent's clothes — the `cmp -s <source> <destination>` shape, a
+    comparison with no available counterexample. The twelve ids are the
+    counterexample, and they exist only because someone wrote them down before
+    there was a fix to confirm.
+
+    The client never compares the section prefix — `atoi(sec + strlen(
+    "NpcType"))`, disassembled at five addresses — and resolves duplicate ids
+    **last wins** via `std::map::operator[]` plus an unconditional copy-assign.
+    """
+
+    #: Dropped on 5517 by the case-sensitive predicate, listed 2026-08-10 BEFORE
+    #: the fix. All twelve resolve to real geometry AND texture.
+    DROPPED_ON_5517 = (505, 506, 507, 528, 529, 923, 925, 926, 927, 928, 929, 930)
+
+    @classmethod
+    def setUpClass(cls):
+        import npcart
+        from coassets import AssetRoot
+        cls.npcart = npcart
+        cls.tables = npcart.Tables(AssetRoot(ROOT).read)
+        cls.by_type = {r["type"]: r for r in cls.tables.npcs}
+
+    def test_the_named_types_are_present(self):
+        """WRONGNESS. Twelve ids named before the fix; a count cannot do this."""
+        if not (ROOT / "ini" / "npc.ini").is_file():
+            self.skipTest("this install reads npc.json, not npc.ini -- the "
+                          "case defect cannot arise here (cco)")
+        base = coroot.base_id(ROOT)
+        if not base.startswith("patch5517"):
+            self.skipTest(f"the twelve ids were measured on 5517; this base is "
+                          f"{base}, whose dropped set is its own and unlisted")
+        missing = [t for t in self.DROPPED_ON_5517 if t not in self.by_type]
+        self.assertEqual(missing, [], f"npc types {missing} are absent. These "
+                         f"were dropped by a case-sensitive prefix match that "
+                         f"the client does not perform; the game loads them.")
+
+    def test_no_type_id_appears_twice(self):
+        """The client keeps one row per id. So must we, or a consumer picks."""
+        types = [r["type"] for r in self.tables.npcs]
+        dupes = [t for t in set(types) if types.count(t) > 1]
+        self.assertEqual(dupes, [], f"type ids {dupes[:8]} appear more than "
+                         f"once. The client resolves these last-wins; a list "
+                         f"with both leaves the choice to whichever consumer "
+                         f"happens to build a dict.")
+
+    def test_the_reader_and_the_file_agree_on_the_count(self):
+        """The reader against its own source. Catches a reader bug."""
+        if not (ROOT / "ini" / "npc.ini").is_file():
+            self.skipTest("no npc.ini on this base")
+        text = (ROOT / "ini" / "npc.ini").read_text("latin-1", errors="replace")
+        import re
+        ids = {m[7:] for m in re.findall(r"\[([^\]\r\n]+)\]", text)
+               if m[:7].casefold() == "npctype"}
+        self.assertEqual(len(self.tables.npcs), len(ids),
+                         "the reader and the file disagree on how many "
+                         "distinct npc types this install declares")
+
+    def test_a_case_sensitive_reader_would_fail_this(self):
+        """The control. Without it, the two above pass on a reader that is
+        merely *consistent* with itself rather than right."""
+        text = "[NpcType1]\nName=Upper\n[Npctype2]\nName=Lower\n"
+        rows = self.npcart.Tables._npc_ini_rows(text)
+        self.assertEqual({r["type"] for r in rows}, {1, 2},
+                         "a lowercase section was dropped")
+
+    def test_last_wins_rather_than_first(self):
+        """The other control: a reader could dedupe FIRST-wins and satisfy
+        every count above while disagreeing with the client on every clash."""
+        text = "[NpcType7]\nName=First\n[NpcType7]\nName=Second\n"
+        rows = self.npcart.Tables._npc_ini_rows(text)
+        self.assertEqual([r["name"] for r in rows], ["Second"],
+                         "the client's policy is last-wins")
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+@requires_index("out/artcrawl/report.json",
+                "the npc census this compares the reader against")
+class NpcIndexIsNotStale(unittest.TestCase):
+    r"""STALENESS, and it is a different question from the class above.
+
+    That one asks *is the reader right*. This asks *does the artefact on disk
+    still agree with it* — and the two cannot substitute for each other:
+
+    > **A count agreeing is consistent with both sides being wrong together.
+    > A named set appearing is not.**
+
+    So this is the weaker check and it is here for the one thing the named-ids
+    test cannot do: notice that a **derived index predates a reader change**.
+    On 2026-08-10 the `npc.ini` predicate was fixed and `report.json` went on
+    saying `byKind.npc: 1123` while the reader produced `1108` — the index was
+    built by the lossy reader and nothing compared them. **A count inside a
+    generated file is the same hazard as a count in prose, minus the human who
+    might doubt it.**
+
+    Gated on the artefact, not the base: an absent index is a fact about this
+    *working tree*, and saying "regenerate" to someone whose install simply
+    ships no such file is the confidently-wrong diagnosis `requires_index`
+    exists to abolish.
+    """
+
+    def test_the_index_npc_count_matches_the_reader(self):
+        import json, npcart
+        from coassets import AssetRoot
+        p = coroot.find_derived("out/artcrawl/report.json")
+        raw = json.loads(Path(p).read_text(encoding="utf-8"))
+        rep = raw.get("data", raw)
+        on_disk = (rep.get("byKind") or {}).get("npc")
+        if on_disk is None:
+            self.skipTest("this report carries no byKind.npc to compare")
+        live = len(npcart.Tables(AssetRoot(ROOT).read).npcs)
+        self.assertEqual(on_disk, live,
+                         f"the derived index says {on_disk} npcs and the "
+                         f"reader produces {live}. The index was generated by "
+                         f"an older reader -- regenerate it for this base and "
+                         f"say which bases you regenerated. This is staleness, "
+                         f"not a content defect.")
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+class SimpleObjectTableAcrossTheLineage(unittest.TestCase):
+    """The simple-object table, in whichever form this client ships.
+
+    `OfficialDbcTables` below is gated on `3DSimpleObj.dbc`, so it skips
+    entirely on the four installs that ship none — 5017, 5065, 5165 and CCO.
+    Those are not untestable: **every** client ships `ini/3DSimpleObj.ini`,
+    the plaintext original, and `npcart.detect_profile` already picks
+    whichever form is live. This is the assertion that spans the lineage,
+    and it is what stops those four having no coverage here at all.
+
+    Measured on all six installs — the Storekeeper resolves identically in
+    every one, read from the `.ini` on four and the `.dbc` on two:
+
+        5017 155 · 5065 156 · 5165 191 · CCO 137     from .ini
+        5517 235 · 6090 388                          from .dbc
+
+    **The `.ini` cannot stand in for the `.dbc` where both exist**, which is
+    why this asserts the entry and never a count. The plaintext file is
+    frozen at 5165's content — 191 sections, 12,834 bytes, byte-identical in
+    5165, 5517 and 6090 — while the compiled table grows to 235 and 388.
+    Crawling the plaintext on an official client would silently drop 44 rows
+    at 5517 and 197 at 6090. `core/dbc.py` calls it the stale 2009 Rosetta
+    for exactly that reason: good for decoding the binary, wrong as a source.
+    """
+
+    def test_the_storekeeper_resolves_from_whichever_table_ships(self):
+        """The one entry verified in the running game, asserted on any
+        client rather than only on the two with a compiled table."""
+        import npcart
+        from coassets import AssetRoot
+        with AssetRoot(ROOT) as assets:
+            tables = npcart.Tables(assets.read)
+        self.assertTrue(tables.simple,
+                        "some simple-object table has to load on any client")
+        self.assertEqual(tables.simple.get(211),
+                         {"parts": 1, "part": 9990010,
+                          "texture": 9990211, "extra": []})
+
+
 @unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "3DSimpleObj.dbc").is_file(),
                      "needs an official client with compiled .dbc tables")
 class OfficialDbcTables(unittest.TestCase):
@@ -6325,14 +12362,106 @@ class OfficialDbcTables(unittest.TestCase):
     def test_the_install_detects_as_official(self):
         self.assertEqual(self.tables.profile.name, "official")
 
+    def test_every_shipped_mesh_table_walks_to_exactly_eof(self):
+        """All five part tables, `mount.dbc` included -- and it is the only
+        one that proves anything.
+
+        armor, armet, weapon and misc are single-part throughout, so they
+        tile under a fixed 24-byte model *and* walk correctly under the real
+        variable-length one; they cannot discriminate. `mount.dbc` carries
+        **1,004 multi-part records** and is the only shipped file that can
+        fail. Asserting the set rather than a count, because the point is
+        that no table is quietly skipped.
+        """
+        ini = ROOT / "ini"
+        found = {p.name for p in ini.glob("*.dbc")
+                 if p.read_bytes()[:4] == b"MESH"}
+        self.assertTrue(found, "this install ships no MESH .dbc")
+        multi_seen = 0
+        for name in sorted(found):
+            with self.subTest(table=name):
+                # read_mesh raises unless the walk lands exactly on EOF.
+                table = self.dbc.read_mesh((ini / name).read_bytes())
+                self.assertTrue(table)
+                multi_seen += sum(1 for v in table.values() if len(v) > 1)
+        if "mount.dbc" in found:
+            self.assertGreater(
+                multi_seen, 0,
+                "mount.dbc is shipped and no multi-part record was seen -- "
+                "the reader is back on a fixed stride, under which such a "
+                "record cannot exist")
+
+    def test_the_compiled_part_table_supersedes_its_plaintext_ini(self):
+        """The `.ini` is a strict, stale SUBSET -- not a disagreeing twin.
+
+        This is what makes reaching for `armor.ini` quietly wrong rather than
+        loudly wrong: every id it carries is in the `.dbc`, the Mesh0 values
+        agree, and it is simply missing thousands of rows. It parses fine and
+        looks complete. Zero ids exclusive to the plaintext is the assertion;
+        the row counts are patch-era content and are not pinned.
+        """
+        ini = ROOT / "ini"
+        pairs = [(n, ini / f"{n}.dbc", ini / f"{n}.ini")
+                 for n in ("armor", "armet", "weapon")]
+        checked = 0
+        for name, dbc_path, ini_path in pairs:
+            if not (dbc_path.is_file() and ini_path.is_file()):
+                continue
+            with self.subTest(table=name):
+                compiled = self.dbc.read_mesh(dbc_path.read_bytes())
+                plain = set()
+                for line in ini_path.read_text(
+                        encoding="latin-1").splitlines():
+                    line = line.strip()
+                    if line.startswith("[") and line.endswith("]") \
+                            and line[1:-1].isdigit():
+                        plain.add(int(line[1:-1]))
+                self.assertTrue(plain, f"{name}.ini parsed to no sections")
+                self.assertFalse(
+                    plain - set(compiled),
+                    f"{name}.ini carries {len(plain - set(compiled))} ids the "
+                    f"compiled table does not -- it is then not a subset and "
+                    f"'the .dbc supersedes it' is the wrong description")
+                self.assertLess(len(plain), len(compiled),
+                                f"{name}.ini is not shorter than its twin")
+                checked += 1
+        if not checked:
+            raise unittest.SkipTest(
+                "this install ships no armor/armet/weapon .dbc+.ini pair")
+
     def test_simo_walks_to_exactly_eof(self):
         """Variable-length records leave no slack: a walk that does not end
         on EOF misread a record shape, and `read_simo` raises rather than
-        tolerating it. Parsing at all is the assertion."""
+        tolerating it. Parsing at all is the assertion.
+
+        **No population count here, deliberately.** This used to assert
+        `len(simo) > 300`, which is 6090's size and fails on 5517 with 235 —
+        so the test went red on a client it parses perfectly, and it was the
+        one failure `docs/suite_triage.md` §1's CCO method could not
+        classify, because CCO ships no `.dbc` to compare against. The count
+        moved to `test_simo_record_count_is_the_6090_table`. What is left is
+        true of any official client, so 5517 keeps the coverage instead of
+        losing it to a threshold about somewhere else.
+        """
         simo = self.dbc.read_simo(self.assets.read("ini/3DSimpleObj.dbc"))
-        self.assertGreater(len(simo), 300)
-        # the Storekeeper's entry, the one case verified in the running game
+        self.assertTrue(simo, "a walk that reaches EOF still has to find rows")
+        # The Storekeeper's entry, the one case verified in the running game.
+        # Byte-identical on 5517 and 6090 -- measured -- so it is a lineage
+        # fact rather than a pin, and it stays ungated.
         self.assertEqual(simo[211], [(9990010, 9990211)])
+
+    @requires_base("patch6090", why="6090's table size; 5517 compiles 235 of "
+                                    "the same records and CCO ships no .dbc"
+                                    + _DBC_CENSUS)
+    def test_simo_record_count_is_the_6090_table(self):
+        """How many simple objects 6090 compiles, as a measurement.
+
+        Measured rather than bounded: **6090 has 388 and 5517 has 235**, both
+        walking to exactly EOF. A `> 300` floor was true of neither client in
+        particular -- it only recorded which one the author had configured.
+        """
+        simo = self.dbc.read_simo(self.assets.read("ini/3DSimpleObj.dbc"))
+        self.assertEqual(len(simo), 388)
 
     def test_motion_ids_wrap_to_u32(self):
         """`npc.ini` says StandByMotion=9990010100 -- ten digits of
@@ -6374,6 +12503,750 @@ class OfficialDbcTables(unittest.TestCase):
                    if all(exists(m) for m in p.motions.values())]
         self.assertGreater(len(on_disk), 50,
                            "derived motion paths name real files")
+
+
+@unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "3DEffect.dbc").is_file(),
+                     "needs an official client with a compiled 3DEffect.dbc")
+class CompiledEffectTable(unittest.TestCase):
+    """`ini/3DEffect.dbc` -- the effect table the client actually reads.
+
+    `GraphicData.dll` names both `ini/3DEffect.ini` and `ini/3DEffect.dbc`,
+    and where the compiled twin exists it is the newer file by six years. The
+    assertions here are the ones that would break if the record layout were
+    misread, and they are deliberately of three independent kinds:
+
+    1. **The walk lands on EOF.** Variable-length records leave no slack.
+    2. **Every layer id resolves in a *different* compiled table.** 5517
+       resolves 8,759 of 8,759 effect ids in `3DEffectobj.dbc` and 8,759 of
+       8,759 texture ids in `3DTexture.dbc`; 6090 resolves 13,276 of 13,285
+       in each. A wrong field offset cannot score that.
+    3. **The plaintext twin is the Rosetta**, exactly as `SIMO` and `MESH`
+       used it -- on 5517 all 2,595 ini sections are present in the compiled
+       table and 2,590 match on every compared field.
+
+    None of it is synthesised. A selftest built from the constants it checks
+    proves nothing (CORRECTIONS C5), so nothing here encodes a record and
+    decodes it again; every number comes from a shipped file, and the
+    population counts that differ per client are gated with `requires_base`
+    rather than asserted as floors.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import dbc
+        cls.dbc = dbc
+        cls.data = (ROOT / "ini" / "3DEffect.dbc").read_bytes()
+        cls.recs = dbc.read_effe(cls.data)
+
+    def test_the_walk_lands_on_exactly_eof(self):
+        """`read_effe` raises rather than tolerating slack, so parsing at all
+        is the assertion. Measured on both clients that ship the table:
+        5517 363,958 bytes / 3,391 records, 6090 508,446 / 4,483."""
+        self.assertTrue(self.recs)
+        self.assertEqual(self.recs[0]["name"], "M_Fire",
+                         "the first record is M_Fire on 5517 and on 6090")
+
+    def test_reading_amount_as_a_u32_walks_off_the_end(self):
+        """The control that makes the u16 width a measurement.
+
+        `amount` is a u16 followed by a u32 `Delay`. Read it as a u32 and
+        every record with `Delay == 0` decodes identically -- 4,411 of
+        6090's 4,483 -- so the wrong layout survives hundreds of records
+        before it fails. This walks the real file under the wrong width and
+        asserts it does **not** reach EOF, which is what makes "the walk
+        lands on EOF" evidence for the right one rather than a tautology.
+        """
+        pos, ok = 8, True
+        (count,) = struct.unpack_from("<I", self.data, 4)
+        for _ in range(count):
+            if pos + 66 > len(self.data):
+                ok = False
+                break
+            (amount,) = struct.unpack_from("<I", self.data, pos + 32)
+            pos += 66 + 16 * amount
+            if pos > len(self.data):
+                ok = False
+                break
+        self.assertFalse(ok and pos == len(self.data),
+                         "a u32 amount must not also tile the file, or the "
+                         "width would be undecidable from the data")
+
+    def test_every_name_is_a_clean_fixed_width_string(self):
+        """The fixed-record analogue of RSDB's "every offset lands in-file":
+        a wrong stride slides the 32-byte name field onto numeric fields.
+        `read_effe` raises on unprintable bytes or on anything but NULs after
+        the terminator; measured zero of either on both clients."""
+        self.assertTrue(all(r["name"] for r in self.recs))
+        self.assertTrue(all(all(32 <= ord(c) < 127 for c in r["name"])
+                            for r in self.recs))
+
+    def test_layer_ids_resolve_in_the_other_compiled_tables(self):
+        """Cross-table validation from an independent source. Effect ids must
+        be rows of `3DEffectobj.dbc` and texture ids rows of
+        `3DTexture.dbc`. A floor rather than a pin, because the two clients
+        differ: 5517 is 8,759/8,759 and 6090 is 13,276/13,285 (nine layers of
+        6090 name ids no shipped table carries -- a fact about the content).
+        """
+        obj = self.dbc.Rsdb.parse((ROOT / "ini" / "3DEffectobj.dbc").read_bytes())
+        tex = self.dbc.Rsdb.parse((ROOT / "ini" / "3DTexture.dbc").read_bytes())
+        layers = [L for r in self.recs for L in r["layers"]]
+        self.assertGreater(len(layers), 8000)
+        good_obj = sum(1 for L in layers if L["effect"] in obj)
+        good_tex = sum(1 for L in layers if L["texture"] in tex)
+        self.assertGreater(good_obj / len(layers), 0.999)
+        self.assertGreater(good_tex / len(layers), 0.999)
+
+    def test_the_plaintext_twin_is_a_subset_not_a_substitute(self):
+        """The finding this reader exists for, asserted on either client.
+
+        The `.ini` is one byte-identical 2009 file at 5165, 5517 and 6090
+        (599,875 bytes, 2,595 sections) while the compiled table grows. Every
+        section it has is in the compiled table -- give or take one dropped
+        name at 6090 -- and the compiled table carries hundreds the plaintext
+        never heard of. Reading the `.ini` on an official client is reading a
+        subset the client itself ignores.
+        """
+        import effects as effmod
+        secs = effmod.read_sections(ROOT / "ini" / "3DEffect.ini")
+        names = {r["name"].lower() for r in self.recs}
+        ini_only = {k.lower() for k in secs} - names
+        dbc_only = names - {k.lower() for k in secs}
+        self.assertLessEqual(len(ini_only), 1)
+        self.assertGreater(len(dbc_only), 700,
+                           "the compiled table knows effects the plaintext "
+                           "twin has never carried")
+
+    @requires_base("patch6090", why="6090's table size; 5517 compiles 3,391 "
+                                    "of the same records and the three "
+                                    "earlier clients ship no .dbc at all"
+                                    + _DBC_CENSUS)
+    def test_record_and_layer_counts_are_the_6090_table(self):
+        """Measured rather than bounded, following
+        `test_simo_record_count_is_the_6090_table`. 6090 has 4,483 records
+        under 4,472 distinct names -- eleven names appear twice, so a
+        name-keyed reader silently loses rows -- and 13,285 layers. 5517 has
+        3,391 / 3,391 / 8,759."""
+        self.assertEqual(len(self.recs), 4483)
+        self.assertEqual(len({r["name"] for r in self.recs}), 4472)
+        self.assertEqual(sum(len(r["layers"]) for r in self.recs), 13285)
+
+    @requires_base("patch5517", why="5517's table size"
+                                    + _DBC_CENSUS)
+    def test_record_and_layer_counts_are_the_5517_table(self):
+        self.assertEqual(len(self.recs), 3391)
+        self.assertEqual(len({r["name"] for r in self.recs}), 3391)
+        self.assertEqual(sum(len(r["layers"]) for r in self.recs), 8759)
+
+    @requires_base("patch6090", why="the divergence is 6090's; at 5517 the "
+                                    "compiled table is the ini plus 796"
+                                    + _DBC_CENSUS)
+    def test_the_6090_divergence_is_the_number_effects_md_quotes(self):
+        """The headline figure, pinned so it cannot drift out of the doc.
+
+        `docs/effects.md` §7a states it and `tools/dbcdiff.py` reproduces it.
+        Reading the plaintext ini on 6090 misses 1,878 of 4,472 effects
+        (42.0 %) and misreads 56 of the 2,594 it does carry.
+        """
+        import dbcdiff
+        r = dbcdiff.compare(ROOT)
+        self.assertTrue(r["compiled"])
+        self.assertEqual(r["distinct"], 4472)
+        self.assertEqual(r["sections"], 2595)
+        self.assertEqual(len(r["dbc_only"]), 1878)
+        self.assertEqual(r["ini_only"], ["red-flower-smallrain"])
+        self.assertEqual(r["identical"], 2538)
+        self.assertEqual(len(r["differ"]), 56)
+
+
+@unittest.skipUnless(HAVE_ROOT, "needs a configured install")
+class EffectDefinitionsComeFromTheLiveTable(unittest.TestCase):
+    """`EffectDB` reads the table the client reads -- per file, per base.
+
+    The defect this guards is not "the reader is wrong", it is **"the reader
+    exists and is not on the path"** (C47). From the outside those are
+    indistinguishable, and the symptom is the one that makes them hard to
+    notice: two bases quietly returning the *same* number because both reads
+    landed on the same 2009 file. So the assertions are about *which file was
+    opened*, on whichever install happens to be configured, and the
+    twin-present and twin-absent cases are both asserted rather than one being
+    treated as the default.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import effects as effmod
+        cls.eff = effmod
+        cls.db = effmod.EffectDB(ROOT)
+
+    def test_the_source_of_every_table_is_reported(self):
+        """`--coverage` names the file behind every number. A tool that does
+        not say which file it read cannot be checked for this defect at all
+        without reading its source."""
+        for stem in ("3DEffect", "3DEffectObj", "3dtexture", "3dobj"):
+            self.assertIn(stem, self.db.sources)
+            src = self.db.sources[stem]
+            self.assertIn(src.form, ("ini", "dbc"))
+            self.assertTrue(src.path and src.path.is_file())
+
+    def test_the_compiled_twin_wins_wherever_one_exists(self):
+        """Twin present -> the twin is what was opened. Twin absent -> the
+        plaintext, and that is the correct answer on four of the six declared
+        bases rather than a degraded one."""
+        import dbcshadow
+        for stem, ini_name in (("3DEffect", "3DEffect.ini"),
+                               ("3DEffectObj", "3DEffectObj.ini"),
+                               ("3dtexture", "3dtexture.ini"),
+                               ("3dobj", "3dobj.ini")):
+            twin = dbcshadow.compiled_twin(ROOT / "ini" / ini_name)
+            src = self.db.sources[stem]
+            if twin is None:
+                self.assertEqual(src.form, "ini", stem)
+                self.assertEqual(src.path.name.lower(), ini_name.lower())
+            else:
+                self.assertEqual(src.form, "dbc", stem)
+                self.assertEqual(src.path, twin, stem)
+
+    def test_definitions_carry_the_source_they_came_from(self):
+        want = self.db.sources["3DEffect"].path.name
+        for d in self.db.effects.values():
+            if d.source != "3DEffect.json":
+                self.assertEqual(d.source, want)
+
+    @requires_base("patch6090", why="6090's compiled table; 5517's is a "
+                                    "different size and the three earlier "
+                                    "clients ship no .dbc at all")
+    def test_6090_reads_the_compiled_table_not_the_2009_plaintext(self):
+        """The pinned consequence, stated as `docs/effects.md` §9a states it.
+
+        4,472 names and 13,248 layers, **not** the plaintext file's 2,595 and
+        5,099. The layer figure is 37 short of `core/dbc.py`'s 13,285 because
+        eleven names appear twice and this table is name-keyed -- asserted
+        here so the discrepancy is a documented property rather than a
+        surprise to whoever next compares the two numbers.
+        """
+        self.assertEqual(self.db.sources["3DEffect"].form, "dbc")
+        self.assertEqual(len(self.db.effects), 4472)
+        self.assertEqual(sum(len(d.layers) for d in self.db.effects.values()),
+                         13248)
+        self.assertEqual(len(self.db.duplicate_effect_names), 11)
+
+    @requires_base("patch5517", why="5517's compiled table"
+                                    + _DBC_CENSUS)
+    def test_5517_reads_the_compiled_table_not_the_2009_plaintext(self):
+        self.assertEqual(self.db.sources["3DEffect"].form, "dbc")
+        self.assertEqual(len(self.db.effects), 3391)
+        self.assertEqual(sum(len(d.layers) for d in self.db.effects.values()),
+                         8759)
+        self.assertEqual(len(self.db.duplicate_effect_names), 0)
+
+    def test_a_padded_id_still_finds_its_row(self):
+        """The gate is per file, so a base may serve compiled definitions
+        (ids as plain ints) beside a plaintext path table (ids sometimes
+        zero-padded -- 46 of them in 6090's `3dtexture.ini`). A raw string
+        lookup across that boundary misses and reports absence, which is the
+        failure CORRECTIONS §2 catalogues five instances of. No shipped base
+        is in that mixed state today, so this is the only thing that would
+        notice if it stopped working."""
+        get = self.eff.EffectDB._table_get
+        self.assertEqual(get({"1137360": "a.c3"}, "001137360"), "a.c3")
+        self.assertEqual(get({"001137360": "a.c3"}, "001137360"), "a.c3")
+        self.assertEqual(get({"1137360": "a.c3"}, "1137360"), "a.c3")
+        self.assertEqual(get({"1137360": "a.c3"}, "zzz"), "")
+        self.assertEqual(get({}, "1137360"), "")
+
+    def test_padded_ini_keys_are_folded_onto_the_twins_spelling(self):
+        """C48. `3dtexture.ini` pads 46 of its ids and `3dobj.ini` 48, so a
+        raw-string overlay leaves each standing beside the row it duplicates.
+        Asserted as the *property* -- no key in a merged table is a padded
+        spelling of another key in the same table -- rather than as a count,
+        which would only hold on one base."""
+        for stem, table in (("3dtexture", self.db.textures),
+                            ("3dobj", self.db.meshes),
+                            ("3DEffectObj", self.db.objs)):
+            ghosts = [k for k in table
+                      if k.isdigit() and k != str(int(k)) and str(int(k)) in table]
+            self.assertEqual(ghosts, [], f"{stem}: one id under two spellings")
+
+    def test_folding_padded_keys_does_not_manufacture_an_overlap(self):
+        """The control the C48 fix needed, and the reason it is its own test.
+
+        `read_flat_live` refuses the overlay when the key spaces are disjoint
+        -- that is what keeps `weaponmotion.dbc` out. Loosening the key
+        comparison to fold zero-padding could have *created* an overlap and
+        silently re-enabled the merge the refusal exists to prevent: one fix
+        undoing another, with both looking correct in isolation. Measured:
+        0 of WeaponMotion's 25,944 keys fold, and the intersection stays
+        empty. If this ever fails, read C48 before "fixing" it.
+        """
+        import dbcshadow
+        p = ROOT / "ini" / "WeaponMotion.ini"
+        if dbcshadow.compiled_twin(p) is None:
+            self.skipTest("no weaponmotion.dbc on this base")
+        rec = self.db.table_sources["WeaponMotion.ini"]
+        self.assertTrue(rec.get("disjoint"))
+        self.assertFalse(rec["overlaid"])
+        self.assertEqual(rec.get("padded_ini_keys_folded"), 0)
+        self.assertEqual(rec["shared"], 0)
+
+    def test_table_provenance_is_this_instances_own_and_not_a_global(self):
+        """`FLAT_SOURCES` is keyed by filename, so two installs in one process
+        overwrite each other's entries and a snapshot of it attributes one
+        base's provenance to another -- C21's shape in the reporting layer.
+        `table_sources` is built from this instance's own calls, so building a
+        second `EffectDB` for a different root must not disturb the first.
+
+        The second root is taken from the **declared** installs rather than
+        written down here -- a test that hardcodes an install path is the same
+        defect one layer up, and `tests/test_sanitization.py` refuses it."""
+        import coroot
+        import effects as effmod
+        alt = next((Path(r) for r in coroot.read_settings().get("kinds", {})
+                    if Path(r) != Path(ROOT) and (Path(r) / "ini").is_dir()),
+                   None)
+        if alt is None:
+            self.skipTest("needs a second declared install to contaminate with")
+        before = {k: dict(v) for k, v in self.db.table_sources.items()}
+        effmod.EffectDB(alt)
+        self.assertEqual(self.db.table_sources, before)
+
+    def test_weaponmotion_twin_does_not_join_under_str_id(self):
+        """The trap, kept as a control -- and note it did NOT fail when the
+        composition was decoded, which is why the test above it was renamed.
+
+        Its predecessor was called "...because its twin cannot be keyed" and
+        promised that "the day someone decodes the composition this test
+        fails". **It would not have.** `str(id)` still joins zero, so the
+        assertion stayed green while its own premise went false: the twin CAN
+        be keyed, just not this way. A test whose title is a claim needs the
+        claim asserted, not the symptom.
+        """
+        import dbc
+        import dbcshadow
+        twin = dbcshadow.compiled_twin(ROOT / "ini" / "WeaponMotion.ini")
+        if twin is None:
+            self.skipTest("no weaponmotion.dbc on this base")
+        table = dbc.Rsdb.parse(twin.read_bytes())
+        keys = {str(k) for k in table.paths}
+        self.assertTrue(self.db.weapon_motion)
+        self.assertEqual(len(keys & set(self.db.weapon_motion)), 0,
+                         "str(id) is the wrong spelling; use "
+                         "dbc.weaponmotion_join")
+
+    def test_weaponmotion_twin_keys_by_the_action_field_width(self):
+        """SOLVED: the two spellings differ by the width of the action field.
+
+            id = (appearance * 10_000 + action) mod 2**32
+
+        The ini writes the action in 3 decimal digits, the twin packs it in 4.
+        Asserted here against the install's own files, not a fixture.
+
+        **What is asserted per base is deliberately different**, because the
+        two bases genuinely differ and pretending otherwise would be the
+        tautology this table is the worked example of:
+
+        * everywhere the twin exists -- **zero wrong**. Where a key resolves,
+          the value agrees. That is the invariant.
+        * on 5517 -- **all 25,944** ini rows resolve.
+        * on 6090 -- most do not, because the frozen ini lists appearances the
+          compiled table no longer carries. That is a fact about the data, not
+          a failure of the key.
+        """
+        import dbc
+        import dbcshadow
+        self.assertEqual(dbc.weaponmotion_key("1050000999300"),
+                         (1050000999 * 10000 + 300) % (1 << 32))
+        twin = dbcshadow.compiled_twin(ROOT / "ini" / "WeaponMotion.ini")
+        if twin is None:
+            self.skipTest("no weaponmotion.dbc on this base")
+        table = dbc.Rsdb.parse(twin.read_bytes())
+        ini = self.db.weapon_motion
+        self.assertTrue(ini)
+        joined, stats = dbc.weaponmotion_join(table, list(ini))
+        wrong = [k for k, v in joined.items()
+                 if str(v).lower() != str(ini[k]).lower()]
+        self.assertEqual(wrong, [], "a resolved key must agree on its value")
+        self.assertGreater(stats["joined"], 0)
+        if coroot.kind_for_root(ROOT) == "patch5517":
+            self.assertEqual(stats["joined"], stats["ini_keys"],
+                             "5517's twin carries every ini row")
+
+    def test_weaponmotion_join_refuses_instead_of_returning_an_empty_map(self):
+        """Zero matches is the key-width signature, not an empty table.
+
+        The whole defect this decoding ends was a join that returned `{}` and
+        raised nothing, reporting a whole table absent with total confidence.
+        The replacement must never be able to do that again.
+        """
+        import dbc
+
+        class Twin:
+            paths = {1: "c3/a.c3", 2: "c3/b.c3"}
+
+        with self.assertRaises(ValueError):
+            dbc.weaponmotion_join(Twin(), ["1050000999300"])
+        self.assertEqual(dbc.weaponmotion_join(Twin(), [])[0], {},
+                         "no keys asked for is not the same as none matching")
+
+
+class WeaponSkillNameSpelling(unittest.TestCase):
+    r"""The weapon-type table ships under two names, and only one was read.
+
+    CCO ships `ini/WeaponSkillName.json`; every official client ships
+    `ini/WeaponSkillName.ini`, which despite the extension is **not**
+    sectioned ini but a flat ``id,name`` list. The reader knew only the JSON
+    and failed inside a bare `except Exception: pass`, so `weapon_type_names`
+    was **empty on all five official clients** -- 48 rows on CCO against 0 on
+    5017/5065/5165/5517/6090, each of which ships the `.ini`. Every weapon
+    then rendered with a blank type name and nothing reported a problem.
+
+    Same class as C-2026-08-09-ani-json-spelling one table over: the *content* was understood, the
+    *choice of which file holds it* was not.
+
+    `test_the_table_is_populated_on_whatever_base_is_configured` is the one
+    that matters and it is deliberately **not** base-gated -- a reader that
+    should work on every client must keep failing everywhere when it breaks
+    (`requires_base`'s own contract).
+    """
+
+    def setUp(self):
+        import effects
+        self.eff = effects
+
+    def _ini_dir(self, d: Path, **files: str) -> Path:
+        d.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (d / name.replace("__", ".")).write_text(text, "utf-8")
+        return d
+
+    def test_the_json_spelling_is_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._ini_dir(Path(d), WeaponSkillName__json=json.dumps(
+                [{"id": 0, "name": "Boxing"}, {"id": 410, "name": "Blade"}]))
+            self.assertEqual(self.eff.read_weapon_skill_names(p),
+                             {"000": "Boxing", "410": "Blade"})
+
+    def test_the_ini_spelling_is_read_and_is_not_sectioned_ini(self):
+        """The trap inside the trap: the official file's extension says ini
+        and its contents are a flat `id,name` list, so `read_sections` --
+        the obvious reader to reach for here -- returns nothing at all."""
+        with tempfile.TemporaryDirectory() as d:
+            p = self._ini_dir(Path(d),
+                              WeaponSkillName__ini="000,Boxing\n410,Blade\n")
+            self.assertEqual(self.eff.read_weapon_skill_names(p),
+                             {"000": "Boxing", "410": "Blade"})
+            self.assertEqual(
+                self.eff.read_sections(p / "WeaponSkillName.ini"), {},
+                "if this ever parses as sections the format changed")
+
+    def test_the_two_spellings_are_indistinguishable_to_a_caller(self):
+        """Measured on the real installs: CCO's 48 JSON rows and 5017's 48
+        ini rows agree on all 48 ids and all 48 names. The reader has to
+        preserve that, including 6090's trailing space in `610,PrayerBeads `
+        and the three-wide zero padding both sources already use."""
+        with tempfile.TemporaryDirectory() as d:
+            a = self._ini_dir(Path(d) / "a",
+                              WeaponSkillName__ini="0,Boxing\n610,PrayerBeads \n")
+            b = self._ini_dir(Path(d) / "b", WeaponSkillName__json=json.dumps(
+                [{"id": 0, "name": "Boxing"}, {"id": 610, "name": "PrayerBeads"}]))
+            self.assertEqual(self.eff.read_weapon_skill_names(a),
+                             self.eff.read_weapon_skill_names(b))
+            self.assertEqual(self.eff.read_weapon_skill_names(a)["000"],
+                             "Boxing")
+
+    def test_neither_spelling_present_is_empty_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                self.eff.read_weapon_skill_names(self._ini_dir(Path(d))), {})
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_table_is_populated_on_whatever_base_is_configured(self):
+        """THE REGRESSION GUARD, and it is ungated on purpose.
+
+        Every declared install ships this table under one spelling or the
+        other, so an empty result means the reader missed the spelling rather
+        than that the client has nothing to say. MEASURED 2026-08-09: 48 on
+        CCO, 5017 and 5065; 49 on 5165; 50 on 5517; 58 on 6090 -- the counts
+        grow with the patch level the way a weapon table should.
+        """
+        import effects
+        db = effects.EffectDB(ROOT)
+        self.assertGreaterEqual(len(db.weapon_type_names), 48)
+        self.assertEqual(db.weapon_type_names.get("410"), "Blade")
+        self.assertEqual(db.effects_for_weapon("410009").type_name, "Blade",
+                         "the type name reaches the consumer, not just the "
+                         "table -- a blank here is what the defect looked like")
+
+
+@unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "EmotionIco.dbc").is_file(),
+                     "needs a client with a compiled EmotionIco.dbc (6090 only)")
+class CompiledEmotionIcons(unittest.TestCase):
+    """`ini/EmotionIco.dbc` -- and the reason the gate above is per-file.
+
+    **6090 is the only install of the six that ships one.** 5517 has compiled
+    twins for fourteen tables and still reads the plaintext `EmotionIco.ini`,
+    so "this client is official" does not imply "this table is compiled".
+    Gating a table's tests on some *other* table's `.dbc` would have run these
+    on 5517 and failed on a client that has nothing to parse.
+    """
+
+    def test_the_rows_tile_the_file_exactly(self):
+        import dbc
+        data = (ROOT / "ini" / "EmotionIco.dbc").read_bytes()
+        table = dbc.read_emoi(data)
+        self.assertEqual(len(data), 8 + 36 * len(table),
+                         "fixed 36-byte rows; a stride error cannot tile")
+        self.assertEqual(table[0], "Hoho")
+
+    def test_the_plaintext_twin_agrees_and_is_short(self):
+        """The Rosetta, and the divergence, in one. All 68 ids the 2008
+        `EmotionIco.ini` carries have byte-identical names in the compiled
+        table; the compiled table adds two the plaintext never got.
+
+        Ids are **not** dense -- 0..67 then 76 and 77 -- so a reader that
+        assumes `range(count)` is wrong by two on the only client that has
+        the file.
+        """
+        import dbc
+        table = dbc.read_emoi((ROOT / "ini" / "EmotionIco.dbc").read_bytes())
+        plain = {}
+        for line in (ROOT / "ini" / "EmotionIco.ini").read_text(
+                encoding="latin-1").splitlines():
+            if line.strip():
+                num, _, name = line.strip().partition(" ")
+                plain[int(num)] = name.strip()
+        self.assertTrue(plain)
+        self.assertTrue(set(plain) <= set(table))
+        for k in plain:
+            self.assertEqual(table[k], plain[k])
+        self.assertEqual(sorted(set(table) - set(plain)), [76, 77])
+        self.assertNotEqual(sorted(table), list(range(len(table))),
+                            "the id space has a hole; do not index by rank")
+
+
+class CompiledTableRefusals(unittest.TestCase):
+    """The failures the readers must not swallow. No install needed.
+
+    These are negative controls, not round-trips: nothing here encodes a
+    record with the same struct the parser decodes with. They assert that a
+    short, padded or mislabelled buffer is an **error** rather than a partial
+    answer -- the shape `read_simo` and `read_mesh` already hold, and the
+    shape C25 is about, where a probe that cannot tell must not return the
+    value that means "fine".
+    """
+
+    def test_the_magic_is_checked(self):
+        import dbc
+        self.assertRaises(ValueError, dbc.read_effe, b"SIMO" + b"\0" * 4)
+        self.assertRaises(ValueError, dbc.read_emoi, b"EFFE" + b"\0" * 4)
+
+    def test_a_count_that_does_not_tile_is_refused(self):
+        import dbc
+        # EMOI claiming one row in a file with room for none.
+        self.assertRaises(ValueError, dbc.read_emoi,
+                          b"EMOI" + (1).to_bytes(4, "little") + b"\0" * 20)
+
+    def test_trailing_slack_is_refused_not_ignored(self):
+        """A real table with padding appended must fail, because "the walk
+        stopped early" and "the file ends here" have to be different
+        answers."""
+        import dbc
+        self.assertRaises(ValueError, dbc.read_effe,
+                          b"EFFE" + (0).to_bytes(4, "little") + b"\0" * 8)
+
+    def test_an_unterminated_name_field_is_refused(self):
+        """A 32-byte name with bytes living after its NUL means the stride
+        slid onto numeric fields. Zero records of that kind exist in the
+        shipped tables, so tolerating it could only ever hide a misparse."""
+        import dbc
+        row = (7).to_bytes(4, "little") + b"Hoho\0\0\0junk" + b"\0" * 21
+        self.assertRaises(ValueError, dbc.read_emoi,
+                          b"EMOI" + (1).to_bytes(4, "little") + row)
+
+    def test_a_mesh_record_is_variable_length_not_a_fixed_24_bytes(self):
+        """The defect this class's `read_mesh` mention used to describe wrong.
+
+        `MESH` was modelled as a flat 24-byte row -- `{id, part, mesh, tex,
+        mixtex, packed}` -- and **four of the five shipped tables cannot tell
+        the difference**, because `partCount` is 1 throughout armor, armet,
+        weapon and misc and a one-part record is exactly 24 bytes. The model
+        tiled those four to the byte and read as verified.
+
+        Built here rather than measured, so it runs with no install: a
+        two-part record is 40 bytes, and under the fixed model it would be
+        one and two-thirds rows -- which is why `mount.dbc`'s 1,004 multi-part
+        records made that file refuse to tile at all.
+        """
+        import dbc
+        u = lambda n: int(n).to_bytes(4, "little")   # noqa: E731
+        part = u(5000) + u(5001) + u(0) + u(0x060500)
+        one = u(111) + u(1) + part                    # 24 bytes
+        two = u(222) + u(2) + part + part             # 40 bytes
+        table = dbc.read_mesh(b"MESH" + u(2) + one + two)
+        self.assertEqual(sorted(table), [111, 222])
+        self.assertEqual(len(table[111]), 1)
+        self.assertEqual(len(table[222]), 2,
+                         "a two-part record collapsed -- the reader is back "
+                         "on a fixed stride")
+        self.assertEqual(table[111][0]["mesh"], 5000)
+        self.assertEqual(table[111][0]["texture"], 5001)
+        self.assertEqual((table[111][0]["mixopt"], table[111][0]["asb"],
+                          table[111][0]["adb"]), (0, 5, 6))
+        # The fixed model reads `partCount` as a value, so it cannot be the
+        # one that produced this: 8 + 2*24 != len.
+        self.assertNotEqual(8 + 2 * 24, len(b"MESH" + u(2) + one + two))
+
+    def test_a_mesh_walk_that_does_not_end_on_eof_is_refused(self):
+        """Variable length means the count alone proves nothing -- only
+        landing on EOF does. This is the check that caught the fixed-stride
+        model on the one file that could expose it, and it has to be
+        whole-file: `MESH` carries no strings and no checksum, so every
+        4-byte window is a valid u32 and a per-row sanity check passes on
+        drift all the way to the end."""
+        import dbc
+        u = lambda n: int(n).to_bytes(4, "little")   # noqa: E731
+        rec = u(111) + u(1) + u(5000) + u(5001) + u(0) + u(0)
+        self.assertRaises(ValueError, dbc.read_mesh,
+                          b"MESH" + u(1) + rec + b"\0" * 16)   # slack
+        self.assertRaises(Exception, dbc.read_mesh,
+                          b"MESH" + u(2) + rec)                # short
+
+
+class WdbResourceDb(unittest.TestCase):
+    """``ini/c3.wdb`` -- the id -> path table, and the base its offsets use.
+
+    Guards a defect that shipped for weeks and never raised: a string offset
+    in this file is relative to **its own RSDB table's start**, not to the
+    file. Read as absolute it does not fail -- it lands a few bytes into a
+    neighbouring string and returns a shorter path that is still printable and
+    still path-shaped (`c3/effect/zf2-e181/1.c3` came back as
+    `t/zf2-e181/1.c3`). The old reader also *searched* for the "RSDB" literal
+    rather than walking tables in order, so it matched those four bytes
+    wherever they occur inside path data and inflated Zephyr's 30,841 real
+    rows to 260,897.
+
+    Both are this project's standing shape: a wrong answer that looks like an
+    answer. `malformed` could not catch either, because a garbage offset into
+    a multi-megabyte blob always finds *some* NUL and yields *some* string --
+    which is why `test_the_absolute_offset_model_is_refused` asserts the old
+    model FAILS rather than only that the new one passes.
+
+    Roots come from the user's declared install map, never a literal path:
+    hardcoding one would break on another machine and trip the sanitization
+    gate.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE.parent / "core"))
+        import coroot
+        declared = dict(coroot.read_settings().get(coroot.KINDS_KEY) or {})
+        cls.DBS = {}
+        for root, kind in declared.items():
+            p = Path(root) / "ini" / "c3.wdb"
+            if p.is_file():
+                cls.DBS[kind] = p
+        if not cls.DBS:
+            raise unittest.SkipTest(
+                "no declared install ships ini/c3.wdb "
+                "(5165/5517/6090 do; 5017/5065/CCO do not)")
+
+    def test_every_declared_row_resolves_on_every_base(self):
+        """The whole table, on every base that has one -- not a sample."""
+        from wdb import ResourceDb
+        for kind, path in sorted(self.DBS.items()):
+            with self.subTest(base=kind):
+                db = ResourceDb(path)
+                self.assertGreater(len(db.sections), 0, kind)
+                declared = sum(s["rows"] for s in db.sections)
+                self.assertEqual(db.malformed, 0,
+                                 f"{kind}: {db.malformed} of {declared} rows "
+                                 f"did not resolve")
+                self.assertEqual(db.count, declared, kind)
+                for ident, p in db:
+                    self.assertTrue(p and all(32 <= ord(c) < 127 for c in p),
+                                    f"{kind}: {ident} -> {p!r}")
+
+    def test_the_absolute_offset_model_is_refused(self):
+        """Reintroducing the bug must break something.
+
+        Reading the same rows with offsets treated as absolute is what the
+        reader used to do. If that still reproduced the shipped table, the
+        table-relative base would not be load-bearing and this guard would be
+        decorative.
+        """
+        import struct
+        from wdb import ResourceDb
+        for kind, path in sorted(self.DBS.items()):
+            with self.subTest(base=kind):
+                d = path.read_bytes()
+                db = ResourceDb(path)
+                good = {i: p for i, p in db}
+                n = struct.unpack_from("<I", d, 0x14)[0]
+                agree = 0
+                for i in range(n):
+                    ident, soff = struct.unpack_from("<II", d, 0x18 + i * 8)
+                    end = d.find(b"\x00", soff)
+                    if end < 0:
+                        continue
+                    absolute = d[soff:end].decode("latin-1", "replace")
+                    if good.get(ident) == absolute.replace("\\", "/"):
+                        agree += 1
+                self.assertLess(
+                    agree, n // 2,
+                    f"{kind}: the absolute model reproduced {agree} of {n} "
+                    f"paths -- the table-relative base is not load-bearing")
+
+    def test_a_small_id_gets_a_confident_wrong_answer(self):
+        """The "answers ids it was never asked about" trap, as a number.
+
+        Carried as prose since onboarding and respected without being
+        reproduced. It is real, and it has a **threshold**: the table merges
+        id spaces and the effect space is dense from 0, so a small id lands
+        on something almost every time while a large one does not. Measured
+        with random ids -- none real, so every hit is a false positive.
+
+        Asserted as a wide band, not a pinned rate: the point is the shape
+        (small ids unsafe, 6-digit ids safe), and pinning a percentage would
+        make this a content pin on whichever client is configured.
+        """
+        import random
+        from wdb import ResourceDb
+        for kind, path in sorted(self.DBS.items()):
+            with self.subTest(base=kind):
+                db = ResourceDb(path)
+                rng = random.Random(20260809)
+                def rate(lo, hi):
+                    ids = [rng.randrange(lo, hi + 1) for _ in range(2000)]
+                    return sum(1 for i in ids if db.path_for(i)) / len(ids)
+                small = rate(100, 9999)
+                big = rate(10 ** 6, 10 ** 7 - 1)
+                self.assertGreater(
+                    small, 0.05,
+                    f"{kind}: 3-4 digit ids no longer collide -- if this "
+                    f"table stopped merging id spaces the rule in "
+                    f"core/wdb.py is obsolete, not merely conservative")
+                self.assertLess(
+                    big, 0.02,
+                    f"{kind}: 7-digit random ids resolve at {big:.1%} -- the "
+                    f"'>=6 digits may be looked up directly' rule in "
+                    f"core/wdb.py does not hold here and every population "
+                    f"figure resting on it needs a control re-run")
+                self.assertGreater(small, big * 5, kind)
+
+    def test_the_table_walk_is_sequential_not_a_search(self):
+        """Each table's blob ends exactly where the next table begins.
+
+        That zero-byte gap is what makes the walk exact. Searching for the
+        "RSDB" literal instead matches inside path data -- 13 such matches
+        exist in Zephyr's file and only 2 are tables.
+        """
+        from wdb import ResourceDb
+        for kind, path in sorted(self.DBS.items()):
+            with self.subTest(base=kind):
+                db = ResourceDb(path)
+                for a, b in zip(db.sections, db.sections[1:]):
+                    self.assertEqual(a["end"], b["offset"],
+                                     f"{kind}: gap between tables")
 
 
 class TqDatTables(unittest.TestCase):
@@ -6433,6 +13306,279 @@ class TqDatTables(unittest.TestCase):
             self.assertTrue(r["name"])
 
 
+class PlaintextTwinsOnCommunityClients(unittest.TestCase):
+    """A community client that ships `X.txt` beside `X.dat`.
+
+    Zephyr ships both forms of two tables, and the pair raised a false alarm
+    twice: `docs/handoff_zephyr_tpi.md` recorded *"same size, different md5 --
+    not one file under two names"* and made it a trap to be respected. It is
+    one file under two names. `Monster.dat` decrypts to `Monster.txt` byte for
+    byte under the cipher `core/tqdat.py` has shipped for months.
+
+    The relation that actually holds across both pairs is **containment, not
+    equality**: the plaintext is an editing copy that lags, so it is a prefix
+    of the decrypted table. `Monster` is the case where the drift is zero;
+    `coat_storage_type.txt` is 1,334 of its `.dat`'s 1,688 rows with **no id
+    the `.dat` lacks**. Asserting the prefix covers both without pinning which
+    client is which. `docs/CORRECTIONS.md`
+    `C-2026-08-09-claude-elastic-elion-0da45c`.
+    """
+
+    def test_decrypt_table_returns_str_and_bytes_never_compare_equal(self):
+        """The instrument bug, which needs no install and must not skip.
+
+        `decrypt_table` returns `str`. Comparing it to a file's `bytes`
+        yields False for *identical content*, and a differ built on that
+        comparison reports **"100.00% of bytes differ"** -- which reads
+        exactly like a finding while the two heads print as the same text.
+
+        **A 100%-differs result next to identical-looking content is a type
+        error, not a discovery.** This test is the cheap standing form of
+        that sentence.
+        """
+        import tqdat
+        text = b"[GuildBeast]\r\nSizeAdd=1\r\nZoomPercent=150\r\n" * 20
+        plain = tqdat.decrypt_table(tqdat.encrypt(text))
+        self.assertIsInstance(plain, str)
+        self.assertEqual(plain, text.decode("latin-1"))
+        # The same content, compared the wrong way, is unequal -- and every
+        # byte position disagrees, which is what made it look like a result.
+        self.assertNotEqual(plain, text)
+        self.assertEqual(
+            sum(1 for a, b in zip(plain, text) if a != b), len(text),
+            "str vs bytes must differ at EVERY position -- if this ever "
+            "stops being true the 100%-differs signature has changed and "
+            "the docs above need rewording, not this assertion relaxing")
+
+    def test_every_plaintext_twin_is_a_prefix_of_its_encrypted_table(self):
+        """Over every declared root, for every `X.txt` with an `X.dat`.
+
+        Roots come from the declared install map, never a literal path.
+        Zephyr is the only client known to ship such a pair and it is **not
+        declared on every box**, so this names what it examined instead of
+        passing quietly on nothing -- a guard that skips is silent exactly
+        where the bug lives.
+        """
+        import tqdat
+        sys.path.insert(0, str(HERE.parent / "core"))
+        import coroot
+        declared = dict(coroot.read_settings().get(coroot.KINDS_KEY) or {})
+        examined = []
+        for root in declared:
+            ini = Path(root) / "ini"
+            if not ini.is_dir():
+                continue
+            for txt in sorted(ini.glob("*.txt")):
+                dat = txt.with_suffix(".dat")
+                if not dat.is_file():
+                    continue
+                with self.subTest(table=f"{Path(root).name}/{txt.name}"):
+                    plain = tqdat.decrypt_table(dat.read_bytes(),
+                                                what=str(dat))
+                    shipped = txt.read_bytes().decode("latin-1")
+                    examined.append((Path(root).name, txt.name,
+                                     plain == shipped))
+                    self.assertTrue(
+                        plain.startswith(shipped),
+                        f"{txt.name} is not a prefix of the decrypted "
+                        f"{dat.name} -- the plaintext is supposed to be a "
+                        f"stale copy of the same table, so this is either a "
+                        f"different table or a different cipher")
+        if not examined:
+            raise unittest.SkipTest(
+                "no declared root ships an ini/X.txt beside an ini/X.dat; "
+                f"looked at {sorted(Path(r).name for r in declared)} -- "
+                "declare a community client (Zephyr) to exercise this")
+
+
+@unittest.skipUnless(HAVE_ROOT, "needs a game install")
+class CommunityJsonTablesHaveAnOfficialTwin(unittest.TestCase):
+    r"""Every reader that used to read only `ini/*.json` now answers on any
+    install -- and SAYS WHICH FILE ANSWERED.
+
+    `ini/*.json` is the COMMUNITY client's pre-parsed form. The inventory is
+    unambiguous: 25 such files exist on CCO and **not one** of them exists on
+    any of 5017, 5065, 5165, 5517 or 6090. Their counterparts are `.dat`
+    (binary, or TQ-cipher) and `.ini`.
+
+    Four instances of this class had already been found and three fixed
+    before this sweep (`docs/CORRECTIONS.md`
+    `C-2026-08-09-comod-json-official-sweep`). What made it survive four
+    sightings is that **every site tolerated the miss** -- `except: pass`,
+    `return None`, `raw = []` -- so an official base looked exactly like a
+    client with no items, no NPC names and no map ids.
+
+    So these tests assert two things at every site, and the second is the one
+    that matters: the reader answers, **and** it records what answered. They
+    assert no count, because counts differ per patch and pinning one is a
+    content pin on whichever install the author had configured.
+    """
+
+    def test_ini_json_is_a_community_only_form(self):
+        """The premise every fallback below rests on. A base ships the json
+        or it ships the original -- never neither, which would make the tests
+        below fail for a reason that is not the one they test."""
+        ini = ROOT / "ini"
+        for community, official in (("monster.json", "Monster.dat"),
+                                    ("itemtype.json", "itemtype.dat"),
+                                    ("GameMap.json", "GameMap.dat"),
+                                    ("npc.json", "npc.ini"),
+                                    ("WeaponSkillName.json", "WeaponSkillName.ini")):
+            self.assertTrue(
+                (ini / community).is_file() or (ini / official).is_file(),
+                f"{ini} ships neither {community} nor {official}")
+
+    def test_the_map_registry_is_read_in_whichever_form_ships(self):
+        """`mapedit`'s picker carried `documentId: null` on every row of
+        every official client: it read only `GameMap.json`, and the list
+        still rendered from the `.DMap` scan alone, so nothing looked wrong.
+        """
+        import mapedit
+        me = mapedit.MapEditor(ROOT)
+        rows = me.rows()
+        self.assertTrue(rows, "no maps at all under this root")
+        self.assertTrue(me.registry_rel,
+                        "rows() built a picker with no map registry behind "
+                        "it -- every row is DocumentId-less and nothing says "
+                        "so")
+        withid = [r for r in rows if r["documentId"] is not None]
+        self.assertTrue(
+            withid,
+            f"{me.registry_rel} was read and joined ZERO of {len(rows)} maps. "
+            f"That is a key mismatch, not a client whose maps are "
+            f"unregistered.")
+
+    def test_the_dmap_summary_joins_its_registry_to_the_files_on_disk(self):
+        """The trap that a second reader alone does NOT fix.
+
+        `GameMap.json` names the expanded `map/map/newbie.DMap`;
+        `GameMap.dat` names the archive it shipped in, `map/map/newbie.7z`.
+        Keying the oracle on the file NAME joined 0 of 180 on 5517 and
+        reported it as `files_matched_to_gamemap: 0` -- the key-width rule
+        (`docs/CORRECTIONS.md` section 2) reached through a file extension.
+        So this asserts the JOIN, not the read.
+        """
+        import dmap as dmapmod
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "summary.json"
+            ns = argparse.Namespace(root=ROOT, out=out)
+            self.assertEqual(dmapmod.cmd_summary(ns), 0)
+            tot = json.loads(out.read_text("utf-8"))["totals"]
+        self.assertTrue(tot["gamemap_registry"],
+                        "no map registry read in either form")
+        self.assertGreater(
+            tot["gamemap_json_entries"], 0,
+            f"{tot['gamemap_registry']} parsed to zero rows")
+        self.assertGreater(
+            tot["files_matched_to_gamemap"], 0,
+            f"{tot['gamemap_registry']} holds "
+            f"{tot['gamemap_json_entries']} rows and NONE of them joined to "
+            f"the {tot['files']} .DMap files on disk")
+
+    def test_weapon_skill_names_come_from_whichever_table_ships(self):
+        """`WeaponSkillName.json` on CCO, the CSV `WeaponSkillName.ini` on
+        every official client. Ids are normalised to three digits on BOTH
+        paths: CCO spells Boxing's id as a bare `0` and the ini as `000`,
+        and the caller keys weapon sets three wide."""
+        import effects as effects_mod
+        db = effects_mod.EffectDB(ROOT)
+        names = db.weapon_type_names
+        self.assertTrue(names, "no weapon-skill name table loaded at all")
+        self.assertTrue(all(len(k) == 3 for k in names),
+                        f"unnormalised keys: {sorted(names)[:6]}")
+        self.assertEqual(names.get("000"), "Boxing")
+        self.assertEqual(names.get("420"), "Sword")
+
+    def test_the_item_table_reaches_pbcorrelate_on_any_client(self):
+        """An empty `item_ids` does not misclassify loudly -- it silently
+        withdraws the `item_type` hypothesis, so a field that IS an item id
+        is reported as `free`."""
+        import pbcorrelate
+        k = pbcorrelate.Known()
+        k.load_itemtypes()
+        self.assertGreater(len(k.item_ids), 1000)
+
+    def test_the_monster_table_is_read_on_any_client(self):
+        """`load_monster_rows` already did this; the point here is that it
+        is asserted on whichever base is configured rather than on CCO.
+
+        And the fact the rows carry: `bodyType` is **0 on every row of every
+        install** -- 431/439/586/762/1010 official plus CCO's 374 -- so the
+        client holds no monster-to-art link and `artcrawl` is right to want a
+        server dump. A `bodyType` that ever read non-zero would refute
+        `docs/suite_triage.md` section 6 and is worth failing loudly for.
+        """
+        import models as models_mod
+        rows = models_mod.load_monster_rows(ROOT)
+        self.assertTrue(rows, f"{ROOT / 'ini'} yielded no monster rows in "
+                              f"either form")
+        self.assertTrue(all(r.name for r in rows))
+        self.assertEqual({r.body_type for r in rows}, {0},
+                         "bodyType is populated on this build -- that would "
+                         "be a client-side monster art link, which no client "
+                         "has been measured to have")
+
+
+@unittest.skipUnless(HAVE_ROOT, "needs a game install")
+class NpcNamesJoinOnAnyClient(unittest.TestCase):
+    r"""The NPC-name join, which needed BOTH halves of the fix.
+
+    `tools/models._attach_npc_names` read `ini/npc.json` and returned early
+    on every official client, so every NPC model carried a numeric label.
+    Reading `ini/npc.ini` instead was **not sufficient**: CCO spells
+    Storekeeper's standby motion `999001100`, 5517 spells the same NPC
+    `9990010100`, and `ini/3dmotion.ini` keys it `0999001100`. The raw
+    lookup joins **0 of 1,123** and reports it as a client that names no
+    NPCs. `npcart._motion_path` already holds the client's own rule
+    (`& 0xFFFFFFFF`, then a geometry-derived stem) and is called rather than
+    re-derived.
+
+    So this asserts the JOIN RATE, not the read: the exact failure mode is a
+    populated table producing zero resolutions.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import models as models_mod
+        from coassets import AssetRoot
+        cls.assets = AssetRoot(ROOT)
+        cls.cat = models_mod.ModelCatalogue(
+            ROOT, paths=models_mod._scan_paths(ROOT, cls.assets),
+            exists=cls.assets.exists, read=cls.assets.read)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.assets.close()
+
+    def test_the_npc_table_names_its_source_and_resolves_its_rows(self):
+        j = self.cat.npc_name_join
+        self.assertIn(j["source"], ("ini/npc.json", "ini/npc.ini"),
+                      f"no NPC table answered: {j}")
+        self.assertGreater(j["rows"], 100, j)
+        self.assertGreater(
+            j["resolved"], 0.9 * j["rows"],
+            f"{j['source']} has {j['rows']} rows and only {j['resolved']} "
+            f"standby motions resolved -- a key-width miss reports "
+            f"'the table does not have it' with total confidence")
+
+    def test_npc_models_carry_the_names_the_table_gave_them(self):
+        npcs = [m for m in self.cat.models
+                if m.kind in ("npc", "npc_simple")]
+        self.assertTrue(npcs, "no NPC models at all")
+        named = [m for m in npcs if m.names]
+        self.assertTrue(
+            named,
+            f"{len(npcs)} NPC models and not one carries a name from "
+            f"{self.cat.npc_name_join}")
+        # The label must be the name, not the numeric fallback, and the
+        # detail must name the file it came from -- "0 rows" and "the wrong
+        # file" are indistinguishable without it.
+        src = self.cat.npc_name_join["source"].rsplit("/", 1)[-1]
+        m = named[0]
+        self.assertIn(m.names[0], m.label)
+        self.assertIn(src, m.detail)
+
+
 @unittest.skipUnless(HAVE_ROOT and (DEFAULT_ROOT / "ini" / "3DSimpleObj.dbc").is_file(),
                      "needs an official client with compiled .dbc tables")
 class ParserPlugins(unittest.TestCase):
@@ -6466,6 +13612,136 @@ class ParserPlugins(unittest.TestCase):
                          "colour_provenance"):
                 self.assertTrue(callable(getattr(p, hook, None)),
                                 f"{p.name} is missing {hook}")
+
+    #: Hooks with **no production consumer**. An entry here is a declared
+    #: gap, not permission: the plugin answers and nothing asks, so the
+    #: answer cannot affect anything. Each says what would consume it.
+    #:
+    #: `import_plan` sat on this list unnoticed for several sessions --
+    #: overridden by two plugins, covered by the contract test above, called
+    #: by nobody -- because a contract test stays green whether or not
+    #: anything calls the method. That is what this list exists to prevent
+    #: happening silently again.
+    UNCONSUMED_HOOKS = {
+        # `table_profile` was here and is WIRED as of 2026-08-09 -- all four
+        # production callers (coviewer, meshtex, artcrawl, collect) now pass
+        # `profile=` from the plugin instead of letting npcart probe. Removed
+        # from this list rather than annotated, because a list of unconsumed
+        # hooks that contains a consumed one is the same lie in the other
+        # direction.
+        "open_row": (
+            "Arrived 2026-08-13 with the catalog surface, and it is the one "
+            "hook of that set with no caller anywhere -- not in tools/, not "
+            "via getattr, not inside the base class. `catalogs` and `browse` "
+            "are driven by real CLI verbs, and `table_specs`/`load_table`/"
+            "`why_no_tables` are driven by `catalogs()` itself; `open_row` "
+            "(one row by id, as a dict) is the detail view nothing has asked "
+            "for yet. Declared rather than deleted because it is the natural "
+            "seam for a row-detail page and deleting it would only mean "
+            "rewriting it; declared rather than left silent because a hook "
+            "whose only exercise is a contract test looks covered and is "
+            "not. Wire it or drop it when the detail view is decided."),
+        "prefers_compiled_tables": (
+            "Still unread, and 2026-08-09 established WHY rather than leaving "
+            "it at 'no seam exists'. The seam is `core/dbcshadow.py` -- the "
+            "one place that answers 'is this ini shadowed by a compiled "
+            "twin' -- and it answers from FILE EXISTENCE. Measured across all "
+            "six declared installs, existence and the hook agree everywhere: "
+            "the plaintext trio ship no .dbc, so `compiled_twin` returns None "
+            "and the ini is used; 5517 and 6090 ship one and it wins. So "
+            "wiring this as an INPUT would add a consumer that changes no "
+            "answer -- redundancy dressed as connection, and the suite would "
+            "go green on it either way. The honest use runs the other "
+            "direction: have dbcshadow CROSS-CHECK the plugin and fail loudly "
+            "where they disagree, which turns a declaration nobody reads into "
+            "a guard. Deliberately not built here -- it is a different change "
+            "from wiring and wants its own measurement. Unread is NOT "
+            "unguarded: "
+            "PlaintextFamilyPlugin.test_the_plaintext_tables_are_the_live_ones "
+            "asserts the value against the install's own .dbc count, so it "
+            "cannot be 'corrected' to True without the suite going red."),
+        "provides_reference": (
+            "Declaration by design: it is the far side of "
+            "socket_correction's `reference-basis:<plugin>`, which today is "
+            "a bare string that coviewer._reference_root looks up among the "
+            "declared installs. Nothing dispatches on it and nothing should "
+            "yet -- making the viewer *require* a matching declaration would "
+            "turn a silent downgrade into a hard failure for a user who has "
+            "declared only one install. What it buys now is that the claim "
+            "has a named owner, so a rename or a retirement fails in "
+            "CcoIsTheReferenceInstall rather than degrading the viewer to "
+            "unit-rows in silence. Wire it up when the viewer grows a "
+            "'this correction is unavailable' state to route to."),
+
+    }
+
+    def test_every_hook_is_consumed_or_declared_unconsumed(self):
+        """The contract test above proves each hook *exists*. This proves
+        somebody *calls* it -- which is the property that actually makes a
+        plugin's answer reach the screen.
+
+        Parsed with `ast`, not grepped: a source scan cannot tell a call from
+        a mention of one in a comment, and this repo has already been bitten
+        by a test that asserted on a comment explaining a fix.
+        """
+        import ast
+        import warnings
+        hooks = {n for n, v in vars(self.plugins.Plugin).items()
+                 if callable(v) and not n.startswith("_")}
+        self.assertIn("import_plan", hooks, "hook discovery is wrong")
+
+        called: set = set()
+        # `plugins` is in this list because the base class in
+        # `plugins/__init__.py` is a real consumer: `catalogs()` drives
+        # `self.table_specs`, `self.load_table` and `self.why_no_tables`, and
+        # that is production machinery, not a contract test. Omitting the
+        # directory made three live hooks read as having no caller at all.
+        for d in ("tools", "core", "client", "capture", "plugins"):
+            root = PROJECT / d
+            if not root.is_dir():
+                continue
+            for p in root.rglob("*.py"):
+                if p.name.startswith("test_") or "webui" in p.parts:
+                    continue
+                try:
+                    with warnings.catch_warnings():
+                        # a stray `\C` in someone's docstring is not this
+                        # test's business, and the noise buries the verdict
+                        warnings.simplefilter("ignore", SyntaxWarning)
+                        tree = ast.parse(p.read_text("utf-8", errors="replace"))
+                except SyntaxError:                       # pragma: no cover
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call) and \
+                            isinstance(node.func, ast.Attribute):
+                        called.add(node.func.attr)
+                    # DYNAMIC DISPATCH. `tools/comod.py` reaches the catalog
+                    # hooks through `getattr(plug, "catalogs", None)` and then
+                    # calls the bound result, so the call node is a Name and
+                    # the attribute name never appears as `x.catalogs(...)`.
+                    # An attribute-only scan is structurally blind to that and
+                    # reported `catalogs` and `browse` -- both live, both
+                    # driven by real CLI verbs -- as having no production
+                    # caller. A getattr with a literal name IS a consumption
+                    # site; treat it as one.
+                    elif (isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name)
+                            and node.func.id == "getattr"
+                            and len(node.args) >= 2
+                            and isinstance(node.args[1], ast.Constant)
+                            and isinstance(node.args[1].value, str)):
+                        called.add(node.args[1].value)
+
+        unconsumed = sorted(h for h in hooks if h not in called)
+        declared = set(self.UNCONSUMED_HOOKS)
+        self.assertEqual(
+            set(unconsumed), declared,
+            "\nA hook's consumption changed and this list did not.\n"
+            f"  no production caller : {sorted(unconsumed)}\n"
+            f"  declared unconsumed  : {sorted(declared)}\n"
+            "If you wired one up, remove it from UNCONSUMED_HOOKS. If you "
+            "added a hook nothing calls yet, add it *with the reason* -- a "
+            "hook that only a contract test touches looks covered and is not.")
 
     def test_a_subclass_does_not_inherit_its_parents_evidence(self):
         """patch5517 reuses 6090's monster colour sets and says so; it must
@@ -6539,7 +13815,12 @@ class ParserPlugins(unittest.TestCase):
             self.assertGreater(len(text), 80, f"{key} needs the detail")
         self.assertEqual(
             p.key_field_widths()["Action3DEffect.ini"]["action"], 4)
-        self.assertEqual(p.aura_convention(), "effect-named-for-id")
+        # CORRECTED (C35): this asserted "effect-named-for-id", on the claim
+        # that 6090 ships zero always-on rows. It ships 2,604 -- the reader
+        # was spelling the always-on action three wide against this client's
+        # own four-wide action field, which is the quirk asserted two lines
+        # up. Both official clients use the table, exactly as CCO does.
+        self.assertEqual(p.aura_convention(), "table")
         cco = self.plugins.for_kind("cco")
         self.assertEqual(
             cco.key_field_widths()["Action3DEffect.ini"]["action"], 3)
@@ -6584,7 +13865,7 @@ class ParserPlugins(unittest.TestCase):
         plugin only declares what 5517 does NOT have."""
         p55 = self.plugins.for_kind("patch5517")
         self.assertTrue(p55.prefers_compiled_tables())
-        self.assertEqual(p55.aura_convention(), "effect-named-for-id")
+        self.assertEqual(p55.aura_convention(), "table")   # inherited; C35
         self.assertEqual(
             p55.key_field_widths()["Action3DEffect.ini"]["action"], 4)
         q = p55.table_quirks()
@@ -6613,6 +13894,430 @@ class ParserPlugins(unittest.TestCase):
         self.assertEqual(p.default_colour("130"), "c3/texture/130000000.dds")
 
 
+class PlaintextFamilyPlugin(unittest.TestCase):
+    r"""**5017 / 5065 / 5165: the plaintext tables are LIVE, not decoys.**
+
+    The third parse family, and the one whose central fact is the *inverse* of
+    the rule the rest of this codebase is built on. `core/dbc.py` opens by
+    warning that an official client's plaintext `ini` tables are stale decoys
+    beside a compiled `.dbc` twin. These three ship **no `.dbc` at all**, so
+    the same files are the only tables that exist.
+
+    This class is the guard on that inversion. It exists because the
+    inversion is the kind of thing a later tidy-up "corrects" -- four of
+    `Patch6090`'s answers are wrong here, and a wrong one is silent in both
+    directions: the plaintext profile does not raise on 6090, it answers with
+    paths 6090 does not ship, and the official profile does not raise on 5017,
+    it answers with nothing at all.
+
+    Gated with `requires_base`, not `HAVE_ROOT`. A `HAVE_ROOT` gate cannot
+    tell "the wrong client is configured" from "the code is broken", and that
+    is exactly the class of error this family's evidence had to be dug out
+    from. The contract half needs no install and is ungated.
+    """
+
+    #: The three members, by plugin name. Run the suite with each configured
+    #: to exercise the whole set; the 5517/6090 control below is the other
+    #: half of the difference-proof and is gated the opposite way.
+    FAMILY = ("patch5017", "patch5065", "patch5165")
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import plugins
+        cls.plugins = plugins
+
+    # -- contract half: no install, so it runs everywhere ------------------
+    def test_the_three_plugins_are_discovered_and_declare_the_family(self):
+        names = {p.name for p in self.plugins.available()}
+        for n in self.FAMILY + ("plaintext",):
+            self.assertIn(n, names)
+        for n in self.FAMILY:
+            p = self.plugins.for_kind(n)
+            self.assertEqual(p.table_profile().name, "plaintext", n)
+            self.assertEqual(p.STAMP, n[-4:], n)
+
+    def test_the_plaintext_is_live_assumption_is_stated_in_every_member(self):
+        """**The tripwire.** `prefers_compiled_tables()` False is the whole
+        family in one boolean, and nothing in production reads it (it is on
+        `ParserPlugins.UNCONSUMED_HOOKS`), so without this it could be
+        flipped to match 6090 and nothing would go red.
+
+        Paired deliberately with the 5517/6090 side: asserting only that the
+        family says False would pass on a build where *every* plugin says
+        False, which is the same failure with the sign reversed.
+        """
+        for n in self.FAMILY + ("plaintext",):
+            p = self.plugins.for_kind(n)
+            self.assertFalse(
+                p.prefers_compiled_tables(),
+                f"{n} must NOT prefer compiled tables -- it ships none, so "
+                f"its plaintext ini files are the live tables. See "
+                f"plugins/plaintext.py; do not align this with patch6090.")
+        for n in ("patch5517", "patch6090"):
+            self.assertTrue(self.plugins.for_kind(n).prefers_compiled_tables(),
+                            f"{n} still has compiled twins and must prefer "
+                            f"them; the two families must not converge")
+
+    def test_the_family_inverts_6090_on_every_hook_it_had_to(self):
+        r"""Three answers differ, and each was measured on all five official
+        installs. A subclass of `Patch6090` would have inherited all three.
+
+        **It was four, and the fourth is now an agreement (C35).** This used
+        to assert `p90.aura_convention() == "effect-named-for-id"` against the
+        family's `"table"`. That answer was wrong: 6090 ships 2,604 always-on
+        rows and uses the table exactly as this family does. The apparent
+        difference was the *action field width* -- which is the very next
+        assertion here, and is the real discriminator. Two hooks were saying
+        one thing, one of them incorrectly; only the honest one is left.
+
+        The aura convention is still checked, as an agreement, because a
+        family that answered anything else would now be the wrong one.
+        """
+        p90 = self.plugins.for_kind("patch6090")
+        self.assertEqual(p90.aura_convention(), "table",
+                         "C35: 6090 uses the table; only its width differs")
+        for n in self.FAMILY:
+            p = self.plugins.for_kind(n)
+            self.assertEqual(p.aura_convention(), "table", n)
+            self.assertEqual(
+                p.key_field_widths()["Action3DEffect.ini"]["action"], 3, n)
+            self.assertEqual(
+                p90.key_field_widths()["Action3DEffect.ini"]["action"], 4)
+            self.assertNotEqual(p.table_profile().name,
+                                p90.table_profile().name, n)
+            # and it must not BE a Patch6090, which is the structural half
+            import plugins.patch6090 as m90
+            self.assertNotIsInstance(p, m90.Patch6090, n)
+
+    def test_the_family_claims_no_evidence_it_does_not_have(self):
+        """Nobody has looked at any of these three on screen, so the hooks
+        whose honest answer is a person's judgement must decline. 6090's
+        `999<dir>0` NPC texture rule in particular is measured NOT to hold
+        here (0/3, 0/3, 1/9 against 22/32 and 85/95)."""
+        for n in self.FAMILY:
+            p = self.plugins.for_kind(n)
+            self.assertIsNone(p.monster_colourways("103"), n)
+            self.assertIsNone(
+                p.texture_for_mesh("c3/npc/281/1.c3", lambda q: True), n)
+            self.assertEqual(list(p.colourways("c3/texture/1.dds",
+                                               lambda q: True)), [], n)
+            self.assertEqual(p.entity_name_overrides(), ({}, set()), n)
+            self.assertEqual(p.colour_provenance()[1], "inferred", n)
+
+    def test_each_member_declares_its_own_absences(self):
+        """5017 is not 5065 with fewer rows: it ships no `ItemTexture.ini`
+        and declares seven part slots where the others declare eight. That
+        is why this is three plugins over a shared family class and not one
+        plugin with a version switch."""
+        p17 = self.plugins.for_kind("patch5017")
+        self.assertIn("ini/ItemTexture.ini", p17.ABSENT_HERE)
+        self.assertNotIn("shield", p17.PART_SLOTS)
+        self.assertEqual(len(p17.PART_SLOTS), 7)
+        for n in ("patch5065", "patch5165"):
+            self.assertEqual(self.plugins.for_kind(n).ABSENT_HERE, (), n)
+        q17 = p17.table_quirks()
+        self.assertIn("no ItemTexture.ini at all", q17)
+        self.assertIn("this client's live tables ARE 6090's decoys",
+                      self.plugins.for_kind("patch5165").table_quirks())
+        for n in self.FAMILY:
+            for key, text in self.plugins.for_kind(n).table_quirks().items():
+                self.assertGreater(len(text), 80, f"{n}/{key} needs detail")
+
+    def test_detection_needs_positive_evidence_not_a_missing_dbc(self):
+        """**Zephyr-1057 is the control that makes this test necessary**: it
+        ships zero `.dbc` files and four-wide action fields, so "no compiled
+        tables" is not the family. CCO has no `.dbc` either. The claim has to
+        be the plaintext lookup chain PRESENT and the compiled one ABSENT --
+        and then `version.dat` says which member."""
+        import tempfile
+        from plugins import plaintext as fam
+        chain = set(fam.PLAINTEXT_CHAIN) | {"ini/npc.ini"}
+
+        def detect(stamp, files):
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                if stamp:
+                    (root / "version.dat").write_bytes(stamp.encode())
+                return self.plugins.detect(root, lambda q: q in files).name
+
+        for stamp in ("5017", "5065", "5165"):
+            self.assertEqual(detect(stamp, chain), f"patch{stamp}", stamp)
+        # a compiled twin disqualifies whatever the stamp says
+        self.assertNotIn(
+            detect("5065", chain | {"ini/3DSimpleObj.dbc", "ini/3DObj.dbc"}),
+            self.FAMILY + ("plaintext",))
+        # CCO's shape: npc.json instead of npc.ini
+        self.assertEqual(
+            detect("", (chain - {"ini/npc.ini"}) | {"ini/npc.json"}), "cco")
+        # Zephyr's shape: npc.ini but none of the four lookup tables
+        self.assertEqual(detect("", {"ini/npc.ini", "ini/itemtype.dat"}),
+                         self.plugins.GENERIC.name)
+        # unstamped but unmistakably the family -> the family class, weakly
+        self.assertEqual(detect("", chain), "plaintext")
+
+    def test_the_container_probe_and_the_plugin_agree_on_shape(self):
+        """Two identity mechanisms is how one client's facts get served as
+        another's. `plugins.detect` is authoritative -- it reads
+        `version.dat` and the user's declaration -- and `npcart.detect_profile`
+        answers only the container-shape question, so where both speak they
+        must not contradict.
+
+        They did: `detect_profile` returned `cco` for all three of these
+        clients, from a terminal fallback with no evidence behind it, and
+        `Tables` then loaded 0 of 503 npcs on 5017.
+        """
+        sys.path.insert(0, str(PROJECT / "core"))
+        import npcart
+        chain = {"ini/npc.ini", "ini/3DSimpleObj.ini", "ini/3dobj.ini",
+                 "ini/3dtexture.ini", "ini/3dmotion.ini"}
+
+        def profile(files):
+            def read(p):
+                if p not in files:
+                    raise FileNotFoundError(p)
+                return b""
+            return npcart.detect_profile(read).name
+
+        self.assertEqual(profile(chain), "plaintext")
+        self.assertEqual(profile(chain | {"ini/3DSimpleObj.dbc"}), "official",
+                         "a compiled twin must still win -- 5517 and 6090 "
+                         "ship the plaintext chain too, byte-identical to "
+                         "5165's, and would be claimed if this probe ran "
+                         "first")
+        self.assertEqual(profile({"ini/npc.json"}), "cco")
+        for n in self.FAMILY:
+            self.assertEqual(self.plugins.for_kind(n).table_profile().name,
+                             "plaintext", n)
+
+    # -- the install half: gated on the family, per base -------------------
+    @requires_base("patch5017", "patch5065", "patch5165",
+                   why="reads this install's own ini/ layer; the 5517/6090 "
+                       "control below is the other half of the proof")
+    def test_the_plaintext_tables_are_the_live_ones(self):
+        """**The assertion the whole family rests on, against the bytes.**
+
+        Three statements that must agree: the install ships no compiled
+        table, its plugin says it does not prefer one, and the plaintext
+        profile resolves its npcs to paths that actually exist. Any one of
+        them alone is arguable; together they cannot be satisfied by a client
+        of the other family.
+        """
+        import npcart
+        from coassets import AssetRoot
+        dbc = sorted(p.name for p in (ROOT / "ini").iterdir()
+                     if p.is_file() and p.suffix.lower() == ".dbc")
+        self.assertEqual(dbc, [],
+                         f"{BASE_KIND} is declared a plaintext-family client "
+                         f"and ships compiled tables {dbc} -- either the "
+                         f"declaration is wrong or this family's central "
+                         f"assumption no longer holds")
+        p = self.plugins.for_kind(BASE_KIND)
+        self.assertFalse(p.prefers_compiled_tables())
+
+        ar = AssetRoot(ROOT)
+        t = npcart.Tables(ar.read, p.table_profile())
+        plans = [t.plan_for_npc(r) for r in t.npcs]
+        ok = [q for q in plans if q.ok]
+        self.assertGreater(len(t.npcs), 400, "npc.ini did not load")
+        self.assertGreaterEqual(
+            len(ok) / len(t.npcs), 0.97,
+            f"{BASE_KIND}: only {len(ok)}/{len(t.npcs)} npcs resolve through "
+            f"the plaintext tables; measured 503/503, 575/575 and 855/880")
+        missing = [path for q in ok[:250] for path in q.paths()
+                   if not ar.exists(path)]
+        self.assertEqual(
+            missing[:5], [],
+            "the plaintext tables named files this install does not ship, "
+            "which is what reading a STALE table looks like -- measured "
+            "1970-2000 of 1970-2000 present here, and 840/1870 on 5517")
+
+    @requires_base("cco", "patch5017", "patch5065", "patch5165",
+                   why="this family's Action3DEffect spelling; three wide "
+                       "here, four wide from 5517 on. MEASURED on all six "
+                       "2026-08-09 off the shipped file -- 4-field rows / rows "
+                       "NOT three wide / always-on (action=999) rows: cco "
+                       "8,926/0/826, 5017 8,685/0/646, 5065 8,128/0/586, 5165 "
+                       "9,772/0/622, 5517 10,616/10,616/0, 6090 "
+                       "10,267/10,267/0. CCO satisfies every assertion here "
+                       "and was being skipped; its plugin declares the same "
+                       "width 3 and aura convention 'table'. Widened per-FACT "
+                       "and not by family: CCO is a different profile (`cco`, "
+                       "ini/npc.json) from the trio (`plaintext`, "
+                       "ini/npc.ini), and they agree on this axis while "
+                       "differing on others -- CORRECTIONS "
+                       "C-2026-08-09-comod-base-gate-audit")
+    def test_the_action_field_is_three_wide_and_the_aura_is_in_the_table(self):
+        """Both measured off the shipped file rather than trusted from the
+        plugin, so the declaration and the data cannot drift apart."""
+        rows = []
+        text = (ROOT / "ini" / "Action3DEffect.ini").read_text(
+            "latin-1", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("["):
+                f = line.split("=", 1)[0].split(".")
+                if len(f) == 4:
+                    rows.append(f)
+        self.assertGreater(len(rows), 5000)
+        wide = [f for f in rows if len(f[1]) != 3]
+        self.assertEqual(wide[:3], [], f"{len(wide)} rows are not three wide")
+        p = self.plugins.for_kind(BASE_KIND)
+        self.assertEqual(
+            p.key_field_widths()["Action3DEffect.ini"]["action"], 3)
+        always_on = [f for f in rows if f[1] == "999"]
+        self.assertGreater(
+            len(always_on), 500,
+            "no always-on Action3DEffect rows, so the aura is NOT declared "
+            "in the table here -- measured 646/586/622, against 0 on 5517 "
+            "and 6090")
+        self.assertEqual(p.aura_convention(), "table")
+
+    @requires_base("patch5017", "patch5065", "patch5165",
+                   why="nine-digit npc motion ids resolving in the plaintext "
+                       "table; at 5517 they are ten and resolve in the .dbc")
+    def test_npc_motion_ids_resolve_directly_with_no_u32_wrap(self):
+        """`patch6090`'s u32 wrap is a property of the compiled table, not of
+        the client's id scheme. Here the ids are nine digits and are plain
+        integer keys in the plaintext table."""
+        table = {}
+        for line in (ROOT / "ini" / "3dmotion.ini").read_text(
+                "latin-1", errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip().isdigit():
+                    table[int(k.strip())] = v.strip()
+        direct = wrapped = miss = 0
+        for line in (ROOT / "ini" / "npc.ini").read_text(
+                "latin-1", errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("StandByMotion="):
+                continue
+            v = line.split("=", 1)[1].strip()
+            if not v.isdigit():
+                continue
+            if int(v) in table:
+                direct += 1
+            elif (int(v) & 0xFFFFFFFF) in table:
+                wrapped += 1
+            else:
+                miss += 1
+        self.assertGreater(direct, 400)
+        self.assertEqual(wrapped, 0, "a u32-wrapped key resolved, which is "
+                                     "the compiled table's convention")
+        self.assertGreaterEqual(direct / (direct + miss), 0.97)
+
+    @requires_base("patch5017", "patch5065", "patch5165",
+                   why="counts this install's own c3/<family>/ directories "
+                       "against what its 3dmotion.ini names")
+    def test_the_motion_families_on_disk_match_what_the_plugin_declares(self):
+        """**Live is not the same as complete, and the two get conflated.**
+
+        `3dmotion.ini` names four body-motion families on every official
+        client. 5517 and 6090 ship sixteen and their compiled twin names
+        them, so the shortfall is invisible there. Here there is no twin --
+        and it splits the family: 5017 and 5065 ship four and name four,
+        **5165 ships eight and names four**, with 204 loose `.c3` files under
+        `c3/1001`..`c3/1004` that nothing in its tables mentions.
+
+        Counted off the filesystem rather than out of the table under test,
+        because a table cannot be its own completeness check.
+        """
+        import re
+        p = self.plugins.for_kind(BASE_KIND)
+        on_disk = tuple(sorted(
+            d.name for d in (ROOT / "c3").iterdir()
+            if d.is_dir() and re.fullmatch(r"[0-3]00[1-4]", d.name)
+            and any(d.rglob("*.c3"))))
+        self.assertEqual(
+            on_disk, tuple(p.MOTION_FAMILIES_ON_DISK),
+            f"{BASE_KIND} ships motion families the plugin does not declare, "
+            f"or the reverse. Measured 0001-0004 on 5017 and 5065, and those "
+            f"plus 1001-1004 on 5165.")
+        named = set()
+        pat = re.compile(r"^c3/(\d{4})/\d{3}/\d{1,3}\.c3$", re.I)
+        for line in (ROOT / "ini" / "3dmotion.ini").read_text(
+                "latin-1", errors="replace").splitlines():
+            if "=" in line:
+                m = pat.match(line.split("=", 1)[1].strip().replace("\\", "/"))
+                if m:
+                    named.add(m.group(1))
+        self.assertEqual(
+            tuple(sorted(set(on_disk) - named)),
+            tuple(p.UNNAMED_MOTION_FAMILIES),
+            f"{BASE_KIND}: the set of motion families present on disk and "
+            f"absent from 3dmotion.ini changed. There is no compiled twin on "
+            f"this client, so nothing but the filesystem can correct that "
+            f"table -- update UNNAMED_MOTION_FAMILIES and say what moved.")
+
+    @requires_base("patch5517", "patch6090",
+                   why="THE CONTROL for the plaintext-is-live claim: the same "
+                       "profile, run where the same files are stale")
+    def test_the_plaintext_profile_is_wrong_on_a_compiled_twin_client(self):
+        """**The other half of the difference-proof, and the reason the claim
+        is a measurement rather than a preference.**
+
+        The plaintext profile does not fail loudly here. It produces 1,066
+        confident plans on 5517 and 1,815 on 6090 -- and fewer than half the
+        files they name are in the install, because those tables froze at
+        5165. Same code, same assertion, opposite answer.
+        """
+        import npcart
+        from coassets import AssetRoot
+        ar = AssetRoot(ROOT)
+        t = npcart.Tables(ar.read, npcart.PROFILE_PLAINTEXT)
+        plans = [q for q in (t.plan_for_npc(r) for r in t.npcs) if q.ok]
+        self.assertGreater(len(plans), 500,
+                           "the stale tables still parse -- that is the trap")
+        checked = [path for q in plans[:250] for path in q.paths()]
+        present = sum(1 for path in checked if ar.exists(path))
+        self.assertLess(
+            present / len(checked), 0.75,
+            f"{BASE_KIND}: the plaintext tables resolved {present} of "
+            f"{len(checked)} paths, which is what a LIVE table looks like. "
+            f"If this client stopped shipping compiled twins, the family "
+            f"split has moved and plugins/plaintext.py needs rewriting.")
+        self.assertTrue(self.plugins.for_kind(BASE_KIND)
+                        .prefers_compiled_tables())
+
+    # -- a reader property, so ungated: it must hold on every client -------
+    @unittest.skipUnless(HAVE_ROOT, "needs an install")
+    def test_a_body_motion_resolves_whatever_the_key_is_spelled_like(self):
+        """Not `requires_base`: a format reader that should work on every
+        client must keep failing everywhere when it breaks.
+
+        The official plaintext `3dmotion.ini` writes a body motion key TEN
+        wide (`0001410100`) where CCO writes it seven (`1410100`), and every
+        caller builds the seven-wide form. On 5517/6090 the compiled twin
+        rebuilds that spelling from each row's path and the difference never
+        showed; on 5017/5065/5165 there is no twin and **every body-motion
+        lookup missed, silently**, leaving static previews on the mesh's own
+        embedded MOTI -- a T-pose on shape 004.
+        """
+        import anim
+        import attach
+        cat = attach.Catalogue(ROOT)
+        for shape, body in sorted(cat.BODIES.items()):
+            if not cat.assets.exists(f"c3/mesh/{body}.c3"):
+                continue
+            bare = cat.idle_motion(body, "000", "100")
+            self.assertIsNotNone(
+                bare, f"shape {shape}: the unarmed idle did not resolve; "
+                      f"check the body-motion key spelling")
+            armed = cat.idle_motion(body, "480", "100")
+            self.assertIsNotNone(armed, f"shape {shape}: armed idle")
+        db = anim.AnimDB(ROOT)
+        body = cat.BODIES["002"]
+        if cat.assets.exists(f"c3/mesh/{body}.c3"):
+            clip = db.clip(body, "100")
+            self.assertIsNotNone(clip, "AnimDB found no unarmed idle")
+            self.assertIn("/000/", clip.path)
+            swung = db.clip(body, "100", weapon="480058")
+            self.assertIsNotNone(swung, "AnimDB found no armed idle")
+            self.assertIn("/410/", swung.path,
+                          "a club must animate from motion set 410")
+
+
 class ArmedMotion(unittest.TestCase):
     r"""**An armed character must play its ARMED motion, and every panel must
     say which one.** This has now broken twice, silently both times, and it is
@@ -6622,9 +14327,11 @@ class ArmedMotion(unittest.TestCase):
     ----------------
     `ini/3dmotion.ini` is keyed `<shape><weaponset><action>`, and a `410` swing
     is a different motion from the unarmed one. CCO spells the pairing out --
-    259 rows for set 480 alone, each `1480100 = c3/0001/410/100.c3`. **6090 and
-    5517 ship none of those rows**, in either the stale ini or the compiled
-    `.dbc`, so an armed key misses.
+    259 rows for set 480 alone, each `1480100 = c3/0001/410/100.c3`. **6090's
+    and 5517's live table -- the compiled `.dbc` -- ships none of those rows**,
+    so an armed key misses. (Their *stale* ini does carry them, spelled ten
+    wide: CORRECTIONS C27, home `attach.WEAPON_MOTION_SET`. Immaterial for
+    these two, load-bearing on 5017/5065/5165 where that table is live.)
 
     It missed *quietly*: the lookup's own fallback chain ends at the unarmed
     set `000` **and reports success**, so an armed character was posed
@@ -6727,6 +14434,422 @@ class ArmedMotion(unittest.TestCase):
         self.assertIn("ensureAnim(", handler)
 
 
+class CcoIsTheReferenceInstall(unittest.TestCase):
+    r"""**CCO is not legacy support; it is the client the others are corrected
+    towards**, and these tests are what makes that a checkable claim rather
+    than a sentence in a handoff.
+
+    Two answers the app uses every day exist only because a CCO install is on
+    hand, and neither can be re-derived from any official client:
+
+    * `attach.WEAPON_MOTION_SET`, read out of CCO's `ini/3dmotion.ini`.
+      Without it every armed character is posed empty-handed **and the
+      lookup's own fallback reports success**.
+    * The female `v_l_weapon` orientation `Patch6090.socket_correction`
+      borrows as `reference-basis:cco`.
+
+    The install-dependent tests are gated with `requires_base("cco")`, because
+    the alternative is what `requires_base` exists to stop: a fixture pinned to
+    one install's content failing on another and reading as a code regression.
+
+    **Two bases are not enough, and here they are not even symmetric.** CCO
+    ships the *interleaved* `PHY MOTI PHY MOTI` chunk layout where pairing by
+    adjacency is accidentally right; the official clients ship *blocked*
+    `PHY PHY MOTI MOTI` where it is not (C16). So an agreement between CCO and
+    one official client is the least trustworthy evidence in this repo. Every
+    socket assertion here goes through `parts.socket_anchors`, which pairs by
+    ordinal on both layouts, and the cross-checks run against **both** 5517
+    and 6090 rather than whichever one is configured.
+    """
+
+    #: The official installs to cross-check against, resolved from the user's
+    #: own `declare_kind` records. Never by listing a clients tree: a declared
+    #: root can be an empty directory (`5065-live2`, `Clients\CCO`), and
+    #: measuring one silently measures nothing.
+    CROSS_CHECK = ("patch5517", "patch6090")
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(PROJECT))
+        import plugins
+        cls.plugins = plugins
+        cls.cco = plugins.for_kind("cco")
+
+    @classmethod
+    def _declared(cls, kind):
+        """A declared, **non-empty** install root for `kind`, or None."""
+        try:
+            declared = coroot.read_settings().get(coroot.KINDS_KEY) or {}
+        except Exception:                                # pragma: no cover
+            return None
+        for path, k in declared.items():
+            if str(k).strip().lower() != kind:
+                continue
+            p = Path(str(path))
+            try:
+                if p.is_dir() and any(p.iterdir()):
+                    return p
+            except OSError:                              # pragma: no cover
+                return None
+        return None
+
+    # -- contract: true on any checkout, no install needed -----------------
+    def test_the_borrowers_reference_string_has_something_on_the_far_side(self):
+        """`reference-basis:cco` names a plugin in a bare string, and until
+        `provides_reference` existed nothing on the far side had agreed to it.
+
+        A rename, a retirement, or a typo would have produced **no error** --
+        `coviewer._reference_root` would return None, the correction would
+        degrade to `unit-rows`, and the viewer would say so in a note nobody
+        reads. That is the exact shape of failure this project keeps paying
+        for, so the two halves are asserted to agree.
+        """
+        hit = self.plugins.for_kind("patch6090").socket_correction(
+            "v_l_weapon", "002135000")
+        self.assertIsNotNone(hit)
+        mode = hit[0]
+        self.assertTrue(mode.startswith("reference-basis:"), mode)
+        named = mode.split(":", 1)[1]
+        ref = self.plugins.for_kind(named)
+        self.assertIsNotNone(
+            ref, f"socket_correction borrows from {named!r} and no plugin "
+                 f"answers to that name")
+        self.assertIn(
+            "female-v_l_weapon-basis", ref.provides_reference(),
+            f"{named} is borrowed from but does not declare that it is the "
+            f"authority for the socket basis -- so nothing would catch the "
+            f"day it stops being one")
+
+    def test_cco_declares_both_things_only_it_can_answer(self):
+        """Both are runtime dependencies of the app, and neither was written
+        down anywhere a reader would find it."""
+        got = self.cco.provides_reference()
+        self.assertIn("weapon-motion-aliases", got)
+        self.assertIn("female-v_l_weapon-basis", got)
+        for topic, note in got.items():
+            self.assertGreater(len(note), 120,
+                               f"{topic} needs the evidence, not the claim")
+        self.assertEqual(self.plugins.GENERIC.provides_reference(), {},
+                         "the base contract stays opinion-free")
+
+    def test_cco_corrects_no_socket_and_that_is_the_load_bearing_answer(self):
+        """CCO returning None from `socket_correction` is not an absence of
+        opinion -- it is the premise `reference-basis:cco` rests on. If CCO
+        ever needs a correction of its own, borrowing from it stops being
+        defensible and this test is where that surfaces."""
+        for sock in ("v_l_weapon", "v_r_weapon", "v_armet", "v_mount"):
+            for body in ("001131000", "002135000", "003133000", "004134000"):
+                self.assertIsNone(self.cco.socket_correction(sock, body),
+                                  f"{sock} on {body}")
+
+    def test_cco_claims_no_scan_it_has_not_done(self):
+        """`patch5517` inherits 6090's colour sets because it shares 6090's
+        archives byte for byte. CCO does **not** share them, so an inherited
+        set would sit over different art -- a confident wrong answer. Empty is
+        the honest state until someone looks at this base."""
+        self.assertIsNone(self.cco.monster_colourways("103"))
+        pins, drops = self.cco.entity_name_overrides()
+        self.assertEqual((pins, drops), ({}, set()))
+        method, kind = self.cco.colour_provenance()
+        self.assertEqual(kind, "inferred",
+                         "nobody has verified a colourway on this base")
+        self.assertNotEqual(
+            self.cco.colour_provenance(),
+            self.plugins.for_kind("patch6090").colour_provenance(),
+            "6090's 'authored' rests on a person looking at 36 monster "
+            "directories in that client; it must not be inherited here")
+
+    def test_the_form_differences_are_declared_from_this_side(self):
+        """`Patch6090.QUIRKS` states six differences from the 6090 side and
+        most are a CCO fact in a mirror. They are worth stating in the
+        positive because a contributor arriving at CCO with official
+        assumptions hits them in the opposite direction."""
+        q = self.cco.table_quirks()
+        self.assertGreaterEqual(len(q), 8)
+        for key, text in q.items():
+            self.assertGreater(len(text), 80, f"{key} needs the detail")
+        joined = " ".join(q).lower()
+        for token in ("interleav", "twice", "json", "nine wide",
+                      "three wide", "alias", "colour"):
+            self.assertIn(token, joined, f"no quirk covers {token}")
+        self.assertEqual(
+            self.cco.key_field_widths()["Action3DEffect.ini"]["action"], 3)
+        self.assertFalse(self.cco.prefers_compiled_tables(),
+                         "CCO ships no compiled twin to prefer")
+
+    def test_the_official_archive_shortcut_is_refused(self):
+        """All five official patches ship byte-identical archives, so 6090
+        sets `sharedArchives` and skips them. CCO's `c3.wdf` is a different
+        file, so inheriting that flag would skip the only copy of its art --
+        and the symptom would be a short catalogue, not an error."""
+        plan = self.cco.import_plan(Path("."), lambda q: False)
+        self.assertIs(plan.get("sharedArchives"), False)
+        self.assertIn("c3.wdf", plan["archives"])
+        self.assertIs(
+            self.plugins.for_kind("patch6090").import_plan(
+                Path("."), lambda q: False).get("sharedArchives"), True,
+            "the 6090 shortcut is the thing being refused; if it is gone, "
+            "this test is asserting nothing")
+
+    # -- measured against the real installs --------------------------------
+    @requires_base("cco", why="re-derives the alias table from CCO's own "
+                              "3dmotion.ini; there is nothing to derive on an "
+                              "official client")
+    def test_the_baked_weapon_motion_aliases_reproduce_from_this_install(self):
+        r"""**The provenance of `attach.WEAPON_MOTION_SET` becomes
+        reproducible instead of merely sourced.**
+
+        122 literals in `tools/attach.py` carried a comment naming CCO and a
+        rule in prose. A sentence cannot be re-run. This executes the rule --
+        keep body-motion keys, take the dominant non-`000` folder per weapon
+        set -- against the live install and asserts it reproduces every entry.
+
+        If it ever disagrees, either the table was edited without its source
+        or this is not the install it came from. Both are worth an error.
+        """
+        import attach
+        got = self.cco.derive_weapon_motion_aliases(ROOT)
+        self.assertGreater(len(got), 100,
+                           "CCO's 3dmotion.ini did not yield the alias rows")
+        for ws, folder in attach.WEAPON_MOTION_SET.items():
+            self.assertEqual(
+                got.get(ws), folder,
+                f"weapon set {ws} is baked as {folder} and re-derives as "
+                f"{got.get(ws)} from this install")
+        self.assertNotIn("000", attach.WEAPON_MOTION_SET,
+                         "the unarmed set maps to itself and must not be an "
+                         "alias -- aliasing it would send every unarmed pose "
+                         "through the armed path")
+
+    @requires_base("cco", why="asserts CCO's own motion table; the official "
+                              "clients ship none of these rows by design")
+    def test_the_alias_rows_are_here_and_absent_from_both_official_clients(self):
+        """The whole reason the table had to come from CCO, checked against
+        **both** official clients rather than one.
+
+        Checking against one cannot distinguish "CCO has something extra"
+        from "that client dropped it" -- and a session that classified pins
+        against a single other base had all five of its results turn out
+        wrong for exactly this reason (`docs/CORRECTIONS.md` section 3).
+        """
+        import attach
+        here = attach.Catalogue(ROOT)
+        mine = self._sets_keyed(here)
+        self.assertIn("480", mine, "CCO must key weapon set 480")
+        self.assertGreater(mine["480"], 100,
+                           "set 480 should be spelled out row by row")
+        checked = 0
+        for kind in self.CROSS_CHECK:
+            root = self._declared(kind)
+            if root is None:
+                continue
+            checked += 1
+            theirs = self._sets_keyed(attach.Catalogue(root))
+            self.assertNotIn(
+                "480", theirs,
+                f"{kind} unexpectedly keys weapon set 480 -- if an official "
+                f"client has grown the alias rows, WEAPON_MOTION_SET's whole "
+                f"justification has changed")
+        self.assertGreaterEqual(
+            checked, 2, "needs both official installs declared: one is not "
+                        "enough to tell a CCO addition from a TQ removal")
+
+    @staticmethod
+    def _sets_keyed(cat):
+        """Weapon set -> how many body-motion keys name it, for one install."""
+        from collections import Counter
+        out = Counter()
+        for k in cat.motion:
+            if k.isdigit() and len(k) >= 7 and k[:-6] in ("1", "2", "3", "4"):
+                out[k[-6:-3]] += 1
+        return out
+
+    @requires_base("cco", why="CCO's clean v_l_weapon track is the fact under "
+                              "test; on an official client it is the thing "
+                              "being corrected")
+    def test_the_reference_track_is_clean_where_the_lineage_is_not(self):
+        r"""The measurement `reference-basis:cco` rests on, re-run rather than
+        quoted, and cross-checked against **both** official clients.
+
+        Shortest basis row of each dummy's track over every frame of motion
+        set 410. CCO must be a unit rotation on all four body shapes; both
+        official clients must collapse `v_l_weapon` on the two FEMALE shapes
+        and leave the male ones and the other sockets alone.
+
+        Read through `parts.socket_anchors`, which pairs body-mesh names to
+        motion tracks by **ordinal**. That matters more here than anywhere:
+        CCO's motion files carry named PHY chunks and the official ones carry
+        bare MOTI tracks, so a name-based reader would work on CCO and find
+        nothing on the lineage it is being compared with.
+        """
+        import parts as partsmod
+        from coassets import AssetRoot
+        female = ("001131000", "002135000")
+        male = ("003133000", "004134000")
+
+        def shortest(root, app, socket, action):
+            cat = partsmod.action_catalogue(root)
+            mesh = cat.appearance_mesh("armor.ini", app) or cat.mesh_path(app)
+            motion = partsmod.idle_motion(app, root, "410", action)
+            if mesh is None or motion is None:
+                return None
+            raw = AssetRoot(root).read(mesh)
+            best = None
+            for f in range(0, 31):
+                try:
+                    a = partsmod.socket_anchors(raw, motion_set=motion,
+                                                frame=f).get(socket)
+                except Exception:                        # pragma: no cover
+                    break
+                if a is None or not a.matrix:
+                    continue
+                m = a.matrix
+                row = min(math.sqrt(m[i * 4] ** 2 + m[i * 4 + 1] ** 2
+                                    + m[i * 4 + 2] ** 2) for i in range(3))
+                best = row if best is None else min(best, row)
+            return best
+
+        for app in female + male:
+            for socket in ("v_l_weapon", "v_r_weapon", "v_armet"):
+                for action in ("100", "403"):
+                    got = shortest(ROOT, app, socket, action)
+                    if got is None:
+                        self.skipTest(f"{app}/{action} not on this install")
+                    self.assertAlmostEqual(
+                        got, 1.0, places=2,
+                        msg=f"CCO {app} {socket} action {action}: the "
+                            f"reference track is not a unit rotation, so "
+                            f"borrowing it is no longer defensible")
+
+        checked = 0
+        for kind in self.CROSS_CHECK:
+            root = self._declared(kind)
+            if root is None:
+                continue
+            checked += 1
+            for app in female:
+                got = shortest(root, app, "v_l_weapon", "403")
+                if got is None:
+                    continue
+                self.assertLess(
+                    got, 0.1,
+                    f"{kind} {app}: the female left-weapon track is no longer "
+                    f"degenerate, so the correction may have stopped being "
+                    f"needed -- verify before believing this test")
+            for app in male:
+                got = shortest(root, app, "v_l_weapon", "403")
+                if got is None:
+                    continue
+                self.assertAlmostEqual(
+                    got, 1.0, places=2,
+                    msg=f"{kind} {app} is male and must be clean")
+        self.assertGreaterEqual(
+            checked, 2,
+            "needs both official installs: 5517 and 6090 are byte-identical "
+            "here, so agreeing with one of them proves nothing about the "
+            "other")
+
+    def test_the_52_declared_dummies_are_not_the_art(self):
+        r"""`RolePart.ini` here declares **13 parts and 52 dummies** -- v_head,
+        v_misc, v_pelvis, v_back, v_mantle, shoulders, flaps -- and names
+        three part tables the install does not ship. The meshes carry four
+        chunks.
+
+        This is the sharpest example in the repo of `sockets_present`'s
+        reason to exist, and `parts.PartManifest` still reads that file "as
+        the authority on what a character is made of".
+
+        **UNGATED 2026-08-09.** It was gated `cco` as "a census of CCO's own
+        body meshes"; measured on all six declared installs it passes on
+        every one, so the socket-set shape is a corpus-wide invariant rather
+        than CCO's content, and gating it meant the invariant went unchecked
+        on the five clients where it could actually regress --
+        CORRECTIONS C-2026-08-09-comod-base-gate-audit
+        """
+        import attach
+        cat = attach.Catalogue(ROOT)
+        shapes = set()
+        n = 0
+        for sec in cat.table("armor.ini").values():
+            mp = cat.mesh_path(sec.get("Mesh0", ""))
+            if not mp or not mp.lower().startswith("c3/mesh/"):
+                continue
+            pm = cat.load(mp)
+            if pm is None:
+                continue
+            n += 1
+            shapes.add(tuple(sorted({c.name.lower() for c in pm.chunks
+                                     if c.name})))
+        self.assertGreater(n, 400, "no character bodies resolved")
+        self.assertLessEqual(
+            len(shapes), 2,
+            f"this install's character bodies grew a new socket-set "
+            f"shape: {shapes}")
+        for shape in shapes:
+            self.assertEqual(
+                set(shape) - {"v_body", "v_body01"},
+                {"v_armet", "v_l_weapon", "v_r_weapon"},
+                "a character body carries a socket the plugin does not "
+                "declare, or has lost one it does")
+        for absent in ("v_head", "v_misc", "v_pelvis", "v_l_shield"):
+            self.assertTrue(
+                all(absent not in s for s in shapes),
+                f"{absent} is declared in RolePart.ini and was believed "
+                f"absent from every body; it is not")
+        for slot in ("misc", "head", "pelvis"):
+            self.assertEqual(self.cco.slot_socket(slot), "",
+                             f"{slot} has no socket on any body and must be "
+                             f"declared unattachable, not dropped at the "
+                             f"body origin")
+
+    @requires_base("cco", why="CCO's chunk layout is the fact under test")
+    def test_cco_interleaves_its_chunks_so_agreement_here_is_suspect(self):
+        r"""**The reason a CCO cross-check is not symmetric**, asserted so it
+        cannot quietly stop being true.
+
+        MEASURED on the one logical path all three installs share. A body
+        motion file is `PHY MOTI PHY MOTI ...` here and bare `MOTI MOTI ...`
+        on the official clients -- no PHY, no names at all. So on CCO a
+        reader that pairs a MOTI with the PHY beside it, or that looks socket
+        names up in the motion file, gets the right answer for the wrong
+        reason; on the lineage it gets nothing or the wrong track. That is
+        C16, which read as a base-dependent code defect for weeks.
+
+        This test exists to keep the asymmetry visible to whoever next uses
+        CCO as a control.
+        """
+        import attach
+        import c3phy
+        cat = attach.Catalogue(ROOT)
+        path = cat.motion.get("2410100")
+        self.assertTrue(path, "CCO must key the armed idle directly")
+        tags = [t for t, _ in c3phy.iter_chunks(cat.assets.read(path))]
+        self.assertIn(b"MOTI", tags)
+        self.assertTrue(any(t in c3phy.VARIANTS for t in tags),
+                        "CCO's motion files carry named PHY chunks; that is "
+                        "what makes an adjacency reader look correct here")
+        names = [c.name for c in attach.PartMesh.parse(
+            cat.assets.read(path), path).chunks]
+        self.assertIn("v_l_weapon", names)
+
+        checked = 0
+        for kind in self.CROSS_CHECK:
+            root = self._declared(kind)
+            if root is None:
+                continue
+            checked += 1
+            ocat = attach.Catalogue(root)
+            opath = ocat.motion.get("2410100") or ocat.motion.get("2000100")
+            if not opath:
+                continue
+            otags = [t for t, _ in c3phy.iter_chunks(ocat.assets.read(opath))]
+            self.assertFalse(
+                any(t in c3phy.VARIANTS for t in otags),
+                f"{kind}'s body-motion file has grown PHY chunks -- the "
+                f"asymmetry this test documents would no longer hold")
+        self.assertGreaterEqual(checked, 2, "needs both official installs")
+
+
 class SocketCorrectionIsViewerOnly(unittest.TestCase):
     r"""The one hook that makes the app disagree with the client on purpose.
 
@@ -6824,15 +14947,301 @@ class SocketCorrectionIsViewerOnly(unittest.TestCase):
             here = partsmod.socket_anchors(raw, motion_set=motion,
                                            frame=frame).get("v_l_weapon")
             there = coviewer._reference_basis("cco", "v_l_weapon", app,
-                                              "410", action, frame)
+                                              "410", action, frame,
+                                              local_motion=motion)
             if here is None or there is None:
                 self.skipTest("motion not resolvable on both installs")
+            basis, _used = there
             for i in range(3):
                 self.assertAlmostEqual(
-                    here.matrix[12 + i], there[12 + i], places=4,
+                    here.matrix[12 + i], basis[12 + i], places=4,
                     msg=f"action {action} frame {frame}: the socket moves "
                         f"between the clients, so its orientation cannot "
                         f"simply be borrowed")
+
+    def test_the_reference_body_falls_back_to_the_shape_not_to_nothing(self):
+        """The resolution rule on its own, with an id no client can ship.
+        Needs only a declared CCO; deterministic, so it cannot skip its way
+        past the regression the way an install-dependent probe can."""
+        import coviewer
+        import parts as partsmod
+        ref = coviewer._reference_root("cco")
+        if ref is None:
+            self.skipTest("no CCO install declared")
+        cat = partsmod.action_catalogue(ref)
+        for shape, canon in (("001", "001131000"), ("002", "002135000")):
+            mesh, used = coviewer._reference_body(cat, shape + "999999")
+            self.assertEqual(used, canon,
+                             f"shape {shape} must fall back to its canonical "
+                             f"body, not give up")
+            self.assertTrue(mesh, "the substitute must resolve to a mesh")
+        # ... and an unknown shape still gives up rather than inventing one.
+        self.assertEqual(coviewer._reference_body(cat, "777123456"),
+                         (None, None))
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_an_appearance_the_reference_lacks_still_borrows(self):
+        """**The bug this class shipped with.** The borrow used to demand the
+        reference client resolve a mesh for the *same appearance id*. Armour
+        appearances are client-specific -- `001139040` ("Abyss Coat") exists on
+        6090 and not in CCO -- so the borrow was unreachable for most bodies
+        and the viewer silently degraded to `unit-rows`: full-size weapon,
+        wrong direction. That is what was reported on screen.
+
+        The basis is a property of the shape's motion track, not of the
+        armour, so a body of the same shape is the same answer. Assert both
+        halves: the borrow resolves, and it equals what the exact-match body
+        would have given."""
+        import coviewer
+        import parts as partsmod
+        if coviewer._reference_root("cco") is None:
+            self.skipTest("no CCO install declared")
+        cat = partsmod.action_catalogue(ROOT)
+        refcat = partsmod.action_catalogue(coviewer._reference_root("cco"))
+
+        def has(c, a):
+            return bool(c.appearance_mesh("armor.ini", a) or c.mesh_path(a))
+
+        # Scanned, not hardcoded. A fixed id would skip on whichever install
+        # happens not to ship it -- and C21 is the standing warning that a
+        # test which skips in the situation the bug needs cannot catch it.
+        app = None
+        for series in range(130, 200):
+            for variant in range(0, 100, 10):
+                a = f"001{series}{variant:03d}"
+                if has(cat, a) and not has(refcat, a):
+                    app = a
+                    break
+            if app:
+                break
+        if app is None:
+            self.skipTest("this install ships no shape-001 body CCO lacks")
+        motion = partsmod.idle_motion(app, ROOT, "410", "100")
+        if motion is None:
+            self.skipTest("armed idle not on this install")
+        got = coviewer._reference_basis("cco", "v_l_weapon", app, "410", "100",
+                                        0, local_motion=motion)
+        self.assertIsNotNone(
+            got, f"the borrow must not require CCO to ship {app}; falling "
+                 f"back here is the reported bug")
+        basis, used = got
+        self.assertNotEqual(used, app, "this test needs the substitution path")
+        self.assertEqual(used[:3], app[:3], "the substitute must be the same "
+                                            "body shape or it is a different "
+                                            "skeleton")
+        canon = coviewer._reference_basis("cco", "v_l_weapon", used, "410",
+                                          "100", 0)
+        self.assertIsNotNone(canon)
+        for i in range(12):
+            self.assertAlmostEqual(basis[i], canon[0][i], places=6,
+                                   msg="the substituted body must give the "
+                                       "same matrix as asking for it directly")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_a_clip_that_is_not_the_same_clip_is_refused(self):
+        """`Motion.matrix` CLAMPS an out-of-range frame to the last key, so a
+        length mismatch does not fail -- it borrows the reference's final pose
+        for every frame past its end and looks plausible. The old docstring
+        claimed frame counts were checked and nothing checked them.
+
+        Action 130 is the live case: 20 frames here, 25 in CCO. Refusing is
+        measured, not assumed -- under proportional mapping the *control*
+        socket `v_r_weapon`, which is identical between the clients on every
+        action that lines up, diverges by ~0.97. They are different clips."""
+        import coviewer
+        import parts as partsmod
+        if coviewer._reference_root("cco") is None:
+            self.skipTest("no CCO install declared")
+        app = "001131000"
+        here = partsmod.idle_motion(app, ROOT, "410", "130")
+        there_root = coviewer._reference_root("cco")
+        there = partsmod.idle_motion(app, there_root, "410", "130")
+        if here is None or there is None:
+            self.skipTest("action 130 not on both installs")
+        if coviewer._frame_counts(here) == coviewer._frame_counts(there):
+            self.skipTest("these two installs agree on action 130's length")
+        self.assertIsNone(
+            coviewer._reference_basis("cco", "v_l_weapon", app, "410", "130",
+                                      0, local_motion=here),
+            "a borrow across clips of different lengths must be refused, not "
+            "silently clamped")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_a_male_body_needs_no_correction_through_the_same_path(self):
+        """**The discriminating control.** "The left socket is wrong and the
+        right one is fine" has two possible causes: the female track, or
+        something in how the app handles left-hand attachment generally. A
+        male body separates them, because it runs the identical code — same
+        clip resolution, same PHY→MOTI pairing, same socket lookup — over a
+        track this lineage did not rewrite.
+
+        MEASURED, weapon set 480, action 100 frame 0: shapes 003 and 004 have
+        unit rows on both hands, the correction does not fire, and their
+        `v_l_weapon` 3x3 equals CCO's to **0.000000**. The females collapse
+        and differ from CCO by 0.87 / 1.01. So the fault is the female track,
+        not left-hand handling."""
+        import coviewer
+        import parts as partsmod
+        from coassets import AssetRoot
+        if coviewer._reference_root("cco") is None:
+            self.skipTest("no CCO install declared")
+        import plugins
+        plug = plugins.for_kind(coroot.kind_for_root(ROOT) or "")
+        if plug is None or plug.socket_correction("v_l_weapon",
+                                                  "001131000") is None:
+            self.skipTest("this base declares no v_l_weapon correction")
+        cat = partsmod.action_catalogue(ROOT)
+        checked = 0
+        for app in ("003133000", "004134000"):
+            mesh = cat.appearance_mesh("armor.ini", app) or cat.mesh_path(app)
+            motion = partsmod.idle_motion(app, ROOT, "410", "100")
+            if not mesh or motion is None:
+                continue
+            raw = AssetRoot(ROOT).read(mesh)
+            a = partsmod.socket_anchors(raw, motion_set=motion, frame=0)
+            self.assertIsNone(plug.socket_correction("v_l_weapon", app),
+                              f"{app} is male and must not be corrected")
+            for sock in ("v_l_weapon", "v_r_weapon"):
+                for r in (0, 4, 8):
+                    m = a[sock].matrix
+                    n = math.sqrt(sum(m[r + i] ** 2 for i in range(3)))
+                    self.assertAlmostEqual(
+                        n, 1.0, places=3,
+                        msg=f"{app} {sock} row {r // 4} is not unit -- the "
+                            f"male tracks are the clean control")
+            ref = coviewer._reference_basis("cco", "v_l_weapon", app, "410",
+                                            "100", 0, local_motion=motion)
+            self.assertIsNotNone(ref, f"{app}: CCO must resolve for a male "
+                                      f"body too")
+            for i in range(12):
+                self.assertAlmostEqual(
+                    a["v_l_weapon"].matrix[i], ref[0][i], places=5,
+                    msg=f"{app}: the clients disagree on a track neither "
+                        f"rewrote -- that would mean the fault is in the "
+                        f"read, not in the female data")
+            checked += 1
+        self.assertGreaterEqual(checked, 1, "no male body was actually read")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_borrowed_track_is_the_one_the_name_points_at(self):
+        """**C16's trap, checked affirmatively instead of assumed away.**
+
+        The two clients' *motion* files do not have the same structure. On
+        `c3/0001/410/100.c3` and `c3/0002/410/100.c3` alike, CCO's four PHY
+        chunks carry their names (`v_body`, `v_armet`, `v_l_weapon`,
+        `v_r_weapon`) and both official clients' four carry **empty** ones. So
+        nothing on the official side can be paired by name, and anything paired
+        by *adjacency* across the two would be comparing different sockets --
+        which is exactly what made C16 look like a real defect for weeks.
+
+        `attach.socket_matrix` pairs by ordinal, taking the index from the
+        **body mesh** and the track from the motion at that same index, each
+        within one install. CCO is where that convention can actually be
+        verified, because its motion file is self-describing: assert its PHY
+        name order equals its body mesh's, so the ordinal the borrow uses does
+        name the socket it claims."""
+        import coviewer
+        import parts as partsmod
+        import attach
+        from coassets import AssetRoot
+        ref = coviewer._reference_root("cco")
+        if ref is None:
+            self.skipTest("no CCO install declared")
+        cat = partsmod.action_catalogue(ref)
+        checked = 0
+        for body in ("001131000", "002135000"):
+            mp = cat.appearance_mesh("armor.ini", body) or cat.mesh_path(body)
+            motion = partsmod.idle_motion(body, ref, "410", "100")
+            if not mp or motion is None:
+                continue
+            mesh = attach.PartMesh.parse(AssetRoot(ref).read(mp), mp)
+            names = [c.phy.name for c in motion.chunks if c.phy is not None]
+            if not any(names):
+                continue           # this install's motions are nameless too
+            for sock in ("v_l_weapon", "v_r_weapon"):
+                i = mesh.find(sock)
+                self.assertGreaterEqual(i, 0, f"{body} has no {sock}")
+                self.assertLess(i, len(names))
+                self.assertEqual(
+                    names[i], sock,
+                    f"{body}: ordinal {i} names {sock} in the mesh but "
+                    f"{names[i]!r} in the motion -- the borrow would take a "
+                    f"different socket's track, which is C16 exactly")
+                self.assertIsNotNone(motion.motion_for(i),
+                                     f"{body}: no MOTI at ordinal {i}")
+            checked += 1
+        if not checked:
+            self.skipTest("the reference motions carry no chunk names")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_pose_and_the_socket_come_from_the_whole_loadout(self):
+        """A sibling session found `api_superfx` resolving a **left**-hand
+        query's clip as if the off-hand item were in the main hand — the motion
+        set is a property of the loadout, `AnimDB.weaponset(right, left)`, not
+        of one item. A basis sampled from the wrong clip would present exactly
+        as this bug does, so assert the figure path does not have it:
+        `api_figure`'s derivation must agree with `AnimDB` on every hand
+        combination, and must not fall through to the unarmed set while
+        reporting armed."""
+        import anim
+        import parts as partsmod
+        db = anim.AnimDB(ROOT)
+        body = "001131000"
+
+        def figure_wset(right, left):        # api_figure's own derivation
+            for wid in (right, left):
+                if wid and len(wid) > 3:
+                    return wid[:-3]
+            return "000"
+
+        combos = (("480138", "480138"), ("", "480138"), ("480138", ""),
+                  ("410009", "480138"), ("", ""))
+        for right, left in combos:
+            fw = figure_wset(right, left)
+            self.assertEqual(fw, db.weaponset(right, left),
+                             f"r={right!r} l={left!r}: the figure page and "
+                             f"AnimDB disagree on the weapon set, so the "
+                             f"socket basis and the pose come from different "
+                             f"clips")
+            here = partsmod.idle_motion(body, ROOT, fw, "100")
+            clip = db.clip(body, "100", weapon=right, off_hand=left)
+            if here is None or clip is None:
+                continue
+            self.assertEqual(here.logical, clip.path,
+                             f"r={right!r} l={left!r}: the pose the socket is "
+                             f"read from is not the clip the body plays")
+            if right or left:
+                self.assertNotIn(
+                    "/000/", here.logical,
+                    f"r={right!r} l={left!r}: an armed loadout fell through to "
+                    f"the unarmed motion while reporting success -- the exact "
+                    f"failure attach.WEAPON_MOTION_SET exists to prevent")
+
+    def test_the_borrow_is_guarded_at_every_callsite(self):
+        """The guard is only real if the viewer passes its own motion. A
+        callsite that forgets re-opens the clamp silently, and the symptom --
+        a plausible-looking pose -- is the kind this project has already
+        spent sessions on."""
+        py = (HERE / "coviewer.py").read_text("utf-8")
+        calls = [m.start() for m in
+                 re.finditer(r"(?<!def )apply_socket_corrections\(", py)]
+        self.assertGreaterEqual(len(calls), 1, "the callsites moved")
+        for i in calls:
+            depth, j = 0, py.index("(", i)
+            end = j
+            for end in range(j, min(len(py), j + 800)):
+                if py[end] == "(":
+                    depth += 1
+                elif py[end] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            args = py[j:end + 1]
+            self.assertIn(
+                "local_motion=", args,
+                f"an apply_socket_corrections callsite at offset {i} does not "
+                f"pass local_motion, so its reference borrow is unguarded "
+                f"against a clip of a different length:\n{args}")
 
     def test_an_undeclared_reference_falls_back_and_says_so(self):
         """A correction that silently degrades is the half-truth this whole
@@ -6850,6 +15259,127 @@ class SocketCorrectionIsViewerOnly(unittest.TestCase):
                         "the warning has to be in it")
 
 
+class CorrectionsRegister(unittest.TestCase):
+    """`tests/test_corrections.py`, run where landings actually look.
+
+    That gate is correct and was verified by mutation, and a duplicate `C48`
+    still reached `master` -- because it is a standalone file and every landing
+    runs *this* suite instead. **A gate nothing invokes is not a gate.**
+
+    It was then wired into `_main` and landed one step short: the result was
+    printed and never asserted, so a duplicate id emitted
+    `REGISTER GATE FAILED` into the output of a ~670-test suite and the suite
+    still exited 0. **A gate that is invoked and cannot fail is not a gate
+    either** -- the honest answer is produced and then not acted on, which is
+    C21 and C30's family.
+
+    So it lives here, as a test, for three reasons: it fails in the failure
+    *set* people already read; it is greppable as an ordinary `FAIL:` line; and
+    a documentation problem does not block unrelated work at import time.
+
+    Three outcomes, never two -- the absent-vs-unmet collapse is the fifth
+    sighting of that shape today (`known_empty`, `blockers()`, 6090's absent
+    hookgate, the scheme-tagged key, this):
+
+    * ran and passed  -> this test passes, and `-v` shows it ran. Not silence.
+      Silence previously meant *both* "pass" and "not wired", and a session
+      grepped for it, found nothing, and concluded the gate was absent when it
+      was present and passing.
+    * ran and FAILED  -> this test fails, naming the duplicate ids.
+    * could not run   -> this test fails too. A gate that cannot run is not a
+      gate that passed.
+    """
+
+    GATE = PROJECT / "tests" / "test_corrections.py"
+    REGISTER = PROJECT / "docs" / "CORRECTIONS.md"
+
+    def test_the_register_has_no_duplicate_ids(self):
+        if not self.REGISTER.is_file() and not self.GATE.is_file():
+            # An extraction that carries neither is not missing a gate.
+            self.skipTest("no CORRECTIONS.md and no gate in this tree")
+        self.assertTrue(
+            self.GATE.is_file(),
+            f"{self.REGISTER.name} is here but {self.GATE.name} is not -- the "
+            f"gate was removed, which is worse than a duplicate id because it "
+            f"is silent")
+        try:
+            rc = subprocess.run([sys.executable, str(self.GATE)],
+                                capture_output=True, text=True, timeout=120)
+        except Exception as exc:                  # could-not-run != passed
+            self.fail(f"the register gate could not run: {exc!r}. That is not "
+                      f"a pass -- it means nothing checked the register.")
+        if rc.returncode == 0:
+            return
+        # Surface the gate's own verdict rather than paraphrasing it.
+        detail = "\n".join(
+            ln.rstrip() for ln in (rc.stdout + rc.stderr).splitlines()
+            if ln.strip())
+        self.fail(f"docs/CORRECTIONS.md failed its id gate "
+                  f"(exit {rc.returncode}):\n{detail}")
+
+    # -- the failure paths, watched to fail -------------------------------
+    #
+    # The three outcomes above are the whole design, and until now nothing
+    # exercised two of them: on a healthy tree the gate passes, so "could not
+    # run" and "gate removed" were reasoned about and never seen. A guard
+    # nobody has watched fail is not known to work -- C25, where 25 green tests
+    # all faked `subprocess.run` and the real probe behaved differently.
+    #
+    # `GATE` and `REGISTER` are class attributes, so a subclass can point them
+    # at a fixture without touching the real one. No monkeypatching, and the
+    # test runs the same code path a landing does.
+
+    def _verdict(self, gate, register=None):
+        """Run the real test method against substituted paths, and report
+        whether it passed, failed, or skipped -- three outcomes, not two."""
+        case = type("Substituted", (CorrectionsRegister,),
+                    {"GATE": gate,
+                     "REGISTER": register if register is not None
+                     else self.REGISTER})("test_the_register_has_no_duplicate_ids")
+        res = unittest.TestResult()
+        case.run(res)
+        if res.skipped:
+            return "skipped", res.skipped[0][1]
+        if res.failures or res.errors:
+            return "failed", (res.failures + res.errors)[0][1]
+        return "passed", ""
+
+    def test_a_removed_gate_fails_rather_than_passing_quietly(self):
+        """`CORRECTIONS.md` present and the gate gone is the silent case, and
+        it is worse than a duplicate id: nothing is checking at all."""
+        verdict, detail = self._verdict(self.GATE.parent / "no-such-gate.py")
+        self.assertEqual(verdict, "failed", detail)
+        self.assertIn("the gate was removed", detail)
+
+    def test_a_gate_that_cannot_run_fails_rather_than_passing(self):
+        """Could-not-run is not a pass. The predecessor of this class wrapped
+        the whole thing in `except Exception` and printed."""
+        with tempfile.TemporaryDirectory() as td:
+            broken = Path(td) / "broken_gate.py"
+            broken.write_text("raise SystemExit(7)\n", encoding="utf-8")
+            verdict, detail = self._verdict(broken)
+        self.assertEqual(verdict, "failed", detail)
+        self.assertIn("exit 7", detail)
+
+    def test_a_tree_carrying_neither_skips_and_says_so(self):
+        """An extraction with no register is not missing a gate -- and this is
+        the ONLY route to a skip. Pinned so the skip cannot widen into the
+        others by accident, which is how C21 happened."""
+        with tempfile.TemporaryDirectory() as td:
+            verdict, _ = self._verdict(Path(td) / "gate.py",
+                                       register=Path(td) / "CORRECTIONS.md")
+        self.assertEqual(verdict, "skipped")
+
+    def test_the_control_a_passing_gate_still_passes(self):
+        """Without this the three above would pass on a method hardwired to
+        fail, which is the failure mode they exist to prevent."""
+        with tempfile.TemporaryDirectory() as td:
+            fine = Path(td) / "fine_gate.py"
+            fine.write_text("pass\n", encoding="utf-8")
+            verdict, detail = self._verdict(fine)
+        self.assertEqual(verdict, "passed", detail)
+
+
 class PerBaseIndexes(unittest.TestCase):
     """Derived indexes are namespaced by the install they were built from.
 
@@ -6858,6 +15388,192 @@ class PerBaseIndexes(unittest.TestCase):
     client over a body describing another, because nothing recorded which
     install an artefact came from and nothing checked.
     """
+
+    #: Paths this class deliberately leaves undeclared, to prove the error
+    #: fires. Named here so the tree-wide scan below can subtract exactly
+    #: these and still fail on a real one.
+    INTENTIONALLY_UNDECLARED = ("out/something_nobody_classified/x.json",
+                                "out/brandnew/x.json",
+                                # test_showandtell writes this in setUp and
+                                # unlinks it in tearDown. It is a fixture, not
+                                # a derived artefact, so declaring it in
+                                # PER_BASE or GLOBAL would assert a build
+                                # produces it -- which nothing does.
+                                "out/_test_goal_artefact.json")
+
+    def test_running_the_client_does_not_change_the_installs_identity(self):
+        """The bug this fixed. `base_fingerprint` hashed every file in `ini/`,
+        including the ones the client rewrites at shutdown, so an install's
+        identity depended on whether anyone had *run* it. Three CCO index
+        namespaces existed at once, two dead and the live one empty, and
+        unattended launches were making it worse by the day.
+
+        An install is the same client before and after you play it."""
+        import shutil, tempfile
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        ini = d / "ini"; ini.mkdir()
+        (ini / "armor.ini").write_text("[a] Mesh0=1", encoding="utf-8")
+        for name in sorted(coroot.VOLATILE_INI):
+            (ini / name).write_text("[x] v=1", encoding="utf-8")
+
+        before = coroot.base_fingerprint(d)
+        self.assertTrue(before, "a real install must fingerprint")
+        # every volatile file rewritten, as a shutdown would
+        for name in sorted(coroot.VOLATILE_INI):
+            (ini / name).write_text("[x] v=999 more=1", encoding="utf-8")
+        self.assertEqual(coroot.base_fingerprint(d), before,
+                         "a client shutdown must not re-key the install")
+
+        # ...but a real table still moves it, or the key would be worthless
+        (ini / "armor.ini").write_text("[a] Mesh0=2", encoding="utf-8")
+        self.assertNotEqual(coroot.base_fingerprint(d), before,
+                            "a table change MUST change the fingerprint")
+
+    def test_the_volatile_list_is_reported_not_just_applied(self):
+        """Twelve opaque characters, so the first question when one moves is
+        what went into it. `fingerprint_inputs` answers without a debugger."""
+        hashed, skipped = coroot.fingerprint_inputs(ROOT)
+        if not hashed:
+            self.skipTest("no install")
+        # Every skipped name must be skipped for a *declared* reason -- the
+        # client rewrote it, we rewrote it, or it is a backup we left. Asserted
+        # through the one predicate both callers use, so a name cannot leave
+        # the hash by some fourth route nobody declared.
+        for n in skipped:
+            self.assertTrue(coroot.fingerprint_skips(n), n)
+        self.assertNotIn("armor.ini", [n.lower() for n in skipped])
+
+    def test_a_sanctioned_tool_edit_does_not_re_key_the_install(self):
+        """Preparing a client for the rig must not change which client it is.
+
+        `tools/clientsidecar.py` rewrote `ini/StartGame.ini` on 5517 -- with a
+        backup, its reason in the file and a restore command, which is the
+        client-modification convention followed properly. That one correct edit
+        moved the install's key and stranded 346 MB of index, then cost four
+        sessions four different viewer failure sets on nominally one root.
+
+        Both halves matter and the second is the one that bites: excluding the
+        patched file alone would not have helped, because **creating the backup
+        adds a file to `ini/`** and re-keys the install by itself.
+        """
+        d = Path(tempfile.mkdtemp(prefix="toolwrite-"))
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        ini = d / "ini"; ini.mkdir()
+        (ini / "armor.ini").write_text("[a] Mesh0=1", encoding="utf-8")
+        (ini / "StartGame.ini").write_text("FileName=zftqat/TQAT.exe",
+                                           encoding="utf-8")
+
+        before = coroot.base_fingerprint(d)
+        self.assertTrue(before, "a real install must fingerprint")
+
+        # exactly what clientsidecar does: back the original up beside it,
+        # then blank the value so Conquer.exe skips the sidecar launch
+        (ini / "StartGame.ini.orig").write_text("FileName=zftqat/TQAT.exe",
+                                                encoding="utf-8")
+        (ini / "StartGame.ini").write_text("; disabled\nFileName=",
+                                           encoding="utf-8")
+        self.assertEqual(
+            coroot.base_fingerprint(d), before,
+            "a sanctioned tool edit must not re-key the install")
+
+        # and the same for the GUI rescale any resolution change requires
+        (ini / "GUI800X600.ini").write_text("[0-0] w=800 h=600",
+                                            encoding="utf-8")
+        self.assertEqual(
+            coroot.base_fingerprint(d), before,
+            "rescaling the interface must not re-key the install")
+
+        # ...but a real table still moves it, or the exclusion is too wide and
+        # the key has stopped identifying anything
+        (ini / "armor.ini").write_text("[a] Mesh0=2", encoding="utf-8")
+        self.assertNotEqual(coroot.base_fingerprint(d), before,
+                            "a table change MUST change the fingerprint")
+
+    def test_excluding_them_still_tells_the_patch_levels_apart(self):
+        """The exclusion must not cost discriminating power -- that is the job.
+
+        Asserted over the *official patch levels*, which genuinely differ.
+        An earlier version of this test asserted that no two **directories**
+        share a fingerprint and failed correctly: seven copies of the 5065
+        client exist on this machine, made by parallel sessions because the
+        test client cannot be shared (`tools/clientlock.py`), and they group
+        into two fingerprints by content. Identical installs *should* share an
+        index -- that is content keying working. A directory is not a client.
+        """
+        clients = Path(DEFAULT_ROOT).parent
+        levels = [clients / n for n in ("5017", "5065", "5165", "5517", "6090")]
+        have = [p for p in levels if (p / "ini").is_dir()]
+        if len(have) < 2:
+            self.skipTest("needs two official patch levels")
+        ids = {}
+        for r in have:
+            ids.setdefault(coroot.base_fingerprint(r), []).append(r.name)
+        clashes = {k: v for k, v in ids.items() if len(v) > 1}
+        self.assertEqual(clashes, {},
+                         "two different patch levels must not share a key")
+        self.assertEqual(len(ids), len(have), "one fingerprint per patch level")
+
+    def test_an_undeclared_out_path_raises_instead_of_being_guessed(self):
+        """The load-bearing one. Both guesses fail, and unequally: sharing an
+        install-specific artefact is silently wrong, while keying a genuinely
+        shared one costs a rebuild (`out/wdf/`) or loses user data
+        (`out/viewer/tags.json`). So the answer is declared, not defaulted."""
+        with self.assertRaises(coroot.UndeclaredDerived):
+            coroot.derived_rel(self.INTENTIONALLY_UNDECLARED[0])
+
+    def test_the_error_says_where_to_put_the_answer(self):
+        """An error a reader cannot act on is how a gate gets switched off."""
+        try:
+            coroot.derived_rel(self.INTENTIONALLY_UNDECLARED[1])
+        except coroot.UndeclaredDerived as e:
+            msg = str(e)
+        else:
+            self.fail("expected UndeclaredDerived")
+        for token in ("PER_BASE", "GLOBAL", "derived_classification"):
+            self.assertIn(token, msg)
+
+    def test_the_declaration_covers_every_out_literal_in_the_tree(self):
+        """What makes the error safe rather than a landmine: if any path the
+        code actually uses were undeclared, it fails here rather than at
+        somebody's runtime."""
+        import re as _re
+        lits: set[str] = set()
+        for p in PROJECT.rglob("*.py"):
+            if any(x in p.parts for x in (".git", "refs", "server", "__pycache__")):
+                continue
+            try:
+                src = p.read_text("utf-8", errors="replace")
+            except OSError:                              # pragma: no cover
+                continue
+            lits.update(m.group(1) for m in
+                        _re.finditer(r'["\'](out/[A-Za-z0-9_./-]*)["\']', src))
+        lits -= set(self.INTENTIONALLY_UNDECLARED)
+        undeclared = []
+        for rel in sorted(lits):
+            try:
+                coroot.derived_rel(rel)
+            except coroot.UndeclaredDerived:
+                undeclared.append(rel)
+        self.assertEqual(undeclared, [], "declare these in PER_BASE or GLOBAL")
+
+    def test_the_bare_out_container_is_not_an_artefact(self):
+        self.assertEqual(coroot.derived_rel("out"), "out")
+        self.assertEqual(coroot.derived_rel("out/"), "out/")
+
+    def test_an_already_keyed_path_is_not_keyed_twice(self):
+        once = coroot.derived_rel("out/meshtex/coverage.json")
+        self.assertEqual(coroot.derived_rel(once), once)
+
+    def test_the_three_that_keying_would_damage_stay_global(self):
+        """Not merely wasteful to key -- actively harmful. `out/wdf/` is a
+        `{hash: name}` table true in any install, `out/recon/` is about the
+        process being reverse-engineered rather than the configured root, and
+        `out/viewer/tags.json` is the user's own data."""
+        for rel in ("out/wdf/c3_names.json", "out/recon/heropath.json",
+                    "out/viewer/tags.json"):
+            with self.subTest(rel=rel):
+                self.assertEqual(coroot.derived_rel(rel), rel)
 
     def test_per_base_trees_are_rewritten_and_the_rest_are_not(self):
         keyed = coroot.derived_rel("out/meshtex/coverage.json")
@@ -6899,6 +15615,78 @@ class PerBaseIndexes(unittest.TestCase):
         self.assertEqual(coroot.base_fingerprint(r), coroot.base_fingerprint(r))
         self.assertTrue(coroot.base_fingerprint(r))
         self.assertEqual(coroot.base_fingerprint(r / "nonesuch"), "")
+
+    def test_an_unusable_co_root_is_refused_not_silently_replaced(self):
+        r"""**A `CO_ROOT` that is not an install must raise, never fall back.**
+
+        Resolution order is env -> config -> discovery, so an unreadable
+        ``CO_ROOT`` used to skip on to the *configured* install and answer for
+        that one. Measured before the fix::
+
+            CO_ROOT="C:/definitely/not/a/real/path" -> patch5517-76c7f4499934
+
+        Base-targeted measurement is taken this way -- ``--root`` is discarded
+        outright by several tools (C22) -- so a typo'd or stale path produced a
+        full set of real, plausible numbers for the wrong client. A six-base
+        gate audit lost four of its six runs to exactly this, and only caught
+        it because two of the bases came back byte-identical.
+
+        The refusal has to survive `base_id`, not merely `game_root`: the broad
+        ``except Exception`` in `base_fingerprint` turned it into ``unkeyed``,
+        which is a second silent answer -- one shared index namespace for every
+        install anybody mistypes.
+        """
+        bogus = str(Path(tempfile.gettempdir()) / "co-root-that-does-not-exist")
+        self.assertFalse(Path(bogus).is_dir(), "the fixture must be absent")
+        with unittest.mock.patch.dict(os.environ, {coroot.ENV_VAR: bogus}):
+            coroot.invalidate_cache()
+            try:
+                for fn in (coroot.game_root, coroot.base_id,
+                           coroot.base_fingerprint, coroot.kind_for_root):
+                    with self.subTest(call=fn.__name__):
+                        with self.assertRaises(coroot.RootNotHonoured) as cm:
+                            fn()
+                        # the path is quoted with !r, so a Windows path is
+                        # backslash-escaped in the text -- compare the value
+                        # the exception carries, and the repr in the message
+                        self.assertEqual(cm.exception.value, bogus)
+                        self.assertIn(repr(bogus), str(cm.exception),
+                                      "the message must name the path given")
+                        self.assertIn(coroot.ENV_VAR, str(cm.exception))
+                # The diagnostic still renders: it is the thing that explains
+                # the failure, so it must not fail in turn.
+                rep = coroot.last_report()
+                self.assertIsNone(rep.get("found"))
+                self.assertEqual(rep["refused"]["value"], bogus)
+            finally:
+                coroot.invalidate_cache()
+        coroot.invalidate_cache()
+
+    def test_a_usable_co_root_is_still_honoured(self):
+        """The refusal must not cost the feature it protects: a real install
+        named in ``CO_ROOT`` still resolves, and to *that* install."""
+        r = Path(DEFAULT_ROOT)
+        if not coroot.looks_like_root(r):
+            self.skipTest("no install")
+        with unittest.mock.patch.dict(os.environ, {coroot.ENV_VAR: str(r)}):
+            coroot.invalidate_cache()
+            try:
+                self.assertEqual(Path(coroot.game_root()).resolve(),
+                                 r.resolve())
+            finally:
+                coroot.invalidate_cache()
+        coroot.invalidate_cache()
+
+    def test_an_empty_co_root_is_not_a_request(self):
+        """``CO_ROOT=`` is how a shell exports a variable it means to leave
+        unset; treating that as a refusal would break every such environment."""
+        with unittest.mock.patch.dict(os.environ, {coroot.ENV_VAR: ""}):
+            coroot.invalidate_cache()
+            try:
+                self.assertIsNone(coroot.env_refusal())
+            finally:
+                coroot.invalidate_cache()
+        coroot.invalidate_cache()
 
     def test_an_undeclared_root_is_never_guessed_a_kind(self):
         """A declaration is the user's, and it would be baked into a
@@ -6977,6 +15765,564 @@ class PerBaseIndexes(unittest.TestCase):
         self.assertNotEqual(len(ua.mesh_matches), len(ub.mesh_matches))
         self.assertNotEqual(str(ua._thumb_dir), str(ub._thumb_dir))
 
+    def test_a_base_with_no_index_does_not_borrow_another_bases(self):
+        """C21, and note the sibling above cannot catch it.
+
+        That test skips unless BOTH bases have an index -- so it is silent in
+        exactly the situation this bug needs, which is C21's own lesson about
+        guards that skip on a missing artefact.
+
+        `UnifiedIndex` used to fall back to the module-level `COVERAGE`,
+        resolved at import for whichever install was configured then. A base
+        with no coverage file of its own therefore read ANOTHER install's:
+        measured, 5017 reported 5042 meshes -- 5517's number, not its own
+        2694. A missing per-base index means "build me", never "borrow another
+        base's answers" (`coroot.base_id`'s own rule).
+        """
+        clients = Path(DEFAULT_ROOT).parent
+        import unify
+        unbuilt = [d for d in sorted(clients.glob("*"))
+                   if d.is_dir() and (d / "ini").is_dir()
+                   and not coroot.find_derived("out/meshtex/coverage.json", d)]
+        if not unbuilt:
+            self.skipTest("every install here already has a coverage index")
+        target = unbuilt[0]
+        u = unify.UnifiedIndex(target, exists=lambda p: True)
+        # It may legitimately hold nothing (building is expensive). What it
+        # must never do is name a per-base index it does not own.
+        self.assertNotIn("out/indexes", u.source.replace("\\", "/"),
+                         f"{target.name} sourced a per-base index it does not "
+                         f"own: {u.source}")
+
+    # -- the binary tree, which is what this class's docstring is about ----
+
+    def test_the_dll_tree_is_keyed_like_every_other_derived_tree(self):
+        """`out/dll/` was the last unkeyed tree, and it is the one this
+        class's docstring cites: `rtti.md` sat titled "Classic Conquer 2.0
+        game DLLs" over a body describing 6090's, because a second client
+        overwrote it in place and nothing recorded which install either
+        version came from."""
+        keyed = coroot.derived_rel("out/dll/rtti.md")
+        self.assertTrue(keyed.startswith(coroot.INDEX_ROOT + "/"), keyed)
+        self.assertTrue(keyed.endswith("/dll/rtti.md"), keyed)
+
+    def test_wdf_name_recovery_stays_global_when_the_dll_tree_is_keyed(self):
+        """Keying `out/dll/` stranded this file, and nothing would have said so.
+
+        Every official client ships byte-identical `c3.wdf` / `data.wdf`, so a
+        recovered archive name belongs to the archives, not to the install
+        that mined it. It lives under `out/dll/` only because the wordlist
+        came from DLL strings. `meshtex` and `health` resolve it through
+        `find_derived`, which by design has no unkeyed fallback -- so keying
+        it returned None, and `meshtex.scan_meshes` is the case
+        `find_derived`'s own docstring cites for degrading quietly.
+        """
+        rel = "out/dll/wdf_name_recovery.json"
+        self.assertEqual(coroot.derived_rel(rel), rel,
+                         "name recovery must stay global")
+        # ...while everything else under out/dll/ is still per-install.
+        self.assertTrue(
+            coroot.derived_rel("out/dll/rtti.md").startswith(
+                coroot.INDEX_ROOT + "/"))
+        clients = Path(DEFAULT_ROOT).parent
+        a, b = clients / "5517", clients / "6090"
+        if a.is_dir() and b.is_dir():
+            self.assertEqual(coroot.derived_rel(rel, a),
+                             coroot.derived_rel(rel, b))
+
+    def test_bin_dir_follows_whichever_layout_the_install_uses(self):
+        """Classic Conquer 2.0 keeps its binaries in `bin/64`; **no** official
+        patch client (5017-6090) has that directory at all. Returning
+        `bin/64` unconditionally is why the whole `dump_*` family analysed
+        nothing under a patch client while printing success six times."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            nested, flat = Path(d) / "nested", Path(d) / "flat"
+            (nested / "bin" / "64").mkdir(parents=True)
+            flat.mkdir()
+            self.assertEqual(coroot.bin_dir(nested), nested / "bin" / "64")
+            self.assertEqual(coroot.bin_dir(flat), flat)
+
+    def test_binaries_are_discovered_and_redistributables_dropped(self):
+        """Discovered, not enumerated. The hardcoded six-name list named
+        modules that exist in one install out of eight, and would never have
+        mentioned `Conquer.exe` or `RoleView.dll`."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for n in ("Conquer.exe", "Role3D.dll", "d3dx10_43.dll",
+                      "readme.txt", "c3.wdf"):
+                (root / n).write_bytes(b"MZ")
+            got = [p.name for p in coroot.binaries(root)]
+        self.assertIn("Conquer.exe", got)
+        self.assertIn("Role3D.dll", got)
+        self.assertNotIn("d3dx10_43.dll", got, "redistributable not dropped")
+        self.assertNotIn("readme.txt", got)
+        self.assertNotIn("c3.wdf", got)
+
+    def test_dump_tools_resolve_their_root_when_run_not_when_imported(self):
+        """The actual defect behind "they accept an argument and discard it".
+
+        Each of these resolved `BIN = coroot.bin_dir()` at **module scope**,
+        so discovery ran at import, before `argv` was parsed -- no `--root`
+        could have worked even if one had been wired up. Asserting the
+        attribute is absent is behavioural; a source scan could not tell the
+        assignment from a comment describing it.
+        """
+        import importlib
+        for name in ("dump_meta", "dump_exports", "dump_imports",
+                     "dump_strings", "dump_functions", "dump_rtti"):
+            mod = importlib.import_module(name)
+            for attr in ("BIN", "TARGETS"):
+                self.assertFalse(
+                    hasattr(mod, attr),
+                    f"{name}.{attr} is resolved at import time again")
+            self.assertTrue(callable(getattr(mod, "main", None)), name)
+
+
+class Provenance(unittest.TestCase):
+    """One invariant, stated once: **every derived artefact records what it
+    was derived from, and every loader refuses one it did not derive.**
+
+    `PerBaseIndexes` above keeps two installs in two *namespaces*. This keeps
+    an artefact honest about its origin wherever it ends up — which is the
+    half that was missing, and why `out/dll/` can hold two clients' answers
+    under one set of filenames with nothing able to tell.
+
+    Every check below is written to fail if the guard is removed, not merely
+    to pass today: each plants a bad artefact and asserts the refusal, and
+    asserts the matching case still loads, so a loader that simply returned
+    `None` for everything would not satisfy it.
+    """
+
+    def setUp(self):
+        import provenance
+        self.pv = provenance
+        self.mine = "patch6090-aaaaaaaaaaaa"
+        self.theirs = "patch5517-bbbbbbbbbbbb"
+
+    # -- the stamp ---------------------------------------------------------
+
+    def test_a_stamp_names_the_install_but_never_its_path(self):
+        """A stamp gets quoted into documentation — `out/dll/rtti.md` is
+        exactly that kind of file — and `tests/test_sanitization.py` forbids
+        absolute user paths in anything publishable. Naming the install by
+        folder name keeps this check from becoming a PII hazard."""
+        st = self.pv.stamp(root=ROOT)
+        self.assertEqual(st["install"], ROOT.name)
+        blob = json.dumps(st)
+        self.assertNotIn(os.sep, blob.replace("\\/", "/"))
+        self.assertNotIn(str(ROOT), blob)
+        self.assertNotIn("Users", blob)
+
+    def test_wrap_refuses_to_shadow_a_payload_key(self):
+        """`out/dll/exports.json` is keyed by binary name at the top level, so
+        a payload could legitimately own any key. Silently overwriting one
+        would corrupt the artefact this is supposed to protect."""
+        with self.assertRaises(ValueError):
+            self.pv.wrap({self.pv.KEY: "mine"})
+
+    # -- the refusal -------------------------------------------------------
+
+    def _planted(self, doc) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        p = d / "index.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    def _read(self, doc, **kw):
+        p = self._planted(doc)
+        with unittest.mock.patch.object(coroot, "find_derived",
+                                        return_value=p), \
+             unittest.mock.patch.object(coroot, "base_id",
+                                        return_value=self.mine):
+            return self.pv.read_json("out/meshtex/index.json", **kw)
+
+    def test_a_matching_artefact_loads(self):
+        """The control. Without it, a loader that refused everything would
+        pass every other test in this class."""
+        doc = {self.pv.KEY: {"schema": 1, "base_id": self.mine},
+               "data": {"rows": 7}}
+        self.assertEqual(self._read(doc), {"rows": 7})
+
+    def test_a_foreign_artefact_is_refused(self):
+        """The load-bearing assertion. An artefact that says it came from
+        another install is the one case with positive evidence of the bug
+        this module exists to stop, so it is refused even leniently."""
+        doc = {self.pv.KEY: {"schema": 1, "base_id": self.theirs},
+               "data": {"rows": 7}}
+        self.assertIsNone(self._read(doc))
+        self.assertIsNone(self._read(doc, strict=False))
+
+    def test_unstamped_is_refused_strictly_and_allowed_leniently(self):
+        """Unstamped is the migration backlog, not a proven fault: on the day
+        this lands every artefact in the tree is unstamped. A check that
+        cannot tell "not yet migrated" from "provably the wrong client" would
+        have to be switched off to be usable."""
+        doc = {"rows": 7}
+        self.assertIsNone(self._read(doc))
+        self.assertEqual(self._read(doc, strict=False), {"rows": 7})
+
+    def test_a_newer_schema_is_refused_rather_than_guessed_at(self):
+        doc = {self.pv.KEY: {"schema": self.pv.SCHEMA + 1,
+                             "base_id": self.mine}, "data": {"rows": 7}}
+        self.assertIsNone(self._read(doc))
+
+    def test_an_unfingerprintable_install_does_not_read_as_a_match(self):
+        """`coroot.base_id` returns "unkeyed" rather than let a broken install
+        share whatever was built last. The read side keeps that promise."""
+        doc = {self.pv.KEY: {"schema": 1, "base_id": "unkeyed"},
+               "data": {"rows": 7}}
+        self.assertEqual(self.pv.verdict(doc, base="unkeyed"),
+                         self.pv.UNKNOWN)
+
+    def test_the_verdicts_are_distinct(self):
+        good = {self.pv.KEY: {"schema": 1, "base_id": self.mine}, "data": 1}
+        bad = {self.pv.KEY: {"schema": 1, "base_id": self.theirs}, "data": 1}
+        self.assertEqual(self.pv.verdict(good, base=self.mine), self.pv.MATCH)
+        self.assertEqual(self.pv.verdict(bad, base=self.mine), self.pv.FOREIGN)
+        self.assertEqual(self.pv.verdict({"x": 1}, base=self.mine),
+                         self.pv.UNSTAMPED)
+
+    # -- artefacts that cannot carry an envelope ---------------------------
+
+    def test_a_non_json_artefact_is_stamped_by_sidecar(self):
+        """Markdown reports and binary indexes have nowhere to put an
+        envelope, and rewriting them would change formats other tools parse.
+        `out/dll/rtti.md` is the artefact that proves the need."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        md = d / "rtti.md"
+        md.write_text("# a report\n", encoding="utf-8")
+        before = md.read_bytes()
+        self.pv.stamp_file(md, root=ROOT, base=self.mine)
+        self.assertEqual(md.read_bytes(), before, "the artefact must not change")
+        self.assertEqual((self.pv.read_stamp(md) or {}).get("base_id"), self.mine)
+
+    # -- the audit ---------------------------------------------------------
+
+    def test_a_keyed_artefact_is_judged_against_its_own_namespace(self):
+        """An artefact under `out/indexes/<base-id>/` is claimed by THAT
+        namespace, not by whichever install is configured. Comparing against
+        the configured base reported a correctly-filed 6090 index as FOREIGN
+        while 5517 was selected -- and FOREIGN is the word this audit uses for
+        a real fault, so a false one teaches people to disbelieve it."""
+        import shutil, tempfile
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        other = "patch6090-bbbbbbbbbbbb"
+        nsd = d / "out" / "indexes" / other / "meshtex"
+        nsd.mkdir(parents=True)
+        (nsd / "mesh_index.json").write_text(
+            json.dumps({"provenance": {"schema": 1, "base_id": other},
+                        "data": {}}), encoding="utf-8")
+        # audited while a DIFFERENT install is the configured one
+        rep = self.pv.audit(repo=d, root=ROOT)
+        self.assertEqual(rep["foreign"], [],
+                         "an index filed under its own base is not foreign")
+
+    def test_the_audit_reports_an_unkeyed_namespace_as_unclassified(self):
+        """The fail-open case: `coroot.derived_rel` keys an allowlist of
+        prefixes and returns everything else unchanged, so an artefact nobody
+        remembered to list is silently shared. The audit is what makes that
+        visible."""
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        (d / "out" / "dll").mkdir(parents=True)
+        (d / "out" / "dll" / "rtti.json").write_text("{}", encoding="utf-8")
+        rep = self.pv.audit(repo=d, root=ROOT)
+        self.assertIn("out/dll/rtti.json", rep["unclassified"])
+        self.assertIn("out/dll/rtti.json", rep["unstamped"])
+        self.assertEqual(rep["foreign"], [])
+
+
+class StampedWriters(unittest.TestCase):
+    """Phase 2: writers stamp, and readers refuse a foreign artefact.
+
+    Phase 1 built the stamp and the audit; nothing used them, so the audit
+    reported every artefact unstamped forever and a gate nobody can satisfy
+    stops being read. These cover the writers that now do.
+
+    Two shapes, chosen per artefact by how many modules read it:
+    an **envelope** where the readers are few (`mesh_index.json` has one,
+    `artcrawl/*` two), and a **sidecar** where the file's shape is
+    load-bearing for many (`coverage.json` seven, `thumbs/manifest.json`
+    eleven) so the artefact stays byte-identical.
+    """
+
+    def setUp(self):
+        import provenance
+        self.pv = provenance
+
+    def test_a_reader_unwraps_a_stamped_document_and_a_legacy_one_alike(self):
+        """The migration property: a stamped artefact and one built before
+        the stamp existed both read, so nothing has to be rebuilt at once."""
+        ents = [{"geometry": "c3/monster/103/100.c3", "name": "ThunderApe"}]
+        stamped = self.pv.wrap(ents, ROOT, tool="artcrawl.py")
+        self.assertEqual(self.pv.unwrap(stamped)[1], ents)
+        self.assertEqual(self.pv.unwrap(ents)[1], ents, "legacy must still read")
+
+    def test_meshtex_refuses_a_foreign_index_by_identity_not_by_size(self):
+        """The bug this whole workstream started from. Two bases shared one
+        `mesh_index.json` and thrashed; `_cache_covers` only noticed because
+        the clients differ in mesh count. Identity does not depend on that."""
+        mine, theirs = "patch5517-aaaaaaaaaaaa", "patch6090-bbbbbbbbbbbb"
+        doc = {self.pv.KEY: {"schema": 1, "base_id": theirs},
+               "data": {"c3/x.c3": {}}}
+        self.assertEqual(self.pv.verdict(doc, base=mine), self.pv.FOREIGN)
+        same_size = {self.pv.KEY: {"schema": 1, "base_id": mine},
+                     "data": {"c3/x.c3": {}}}
+        self.assertEqual(self.pv.verdict(same_size, base=mine), self.pv.MATCH)
+
+    def test_the_writers_that_stamp_say_so_in_source(self):
+        """Cheap guard against a writer being reverted to a bare write_text
+        -- which is exactly how this branch lost `coroot.py` once."""
+        for name, needle in (("meshtex.py", "provenance.write_json"),
+                             ("artcrawl.py", "provenance.write_json"),
+                             ("thumbs.py", "provenance.stamp_file")):
+            with self.subTest(tool=name):
+                src = (HERE / name).read_text("utf-8")
+                self.assertIn(needle, src)
+
+    def test_coviewer_unwraps_the_entity_crawl(self):
+        """`entities.json` gained an envelope, and `coviewer` is its only
+        other reader -- if it stopped unwrapping, every monster and NPC label
+        would silently fall back to a numeric one."""
+        src = (HERE / "coviewer.py").read_text("utf-8")
+        self.assertEqual(src.count("provenance.unwrap"), 2)
+
+
+class TheBaseGate(unittest.TestCase):
+    """`requires_base` — so that red means broken code.
+
+    `HAVE_ROOT` answers "does a directory exist", which cannot distinguish a
+    wrong client from a wrong answer. 55 tests gate on it, the fixtures were
+    written against CCO 2.0, and the configured install is a patch client —
+    which is how 45 failures and 9 errors became un-triageable.
+    """
+
+    def test_it_skips_when_the_configured_install_is_not_one_it_wants(self):
+        ran = []
+
+        class T(unittest.TestCase):
+            @requires_base("definitely-not-a-real-kind")
+            def test_x(self):                       # pragma: no cover
+                ran.append(1)
+
+        res = unittest.TextTestRunner(stream=io.StringIO()).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(T))
+        self.assertEqual(ran, [], "the body must not run")
+        self.assertEqual(len(res.skipped), 1)
+        self.assertEqual(res.failures, [])
+        self.assertEqual(res.errors, [])
+
+    def test_the_skip_reason_names_both_sides(self):
+        """A skip nobody can interpret is how a gate quietly stops gating."""
+
+        class T(unittest.TestCase):
+            @requires_base("cco")
+            def test_x(self):                       # pragma: no cover
+                pass
+
+        res = unittest.TextTestRunner(stream=io.StringIO()).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(T))
+        if not res.skipped:
+            self.skipTest("this machine is configured on a cco install")
+        reason = res.skipped[0][1]
+        self.assertIn("cco", reason)
+        self.assertIn(BASE_KIND or "undeclared", reason)
+
+    def test_it_runs_when_the_install_matches(self):
+        if not BASE_KIND:
+            self.skipTest("no install declared, so there is nothing to match")
+        ran = []
+
+        class T(unittest.TestCase):
+            @requires_base(BASE_KIND)
+            def test_x(self):
+                ran.append(1)
+
+        unittest.TextTestRunner(stream=io.StringIO()).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(T))
+        self.assertEqual(ran, [1], "a matching install must not be skipped")
+
+
+class TheIndexGate(unittest.TestCase):
+    """`requires_index` — so that an absent index cannot read as a red.
+
+    `requires_base` above answers *"is this the client the fixture was written
+    against?"*. This one answers *"is the derived index it reads actually
+    here?"* — a question `HAVE_ROOT` cannot touch, because an install
+    directory exists whether or not anything has been derived from it.
+
+    These exist because the gate has two failure modes that are invisible
+    without them. It can skip **too much**, absorbing a test that was passing
+    and making the suite quieter rather than truer; and it can answer for
+    something it knows nothing about, which is the diagnosis being confidently
+    wrong instead of absent. Both are the shape of bug the gate exists to
+    remove, committed by the gate.
+    """
+
+    def test_it_refuses_a_file_that_ships_with_the_repo(self):
+        """The trap: `tools/tileset.py` missing is an incomplete checkout, and
+        "run the build" is a confidently wrong answer to it."""
+        with self.assertRaises(NotAnIndex) as cm:
+            requires_index("tools/tileset.py")
+        self.assertIn("not under out/", str(cm.exception))
+        # ...and the message must point at the gate that IS right for it,
+        # rather than merely declining.
+        self.assertIn("HAVE_TILESET", str(cm.exception))
+
+    def test_it_refuses_a_derived_tree_that_is_not_keyed_to_a_base(self):
+        """`out/wdf/` is real, built, and GLOBAL. Naming a base id in its skip
+        reason would assert something false: it has no namespace to be absent
+        from."""
+        self.assertIn("out/wdf/", coroot.GLOBAL)
+        with self.assertRaises(NotAnIndex) as cm:
+            requires_index("out/wdf/c3_names.json")
+        self.assertIn("not keyed to a base", str(cm.exception))
+
+    def test_the_reason_carries_the_base_id_and_the_artefact(self):
+        """The requirement the gate is for. A skip saying only "index missing"
+        reproduces the ambiguity it was built to end, in a politer voice."""
+        rel = "out/meshtex/does-not-exist.json"
+        reason = _index_reason(rel)
+        self.assertIn(coroot.base_id(), reason, "the base id must be in it")
+        self.assertIn(rel, reason, "the artefact must be in it")
+        self.assertIn(coroot.derived_rel(rel), reason, "and the keyed path")
+        # exactly one of the three detectable states is claimed
+        states = [s for s in ("NEVER BUILT", "ORPHANED", "PARTIALLY BUILT")
+                  if s in reason]
+        self.assertEqual(len(states), 1, f"ambiguous state: {states}")
+
+    def test_an_absent_artefact_skips_without_running_the_body(self):
+        ran = []
+
+        class T(unittest.TestCase):
+            @requires_index("out/meshtex/does-not-exist.json")
+            def test_x(self):                       # pragma: no cover
+                ran.append(1)
+
+        res = unittest.TextTestRunner(stream=io.StringIO()).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(T))
+        self.assertEqual(ran, [], "the body must not run")
+        self.assertEqual(len(res.skipped), 1)
+        self.assertEqual((res.failures, res.errors), ([], []))
+
+    def test_a_present_artefact_RUNS_because_presence_is_the_whole_question(self):
+        """The half that is easy to lose. Once the artefact is on disk the test
+        runs and a red means the code -- a gate that skipped here would be
+        hiding the absence rather than reporting it."""
+        rel = "out/meshtex/mesh_index.json"
+        if coroot.find_derived(rel) is None:
+            self.skipTest(_index_reason(rel, note="this test needs one built"))
+        ran = []
+
+        class T(unittest.TestCase):
+            @requires_index(rel)
+            def test_x(self):
+                ran.append(1)
+
+        unittest.TextTestRunner(stream=io.StringIO()).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(T))
+        self.assertEqual(ran, [1], "a built index must not be skipped")
+
+
+class MonsterArtResolution(unittest.TestCase):
+    """A monster body id -> the geometry directory and skin it draws.
+
+    The rule was private to `artcrawl`'s crawler, so only the index builder
+    could resolve a colour variant and a viewer handed body `0303` had no
+    route to SnowApe's geometry. These pin the behaviour the move into COre
+    has to preserve, and each discriminates rather than merely passing: the
+    interleave case goes to the wrong family under a naive rule, `217` gets
+    morphed under a rule that skips the own-directory check, and `104` names
+    a directory that does not exist under one that rebuilds the name from the
+    number.
+    """
+
+    #: A deliberately small stand-in for a shipped install, carrying the two
+    #: families that share a tail (117/217) and the two non-numeric names.
+    DIRS = {"103", "203", "117", "217", "104n", "132n"}
+
+    def setUp(self):
+        import monsterart
+        self.ma = monsterart
+
+    def test_a_body_with_its_own_directory_uses_it(self):
+        a = self.ma.resolve(103, self.DIRS)
+        self.assertEqual(a.mesh_path, "c3/monster/103/")
+        self.assertFalse(a.borrowed)
+        self.assertEqual(a.colour, 0)
+
+    def test_a_colour_morph_borrows_geometry_and_keeps_its_own_skin(self):
+        """SnowApe is the ape wearing a different texture: borrowed geometry,
+        its own skin. That split is the whole point of the rule."""
+        a = self.ma.resolve(303, self.DIRS)
+        self.assertEqual(a.mesh_path, "c3/monster/103/")
+        self.assertTrue(a.borrowed)
+        self.assertEqual(a.colour, 2)
+        self.assertEqual(a.texture, "c3/texture/303000000.dds")
+
+    def test_families_sharing_a_tail_interleave_by_two_hundred(self):
+        """403 is FireSnake and belongs to the snake family at 203, not the
+        ape family at 103 -- both satisfy the multiple-of-100 test, and only
+        the even-hundreds rule separates them."""
+        self.assertEqual(self.ma.resolve(403, self.DIRS).mesh_dir, 203)
+        self.assertEqual(self.ma.resolve(317, self.DIRS).mesh_dir, 117)
+
+    def test_a_body_that_ships_its_own_art_is_never_morphed(self):
+        """217 satisfies the arithmetic as a morph of 117 *and* ships its own
+        directory. Applying the rule first would dress NightDevil in
+        BullMonster's mesh, so the ordering is load-bearing."""
+        a = self.ma.resolve(217, self.DIRS)
+        self.assertEqual(a.mesh_dir, 217)
+        self.assertFalse(a.borrowed)
+        # the rule alone, asked directly, really does offer 117
+        self.assertEqual(self.ma.split_colour(217, self.DIRS), (117, 1))
+
+    def test_a_directory_name_is_not_always_its_number(self):
+        """`c3/monster/104n/` and `132n` ship under names that are not the
+        number, so a path rebuilt from the int names nothing."""
+        self.assertEqual(self.ma.resolve(104, self.DIRS).mesh_path,
+                         "c3/monster/104n/")
+        self.assertEqual(self.ma.resolve(132, self.DIRS).mesh_path,
+                         "c3/monster/132n/")
+
+    def test_an_unplaceable_body_says_so_instead_of_guessing(self):
+        """145 is a real spawnable body with no directory and no base an exact
+        multiple of 100 below it. A wrong directory draws the wrong monster,
+        so a guess is worse than an admission."""
+        a = self.ma.resolve(145, self.DIRS)
+        self.assertFalse(a.resolved)
+        self.assertEqual(a.mesh_path, "")
+        self.assertIn("no directory of its own", a.why)
+        # the skin is still known -- only the geometry is missing
+        self.assertEqual(a.texture, "c3/texture/145000000.dds")
+
+    def test_it_accepts_the_shape_artcrawl_already_keeps(self):
+        """`artcrawl` holds `{number: name}`; an iterable of names is the
+        other natural input. Both must agree or the move changed behaviour
+        for its first caller."""
+        as_map = {103: "103", 104: "104n"}
+        self.assertEqual(self.ma.resolve(303, as_map).mesh_dir, 103)
+        self.assertEqual(self.ma.resolve(104, as_map).mesh_path,
+                         "c3/monster/104n/")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_rule_still_places_the_real_corpus(self):
+        """Against the install's own directories, not a fixture."""
+        p = coroot.find_derived("out/wdf/c3_names.json")
+        if p is None:
+            self.skipTest("needs the recovered archive names")
+        dirs = {n.split("/")[2] for n in json.loads(p.read_text("utf-8")).values()
+                if n.lower().startswith("c3/monster/") and n.count("/") >= 3}
+        self.assertGreater(len(dirs), 20)
+        a = self.ma.resolve(303, dirs)
+        self.assertTrue(a.borrowed)
+        self.assertEqual(a.mesh_dir, 103)
+
 
 class NpcModelArtPins(unittest.TestCase):
     """The model page's NPC/mount art, pinned to the author's verified scan.
@@ -7004,6 +16350,7 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertIsNotNone(m, key)
         return m
 
+    @requires_base("patch6090", why="the author's 6090 scan; verified 19/19 on 6090 and red on 5517 and CCO")
     def test_npc_dirs_resolve_through_the_tables(self):
         """281 was reported textureless; the tables said 9992810 all
         along. Same family shape for every table-reached dir."""
@@ -7015,6 +16362,16 @@ class NpcModelArtPins(unittest.TestCase):
             self.assertEqual(m.texture, tex, d)
             self.assertEqual(m.texture_method, "npc tables", d)
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
     def test_unreached_npc_dirs_fall_to_the_999_family(self):
         """373 was reported mismatched: the generic guess crossed into the
         monster namespace (373000000). The npc family wins."""
@@ -7029,6 +16386,16 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertEqual(m.mesh, "c3/mesh/9990010.c3")
         self.assertEqual(m.texture, "c3/texture/9990211.dds")
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
     def test_the_short_stem_is_the_standby_looks_body(self):
         """The author's second scan corrected the first: the 9-digit action
         files of these looks carry 3-4 vertex shards, and the short-stem
@@ -7043,6 +16410,44 @@ class NpcModelArtPins(unittest.TestCase):
         m = self._model("npc_simple:010")
         self.assertEqual(m.mesh, "c3/npc/999010100.c3")
 
+    @requires_base(
+        "patch5517",
+        why="locks the 2026-08-09 measurement that 5517 inherits 6090's "
+            "colour sets with exactly ONE divergence; measured on 5517 and "
+            "6090 in separate processes, and only meaningful on 5517")
+    def test_the_inherited_colour_sets_diverge_in_exactly_one_place(self):
+        """`Patch5517` inherits `Patch6090.MONSTERS`. Measured, 38 of the 39
+        directories resolve an identical strip on both clients and one does
+        not: `104n` is missing `906000000`, which lives in 6090's loose layer
+        and not 5517's.
+
+        **This asserts the divergence, not the correctness**, and the
+        difference matters. `monster_colourways` filters by existence, so a set
+        naming art 5517 lacks shows up as a short strip -- that is what this
+        catches. A set naming the *wrong* art shows up as nothing at all, on
+        either client, because both resolve from one shared `c3.wdf`. Identical
+        output proves the two clients agree; it cannot prove the 6090 scan was
+        right. See `Patch5517.colour_provenance`.
+
+        Locked here so that if a future 5517 index or loose-layer change makes
+        a second set diverge, it is a red test rather than a quietly shorter
+        strip in the viewer.
+        """
+        from plugins import patch6090 as _p90
+        sets = _p90.Patch6090.MONSTERS
+        short = {}
+        for d, stems in sets.items():
+            got = self.cat.monster_colourways(d, "")
+            missing = [s for s in stems
+                       if f"c3/texture/{s}.dds" not in got]
+            if missing:
+                short[d] = missing
+        self.assertEqual(short, {"104n": ["906000000"]},
+                         "the inherited-set divergence moved; re-measure "
+                         "against 6090 in a SEPARATE process before editing "
+                         "this expectation")
+
+    @requires_base("patch6090", why="the author's 6090 scan; verified 19/19 on 6090 and red on 5517 and CCO")
     def test_mounts_skin_from_their_own_directory(self):
         """802/804/808/810/845/849/850 were dressed from the monster
         family (802000000-style). A mount's colours live beside it."""
@@ -7053,10 +16458,40 @@ class NpcModelArtPins(unittest.TestCase):
         m = self._model("mount:801")
         self.assertEqual(m.texture_method, "npc tables")
 
+    @requires_index("out/artcrawl/entities.json",
+                    "the name map is empty and every label falls back to "
+                    '"Monster <id>"')
     def test_monster_labels_carry_entity_names(self):
+        """A capability skip, NOT a base gate -- see `requires_index`.
+
+        MEASURED on all six declared installs: red on `patch5017`, `patch5065`
+        and `patch5165`, green on `cco`, `patch5517` and `patch6090`. The
+        failing three are **exactly** the three with no `artcrawl` index built,
+        and the cause is read from code rather than inferred:
+        `coviewer._entity_name_map()` reads `out/artcrawl/entities.json`,
+        `models.py` stores it as `_entity_names`, and a miss falls back to
+        `f"Monster {ident}"`.
+
+        So the honest statement is *"this base has no crawl"*, not *"this
+        client cannot name its monsters"* -- and the names come from a server
+        dump rather than a client table, so building the crawl on the
+        plaintext family should light this up. Gating by base would have
+        frozen a false claim about three clients and kept skipping after
+        somebody built the index.
+        """
         m = self._model("monster:103")
         self.assertEqual(m.label, "ThunderApe (103)")
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
     def test_monster_colourways_are_the_verified_sets(self):
         """The author's eyeballed scan, not a digit probe: the leading-digit
         guess pulled 203000000 (monster 203's own skin) into 103's strip
@@ -7085,6 +16520,16 @@ class NpcModelArtPins(unittest.TestCase):
             self.assertEqual(m.texture, f"c3/texture/{stems[0]}.dds",
                              m.ident)
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
     def test_a_colourway_probe_asks_the_archive_not_the_name_table(self):
         """c3/texture/109000000.dds is a real 16KB skin whose WDF name was
         never recovered, so the path set has never heard of it while the
@@ -7105,11 +16550,32 @@ class NpcModelArtPins(unittest.TestCase):
     #: their own and are checked separately below.
     VERIFIED_WHOLE_KINDS = ("npc", "npc_simple", "ghost", "mount", "role")
 
+    @requires_base(
+        "cco", "patch5517", "patch6090",
+        why="MEASURED on all six declared installs 2026-08-09, and the scope "
+            "is the measurement rather than the obvious guess: green on cco / "
+            "patch5517 / patch6090, red on the plaintext trio for TWO "
+            "different reasons -- mount is empty on 5017 and 5065 (0 models, "
+            "against 1 on 5165, 4 on 5517, 37 on 6090) and npc:813 ships a "
+            "mesh with no texture on 5165. OPEN, and handed to the "
+            "plaintext-family work: whether mount=0 is the client having no "
+            "mounts or the plugin not enumerating them for that family is NOT "
+            "settled -- all five official clients share one byte-identical "
+            "c3.wdf, so the art is common and only the table differs. This "
+            "gate claims where the assertions hold, and nothing more")
     def test_every_verified_kind_still_resolves_whole(self):
         """NPCs, the standby set, ghosts, mounts, the character-select
         roles and effects were each confirmed correct end to end. Effects
         carry their art in their own scene rather than a mesh/texture pair,
-        so they are checked for resolvability, not for a texture."""
+        so they are checked for resolvability, not for a texture.
+
+        **Why this is gated by base where the label test beside it is not.**
+        That one fails for a build state (no `artcrawl` index) and is keyed on
+        the artefact so it self-heals. This one fails on *client content* --
+        two distinct facts, measured per base, recorded in the gate's reason.
+        Same class of red, different causes; C54 is the entry that says a gate
+        must carry the evidence for its own scope.
+        """
         # 217 ships two motion-only files (999217100, 999217190) and no
         # geometry or texture anywhere in the install -- the client has
         # nothing to draw either. Absent content, not a resolution failure.
@@ -7183,6 +16649,16 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertLess(abs(m[12] - cx), 1.0, "lateral socket drift")
         self.assertLess(abs(m[13] - cy), 1.0, "fore-aft socket drift")
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
     def test_effect_keys_match_across_a_padding_change(self):
         """CCO writes Action3DEffect's action field three wide, 6090 four
         and zero-padded -- 999.100.135.999 against 999.0100.130.300, over
@@ -7200,31 +16676,78 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertTrue(db.lookup_action_effect("130300", "100", shape="999"),
                         "a body idle effect must resolve")
 
-    def test_the_super_aura_is_declared_by_an_effect_named_for_the_id(self):
-        """How 6090 says a weapon glows. CCO ships 826 always-on rows of
-        the form `999.999.410.009=410009` -- the effect is named after the
-        appearance id and the row exists only to point at it. 6090 ships
-        ZERO action-999 rows and declares the effect directly:
-        `3DEffect.ini [410199]` is Rainbow Blade Super's aura, and there is
-        no such section for 410195 or 410196.
+    def test_the_super_aura_resolves_from_the_table_on_every_base(self):
+        r"""RENAMED AND CORRECTED (C35). This was
+        `test_the_super_aura_is_declared_by_an_effect_named_for_the_id` and it
+        taught the refuted model: *"6090 ships ZERO action-999 rows and
+        declares the effect directly"*. 6090 ships **2,604** always-on rows
+        and 5517 ships 972; the reader was spelling the always-on action three
+        wide against a four-wide field, so the table came up empty and a
+        fallback was written to explain the emptiness.
 
-        The author confirmed the glow exists in the real client, which is the
-        only reason we kept looking after the table came up empty."""
+        **Every assertion below is unchanged and still passes on all three
+        bases** -- which is exactly why the wrong model survived. What changed
+        is the SOURCE: these answers now come from the client's own table on
+        every base, where before they came from the table on CCO and from our
+        guess on 5517 and 6090. So this now asserts the source too, because
+        the source is the thing that was wrong."""
+        import effects as fx
         import superfx
         db = superfx.SuperFxDB(ROOT, self.cat.assets)
         for ident in ("410199", "410099", "410009"):
             self.assertEqual(db.effect_name(ident), ident,
                              f"{ident} is a Super and must carry its aura")
+            self.assertEqual(db.fx.always_on_effect(ident), ident,
+                             f"{ident} must resolve from the TABLE, not from "
+                             f"the effect-named-for-id fallback")
         for ident in ("410195", "410196", "410197", "410198"):
             self.assertEqual(db.effect_name(ident), "",
                              f"{ident} is not a Super and must not glow")
+            self.assertIsNone(db.fx.always_on_effect(ident),
+                              f"{ident} must have no always-on row either")
         se = db.super_effect("410199", "l_weapon")
         self.assertIsNotNone(se)
         self.assertTrue(se.layers)
+        # and the rows the old model said were absent
+        rows = db.fx.always_on_rules()
+        self.assertGreater(len(rows), 400,
+                           "every shipped client carries always-on rows; the "
+                           "claim that this one has none was a width bug")
+        self.assertTrue(all(fx.is_always_on(r.action) for r in rows))
 
+    @requires_base("patch5017", "patch5065", "patch5165", "patch5517",
+                   "patch6090",
+                   why="on CCO all four body shapes carry unit socket bases, "
+                       "so the bug is absent and unittest reports UNEXPECTED "
+                       "SUCCESS -- which reads as 'fixed'")
     @unittest.expectedFailure
     def test_socket_bases_cannot_flatten_a_weapon(self):
         """OPEN BUG, asserted as expectedFailure so it cannot be forgotten.
+
+        Gated as well as expected-failing, because an `expectedFailure` with
+        no base gate is the one pin whose wrong verdict is *encouraging*: on
+        CCO the assertion passes and unittest prints UNEXPECTED SUCCESS, which
+        reads as "the open bug is fixed" when it means "you are on the wrong
+        client". Measured on all six declared bases (2026-08-09): the five
+        patch clients read `v_l_weapon` as (0.9987, 0.0506, 0.0562) and CCO
+        reads (1.0, 1.0, 1.0). Per shape, the flattening is shape 0002's
+        alone: 0001/0003/0004 are unit on every base, and on CCO so is 0002.
+
+        **The five are one measurement, not five.** All five ship both inputs
+        byte-identically -- `c3/mesh/002131090.c3` md5 `be6093c8c7fd` (67,364
+        B) and the motion `c3/0002/000/403.c3` md5 `102db527ca05` (75,892 B)
+        -- where CCO ships `a21c8462a4b2` (173,616 B) and `d44859a636f4`
+        (224,132 B). Clients that share a file always agree, so this pin has
+        exactly two data points: the official asset and CCO's. That is C16's
+        lesson in docs/CORRECTIONS.md, where 5517 and 6090 agreeing on a
+        byte-identical motion was read as "not a base mismatch".
+
+        The gate still names all five rather than the 5517/6090 pair it was
+        first classified against, because a skip has to be true of the client
+        in front of you: 5017, 5065 and 5165 do carry the bug, and gating to
+        the pair would have skipped three clients that reproduce it. Section 3
+        of that file states the rule -- classify against every declared base --
+        and it is what turned up the other three here.
 
         A socket track's basis is neither unit nor orthogonal, and it varies
         per dummy within one file: in c3/0002/000/100.c3 v_armet and
@@ -7262,6 +16785,65 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertTrue(all(0.97 <= n <= 1.03 for n in lens),
                         f"socket basis is not unit: {lens}")
 
+    def test_no_socket_basis_is_skewed_into_the_claimed_band(self):
+        """C-2026-08-09-skew-severity: the retired "determinant 0.52 to 0.9" band is empty.
+
+        `plugins/patch6090.py` claimed socket bases skew to a determinant of
+        **0.52-0.9** on ~5% of frames, with no recorded method. Re-measured
+        over three sockets x five actions x every frame x four body shapes x
+        three bases, the *rate* reproduced (22 frames against the claimed 23)
+        but the *range* did not: the real spread is **0.94-0.98**, and the
+        claimed band is **empty everywhere**.
+
+        **Deliberately not base-gated, and that is the point.** The band is
+        absent on CCO (every basis exactly unit) *and* on the official clients
+        (0.94 at worst), so its absence is a universal invariant rather than a
+        fact about one lineage. Gating it would be a claim about the bases it
+        excluded, needing evidence of its own (C54); an assertion true
+        everywhere needs no gate.
+
+        A basis inside that band would be a real regression -- 0.52 shears a
+        weapon by 48%, against ~6% for the 0.94 actually present.
+        """
+        import math
+        import parts as partsmod
+        seen = 0
+        for shape in ("001", "002", "003", "004"):
+            app = f"{shape}131090"
+            try:
+                raw = self.cat.assets.read(f"c3/mesh/{app}.c3")
+            except Exception:                                   # noqa: BLE001
+                continue
+            for action in ("100", "403"):
+                mo = partsmod.idle_motion(app, ROOT, "000", action)
+                if mo is None:
+                    continue
+                for frame in (0, 5, 12):
+                    anc = partsmod.socket_anchors(raw, motion_set=mo,
+                                                  frame=frame)
+                    for name in ("v_armet", "v_r_weapon", "v_l_weapon"):
+                        a = anc.get(name)
+                        if a is None:
+                            continue
+                        m = a.matrix
+                        lens = [math.sqrt(m[i] ** 2 + m[i + 1] ** 2
+                                          + m[i + 2] ** 2) for i in (0, 4, 8)]
+                        if not all(0.97 <= n <= 1.03 for n in lens):
+                            continue   # degenerate rows are a separate finding
+                        det = abs(
+                            m[0] * (m[5] * m[10] - m[6] * m[9])
+                            - m[1] * (m[4] * m[10] - m[6] * m[8])
+                            + m[2] * (m[4] * m[9] - m[5] * m[8]))
+                        seen += 1
+                        self.assertFalse(
+                            0.52 <= det <= 0.90,
+                            f"{app}/{action}/f{frame}/{name}: determinant "
+                            f"{det:.3f} falls in the band C-2026-08-09-skew-severity measured as "
+                            f"empty -- either a regression, or C-2026-08-09-skew-severity's sweep "
+                            f"missed a case and must be re-run")
+        self.assertGreater(seen, 20,
+                           "sampled too few unit-row bases to mean anything")
+
     def test_an_armed_body_plays_its_armed_motion(self):
         """6090 ships none of CCO's per-(weapon set, action) alias rows, and
         the lookup's fallback chain ends at the unarmed set 000 while
@@ -7280,6 +16862,18 @@ class NpcModelArtPins(unittest.TestCase):
         bow = db.clip("002131090", "100", weapon="500019")
         self.assertEqual(bow.path, "c3/0002/500/100.c3")
 
+    @requires_base("patch5017", "patch5065", "patch5165", "patch5517",
+                   "patch6090",
+                   why="MEASURED on all six 2026-08-09: holds on ALL FIVE "
+                       "official clients, red only on CCO. The former text "
+                       "claimed 'red on 5517 and CCO' and gated to 6090 alone, "
+                       "skipping four clients that carry the fact -- the shape "
+                       "that hides a defect rather than merely mislabelling "
+                       "one. The five official archives are byte-identical "
+                       "(c3.wdf 359,069,116 bytes, same head+tail sha256 on "
+                       "all five; CCO's differ), so an archive-borne fact is "
+                       "lineage-wide by construction -- CORRECTIONS "
+                       "C-2026-08-09-comod-base-gate-audit")
     def test_the_right_weapon_socket_is_the_trustworthy_one(self):
         """The finding that ended a four-round hunt. In the SAME motion file,
         v_r_weapon and v_armet are bit-identical to CCO's (difference
@@ -7316,10 +16910,36 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertEqual(json.loads(raw),
                          {"a": 0.0, "b": [0.0, 1.5], "c": {"d": 0.0}})
 
+    @requires_base("patch6090", "patch5517",
+                   why="MEASURED on all six declared installs 2026-08-09: "
+                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "text said 'red on 5517' and that was never measured. "
+                       "Widened to 5517 only, NOT to the whole official "
+                       "lineage: 5017/5065/5165 are red here too, but their "
+                       "artcrawl index has never been built (5065 and 5165 "
+                       "have no index namespace at all), so those are "
+                       "unmeasured bases rather than absent facts -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
+    @requires_index("out/artcrawl/entities.json",
+                    "half of what this asserts is entity names, which come "
+                    "from the crawl")
     def test_dropped_labels_do_not_claim_the_wrong_entity(self):
         """109 was labelled a shopkeeper it does not resemble, and 141
         BanditMessenger, whose art is monster 201's colourway. A numeric
-        label is the honest answer until the real name is known."""
+        label is the honest answer until the real name is known.
+
+        **It needs BOTH gates, and that is the point.** It is a 6090 content
+        pin *and* it depends on the artcrawl index, and those are independent
+        conditions. The base gate alone was not enough: while a sanctioned rig
+        edit was moving install fingerprints -- the coupling `8a5d41b` fixed
+        with `coroot.TOOL_WRITTEN_INI` -- 6090's index was orphaned and this
+        failed `'Monster 133' != 'Ganoderma (133)'`, the same fallback on the
+        same mechanism as `test_monster_labels_carry_entity_names` beside it.
+
+        Found by the re-key rather than reasoned about, which is the honest
+        provenance: one test having a capability guard and its neighbour not
+        was invisible until an index actually went missing.
+        """
         for d in ("109", "301", "218"):
             self.assertEqual(self._model(f"monster:{d}").label,
                              f"Monster {d}", d)
@@ -7663,6 +17283,494 @@ class TwoInstalls(unittest.TestCase):
         self.assertIn("ini/", r["missing"])
 
 
+class ContentFolderJudgementIsAudible(unittest.TestCase):
+    r"""`MAX_ACTIONS` discards the whole unanchored set, and says so now.
+
+    **The discard is CORRECT and is not what this class is about.**
+    `MAX_ACTIONS` is a classifier, not a truncation: its own comment says "a
+    folder with more 4-digit .c3 files than this is a content folder, not one
+    model's action set", and `actions_beside` records what happens without it
+    — reading a garment archive as one model's action set "pulled **455**
+    unrelated meshes into a single entry". Once the count says "content
+    folder", every unanchored match is a false positive, so keeping the first
+    40 would keep 40 arbitrary false positives. **Truncating is the wrong
+    fix** and this class exists partly to stop it.
+
+    What was defective is that the *judgement* was silent. A caller could not
+    tell "this directory has no unanchored actions" from "this directory was
+    judged a content folder and N candidates were thrown away" — both are an
+    empty list. Same shape as `PartIni`'s twin fallback: the data was right,
+    the decision was invisible.
+
+    **And the silence was costing something, which is why this got built
+    rather than closed.** MEASURED on `patch5517-76c7f4499934` over the full
+    `.c3` universe (recovered name tables + loose files on disk), reported as
+    a delta rather than an absolute because the number expires with the tree:
+
+        universe                 10,473 .c3
+        directories              1,398
+        tripping MAX_ACTIONS     15
+        largest surviving        40
+        smallest discarded       41          <- the margin is ZERO
+
+    The band is not what "content folder vs one model's action set"
+    predicts:
+
+        41  c3/0001/410  c3/0002/410  c3/0003/410  c3/0004/410
+        41  c3/0002/500  c3/mount/802  c3/mount/803
+        44  c3/0001/500  c3/0004/500
+        47  c3/0003/500  c3/mount/801
+       117  c3/0001/000  c3/0002/000  c3/0003/000  c3/0004/000
+
+    `c3/mount/801`, `802`, `803` are sibling mount directories split by the
+    threshold. Only the four at **117** look like the content folders the
+    docstring describes; the gap between **47 and 117** is where a boundary
+    would sit if that model were right.
+
+    **And the margin is not even the worst of it** — see
+    `test_the_verdict_depends_on_WHICH_MESH_you_ask_about`. The count is a
+    property of *(directory, querying mesh)*, not of the directory, so
+    `c3/mount/802` and `803` **both keep and cut depending on who asks**.
+    The quantity compared to `MAX_ACTIONS` is not well-defined per
+    directory, which is why the numbers above are reported per directory as
+    a *maximum* and why two honest censuses of this tree disagreed.
+
+    **That is written up as OPEN and deliberately not acted on** —
+    `docs/CORRECTIONS.md` `C-2026-08-10-asstdir-action-classifier`. Moving
+    the threshold now is the `EXTRA_RECORD = 264` move: right about the
+    symptom, wrong about the structure. The record this class adds is what
+    will produce the evidence.
+    """
+
+    def _rows(self, n_loose: int) -> list:
+        """One directory, one model, and `n_loose` unanchored siblings."""
+        rows = ["c3/0001/500/1.c3"]
+        rows += [f"c3/0001/500/{100 + i}.c3" for i in range(n_loose)]
+        return rows
+
+    def _call(self, rows, record=None):
+        import collection
+        return collection.actions_beside(
+            lambda pre: [p for p in rows if p.startswith(pre)],
+            "c3/0001/500/1.c3", record=record)
+
+    def test_under_the_threshold_nothing_is_discarded_and_nothing_is_said(self):
+        """The control.
+
+        Without it, every assertion below passes against a classifier that
+        fires unconditionally — the record would always be populated and the
+        list always empty, and both would look like the fix working.
+        """
+        import collection
+        rec = {}
+        got = self._call(self._rows(collection.MAX_ACTIONS - 1), rec)
+        self.assertEqual(rec, {}, "the judgement fired when it should not")
+        self.assertEqual(len(got), collection.MAX_ACTIONS - 1)
+
+    def test_at_the_threshold_exactly_it_still_does_not_fire(self):
+        """`> MAX_ACTIONS`, not `>=`. The measured margin is zero, so which
+        side of the boundary 40 sits on is load-bearing for 15 directories."""
+        import collection
+        rec = {}
+        got = self._call(self._rows(collection.MAX_ACTIONS), rec)
+        self.assertEqual(rec, {})
+        self.assertEqual(len(got), collection.MAX_ACTIONS)
+
+    def test_over_the_threshold_the_judgement_is_recorded(self):
+        import collection
+        rec = {}
+        got = self._call(self._rows(collection.MAX_ACTIONS + 1), rec)
+        self.assertEqual(got, [], "the discard itself must not change")
+        self.assertEqual(rec["discarded"], collection.MAX_ACTIONS + 1)
+        self.assertEqual(rec["reason"], "content-folder")
+        self.assertEqual(rec["threshold"], collection.MAX_ACTIONS)
+        self.assertEqual(rec["directory"], "c3/0001/500/")
+
+    def test_the_discarded_candidates_are_kept_not_just_counted(self):
+        """"Which ones" is the next question, and a bare count sends the
+        reader off to re-derive a list this function already held."""
+        import collection
+        rec = {}
+        self._call(self._rows(collection.MAX_ACTIONS + 1), rec)
+        self.assertEqual(len(rec["candidates"]), collection.MAX_ACTIONS + 1)
+        self.assertIn("c3/0001/500/100.c3", rec["candidates"])
+        self.assertNotIn("c3/0001/500/1.c3", rec["candidates"],
+                         "the mesh itself is not one of its own candidates")
+
+    def test_existing_callers_receive_exactly_what_they_did_before(self):
+        """`record` is keyword-only and optional. `collection.py` and
+        `coviewer._sibling_actions` pass neither."""
+        over = self._rows(collection_MAX() + 1)
+        under = self._rows(collection_MAX() - 1)
+        rec = {}
+        self.assertEqual(self._call(over), self._call(over, rec))
+        self.assertEqual(self._call(under), self._call(under, {}))
+
+    def test_the_verdict_depends_on_WHICH_MESH_you_ask_about(self):
+        r"""The finding, and it is bigger than the zero margin.
+
+        The loose count is not a property of the directory. It is a property
+        of **(directory, querying mesh)**, because `action_code(stem, sib)`
+        takes the asking mesh's stem as its first argument. So one folder can
+        both keep and cut.
+
+        MEASURED on `patch5517-76c7f4499934`, `c3/mount/802` — 48 files:
+
+            41 of its meshes see 40 loose siblings  -> kept
+             7 of its meshes see 41                 -> ALL DISCARDED
+
+        The cause is visible in the stems: `130` ships beside `130-1`,
+        `130-2`, `130-3`. A plain numeric mesh does not match a hyphenated
+        sibling, so it counts one fewer; a hyphenated mesh matches all the
+        plain ones and counts one more. `c3/mount/803` splits identically.
+
+        **So two callers asking `actions_beside` about two different meshes
+        in the same folder receive opposite answers** — one the complete
+        action set, the other nothing — and neither can tell.
+
+        That is strictly stronger than "the boundary is arbitrary". It says
+        the quantity being compared to `MAX_ACTIONS` **is not well-defined
+        per directory**, so the docstring's "content folder vs one model's
+        action set" model cannot be true as written: a directory is one kind
+        or the other, and this number is not.
+
+        Synthetic, not install-dependent — 41 plain stems plus one
+        hyphenated, which reproduces the real split at exactly the boundary.
+        """
+        import collection
+        rows = [f"c3/mount/802/{100 + i}.c3" for i in range(41)]
+        rows.append("c3/mount/802/130-1.c3")
+        lu = (lambda pre: [p for p in rows if p.startswith(pre)])
+        plain, hyphen = {}, {}
+        got_plain = collection.actions_beside(
+            lu, "c3/mount/802/100.c3", record=plain)
+        got_hyphen = collection.actions_beside(
+            lu, "c3/mount/802/130-1.c3", record=hyphen)
+        self.assertEqual(len(got_plain), 40, "the plain mesh should be kept")
+        self.assertEqual(plain, {}, "no judgement should fire for it")
+        self.assertEqual(got_hyphen, [], "the hyphenated mesh is cut")
+        self.assertEqual(hyphen["discarded"], 41)
+        # Same folder, same instant, opposite verdicts.
+        self.assertNotEqual(bool(got_plain), bool(got_hyphen))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_tripping_set_on_this_install(self):
+        r"""The census, as a within-tree delta.
+
+        Not "15" — *"15 of 1,398 on this base"*, both measured in the same
+        run. An absolute inherits the lifetime of the tree it was taken on; a
+        ratio measured here inherits nothing.
+
+        This asserts the SHAPE that made the OPEN worth filing — that the
+        margin is zero — rather than pinning the membership.
+
+        **That choice was made to protect against the name tables moving,
+        and it turns out to guard something worse, which its author had not
+        identified**: per the test above, membership is not stable *within a
+        single run of a single tree*, because the count depends on which mesh
+        is asking. Pinning membership would have made this test a hostage to
+        which representative the census happened to pick — which is exactly
+        how two honest censuses of this tree disagreed about `c3/mount/803`.
+        Recorded as such rather than claimed as foresight.
+        """
+        import collection
+        import coroot
+        counts = _loose_census()
+        if not counts:
+            self.skipTest("no .c3 universe on this base")
+        trip = {d: n for d, n in counts.items() if n > collection.MAX_ACTIONS}
+        keep = [n for n in counts.values() if n <= collection.MAX_ACTIONS]
+        self.assertTrue(trip, f"nothing trips the cap on {coroot.base_id()}")
+        largest_kept, smallest_cut = max(keep), min(trip.values())
+        # The finding: the two classes are separated by nothing at all.
+        self.assertEqual(smallest_cut - largest_kept, 1,
+                         f"the margin moved: {largest_kept} kept, "
+                         f"{smallest_cut} cut, on {coroot.base_id()}")
+        # And the discard is genuinely reaching real directories, not one
+        # pathological archive.
+        self.assertGreater(len(trip), 1,
+                           f"{len(trip)} of {len(counts)} directories")
+
+
+def collection_MAX():
+    import collection
+    return collection.MAX_ACTIONS
+
+
+def _loose_census() -> "dict[str, int]":
+    """`{directory: most unanchored candidates any mesh in it produces}`.
+
+    Built from the same universe the viewer resolves — the recovered name
+    tables plus loose files on disk — because a census over only one of them
+    under-reports. Measured with `action_code` itself, so it cannot drift
+    from the rule it is describing.
+    """
+    import json
+    import collection
+    import coroot
+    from collections import defaultdict
+    names: dict = {}
+    for rel in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
+        p = coroot.find_derived(rel)
+        if p is not None:
+            names.update(json.loads(p.read_text("utf-8")))
+    root = Path(coroot.default_root())
+    uni = {v.lower().replace("\\", "/") for v in names.values()}
+    uni.update(str(f.relative_to(root)).lower().replace("\\", "/")
+               for f in root.rglob("*.c3"))
+    c3 = sorted(x for x in uni if x.endswith(".c3"))
+    under: dict = defaultdict(list)
+    for p in c3:
+        under[p.rsplit("/", 1)[0] + "/"].append(p)
+    out: dict = {}
+    for d, mem in under.items():
+        best = 0
+        for m in mem:
+            stem = m.rsplit("/", 1)[-1][:-3]
+            loose = 0
+            for q in mem:
+                if q == m or q.count("/") != m.count("/"):
+                    continue
+                code, anch = collection.action_code(
+                    stem, q.rsplit("/", 1)[-1][:-3])
+                if code and not anch:
+                    loose += 1
+            best = max(best, loose)
+        out[d] = best
+    return out
+
+
+class NestedPerActionMeshesAreCollected(unittest.TestCase):
+    r"""`c3/npc/2231/{100,101,190}.c3` — the owner's reported bug.
+
+    **Three layouts ship and the geometry test only knew two.** `gather_parts`
+    keeps a MOTI sibling only when it carries no geometry, because that test
+    is what stops the unanchored rule swallowing a folder of unrelated models
+    — 455 of them, once. The flat family `c3/npc/999<look><action>.c3` was
+    exempted from it when the storekeeper case showed those are per-action
+    *meshes*, every file PHY+MOTI. **The nested family is per-action meshes
+    too**, and nothing exempted it:
+
+        c3/npc/2231/  ->  1.c3  1.dds  100.c3  101.c3  190.c3
+        actions_beside    3 actions          anchored=False for all three
+        each action       MOTI=True  geometry=True
+        gather_parts      0 parts            <- the whole action set discarded
+
+    MEASURED on the two installs, before/after, with real blobs:
+
+                                       7878        CCO
+        meshes that gain parts        7,747      1,298
+        model directories               771         72
+        `c3/npc/2231/1.c3`            0 -> 3          —
+
+    **`MAX_ACTIONS` is not relaxed, weakened, or routed around.** The fix is a
+    test on the PATH inside `gather_parts`; `action_code` and `actions_beside`
+    are untouched, so the content-folder classifier counts exactly what it
+    counted before and condemns exactly what it condemned before. That is
+    asserted below rather than asserted about.
+    """
+
+    MAGIC = b"MAXFILE C3 00001"
+
+    def _c3(self, *chunks) -> bytes:
+        out = bytearray(self.MAGIC)
+        for tag, body in chunks:
+            out += tag + len(body).to_bytes(4, "little") + body
+        return bytes(out)
+
+    def setUp(self):
+        import collection
+        self.mod = collection
+        #: A per-action mesh: PHY *and* MOTI in one file. This is the shape
+        #: the geometry test was discarding.
+        self.per_action = self._c3((b"PHY4", b"GEOM"), (b"MOTI", b"walk"))
+        #: The other shipped shape, which was never affected.
+        self.motion_only = self._c3((b"MOTI", b"walk"))
+
+    def _view(self, rows, blob=None):
+        blob = blob or self.per_action
+        lu = (lambda pre: [p for p in rows if p.startswith(pre)])
+        return (lambda p: blob), lu
+
+    def _parts(self, rows, mesh, blob=None):
+        read, lu = self._view(rows, blob)
+        return self.mod.gather_parts(read, lu, mesh)
+
+    # -- the reported bug --------------------------------------------------
+
+    OWNER = ["c3/npc/2231/1.c3", "c3/npc/2231/100.c3",
+             "c3/npc/2231/101.c3", "c3/npc/2231/190.c3"]
+
+    def test_the_owners_npc_keeps_its_actions(self):
+        """VERIFIED against 7878 itself, not only this listing: all three
+        files read MOTI=True geometry=True, and `gather_parts` went 0 -> 3."""
+        got = self._parts(self.OWNER, "c3/npc/2231/1.c3")
+        self.assertEqual([r[1] for r in got], ["100.c3", "101.c3", "190.c3"])
+        self.assertTrue(all(r[0] == "motion" for r in got))
+
+    def test_the_motion_only_nested_case_is_unchanged(self):
+        """`c3/npc/614/` on 7878 is the same layout with motion-only actions.
+        It already worked, and a fix that moved it would be a regression:
+        MEASURED 6 parts before, 6 after."""
+        got = self._parts(self.OWNER, "c3/npc/2231/1.c3", self.motion_only)
+        self.assertEqual(len(got), 3)
+
+    def test_the_flat_family_still_collects(self):
+        """The other half. `c3/npc/999001100.c3` on CCO gathers 2 parts today
+        — it is anchored by `_is_flat_action`, not by this change — and it
+        must still gather 2. MEASURED on CCO: 2 before, 2 after."""
+        rows = ["c3/npc/999001100.c3", "c3/npc/999001101.c3",
+                "c3/npc/999001190.c3"]
+        got = self._parts(rows, "c3/npc/999001100.c3")
+        self.assertEqual([r[1] for r in got],
+                         ["999001101.c3", "999001190.c3"])
+
+    # -- THE 455 CONTROL ---------------------------------------------------
+
+    #: The incident, at the size it happened. The recovered garment archives
+    #: browse as `zephyr/garments`, `zephyr/garments1` ..; MEASURED on the
+    #: library on disk they hold 1,217 / 567 / 462 / 527 / 425 `.c3`, **every
+    #: stem a 4-digit model id**, in one flat directory each. Reading one as
+    #: another's action set is what pulled 455 unrelated meshes into a single
+    #: entry.
+    HAZARD_DIR = "zephyr/garments4/"
+    HAZARD_N = 425
+
+    def _hazard(self):
+        return [f"{self.HAZARD_DIR}{i:04d}.c3" for i in range(self.HAZARD_N)]
+
+    def test_the_455_hazard_is_still_refused(self):
+        """**The control.** Not an argument that it cannot fire — the folder,
+        at its measured size, put through the changed code."""
+        rows = self._hazard()
+        got = self._parts(rows, f"{self.HAZARD_DIR}0000.c3")
+        self.assertEqual(got, [], f"{self.HAZARD_N - 1} unrelated models were "
+                                  "swallowed into one entry")
+
+    def test_the_455_hazard_is_refused_TWICE_and_both_are_asserted(self):
+        r"""Belt and braces, and the braces are the ones that matter.
+
+        1. `MAX_ACTIONS` still condemns the directory. This change does not
+           touch `action_code` or `actions_beside`, so the classifier's input
+           is unchanged — asserted here by reading its own record.
+        2. The new predicate says no independently: `garments4` is not a
+           model id, so the directory cannot anchor anything in it.
+
+        Either alone is sufficient. Asserting both is what makes this a
+        control rather than a coincidence: if a later change moves
+        `MAX_ACTIONS`, leg 2 still holds and this test says which one broke.
+        """
+        rec = {}
+        self.mod.actions_beside(
+            (lambda pre: [p for p in self._hazard() if p.startswith(pre)]),
+            f"{self.HAZARD_DIR}0000.c3", record=rec)
+        self.assertEqual(rec["reason"], "content-folder", "leg 1: the cap")
+        self.assertEqual(rec["discarded"], self.HAZARD_N - 1)
+        self.assertFalse(
+            self.mod._directory_anchored(f"{self.HAZARD_DIR}0001.c3"),
+            "leg 2: a non-numeric directory is not a model's own directory")
+
+    def test_the_cap_classifies_on_exactly_what_it_classified_on_before(self):
+        """The classifier is a pure function of the path listing, and this
+        change added nothing to its input. Same folder, one file under the
+        threshold and one over, both verdicts unchanged."""
+        under = [f"c3/npc/2231/{100 + i}.c3"
+                 for i in range(self.mod.MAX_ACTIONS)] + ["c3/npc/2231/1.c3"]
+        over = under + [f"c3/npc/2231/{100 + self.mod.MAX_ACTIONS}.c3"]
+        for rows, fires in ((under, False), (over, True)):
+            rec = {}
+            got = self.mod.actions_beside(
+                (lambda pre: [p for p in rows if p.startswith(pre)]),
+                "c3/npc/2231/1.c3", record=rec)
+            self.assertEqual(bool(rec), fires)
+            self.assertEqual(bool(got), not fires)
+
+    def test_a_condemned_directory_stays_condemned_through_gather_parts(self):
+        """The cap is upstream of the new predicate, not beside it. Even in a
+        NUMERIC directory — where the predicate would otherwise say yes —
+        `gather_parts` gets nothing, because `actions_beside` already
+        returned nothing."""
+        rows = ["c3/npc/2231/1.c3"] + [
+            f"c3/npc/2231/{100 + i}.c3"
+            for i in range(self.mod.MAX_ACTIONS + 1)]
+        self.assertTrue(self.mod._directory_anchored("c3/npc/2231/100.c3"))
+        self.assertEqual(self._parts(rows, "c3/npc/2231/1.c3"), [])
+
+    # -- the two counterexamples the cap CANNOT see -------------------------
+
+    def test_a_content_folder_inside_c3_npc_id_is_still_refused(self):
+        r"""**The brief's reasoning that "the hazard cannot occur inside
+        `c3/npc/<id>/`" is REFUTED, and this is the case that refutes it.**
+
+        MEASURED on 7878, `c3/npc/10023/` — 28 files, every one PHY+MOTI:
+
+            01 02 03 04 05 06  11 12 13 14 15 16  22 23 24 25 26
+            33 34 35 36  44 45 46  55 56  66   and  1
+
+        A tile set: **27 unrelated models, in `c3/npc/<id>/`, at a size
+        `MAX_ACTIONS` cannot see** — 28 is under the threshold, so the cap
+        never fires and leg 1 of the control above is absent here. The 455
+        incident in miniature, and the reason the predicate tests the code
+        shape as well as the directory: a 2-digit stem is not an action code.
+        """
+        rows = ([f"c3/npc/10023/{a}{b}.c3" for a in range(7) for b in range(7)
+                 if a <= b] + ["c3/npc/10023/1.c3"])
+        rec = {}
+        self.mod.actions_beside(
+            (lambda pre: [p for p in rows if p.startswith(pre)]),
+            "c3/npc/10023/01.c3", record=rec)
+        self.assertEqual(rec, {}, "the cap does not fire at this size -- "
+                                  "which is the point of this test")
+        self.assertEqual(self._parts(rows, "c3/npc/10023/01.c3"), [])
+        self.assertFalse(self.mod._directory_anchored("c3/npc/10023/02.c3"))
+
+    def test_action_shaped_names_in_a_non_model_directory_are_refused(self):
+        """MEASURED on 7878, `c3/effect/bow/` — stems `179`, `219`, `69-89`,
+        all PHY+MOTI, three unrelated bow effects whose names *are*
+        action-shaped. Under the cap, and 3-digit. Only the directory half of
+        the predicate refuses it: `bow` is not a model id."""
+        rows = ["c3/effect/bow/179.c3", "c3/effect/bow/219.c3"]
+        self.assertEqual(self._parts(rows, "c3/effect/bow/179.c3"), [])
+
+    def test_effect_variant_sets_are_not_read_as_action_sets(self):
+        r"""`c3/effect/weapon/801003/{1..6}.c3` — a numeric directory, so the
+        directory half says yes, and every file PHY+MOTI. These are variants
+        of one effect, not one model's actions.
+
+        MEASURED: without the code-shape half, the relaxation reached **2,353
+        further meshes on 7878** in the effect family alone and filed their
+        siblings under role `motion`. The whole numeric-sibling population in
+        cap-surviving numeric directories splits 3,025 one-digit and 284
+        two-digit against 13,772 three-digit and 353 four-digit, and the
+        effect family holds **no 3-digit stems at all** — the two families do
+        not overlap, which is why a length test separates them cleanly.
+        """
+        rows = [f"c3/effect/weapon/801003/{i}.c3" for i in range(1, 7)]
+        self.assertEqual(self._parts(rows, "c3/effect/weapon/801003/1.c3"), [])
+
+    def test_the_base_mesh_is_not_an_action_of_its_own_actions(self):
+        """`1.c3` is the model, not action 1. Collecting `100.c3` must not
+        pull the base mesh in as a motion part."""
+        got = self._parts(self.OWNER, "c3/npc/2231/100.c3")
+        self.assertEqual([r[1] for r in got], ["101.c3", "190.c3"])
+
+    def test_the_predicate_is_a_pure_path_test(self):
+        """It reads a path and nothing else -- no blob, no listing, no view.
+        That is what keeps it out of the classifier's way."""
+        yes = ["c3/npc/2231/100.c3", "c3/mount/8114/1114.c3",
+               "c3/0007/423/1501.c3"]
+        no = ["zephyr/garments4/0001.c3",     # directory is not a model id
+              "c3/effect/bow/179.c3",         # same
+              "c3/npc/10023/01.c3",           # 2-digit: not an action code
+              "c3/npc/2231/1.c3",             # the base mesh
+              "c3/npc/999001101.c3",          # flat family: anchored already
+              "2231/100.c3"]                  # no directory above the model
+        for p in yes:
+            self.assertTrue(self.mod._directory_anchored(p), p)
+        for p in no:
+            self.assertFalse(self.mod._directory_anchored(p), p)
+
+
 class CollectedActions(unittest.TestCase):
     """A collected model's action list.
 
@@ -7815,6 +17923,998 @@ class CollectedActions(unittest.TestCase):
         self.assertEqual(_c.action_target_name("1", "100"), "100.c3")
 
 
+def _discovered_installs() -> "list[Path]":
+    """Every install this machine can see: the declared ones, plus anything
+    beside them that `coroot` recognises as a root.
+
+    Discovery rather than a hardcoded list, so this stays true in a checkout
+    that has different clients -- and so the plaintext lineage (5017/5065/5165)
+    is covered even though its kinds are declared on another branch.
+    """
+    roots: set[Path] = set()
+    for p in coroot.read_settings().get("kinds", {}):
+        rp = Path(p)
+        if rp.is_dir():
+            roots.add(rp)
+    for r in list(roots):
+        try:
+            siblings = list(r.parent.iterdir())
+        except OSError:                                   # pragma: no cover
+            continue
+        for s in siblings:
+            if s.is_dir() and coroot.looks_like_root(s):
+                roots.add(s)
+    return sorted(roots)
+
+
+class DbcShadowGate(unittest.TestCase):
+    r"""`.dbc` shadows `.ini`, and reading the shadowed ini is an error.
+
+    `GraphicData.dll` reads the compiled tables. **Where a compiled twin
+    exists, the client reads the twin**, so a tool that opens the `.ini` beside
+    it is reading a file the client ignores -- a declaration presented as a
+    measurement. That argument is about which file is authoritative and does
+    not depend on how far the two have drifted: **if the two were reported to
+    agree today the gate would still be correct**, because a zero diff is a
+    fact about current content, not about which file is loaded. (No divergence
+    figure is asserted here. One is being measured on `comod/dbc-effe-emoi`.)
+
+    The inverse case is load-bearing and gets equal weight below: 5017 / 5065 /
+    5165 and CCO ship no `.dbc` at all, so there the plaintext ini IS the live
+    table and the gate must stay silent.
+    """
+
+    def _base(self, files: "dict[str, bytes]") -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / "ini").mkdir()
+        for name, blob in files.items():
+            (d / "ini" / name).write_bytes(blob)
+        return d
+
+    # -- the rule, on synthetic bases so it needs no install ----------------
+
+    def test_a_compiled_twin_shadows_its_ini(self):
+        b = self._base({"armor.ini": b"[1] Mesh0=2", "armor.dbc": b"MESH\0"})
+        self.assertTrue(dbcshadow.is_shadowed(b / "ini" / "armor.ini"))
+        with self.assertRaises(dbcshadow.ShadowedIni):
+            dbcshadow.check_ini(b / "ini" / "armor.ini")
+
+    def test_no_twin_means_no_gate(self):
+        """The plaintext lineage. An ini with no `.dbc` beside it is live."""
+        b = self._base({"armor.ini": b"[1] Mesh0=2"})
+        self.assertFalse(dbcshadow.is_shadowed(b / "ini" / "armor.ini"))
+        self.assertIsNone(dbcshadow.check_ini(b / "ini" / "armor.ini"))
+
+    def test_the_error_names_the_twin(self):
+        """An error that does not say what to read instead is a warning with
+        a traceback. The twin's name, its magic and its directory must all be
+        in the message."""
+        b = self._base({"armor.ini": b"[1] Mesh0=2", "armor.dbc": b"MESH\0\0"})
+        with self.assertRaises(dbcshadow.ShadowedIni) as cm:
+            dbcshadow.check_ini(b / "ini" / "armor.ini")
+        msg = str(cm.exception)
+        self.assertIn("armor.dbc", msg)
+        self.assertIn("MESH", msg)
+        self.assertIn(str(b / "ini"), msg)
+        self.assertEqual(cm.exception.twin, b / "ini" / "armor.dbc")
+
+    def test_the_stem_match_is_case_insensitive(self):
+        """Not tidiness: 6090 pairs `3dobj.ini` with `3DObj.dbc` and
+        `3DEffectObj.ini` with `3DEffectobj.dbc`. `Path.with_suffix` only ever
+        found those because NTFS is case-insensitive."""
+        b = self._base({"3dobj.ini": b"x=1", "3DObj.dbc": b"RSDB"})
+        twin = dbcshadow.compiled_twin(b / "ini" / "3dobj.ini")
+        self.assertIsNotNone(twin)
+        self.assertEqual(twin.name, "3DObj.dbc")
+
+    def test_only_ini_files_can_be_shadowed(self):
+        b = self._base({"itemtype.json": b"[]", "itemtype.dbc": b"RSDB",
+                        "Action.dat": b"\0", "Action.dbc": b"RSDB"})
+        self.assertFalse(dbcshadow.is_shadowed(b / "ini" / "itemtype.json"))
+        self.assertFalse(dbcshadow.is_shadowed(b / "ini" / "Action.dat"))
+
+    def test_allow_stale_still_reports_the_twin(self):
+        """A declared exception must still know what it chose not to read."""
+        b = self._base({"armor.ini": b"[1] Mesh0=2", "armor.dbc": b"MESH"})
+        twin = dbcshadow.check_ini(b / "ini" / "armor.ini", allow_stale=True)
+        self.assertEqual(twin.name, "armor.dbc")
+
+    # -- C21 / C22: the answer is per base and per call ---------------------
+
+    def test_two_bases_in_one_process_get_different_answers(self):
+        """C21 in miniature. `unify.py` resolved a derived path into a module
+        constant at import and served one install's index as another's; the
+        guard for it was silent because it needed both bases to be built.
+
+        This one cannot go silent: it builds both bases itself, in one
+        process, and interleaves the calls. A cached or process-global answer
+        makes it fail.
+        """
+        shadowed = self._base({"3DEffect.ini": b"[a]", "3DEffect.dbc": b"EFFE"})
+        plain = self._base({"3DEffect.ini": b"[a]"})
+        for _ in range(3):
+            self.assertTrue(dbcshadow.is_shadowed(
+                shadowed / "ini" / "3DEffect.ini"))
+            self.assertFalse(dbcshadow.is_shadowed(
+                plain / "ini" / "3DEffect.ini"))
+        self.assertEqual(len(dbcshadow.shadowed_inis(shadowed)), 1)
+        self.assertEqual(len(dbcshadow.shadowed_inis(plain)), 0)
+
+    def test_an_answer_given_before_the_twin_existed_is_not_reused(self):
+        """No cache, stated as behaviour rather than as a comment."""
+        b = self._base({"weapon.ini": b"[1]"})
+        self.assertFalse(dbcshadow.is_shadowed(b / "ini" / "weapon.ini"))
+        (b / "ini" / "weapon.dbc").write_bytes(b"MESH")
+        self.assertTrue(dbcshadow.is_shadowed(b / "ini" / "weapon.ini"))
+
+    def test_the_module_resolves_no_install_at_import_time(self):
+        """C22's other half. Parsed with `ast`, not grepped: no call at module
+        level, so there is no value in this module derived from whichever
+        install happened to be configured when it was first imported."""
+        src = (PROJECT / "core" / "dbcshadow.py").read_text("utf-8")
+        tree = ast.parse(src)
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for sub in ast.walk(node):
+                    self.assertNotIsInstance(
+                        sub, ast.Call,
+                        "core/dbcshadow.py resolves something at import time; "
+                        "that is the C21 defect this module exists to avoid")
+        self.assertFalse(
+            [n for n in tree.body if isinstance(n, ast.Expr)
+             and isinstance(n.value, ast.Call)])
+
+    def test_it_takes_no_root_it_could_discard(self):
+        """C22 was a tool that accepted `--root` and ignored it. The entry
+        points here answer from the ini path's own directory, so there is no
+        second source of truth to disagree with."""
+        import inspect
+        for fn in (dbcshadow.compiled_twin, dbcshadow.is_shadowed,
+                   dbcshadow.check_ini, dbcshadow.authoritative):
+            params = list(inspect.signature(fn).parameters)
+            self.assertEqual(params[0], "ini_path", fn.__name__)
+            self.assertNotIn("root", params, fn.__name__)
+
+    # -- the real installs, both lineages -----------------------------------
+
+    def test_the_gate_matches_the_dbc_files_on_every_install_here(self):
+        """Per base, against what is actually on disk.
+
+        Both halves are asserted in one test on purpose, and the test fails
+        rather than skips if it did not see **both** kinds of install --
+        C21's corollary is that a guard which goes quiet when an input is
+        missing cannot catch a bug whose trigger is a missing input.
+        """
+        installs = _discovered_installs()
+        if not installs:
+            self.skipTest("no game installs visible")
+        fired, silent = [], []
+        for root in installs:
+            ini = root / "ini"
+            has_dbc = any(p.suffix.lower() == ".dbc" for p in ini.iterdir())
+            pairs = dbcshadow.shadowed_inis(root)
+            self.assertEqual(
+                bool(pairs), has_dbc,
+                f"{root}: {len(pairs)} shadowed but has_dbc={has_dbc}")
+            (fired if has_dbc else silent).append(root.name)
+            for i, t in pairs.items():
+                self.assertEqual(i.stem.lower(), t.stem.lower())
+                self.assertTrue(t.is_file())
+        self.assertTrue(fired, "saw no install with compiled twins (5517/6090 "
+                               "expected); the firing half proved nothing")
+        self.assertTrue(silent, "saw no install without compiled twins "
+                                "(5017/5065/5165/CCO expected); the inverse "
+                                "half proved nothing, and a gate that fires "
+                                "on the plaintext lineage breaks it")
+
+    def test_twin_presence_is_per_file_not_per_client(self):
+        """The gate must never answer "does this client have `.dbc` files?".
+
+        `EmotionIco.dbc` exists on **6090 only**, while `3DEffect.dbc` exists
+        on 5517 and 6090. A client-level verdict would refuse a legitimate
+        plaintext read of `EmotionIco.ini` on 5517 -- which is the same error
+        the gate exists to stop, a declaration standing in for a measurement,
+        just pointed the other way.
+
+        Asserted on the real installs because that asymmetry is the point;
+        a synthetic pair could not go wrong in the interesting way.
+        """
+        by_name = {r.name: r for r in _discovered_installs()}
+        pairs = []
+        for name in ("5517", "6090"):
+            if name in by_name:
+                pairs.append((name, by_name[name]))
+        if len(pairs) < 2:
+            self.skipTest("needs both the 5517 and 6090 installs")
+        seen = {}
+        for name, root in pairs:
+            ini = root / "ini"
+            self.assertTrue((ini / "EmotionIco.ini").is_file(), name)
+            self.assertTrue((ini / "3DEffect.ini").is_file(), name)
+            seen[name] = (
+                dbcshadow.is_shadowed(ini / "EmotionIco.ini"),
+                dbcshadow.is_shadowed(ini / "3DEffect.ini"))
+        # 3DEffect is shadowed on both; EmotionIco only on 6090. If the gate
+        # were keyed on the client, these two columns could not differ.
+        self.assertEqual(seen["5517"], (False, True))
+        self.assertEqual(seen["6090"], (True, True))
+
+    def test_an_untwinned_ini_on_a_compiled_base_stays_open(self):
+        """A base that has twins does not become closed to its other tables."""
+        b = self._base({"3DEffect.ini": b"[a]", "3DEffect.dbc": b"EFFE",
+                        "EmotionIco.ini": b"0 Hoho\n"})
+        self.assertTrue(dbcshadow.is_shadowed(b / "ini" / "3DEffect.ini"))
+        self.assertFalse(dbcshadow.is_shadowed(b / "ini" / "EmotionIco.ini"))
+        self.assertIsNone(dbcshadow.check_ini(b / "ini" / "EmotionIco.ini"))
+
+    @requires_base("patch5517", "patch6090",
+                   why="asserts the compiled lineage's own twin set")
+    def test_the_configured_compiled_base_shadows_its_effect_table(self):
+        pairs = {p.name for p in dbcshadow.shadowed_inis(ROOT)}
+        self.assertIn("3DEffect.ini", pairs)
+        self.assertIn("armor.ini", pairs)
+        with self.assertRaises(dbcshadow.ShadowedIni):
+            coassets.parse_ini(ROOT / "ini" / "3DEffect.ini")
+
+    @requires_base("cco", "patch5017", "patch5065", "patch5165",
+                   why="asserts the plaintext lineage stays ungated -- and "
+                       "that lineage is FOUR installs, not one. MEASURED on "
+                       "all six 2026-08-09 with no derived index involved: "
+                       "ini/*.dbc counts are cco 0, 5017 0, 5065 0, 5165 0, "
+                       "5517 14, 6090 15, and parse_ini(armor.ini) succeeds on "
+                       "the four plaintext installs while raising ShadowedIni "
+                       "on the two compiled ones. Gated to `cco` alone this "
+                       "skipped three clients that carry the fact -- "
+                       "CORRECTIONS C-2026-08-09-comod-base-gate-audit")
+    def test_the_configured_plaintext_base_is_never_gated(self):
+        self.assertEqual(dbcshadow.shadowed_inis(ROOT), {})
+        self.assertTrue(coassets.parse_ini(ROOT / "ini" / "armor.ini"))
+
+    # -- the tool the gate was written for ----------------------------------
+
+    def test_inidb_refuses_to_profile_a_shadowed_table(self):
+        import inidb
+        b = self._base({"3DEffect.ini": b"[a]\nAmount=1\n",
+                        "3DEffect.dbc": b"EFFE\x01\x00\x00\x00"})
+        p = b / "ini" / "3DEffect.ini"
+        with self.assertRaises(dbcshadow.ShadowedIni):
+            inidb.load(p)
+        rec = inidb.profile_file(p)
+        self.assertEqual(rec["kind"], "shadowed_by_dbc")
+        self.assertEqual(rec["twin"], "3DEffect.dbc")
+        self.assertEqual(rec["twin_magic"], "EFFE")
+        self.assertNotIn("sections", rec)
+
+    def test_inidb_profiles_the_plaintext_lineage_normally(self):
+        import inidb
+        b = self._base({"3DEffect.ini": b"[a]\nAmount=1\n"})
+        rec = inidb.profile_file(b / "ini" / "3DEffect.ini")
+        self.assertEqual(rec["kind"], "ini_sectioned")
+        self.assertEqual(rec["sections"], 1)
+        self.assertNotIn("shadowed", rec)
+
+    def test_inidb_allow_stale_profiles_it_and_says_so(self):
+        import inidb
+        b = self._base({"3DEffect.ini": b"[a]\nAmount=1\n",
+                        "3DEffect.dbc": b"EFFE"})
+        rec = inidb.profile_file(b / "ini" / "3DEffect.ini", allow_stale=True)
+        self.assertEqual(rec["kind"], "ini_sectioned")
+        self.assertTrue(rec["stale_ini_allowed"])
+        self.assertEqual(rec["twin"], "3DEffect.dbc")
+
+    def test_inidb_schemas_writes_under_the_root_it_was_given(self):
+        """C22's exact shape, in the tool this gate was wired into: `-o` used
+        to default to `derived_path(...)` against the *configured* install, so
+        `inidb schemas --root <other base>` filed one base's profile under
+        another's namespace and printed "wrote" either way."""
+        src = (PROJECT / "tools" / "inidb.py").read_text("utf-8")
+        self.assertNotIn('default=coroot.derived_path(', src)
+        self.assertIn('root=a.root', src)
+
+
+class LiveFlatTables(unittest.TestCase):
+    """`effects.read_flat_live` reads the table the client reads.
+
+    The effects asset path was the third and largest instance of the shadow
+    trap, and it carried two failure modes at once: tables that *disagree*
+    with their twin, and two that are **zero bytes** while the twin holds
+    every row. The second is the dangerous one -- it reads as "this table is
+    empty" rather than "you opened the wrong file", so nothing errors and an
+    empty table is indistinguishable from an absent feature.
+    """
+
+    def _base(self, files):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / "ini").mkdir()
+        for name, blob in files.items():
+            (d / "ini" / name).write_bytes(blob)
+        return d
+
+    @staticmethod
+    def _rsdb(rows):
+        """A minimal RSDB image: {id: path}."""
+        n = len(rows)
+        head = b"RSDB" + struct.pack("<I", n)
+        table, blob = b"", b""
+        base = 8 + n * 8
+        for rid, path in rows.items():
+            table += struct.pack("<II", rid, base + len(blob))
+            blob += path.encode("latin-1") + b"\0"
+        return head + table + blob
+
+    def test_the_twin_overlays_the_plaintext(self):
+        import effects
+        b = self._base({"3dobj.ini": b"1=c3/old.c3\n",
+                        "3dobj.dbc": self._rsdb({1: "c3/new.c3",
+                                                 2: "c3/extra.c3"})})
+        out = effects.read_flat_live(b / "ini" / "3dobj.ini")
+        self.assertEqual(out["1"], "c3/new.c3")   # the client's file wins
+        self.assertEqual(out["2"], "c3/extra.c3")
+
+    def test_a_zero_byte_ini_is_filled_from_its_twin(self):
+        """`miscmotion.ini` / `MountMotion.ini` on 5517 and 6090. Zero bytes is
+        not "no data", it is "wrong file" -- and no content comparison can
+        catch it, because there is no content to compare."""
+        import effects
+        b = self._base({"miscmotion.ini": b"",
+                        "miscmotion.dbc": self._rsdb({7: "c3/misc/7.c3"})})
+        out = effects.read_flat_live(b / "ini" / "miscmotion.ini")
+        self.assertEqual(out, {"7": "c3/misc/7.c3"})
+        rec = effects.FLAT_SOURCES["miscmotion.ini"]
+        self.assertEqual(rec["ini_keys"], 0)
+        self.assertTrue(rec["overlaid"])
+
+    def test_a_disjoint_key_space_is_refused_not_merged(self):
+        """`WeaponMotion`: 25,944 ini keys against 169,968 twin keys with zero
+        shared on 6090. `EffectDB` matches these by string *prefix*, so merging
+        would match spuriously rather than merely uselessly."""
+        import effects
+        b = self._base({"WeaponMotion.ini": b"1050000999300=c3/mesh/a.c3\n",
+                        "weaponmotion.dbc": self._rsdb({668057766: "c3/b.c3"})})
+        out = effects.read_flat_live(b / "ini" / "WeaponMotion.ini")
+        self.assertEqual(set(out), {"1050000999300"})
+        rec = effects.FLAT_SOURCES["WeaponMotion.ini"]
+        self.assertFalse(rec["overlaid"])
+        self.assertTrue(rec["disjoint"])
+
+    def test_the_plaintext_lineage_is_returned_untouched(self):
+        import effects
+        b = self._base({"3dobj.ini": b"1=c3/a.c3\n2=c3/b.c3\n"})
+        out = effects.read_flat_live(b / "ini" / "3dobj.ini")
+        self.assertEqual(out, {"1": "c3/a.c3", "2": "c3/b.c3"})
+        self.assertFalse(effects.FLAT_SOURCES["3dobj.ini"]["overlaid"])
+
+    def test_twin_rows_serves_rsdb_only(self):
+        """`MESH` / `SIMO` / `EFFE` are record tables; their callers want
+        structure, not a flat map, so the helper declines rather than hand
+        back something plausible. The gate still fires."""
+        b = self._base({"armor.ini": b"[1]\n", "armor.dbc": b"MESH\0\0\0\0"})
+        self.assertIsNone(dbcshadow.twin_rows(b / "ini" / "armor.ini"))
+        self.assertTrue(dbcshadow.is_shadowed(b / "ini" / "armor.ini"))
+
+    def test_an_RSDB_twin_that_does_not_parse_also_reads_as_None(self):
+        """PINS current behaviour; it is not an endorsement of it.
+
+        `twin_rows` returns `None` for three different things -- no twin,
+        wrong magic, and *a twin whose body fails to parse*. Only the first
+        two are answers; the third is a defect wearing an answer's clothes.
+        It matters because `tools/effects.py:1529` does
+        `dbcshadow.twin_rows(...) or {}`, which flattens it again into "the
+        twin names no motions" -- and `WeaponMotion.ini` names **1.7%** of
+        its twin's 25,944 rows on 6090, so the difference between a failed
+        parse and an empty table is most of the data.
+
+        The `except Exception: return None` at `core/dbcshadow.py:336` is
+        DECLARED in the docstring, which is why this is a pin rather than a
+        fix: narrowing it changes a `core/` contract every caller shares, and
+        `handoff_vendor_drift_gate.md` §Open flags it as a decision rather
+        than a patch. This test exists so that when someone takes that
+        decision, the current behaviour is written down and the change is
+        visible instead of silent.
+
+        The sibling above covers the wrong-magic branch. Nothing covered this
+        one: RSDB magic present, body corrupt.
+        """
+        b = self._base({"3dobj.ini": b"1=c3/a.c3\n",
+                        "3dobj.dbc": b"RSDB" + b"\xff" * 12})
+        p = b / "ini" / "3dobj.ini"
+        self.assertEqual(dbcshadow.twin_magic(
+            dbcshadow.compiled_twin(p)), b"RSDB",
+            "fixture no longer reaches the parse branch")
+        self.assertIsNone(dbcshadow.twin_rows(p))
+        # ... and the caller cannot currently tell it apart from an empty one.
+        self.assertEqual(dbcshadow.twin_rows(p) or {}, {})
+
+    def test_the_shadowed_inis_are_identical_across_bases(self):
+        """The false-equivalence mechanism, at file level.
+
+        Every shadowed `.ini` is byte-identical between 5517 and 6090 while
+        the twins differ, so any cross-base comparison run on the plaintext
+        reports "identical" as a tautology rather than as a finding. That is
+        what made `ptclprove` call the two a byte-identical particle corpus --
+        a correct refusal on the plaintext, wrong by 2,303 chunks on the real
+        corpus.
+        """
+        import hashlib
+        by = {r.name: r for r in _discovered_installs()}
+        if not ("5517" in by and "6090" in by):
+            self.skipTest("needs both the 5517 and 6090 installs")
+
+        def h(p):
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+
+        same_ini = diff_dbc = 0
+        for ini, twin in sorted(dbcshadow.shadowed_inis(by["5517"]).items()):
+            other = by["6090"] / "ini" / ini.name
+            other_twin = by["6090"] / "ini" / twin.name
+            if not (other.is_file() and other_twin.is_file()):
+                continue
+            self.assertEqual(h(ini), h(other),
+                             f"{ini.name} now differs across bases -- the "
+                             f"false-equivalence premise has changed and the "
+                             f"docs need remeasuring")
+            same_ini += 1
+            diff_dbc += (h(twin) != h(other_twin))
+        self.assertGreater(same_ini, 10)
+        self.assertGreater(diff_dbc, 5,
+                           "the twins should differ across bases; if they no "
+                           "longer do, this argument needs remeasuring")
+
+
+class PartIniTwinFailureIsAudible(unittest.TestCase):
+    r"""A twin that is present and unreadable must not read as "no twin".
+
+    `PartIni.__init__` had `except Exception: pass` around the compiled-MESH
+    load, so the stale-ini fallback below it was reached by two completely
+    different events:
+
+      * **no twin** — true on the whole 5017/5065/5165/CCO lineage, where the
+        ini *is* the live table. An ordinary answer.
+      * **a twin is right there and we could not read it** — a defect, and on
+        a 5517+ base it silently serves the 2008-era table. `armet`'s ini is
+        missing **1,441 of the twin's 2,609 rows**.
+
+    `self.source` could not tell them apart — it is `armor.ini` either way.
+    And `self.source` was not a channel anyone was listening on: MEASURED
+    across `core/`, `tools/`, `client/`, `capture/` and `tests/`, it is
+    written in both branches of `__init__` and **read by nothing**. That is
+    the `C46-dds-numpy` shape — a value that exists so the answer *could* be
+    known, with no reader.
+
+    So this class is the reader, and it is the half of the fix that the rule
+    is actually about: *a fallback is not a fix unless the miss is audible.*
+    Narrowing the `except` alone would have made the tool no more honest.
+
+    `PartIni` is a reader tools use, so it still **degrades** to the ini
+    rather than refusing — `CONTRIBUTING` §"A tool degrades; a test refuses".
+    The refusing is done here.
+    """
+
+    def _base(self, files: "dict[str, bytes]") -> Path:
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        (d / "ini").mkdir()
+        for name, blob in files.items():
+            (d / "ini" / name).write_bytes(blob)
+        return d
+
+    def _ini(self, name, files):
+        import coassets
+        return coassets.PartIni(self._base(files) / "ini" / name)
+
+    def test_no_twin_is_an_ordinary_answer_not_an_error(self):
+        """The 5017/5065/5165/CCO case. Must stay quiet."""
+        t = self._ini("armor.ini", {"armor.ini": b"[1]\nPart=1\nMesh0=2\n"})
+        self.assertIsNone(t.twin)
+        self.assertIsNone(t.twin_error)
+        self.assertEqual(t.source, "armor.ini")
+
+    def test_a_twin_that_does_not_parse_is_recorded_and_still_degrades(self):
+        """The defect. Both halves asserted: it is heard, AND it still works."""
+        # MESH magic with a body that cannot walk -- the realistic shape. A
+        # fixture with the WRONG MAGIC does not test this at all: it exits at
+        # the kind check above and is the "different table" case below.
+        t = self._ini("armor.ini", {"armor.ini": b"[1]\nPart=1\nMesh0=2\n",
+                                    "armor.dbc": b"MESH" + b"\0" * 12})
+        self.assertEqual(t.twin, "armor.dbc")
+        self.assertIsNotNone(t.twin_error, "the failure left no trace")
+        self.assertIn("ValueError", t.twin_error)
+        # ... and the tool degraded rather than refused: the ini still read.
+        self.assertEqual(t.source, "armor.ini")
+        self.assertIn("1", t.appearances)
+
+    def test_a_twin_of_a_DIFFERENT_KIND_is_not_a_failure(self):
+        r"""The third state, and the one that caught me.
+
+        MEASURED on 5517: 14 part-adjacent inis have a `.dbc` beside them and
+        only **6** are MESH. The rest are `RSDB` path tables (`3dobj`,
+        `3dtexture`, `WeaponMotion`, ...), one `SIMO`, one `EFFE`.
+        `read_mesh` refusing those is the CORRECT answer — they are not
+        appearance tables.
+
+        The first version of this class checked magic nowhere and went red
+        over all eight on its first run against the install. A gate that
+        fires on eight things working as designed is worse than no gate: the
+        next person makes it pass.
+        """
+        t = self._ini("3dobj.ini", {"3dobj.ini": b"[1]\nPart=1\nMesh0=2\n",
+                                    "3dobj.dbc": b"RSDB" + b"\0" * 12})
+        self.assertIsNone(t.twin, "a non-MESH twin is not this reader's twin")
+        self.assertIsNone(t.twin_error, "refusing a path table is not a fault")
+
+    def test_the_two_cases_are_distinguishable(self):
+        """The control, and the whole point.
+
+        Without this, both tests above pass against a `twin_error` that is
+        always None and a `twin` that is always set — `source` is identical
+        in the two cases, so only a direct comparison shows the fix did
+        anything.
+        """
+        good = {"armor.ini": b"[1]\nPart=1\nMesh0=2\n"}
+        bad = dict(good, **{"armor.dbc": b"MESH" + b"\0" * 12})
+        a, b = self._ini("armor.ini", good), self._ini("armor.ini", bad)
+        self.assertEqual(a.source, b.source, "premise: source cannot tell")
+        self.assertNotEqual((a.twin, a.twin_error), (b.twin, b.twin_error))
+
+    def test_a_broken_first_party_import_is_not_swallowed_as_no_twin(self):
+        r"""`ImportError` must propagate, not become "this install has none".
+
+        `import dbc` lives inside `_load_mesh_dbc`, which is called from
+        inside the `try` — so before narrowing, a broken `core/dbc.py`
+        arrived here as an install that ships no compiled twin. That is
+        `CONTRIBUTING` §"a guard on a first-party module protects nothing",
+        one layer down from the guards `GuardedImportsThatMustSucceed`
+        covers.
+        """
+        import coassets
+        base = self._base({"armor.ini": b"[1]\nPart=1\nMesh0=2\n",
+                           "armor.dbc": b"MESH\0\0\0\0"})
+        real = sys.modules.get("dbc")
+
+        class Poisoned:
+            def __getattr__(self, _):
+                raise ImportError("simulated broken core/dbc.py")
+
+        sys.modules["dbc"] = Poisoned()
+        try:
+            with self.assertRaises(ImportError):
+                coassets.PartIni(base / "ini" / "armor.ini")
+        finally:
+            if real is None:
+                sys.modules.pop("dbc", None)
+            else:
+                sys.modules["dbc"] = real
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_no_shipped_twin_fails_to_parse_on_this_install(self):
+        """The gate. Every `.dbc` twin beside a part ini must actually read.
+
+        This is what refuses. If a shipped twin stops parsing — a reader
+        regression, or a base we have not met — it now fails here instead of
+        being served as the 2008-era ini with nobody the wiser.
+        """
+        import coassets
+        import coroot
+        root = Path(coroot.default_root())
+        seen, bad = 0, []
+        for ini in sorted((root / "ini").glob("*.ini")):
+            tw = ini.with_suffix(".dbc")
+            # MESH only. 8 of this base's 14 twins are RSDB/SIMO/EFFE path
+            # tables that `read_mesh` refuses correctly; counting those as
+            # failures is what this test did on its first run.
+            if not tw.is_file() or dbcshadow.twin_magic(tw) != b"MESH":
+                continue
+            t = coassets.PartIni(ini)
+            seen += 1
+            if t.twin_error:
+                bad.append(f"{ini.name} -> {t.twin} : {t.twin_error}")
+        if not seen:
+            self.skipTest(f"{coroot.base_id()} ships no MESH twin")
+        self.assertEqual(bad, [], f"of {seen} twins on {coroot.base_id()}")
+
+
+class StaleIniDebt(unittest.TestCase):
+    """Every deliberate read of a shadowed ini is declared, and counted.
+
+    `allow_stale=True` is the escape hatch from `DbcShadowGate`, and an escape
+    hatch nobody can enumerate is just the original silence with extra steps.
+    Each use must carry a `STALE-INI:` note, and the set of files using it is
+    declared here so that adding one is a deliberate act with a test change
+    attached -- the same control `CoreBoundary.MEMBERS` applies to COre.
+    """
+
+    #: file -> why it still reads the stale plaintext.
+    DECLARED = {
+        "core/coassets.py":
+            "PartIni prefers the MESH twin and falls back only when there is "
+            "none (the whole plaintext lineage) or it failed to parse",
+        "tools/attach.py":
+            "Catalogue.table reads armor/armet/weapon/mount plaintext; the "
+            "MESH twin is readable and converting it is attach's owner's call",
+        "tools/meshtex.py":
+            "3DEffect.ini and 3DSimpleObj.ini both have readers now (EFFE, "
+            "SIMO) -- the old 'no EFFE reader yet' reason is retracted; "
+            "switching moves meshtex's own coverage index, which is its "
+            "owner's call",
+        "tools/models.py":
+            "3DSimpleObj.ini, same SIMO twin; declared so the bare except "
+            "below it cannot swallow the gate into an empty table",
+        "tools/inidb.py":
+            "the --allow-stale-ini path, and profile_file after it has "
+            "already refused or been told to proceed",
+    }
+
+    def _uses(self):
+        out = {}
+        for d in ("core", "tools"):
+            for p in sorted((PROJECT / d).rglob("*.py")):
+                if p.name == "dbcshadow.py" or "test" in p.name:
+                    continue
+                lines = p.read_text("utf-8", errors="replace").splitlines()
+                hits = [i for i, l in enumerate(lines)
+                        if "allow_stale=True" in l]
+                if hits:
+                    out[f"{d}/{p.name}"] = (lines, hits)
+        return out
+
+    def test_the_declared_set_is_exactly_what_the_tree_does(self):
+        self.assertEqual(set(self._uses()), set(self.DECLARED))
+
+    def test_every_stale_read_carries_a_note_saying_why(self):
+        for rel, (lines, hits) in self._uses().items():
+            if rel in ("core/coassets.py", "tools/inidb.py"):
+                continue          # the gate's own plumbing, documented at the
+                                  # function level rather than per call site
+            for i in hits:
+                window = "\n".join(lines[max(0, i - 10):i + 1])
+                self.assertIn(
+                    "STALE-INI:", window,
+                    f"{rel}:{i + 1} reads a shadowed ini with no STALE-INI: "
+                    f"note. Say which twin it is ignoring and why.")
+
+
+class ServerViewParseProfile(unittest.TestCase):
+    r"""A `ServerView`'s parse profile must come from the CLIENT IT SHOWS.
+
+    **The defect.** `core/colibrary.ServerView.__init__` calls
+    `super().__init__(root)`, so a `ServerView` *is* an `AssetRoot` rooted at
+    the **baseline**. Every parse-profile probe asked of the composed view --
+    `npcart.detect_profile(view.read)` or `plugin_for(view.root)` -- is
+    therefore answered by whichever baseline the user happens to have
+    configured, and the community client whose assets are on screen is never
+    asked. `docs/CORRECTIONS.md` **C-2026-08-09-plugin-c-serverview-profile**
+    -- *"a DatPkg `ServerView` takes its parse profile from the BASELINE, not
+    from the client whose assets it shows -- and 25 of 397 NPCs silently lose
+    their art"*.
+
+    **Deliberately HERMETIC -- no install, no library, no derived index, and
+    so no skip of any kind.** Everything is fabricated in a temp directory:
+    `coroot.REQUIRED` is only `c3.wdf`, `data.wdf` and `ini/`, and
+    `core/wdf.WdfArchive` accepts a 12-byte header declaring zero entries. That
+    is worth the fixture code. A test that can only run where somebody happens
+    to have two baselines and a library is a test that proves nothing on the
+    machine where the regression lands, and this suite already carries the
+    lesson that an environmental absence and a content regression must never
+    report the same way.
+
+    **`test_the_fixtures_really_do_discriminate` is the load-bearing one.**
+    Without it the whole class could pass vacuously -- if the two fabricated
+    baselines happened to select the same profile, "the answer did not move"
+    would be true for the wrong reason. It asserts the OLD rule still splits
+    them, so the new rule's agreement is a fact about the fix rather than about
+    the fixture. Same check the register keeps asking for: *before believing a
+    number, ask what it would read if the model were wrong.*
+
+    Verified by breaking it, per the standing requirement: reverting
+    `ServerView.table_profile` to `npcart.detect_profile(self.read)` turns
+    `test_the_profile_does_not_move_when_the_baseline_is_swapped` red with
+    `'plaintext' != 'official'`.
+    """
+
+    #: One `NpcType` section, enough for `_npc_ini_rows` to produce a row.
+    CLIENT_NPC_INI = ("[NpcType1]\nName=Storekeeper\nSimpleObjID=211\n"
+                      "StandByMotion=999001100\nRestMotion=999001101\n"
+                      "BlazeMotion=999001190\n")
+
+    @staticmethod
+    def _install(d: Path, ini: dict) -> Path:
+        """A directory `coroot` accepts as a complete install.
+
+        `REQUIRED` is a *content* check -- `c3.wdf`, `data.wdf`, `ini/` -- so
+        an empty-but-valid WDF is all the archives need to be.
+        """
+        import wdf                                        # noqa: PLC0415
+        d.mkdir(parents=True, exist_ok=True)
+        header = struct.pack("<III", wdf.WDF_MAGIC, 0, wdf.HEADER_SIZE)
+        for name in ("c3.wdf", "data.wdf"):
+            (d / name).write_bytes(header)
+        (d / "ini").mkdir(exist_ok=True)
+        for name, text in ini.items():
+            (d / "ini" / name).write_text(text, "latin-1")
+        return d
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        root = Path(cls._tmp.name)
+
+        # Two baselines whose ini/ shapes differ EXACTLY where
+        # `npcart.detect_profile` looks. `plain` is the 5017/5065/5165 shape
+        # (plaintext tables, no compiled twin); `compiled` is the 5517/6090
+        # shape, which ships the frozen plaintext tables TOO -- so the only
+        # discriminator is the `.dbc`, which is what makes this a faithful
+        # fixture rather than a convenient one.
+        plaintext_tables = {
+            "npc.ini": "[NpcType1]\nName=Baseline\nSimpleObjID=211\n",
+            "3DSimpleObj.ini": "[ObjIDType211]\nPartAmount=1\nPart0=9990010\n"
+                               "Texture0=9990211\n",
+            "3dobj.ini": "9990010=c3/mesh/9990010.c3\n",
+            "3dtexture.ini": "9990211=c3/texture/9990211.dds\n",
+            "3dmotion.ini": "999001100=c3/npc/999001100.c3\n",
+        }
+        cls.base_plain = cls._install(root / "base_plain", plaintext_tables)
+        cls.base_compiled = cls._install(
+            root / "base_compiled",
+            dict(plaintext_tables, **{"3DSimpleObj.dbc": "\x00" * 16}))
+
+        # A library holding one server that ships ONLY the row table -- the
+        # shape MEASURED on `zephyr` (162,050 filemap entries, 548 under
+        # `ini/`: `ini/npc.ini` present, and `npc.json`, `3DSimpleObj.{ini,dbc}`,
+        # `3dobj.ini`/`3DObj.dbc`, `3dtexture.ini`/`3DTexture.dbc` and
+        # `3dmotion.{ini,dbc}` all absent). This is the common case, not an
+        # edge: the rows are the client's and every lookup table is the
+        # baseline's.
+        cls.lib = root / "library"
+        srv = cls.lib / "servers" / "rowsonly"
+        srv.mkdir(parents=True)
+        (cls.lib / "assets" / "ini").mkdir(parents=True)
+        (cls.lib / "assets" / "ini" / "npc.ini").write_text(
+            cls.CLIENT_NPC_INI, "latin-1")
+        (srv / "filemap.json").write_text(json.dumps(
+            {"ini/npc.ini": ["l", "assets/ini/npc.ini", "loose"]}), "utf-8")
+        (srv / "profile.json").write_text(json.dumps(
+            {"server": "rowsonly", "clientVersion": "1064"}), "utf-8")
+
+        # And one with no npc table at all -- the `collection` shape
+        # (`clientVersion: "curated"`, `client: None`, 38 files). Tested rather
+        # than reasoned about, because it is the case that breaks anything
+        # which parses `clientVersion` or assumes a real source client.
+        bare = cls.lib / "servers" / "curated"
+        bare.mkdir(parents=True)
+        (bare / "filemap.json").write_text(json.dumps(
+            {"c3/mesh/1.c3": ["l", "assets/c3/mesh/1.c3", "loose"]}), "utf-8")
+        (bare / "profile.json").write_text(json.dumps(
+            {"server": "curated", "clientVersion": "curated",
+             "client": None}), "utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    @staticmethod
+    def _colibrary():
+        """`core/colibrary.py`, never `tools/colibrary.py`.
+
+        Both exist and which one `import colibrary` finds is decided by
+        whatever order `sys.path` happens to be in -- this suite puts `tools/`
+        first, so the bare import reaches the CLI, whose own top-level
+        `from colibrary import ServerView` then resolves to itself and raises.
+        Observed here before it was routed: an `ImportError` naming a symbol
+        the caller never asked for. Borrowing `coviewer`'s resolver rather than
+        writing a second one, because a second one is how the two diverge.
+        """
+        import coviewer                                   # noqa: PLC0415
+        return coviewer._core_colibrary()
+
+    def _view(self, base, server="rowsonly"):
+        return self._colibrary().ServerView(self.lib, server, base)
+
+    # -- the control, first ------------------------------------------------
+
+    def test_the_fixtures_really_do_discriminate(self):
+        """The two baselines MUST disagree under the old rule.
+
+        If they did not, every assertion below would pass for a reason that
+        has nothing to do with the fix. This is the test that makes the rest
+        of the class mean something.
+        """
+        import npcart                                     # noqa: PLC0415
+        a = npcart.detect_profile(coassets.AssetRoot(self.base_plain).read)
+        b = npcart.detect_profile(coassets.AssetRoot(self.base_compiled).read)
+        self.assertEqual(a.name, "plaintext")
+        self.assertEqual(b.name, "official")
+        self.assertNotEqual(a.name, b.name)
+
+    def test_the_composed_view_still_answers_from_the_baseline(self):
+        """The defect itself, pinned so the fix cannot be mistaken for it
+        having never existed. Probing the *composed view* -- which is what
+        every call site used to do -- still splits on the baseline, because
+        the view falls through to it. That is precisely why the profile may
+        not be asked of `view.read`."""
+        import npcart                                     # noqa: PLC0415
+        self.assertNotEqual(
+            npcart.detect_profile(self._view(self.base_plain).read).name,
+            npcart.detect_profile(self._view(self.base_compiled).read).name,
+            "if this ever agrees, the fixture stopped exercising the defect")
+
+    # -- the property ------------------------------------------------------
+
+    def test_the_profile_does_not_move_when_the_baseline_is_swapped(self):
+        """THE assertion. Same server, two baselines that disagree about
+        their own shape, one answer."""
+        a = self._view(self.base_plain).table_profile()
+        b = self._view(self.base_compiled).table_profile()
+        self.assertIsNotNone(a)
+        self.assertEqual(a.name, b.name)
+
+    def test_the_pin_is_the_stable_profile_not_the_richer_one(self):
+        """Decided by measurement, and the direction is the counter-intuitive
+        one. Holding the profile fixed and varying the baseline (MEASURED on
+        `21f2501`, `zephyr`): `plaintext` gives **0** differences across
+        5165/5517/6090, while `official` still disagrees with itself on
+        **404** NPCs between 5517 and 6090. `official` over 6090 resolves 639
+        more npc_types and they are NOT taken -- a provenance metric that
+        scores 100.0% under the real id mapping scores 99.7% under one
+        SHUFFLED WRONG BY CONSTRUCTION, so it measures namespace density, not
+        agreement. `docs/CORRECTIONS.md` C-2026-08-09-reproduce-not-hold."""
+        self.assertEqual(
+            self._view(self.base_compiled).table_profile().name,
+            self._colibrary().ServerView.PINNED_COMPOSED_PROFILE)
+
+    def test_a_client_shipping_only_rows_never_falls_through_to_cco(self):
+        """The trap in the obvious fix. Probing the client's own namespace
+        naively reaches `detect_profile`'s terminal `return PROFILE_CCO`:
+        `npc.json` absent, `3DSimpleObj.dbc` absent, `3DSimpleObj.ini` absent.
+        MEASURED on `zephyr`: `PROFILE_CCO` loads **0 rows and resolves 0
+        NPCs on all five baselines**, so 1,989 resolved NPCs would become 0 in
+        silence -- `detect_profile`'s own *"a default wearing an identity's
+        label"* wearing a fix's clothes."""
+        for base in (self.base_plain, self.base_compiled):
+            with self.subTest(base=base.name):
+                self.assertNotEqual(
+                    self._view(base).table_profile().name, "cco")
+
+    def test_the_probe_asks_the_filemap_not_the_composed_view(self):
+        """`ships()` is the whole mechanism: the filemap is the only record
+        of what the CLIENT carried, because `read`/`locate` fall back to the
+        library tree and then the baseline."""
+        v = self._view(self.base_compiled)
+        self.assertTrue(v.ships("ini/npc.ini"))
+        self.assertFalse(v.ships("ini/3DSimpleObj.dbc"))
+        # ... and the composed view resolves it anyway, which is the trap.
+        self.assertIsNotNone(v.locate("ini/3DSimpleObj.dbc"))
+
+    def test_a_server_with_no_npc_table_has_no_opinion_rather_than_cco(self):
+        """The `collection` edge case. "No opinion" (`None`) sends the caller
+        back to the baseline route -- today's behaviour, unchanged -- whereas
+        answering `cco` would assert something false and load nothing."""
+        for base in (self.base_plain, self.base_compiled):
+            with self.subTest(base=base.name):
+                self.assertIsNone(
+                    self._view(base, "curated").table_profile())
+
+    # -- the loss must be audible ------------------------------------------
+
+    def test_the_report_names_the_pin_the_baseline_and_the_loss(self):
+        """§5b, and it is a deliverable rather than decoration. Pinning
+        removes the variance BY FIAT, trading a wrong-and-unstable answer for
+        a NARROWER one -- and a silent narrower answer is the failure shape
+        this project has recorded most often (`WeaponSkillName`'s vacuous
+        zero, the armed-motion fallback that reported success, `malformed`
+        reading 0 because a garbage offset always finds some NUL)."""
+        r = self._view(self.base_compiled).table_profile_report()
+        self.assertEqual(r["profile"], "plaintext")
+        self.assertTrue(r["pinned"])
+        self.assertIn(str(self.base_compiled), r["baseline"])
+        for key in ("npcs", "resolved", "unresolved"):
+            self.assertIn(key, r, "the count it could NOT resolve must be "
+                                  "reported, not left to a docstring")
+        self.assertEqual(r["npcs"], r["resolved"] + r["unresolved"])
+        self.assertEqual(r["correction"],
+                         "C-2026-08-09-plugin-c-serverview-profile")
+
+    def test_the_note_a_user_meets_carries_the_unresolved_count(self):
+        note = self._view(self.base_compiled).table_profile_note()
+        for token in ("plaintext", "PINNED", "do NOT"):
+            self.assertIn(token, note)
+
+    def test_the_pin_does_not_claim_invariance_it_did_not_measure(self):
+        """The invariance is MEASURED over 5165/5517/6090 and NOT over
+        5017/5065, which differ from 5165 on **220** NPCs under `plaintext`.
+        A fabricated baseline is declared as none of them, so the report must
+        say the guarantee does not reach here rather than imply it does."""
+        r = self._view(self.base_compiled).table_profile_report(resolve=False)
+        self.assertFalse(r["stableOverBaseline"])
+        self.assertIn("[the pin's invariance was measured over",
+                      self._view(self.base_compiled).table_profile_note())
+
+    # -- the shared rule ---------------------------------------------------
+
+    def test_one_definition_of_ask_the_client_not_the_baseline(self):
+        """Four sites build `npcart.Tables` and each had its own spelling of
+        "resolve the plugin from a root". A fifth is how the four drift, so
+        they route through one function."""
+        import assetdiff                                  # noqa: PLC0415
+        pa, _ = assetdiff.table_profile_for(self._view(self.base_plain))
+        pb, _ = assetdiff.table_profile_for(self._view(self.base_compiled))
+        self.assertEqual(pa.name, pb.name)
+
+    def test_a_bare_install_is_still_answered_by_its_own_plugin(self):
+        """The fix must not cost the behaviour it protects: with no view to
+        ask, the baseline route is still the right one and still runs."""
+        import assetdiff                                  # noqa: PLC0415
+        prof, rep = assetdiff.table_profile_for(
+            coassets.AssetRoot(self.base_plain), self.base_plain)
+        self.assertIsNotNone(prof)
+        self.assertFalse(rep["pinned"])
+
+    def test_the_call_sites_do_not_resolve_the_profile_from_a_root(self):
+        """The regression that would undo this is textual and easy to make:
+        somebody reinstates `plugin_for(self.root)` beside an `npcart.Tables`
+        call. Assert the shared route by name at each site, so the next
+        reader meets the rule rather than rediscovering it."""
+        for rel in ("tools/coviewer.py", "tools/meshtex.py",
+                    "tools/artcrawl.py", "tools/collect.py"):
+            with self.subTest(rel=rel):
+                src = (PROJECT / rel).read_text("utf-8", errors="replace")
+                self.assertIn("table_profile_for", src)
+                self.assertNotIn("pl.table_profile()", src)
+                self.assertNotIn("_pl.table_profile()", src)
+
+    def test_no_call_site_builds_npc_tables_without_a_profile(self):
+        r"""**The fifth site, and why this is a census and not a list.**
+
+        `docs/handoff_zephyr_planning.md` §1 ruled the plugin registry is keyed
+        on a root with *"four call sites and no fifth"*, and the brief for this
+        change inherited that. `tools/models.py` was the fifth: it called
+        `npcart.Tables(read)` with **no profile at all**, and `coviewer` builds
+        it with `read=self.read`, which delegates to the `ServerView`. So
+        `detect_profile` answered from the composed view and therefore from the
+        baseline -- the same defect, at the site that names NPC models in the
+        UI.
+
+        CONTRIBUTING's rule, exactly: *"three sites, all fixed" becomes "this
+        class is closed" while the fourth site sits unlooked-for.* An instance
+        count is a floor, never a total. So this asserts the property over the
+        whole tree rather than over a remembered list: **every**
+        `npcart.Tables(...)` construction passes a second argument.
+
+        Parsed with `ast` rather than grepped, because a regex over raw source
+        also matches the prose describing the defect -- this docstring and the
+        comment in `models.py` both contain the offending call as text, and a
+        gate that fires on its own explanation is a gate someone switches off.
+        """
+        offenders = []
+        for p in sorted(PROJECT.rglob("*.py")):
+            if any(x in p.parts for x in (".git", "__pycache__", "refs",
+                                          "build", "out")):
+                continue
+            if p.name in ("test_viewer.py", "npcart.py"):
+                continue          # the suite itself, and the class's own home
+            try:
+                tree = ast.parse(p.read_text("utf-8", errors="replace"))
+            except SyntaxError:                          # pragma: no cover
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = (fn.attr if isinstance(fn, ast.Attribute)
+                        else getattr(fn, "id", ""))
+                if name != "Tables":
+                    continue
+                if len(node.args) + len(node.keywords) < 2:
+                    offenders.append(
+                        f"{p.relative_to(PROJECT).as_posix()}:{node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "these build npcart.Tables with no profile, so `detect_profile` "
+            "answers -- and for a ServerView that means the BASELINE answers. "
+            "Resolve it with assetdiff.table_profile_for and pass it.")
+
+
 class CoreBoundary(unittest.TestCase):
     """COre must stay extractable, which means it must not reach upwards.
 
@@ -7835,7 +18935,12 @@ class CoreBoundary(unittest.TestCase):
     #: module to COre is a deliberate act with a test change attached.
     MEMBERS = {"coroot", "safepath", "tqhash", "wdf", "dds", "c3phy",
                "dmap", "tpd", "coassets", "colibrary", "collection", "wdb",
-               "dbc", "npcart", "tqdat"}
+               "dbc", "dbcshadow", "npcart", "tqdat", "inidat", "provenance",
+               "monsterart", "cosettings", "dcache", "weaponparts", "weaponswap", "swapplan", "npcalloc",
+               # The tri-state safety answer -- "I could not look" that cannot
+               # be read as "nothing to worry about". Arrived with
+               # claude/integrate-final.
+               "verdict"}
 
     def test_the_directory_holds_exactly_the_declared_modules(self):
         on_disk = {p.stem for p in self.CORE.glob("*.py")}
@@ -7847,6 +18952,32 @@ class CoreBoundary(unittest.TestCase):
         text = (self.CORE / "pyproject.toml").read_text("utf-8")
         declared = set(re.findall(r'^\s*"([a-z0-9_]+)",', text, re.M))
         self.assertEqual(declared, self.MEMBERS)
+
+    @unittest.skipUnless(HAVE_EXTRACTOR,
+                         "tools/extract_comod.py not present in this tree")
+    def test_the_comod_extractor_ships_every_core_module(self):
+        """COre ships WHOLE, so the extractor's list must equal MEMBERS.
+
+        `test_the_directory_holds_exactly_the_declared_modules` runs in the
+        *extracted* tree too, so a COre module the extractor does not know
+        about produces a COMod that fails its own suite -- and it fails there,
+        after publication, rather than here where the module was added.
+
+        This has happened twice. `wdb` was dropped when the manifest was first
+        derived from an import closure, and `provenance` was dropped four
+        commits later by simply being added to COre and not to the extractor.
+        Both were found by running the extracted tree, which is far too late.
+        `docs/handoff_repo_consolidation.md` 4.1.
+        """
+        src = (HERE / "extract_comod.py").read_text("utf-8")
+        m = re.search(r'^CORE = """(.*?)"""', src, re.S | re.M)
+        self.assertIsNotNone(m, "extract_comod.py has no CORE block")
+        shipped = set(m.group(1).split())
+        self.assertEqual(
+            shipped, self.MEMBERS,
+            "tools/extract_comod.py CORE and CoreBoundary.MEMBERS disagree. "
+            "COre ships whole -- add the module to BOTH, or COMod ships a "
+            "package that fails its own boundary test.")
 
     def test_no_core_module_imports_anything_outside_core(self):
         """The load-bearing assertion. Parsed with `ast`, not grepped, so a
@@ -7890,14 +19021,82 @@ class CoreBoundary(unittest.TestCase):
                             or "HAVE_" in src,
                             f"core/{path.name} imports {pkg} unguarded")
 
+    #: Copy/delete primitives COre must not reach for. `shutil.copy` covers
+    #: `copy2`/`copytree` the way the old substring did, so the invariant this
+    #: enforces is unchanged.
+    FORBIDDEN_WRITES = {("shutil", "copy"), ("shutil", "copy2"),
+                        ("shutil", "copytree"), ("shutil", "move"),
+                        ("os", "remove"), ("os", "unlink")}
+
+    @staticmethod
+    def _write_calls(src: str) -> list:
+        """`(base, attr)` for every forbidden write CALL in `src`."""
+        found = []
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)):
+                continue
+            pair = (node.func.value.id, node.func.attr)
+            if pair in CoreBoundary.FORBIDDEN_WRITES:
+                found.append(pair)
+        return found
+
     def test_nothing_in_core_writes_to_the_game_install(self):
         """COre reads. `comod.py` — which is COMod's, not COre's — is the only
-        writer in the project."""
+        writer in the project.
+
+        Checked as a CALL, not as a substring. It was `assertNotIn("shutil.copy",
+        src)` until 2026-08-13, and it went red on a `core/safepath.py` docstring
+        that *described* what `comod.cmd_install` does — prose about a caller in
+        another package, in a module that imports neither `shutil` nor anything
+        it names. A gate that cannot tell code from a comment costs a real
+        finding its explanation, and the pressure it applies is on the wording
+        of documentation rather than on the behaviour it exists to protect.
+
+        This is the same correction `tests/test_boundary_guards.py` makes for the
+        attach gate, and for the same reason: `tools/procmem.py` names
+        `DebugActiveProcess` in a docstring saying it does *not* call it, and an
+        AST gate classifies that correctly with no allowlist to maintain.
+
+        The one thing a substring caught that an AST walk does not is a
+        dynamically-built call (`getattr(shutil, "copy")`). That is covered more
+        strictly below: COre must not import `shutil` at all.
+        """
         for path in sorted(self.CORE.glob("*.py")):
-            src = path.read_text("utf-8")
-            for bad in ("shutil.copy", "shutil.move", "os.remove", "os.unlink"):
-                with self.subTest(module=path.name, call=bad):
-                    self.assertNotIn(bad, src)
+            found = self._write_calls(path.read_text("utf-8"))
+            with self.subTest(module=path.name):
+                self.assertEqual(
+                    found, [],
+                    f"{path.name} calls {found} -- COre reads; comod.py writes")
+
+    def test_the_write_gate_can_actually_fire(self):
+        """The control. A checker asserted only against clean sources passes
+        whether or not it works, which is how the substring version's real
+        defect (prose) and its real strength (calls) became indistinguishable."""
+        self.assertEqual(
+            self._write_calls('"""prose mentioning shutil.copy2 and os.unlink"""\n'
+                              'X = "shutil.move"\n'),
+            [], "a mention in a docstring or a string literal is not a call")
+        self.assertEqual(
+            self._write_calls("import shutil\ndef f(a, b):\n"
+                              "    shutil.copy2(a, b)\n"),
+            [("shutil", "copy2")], "a real call must still be caught")
+
+    def test_no_core_module_imports_shutil(self):
+        """Stricter than the call check and it subsumes the dynamic forms:
+        `getattr(shutil, "copy")` needs the import, and COre has no use for the
+        module at all. MEASURED 2026-08-13: zero core modules import it."""
+        for path in sorted(self.CORE.glob("*.py")):
+            names = set()
+            for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+                if isinstance(node, ast.Import):
+                    names |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names.add(node.module.split(".")[0])
+            with self.subTest(module=path.name):
+                self.assertNotIn("shutil", names,
+                                 f"{path.name} imports shutil; COre reads")
 
 
 class ConfinementIsActuallyWired(unittest.TestCase):
@@ -8092,5 +19291,1037 @@ class TileSetForTheClient(unittest.TestCase):
                          "a slot the client can see has no tile in the bundle")
 
 
+#: Filled by the first `_measured_on()` call -- i.e. at START, before any test
+#: runs -- and reused verbatim by the closing line. Never reset in a real run:
+#: a second reading is a reading of a different moment, which is the bug.
+_MEASURED_ON: "str | None" = None
+
+
+def _measured_on() -> str:
+    """Which tree and which install this run measured, for the verdict line.
+
+    A failure count is a measurement of a tree at a moment, and it **expires**.
+    That is not the same as an address, which stays true: `0x46E8E7` on 5065
+    will be right next year, while a suite figure starts decaying the instant
+    `master` moves. On this tree it decayed **127 tests in one day** -- a
+    `556 / 3 / 62` was quoted for hours after 138 commits had landed, and was
+    enforced by another team as their baseline before anyone re-measured.
+
+    So the number carries its own provenance rather than relying on whoever
+    repeats it to attach one. Same discipline as every other control here:
+    mechanical, not remembered.
+
+    **CACHED ON FIRST CALL, and that is the whole correctness of it.** This
+    used to shell out to `git rev-parse HEAD` again for the closing line, so
+    the stamp named HEAD *when the suite finished* -- and a full run here is
+    ~25 minutes, ample time for the tree to move under it. MEASURED, on the
+    run that caught it: `START: 7d82623` and `measured on: 0ace71f`, a commit
+    **created twenty minutes into the run and never tested by it**. A second
+    run in flight printed `measured on: unknown` against a `START` of
+    `b2f32ae` -- same defect, git failing instead of drifting.
+
+    That makes it the failure this function exists to prevent, committed by
+    the function itself: a figure travelling with provenance that is not its
+    own. A stale sha is worse than none, because `unknown` prompts a question
+    and a plausible sha does not -- one of those runs was quoted as a master
+    baseline on the strength of its closing line before anyone read its START.
+
+    Guarded by `TheRunsOwnProvenance`. `docs/CORRECTIONS.md`
+    `C-2026-08-09-claude-elastic-elion-0da45c`.
+
+    Never raises. A missing git, a detached checkout or an unreadable install
+    degrades to `unknown` -- the closing call runs *after* the suite, where an
+    exception would destroy the verdict it is annotating.
+    """
+    global _MEASURED_ON
+    if _MEASURED_ON is not None:
+        return _MEASURED_ON
+    rev = "unknown"
+    try:
+        _r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            cwd=str(PROJECT), capture_output=True, text=True,
+                            timeout=10)
+        if _r.returncode == 0 and _r.stdout.strip():
+            rev = _r.stdout.strip()
+            _d = subprocess.run(["git", "status", "--porcelain"],
+                                cwd=str(PROJECT), capture_output=True,
+                                text=True, timeout=15)
+            if _d.returncode == 0 and _d.stdout.strip():
+                rev += "+dirty"
+    except Exception:
+        pass
+    base = "unknown"
+    try:
+        base = coroot.base_id()
+    except Exception:
+        pass
+    # The base id alone is an opaque `unknown-<hash>`, and two runs of this
+    # suite against DIFFERENT installs produced DISJOINT failure sets on the
+    # same commit -- 8 and 4 failures at cde7fbd, zero tests in common.  Both
+    # lines named their base and neither reader could tell them apart, so the
+    # install travels by NAME as well.  Basename only: the full path is what
+    # `tests/test_sanitization.py` exists to keep out of this repo.
+    where = ""
+    try:
+        where = f" ({Path(ROOT).name})"
+    except Exception:
+        pass
+    _MEASURED_ON = f"{rev} on {base}{where}"
+    return _MEASURED_ON
+
+
+class SkipReasonsDoNotInventCauses(unittest.TestCase):
+    r"""A skip may say what it observed; it may not assert a cause it cannot see.
+
+    `_index_reason` grouped namespaces by the kind half of `<kind>-<fingerprint>`
+    and concluded, when it found siblings, that *"this install was RE-KEYED …
+    something wrote to the install's `ini/`"*. **`unknown` is the absence of a
+    kind, not a kind**, so once kind declarations went missing every undeclared
+    install matched every other one and the branch fired on all of them.
+
+    **The cost was not a wrong test result -- the test skipped either way.** The
+    sentence was read by a director, believed, and escalated to the owner as a
+    write into a live client directory, which is the one thing the owner had put
+    off limits. **The contrary evidence was in the same directory listing:**
+    `out/indexes/` held `patch5017-bbb6b10d9221` *and* `unknown-bbb6b10d9221`,
+    and `patch5517-76c7f4499934` *and* `unknown-76c7f4499934` -- identical
+    fingerprints across the pairs. The fingerprint is computed from `ini/`, so
+    an unchanged fingerprint is proof `ini/` did not change.
+
+    Both directions, because narrowing a diagnosis is only correct if the case
+    it was built for still reaches it.
+    """
+
+    REL = "out/meshtex/mesh_index.json"
+
+    def _reason(self, base, namespaces):
+        from unittest import mock
+        _INDEX_REASONS.clear()
+        with mock.patch(__name__ + "._index_namespaces", lambda: namespaces), \
+             mock.patch.object(coroot, "base_id", lambda *a, **k: base), \
+             mock.patch.object(coroot, "derived_rel",
+                               lambda r: f"out/indexes/{base}/{r}"), \
+             mock.patch(__name__ + "._index_contents", lambda b: []):
+            return _index_reason(self.REL)
+
+    def test_an_undeclared_install_is_not_reported_as_re_keyed(self):
+        r = self._reason("unknown-bbbb", ["unknown-aaaa"])
+        self.assertIn("NO KIND DECLARED", r)
+        self.assertNotIn("RE-KEYED", r,
+                         "two different undeclared installs are not one "
+                         "install re-keyed")
+        self.assertNotIn("something wrote", r,
+                         "nothing here observed a write; do not assert one")
+
+    def test_a_real_re_key_is_still_diagnosed_and_now_names_the_mechanism(self):
+        r = self._reason("patch5017-bbbb", ["patch5017-aaaa"])
+        self.assertIn("RE-KEYED", r,
+                      "same kind, different fingerprint IS a re-key -- "
+                      "narrowing the unknown case must not disable this one")
+        self.assertIn("computed from `ini/` contents", r,
+                      "state why the fingerprint moving implicates ini/, "
+                      "rather than asserting a write as bare fact")
+
+    def test_never_built_is_untouched(self):
+        self.assertIn("NEVER BUILT",
+                      self._reason("patch9999-bbbb", ["patch5017-aaaa"]))
+def _run_surface() -> list:
+    """Repo-relative posix paths of every module THIS RUN actually loaded.
+
+    This is the tree surface the verdict is a measurement of, taken from
+    `sys.modules` at the end of the run -- **measured, not declared**.  A
+    hand-maintained prefix list here would be the next gate tuned to the
+    corpus that built it (`C-2026-08-10-quickfix-required-tpd` is the family);
+    what was actually imported cannot drift from what was actually imported.
+
+    **Scope limit, stated because the record travels**: this enumerates
+    Python modules only.  Repo FIXTURE and data files that tests read are not
+    listed, so a fixture-only change can expire a verdict without appearing
+    here -- `verdictcheck` says so in its output.  The install's own data is
+    the other axis entirely (`base_id`), not a file list.
+    """
+    out = set()
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f:
+            continue
+        try:
+            rel = Path(f).resolve().relative_to(PROJECT)
+        except (ValueError, OSError):
+            continue                      # stdlib / site-packages: not ours
+        out.add(rel.as_posix())
+    try:
+        out.add(Path(__file__).resolve().relative_to(PROJECT).as_posix())
+    except (ValueError, OSError):
+        pass
+    return sorted(out)
+
+
+def _class_of_case_id(case_id: str):
+    """``(class_name, is_class_level)`` from a unittest case id.
+
+    Two shapes exist: ``__main__.Cls.test_x`` for a per-test entry, and
+    ``setUpClass (__main__.Cls)`` for a class-level skip -- the one that
+    removes every test in the class from ``testsRun`` while recording a
+    single entry (`C-2026-08-09` lineage: `ran - skipped` is wrong in both
+    terms when this fires).
+    """
+    if "(" in case_id:
+        inner = case_id.split("(", 1)[1].rstrip(")")
+        return inner.rsplit(".", 1)[-1], True
+    parts = case_id.split(".")
+    return (parts[-2] if len(parts) >= 2 else case_id), False
+
+
+def _verdict_record(result, collected: int, elapsed: float,
+                    by_class: dict | None = None) -> dict:
+    """The verdict as a machine-readable record, so expiry can be COMPUTED.
+
+    The verdict line already carries provenance a human can read; this is the
+    same provenance a tool can act on.  Two incidents, one day apart, are the
+    reason (`C-2026-08-11-quickfix-verdict-staleness`): a rebase brought in
+    commits touching this file and the viewer under a just-measured verdict,
+    and the staleness had to be reasoned out BY HAND and reported on honour;
+    and the same commit (`cde7fbd`) measured against two installs produced
+    DISJOINT failure sets -- 8 and 4, zero overlap -- under stamps nobody
+    could tell apart.  `tools/verdictcheck.py` reads this record and answers
+    "does that number still apply here", mechanically.
+
+    **Everything here derives from the cached stamp STRING, on purpose.**
+    The first version stashed the full sha as a function attribute set on
+    every uncached call -- and `TheRunsOwnProvenance` resets the cache and
+    calls `_measured_on()` inside fabricated temp git repos, so the
+    attribute came back naming a commit in a repo that had been deleted
+    (`git cat-file`: bad object) while the test carefully restored the
+    stamp itself.  **A test of the provenance function poisoned the
+    provenance record.**  The stamp is the one value the tests contract to
+    restore; the short rev in it is expanded to a full sha HERE, at
+    record-write time, and a failed expansion degrades to "unknown", which
+    `verdictcheck` refuses to certify -- exactly how the poisoned record
+    was caught (the checker answered UNVERIFIABLE on its first live run).
+    """
+    stamp = _measured_on()
+    m = re.match(r"^(?P<rev>\S+) on (?P<base>\S+)(?: \((?P<inst>[^)]*)\))?$",
+                 stamp)
+    rev_short = m.group("rev") if m else "unknown"
+    dirty = rev_short.endswith("+dirty")
+    if dirty:
+        rev_short = rev_short[:-len("+dirty")]
+    rev_full = "unknown"
+    if rev_short != "unknown" and not dirty:
+        try:
+            _v = subprocess.run(
+                ["git", "rev-parse", "--verify", f"{rev_short}^{{commit}}"],
+                cwd=str(PROJECT), capture_output=True, text=True, timeout=10)
+            if _v.returncode == 0 and _v.stdout.strip():
+                rev_full = _v.stdout.strip()
+        except Exception:
+            pass
+    # Per-class collected/skipped, so a verdict PAIR can be decomposed:
+    # "ParserPlugins on CCO: Ran 12 OK (skipped=12)" is a one-install gate
+    # wearing a rosette, and neither the verdict word nor the failure-set
+    # delta can show it. A class-level skip records ONE entry while
+    # removing the whole class from testsRun, so its skipped count is the
+    # class's collected count, not 1.
+    classes = {}
+    for cls_name, n in sorted((by_class or {}).items()):
+        classes[cls_name] = {"collected": n, "skipped": 0}
+    for case, _reason in list(result.skipped):
+        cls_name, class_level = _class_of_case_id(case.id())
+        rec = classes.setdefault(cls_name, {"collected": 0, "skipped": 0})
+        rec["skipped"] = (rec["collected"] if class_level
+                          else rec["skipped"] + 1)
+
+    return {
+        "what": "tools/test_viewer.py suite verdict, machine-readable twin "
+                "of the '[test_viewer] VERDICT'/'measured on' lines",
+        # v2: adds "classes" (collected/skipped per class). Readers must
+        # DEGRADE EXPLICITLY on v1 -- say the record predates class data,
+        # never answer UNVERIFIABLE: a correct refusal that reads as a
+        # broken tool is this week's documented trap.
+        "record_version": 2,
+        "classes": classes,
+        "stamp": stamp,
+        "rev_full": rev_full,
+        "dirty_at_start": dirty,
+        "base_id": m.group("base") if m else "unknown",
+        "install": (m.group("inst") if m and m.group("inst") else "unknown"),
+        "ok": result.wasSuccessful(),
+        "counts": {
+            "ran": result.testsRun,
+            "failures": len(result.failures),
+            "errors": len(result.errors),
+            "skipped": len(result.skipped),
+            "expected_failures": len(result.expectedFailures),
+            "collected": collected,
+        },
+        "failure_labels": sorted(c.id() for c, _ in result.failures),
+        "error_labels": sorted(c.id() for c, _ in result.errors),
+        "elapsed_s": round(elapsed, 3),
+        "surface": _run_surface(),
+        "surface_scope": (
+            "python modules imported by this run, repo-relative posix. "
+            "Repo fixture/data files read by tests are NOT enumerated -- a "
+            "fixture-only change can expire this verdict without matching "
+            "the surface. The configured install is the OTHER axis "
+            "(base_id), not a file list."),
+    }
+
+
+class TheRunsOwnProvenance(unittest.TestCase):
+    """The stamp on the verdict line must name the tree that was TESTED.
+
+    Guards a defect the suite committed against itself: `_measured_on` shelled
+    out to `git rev-parse HEAD` twice, so the closing line named HEAD when the
+    run *finished*. A full run is ~25 minutes, and the run that caught this
+    printed `START: 7d82623` / `measured on: 0ace71f` -- a commit created
+    twenty minutes in and never tested.
+
+    Asserting the cache holds is not enough on its own; a constant would pass
+    that. So this also asserts the **uncached** read drifts when HEAD moves,
+    which is what makes the caching load-bearing rather than decorative --
+    the same shape as `test_the_absolute_offset_model_is_refused`.
+    """
+
+    def test_the_stamp_is_taken_once_and_survives_head_moving(self):
+        import subprocess
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              cwd=str(PROJECT), capture_output=True,
+                              text=True, timeout=10)
+        if head.returncode != 0:
+            self.skipTest("not a git checkout; the stamp degrades to 'unknown'")
+        first = _measured_on()
+        self.assertEqual(first, _measured_on(),
+                         "the stamp changed between two calls in the same run")
+        self.assertIn(" on ", first, "stamp lost its 'rev on base' shape")
+
+    def test_the_stamp_names_the_install_and_not_only_its_hash(self):
+        """The stamp must identify the install a reader can recognise.
+
+        Two runs of this suite on the SAME commit (`cde7fbd`) against different
+        installs produced **disjoint** failure sets -- 8 and 4, zero tests in
+        common. Both verdict lines carried a base id, and both were of the form
+        `unknown-<hex>`, so nothing on the line let either reader see they were
+        comparing different measurements. The information was present and
+        unreadable, which is the same defect as absent for anything that
+        travels by being quoted.
+
+        Asserting the base id is present is not enough -- that already held
+        while the confusion happened. This asserts a **human-recognisable**
+        install name is there too, keyed to the configured root.
+        """
+        stamp = _measured_on()
+        self.assertIn(Path(ROOT).name, stamp,
+                      f"the verdict stamp {stamp!r} does not name the "
+                      f"configured install {Path(ROOT).name!r}; a count that "
+                      f"cannot be attributed to an install will be compared "
+                      f"against one measured somewhere else")
+        # And the sentence the stamp is printed with must say the scope, or the
+        # name is decoration.  Read from the source, since the line is printed
+        # by the runner rather than returned.
+        src = Path(__file__).read_text("utf-8", errors="replace")
+        self.assertIn("scoped to the install named", src,
+                      "the verdict line no longer states that a failure count "
+                      "is scoped to one install")
+
+    def test_an_uncached_read_would_have_drifted(self):
+        """Reintroducing the bug must break something.
+
+        Moves HEAD and shows an uncached read follows it. If this ever stops
+        drifting, the cache is no longer what keeps the stamp honest and the
+        test above is measuring nothing.
+
+        **Runs against a THROWAWAY repo, never the real one.** The first
+        version made an empty commit in the actual worktree and reset it --
+        which works right up until a run is killed between the two, leaving a
+        stray commit on someone's branch. A guard for a provenance bug has no
+        business mutating the tree whose provenance is in question, and the
+        author of this one had already lost an uncommitted fix to exactly that
+        move (`git reset --hard` in a verification script, same sprint).
+        """
+        import subprocess
+        import tempfile
+        from unittest import mock
+
+        def git(cwd, *a):
+            return subprocess.run(["git", *a], cwd=cwd, capture_output=True,
+                                  text=True, timeout=20)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = ["-c", "user.email=t@t", "-c", "user.name=t"]
+            if git(tmp, "init", "-q").returncode != 0:
+                self.skipTest("no usable git binary")
+            git(tmp, *env, "commit", "-q", "--allow-empty", "-m", "one")
+            global _MEASURED_ON
+            saved = _MEASURED_ON
+            try:
+                with mock.patch.object(sys.modules[__name__], "PROJECT",
+                                       Path(tmp)):
+                    _MEASURED_ON = None
+                    before = _measured_on()
+                    git(tmp, *env, "commit", "-q", "--allow-empty", "-m", "two")
+                    _MEASURED_ON = None
+                    after = _measured_on()
+            finally:
+                _MEASURED_ON = saved
+        self.assertNotEqual(
+            before, after,
+            "an uncached read did NOT drift when HEAD moved -- caching is "
+            "then not what keeps the closing stamp honest")
+        self.assertEqual(saved, _MEASURED_ON, "the real run's stamp was left "
+                                              "disturbed by this guard")
+
+
+def _stdout_is_stderr() -> bool:
+    """Are fd 1 and fd 2 the same destination (i.e. was `2>&1` used)?
+
+    Used to avoid emitting the conventional summary twice into one stream,
+    which would make anything *counting* `^FAILED` matches double-count.
+
+    MEASURED on this platform, because the answer is not uniform:
+
+        `> log 2>&1`   both fds report the same dev/ino  -> detected
+        `2>&1 | x`     both report dev=0 ino=0           -> NOT detectable
+        `2>/dev/null | x`  fd1 ino=0 pipe, fd2 ino=0 chardev
+
+    A redirect into a **file** is knowable and is suppressed. A `2>&1` into a
+    **pipe** is indistinguishable from two separate pipes, so it is not
+    suppressed and the conventional block appears twice there.
+
+    That asymmetry is deliberate, and the tie-break is the point: a false
+    positive here would *suppress* the summary and silently recreate the exact
+    bug this function exists to fix -- a run reporting its own absence. A false
+    negative merely prints a truthful summary twice. **Printing once too often
+    is recoverable; printing never is the bug.** So this only answers True when
+    it is certain.
+    """
+    try:
+        a, b = os.fstat(1), os.fstat(2)
+    except OSError:
+        return False
+    # `st_ino != 0` is the certainty guard: 0 means "the OS did not tell us",
+    # which is not evidence of sameness.
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) and a.st_ino != 0
+
+
+def _main() -> int:
+    """Run the suite and print a verdict **to stdout** as well as stderr.
+
+    `unittest` writes its entire report -- every `FAIL:`/`ERROR:` line, the
+    `Ran N tests` line and the `OK`/`FAILED` verdict -- to **stderr**.  That is
+    normal Python and not a bug, but on this project it produces a specific,
+    expensive illusion: a runner that captures stdout only sees the `[coviewer]`
+    chatter stop partway and the process exit non-zero, with no summary and no
+    failures listed.  It looks exactly like the suite died.
+
+    MEASURED: a full run here emitted 0 summary lines on stdout and all of them
+    on stderr, and was reported by another team as "dies after roughly 447
+    tests, no `Ran N tests`, no FAIL/ERROR lines" -- while in fact completing
+    556 tests with a proper `FAILED (failures=3, ...)`.  The suite was fine; the
+    observation dropped the channel the verdict was on.
+
+    This is the same family as `docs/CORRECTIONS.md` §2 (*a pipe masks the exit
+    status of everything upstream*) and C12 (*a readout is an instrument*).  So
+    the verdict is now echoed on stdout, where a naive capture will find it, and
+    a run can no longer report its own absence.
+    """
+    # ------------------------------------------------------------------
+    # ADDING A LINE BELOW? VERIFY ITS NAMES BY IMPORTING THIS MODULE, NOT BY
+    # READING IT.  Everything after the run is the one place in this file
+    # where a NameError is invisible until the expensive part is over: it
+    # raises ~500 s in, on the code whose entire job is to report the verdict,
+    # so the failure mode is *a suite that dies while trying to say it
+    # finished* -- precisely the bug this function exists to prevent,
+    # reintroduced by the fix for it.
+    #
+    # That already happened once: `time` was used here while unimported. The
+    # file parsed cleanly, so a syntax check passed; it was caught by
+    # `import test_viewer; hasattr(tv, "time")`. Same shape as the `colibrary`
+    # slip in `docs/CORRECTIONS.md` C26 -- "it parses" is not "it runs".
+    # ------------------------------------------------------------------
+    # A START marker, so a truncated run is detected by PRESENCE rather than by
+    # absence. Without it, "no VERDICT line" conflates three different states:
+    # the run died mid-suite, the run never began, and you captured the wrong
+    # stream. That is the absent-vs-unmet collapse, in the tool that exists to
+    # stop a run reporting its own absence.
+    #
+    # MEASURED, and this is why: a piped run
+    # (`py -3 tools/test_viewer.py 2>&1 | tail -45`) returned exit 0 -- `tail`'s
+    # status -- having died mid-suite under contention, with no traceback. Its
+    # absent VERDICT line is what caught it, but only because someone knew to
+    # look for a line that was not there.
+    #
+    #     START + VERDICT  -> the run completed; trust the counts
+    #     START, no VERDICT-> it DIED mid-suite. Not "no failures".
+    #     no START         -> it never began, or you are not reading stdout
+    # NB: this line must NOT contain the closing line's token. The first
+    # version quoted it verbatim to explain itself, which made
+    # `grep "[test_viewer] VERDICT"` match the START line -- so a truncated run
+    # looked complete and the marker defeated its own detector. Caught by
+    # killing a real run mid-suite and grepping the capture, which is the only
+    # test that could have found it.
+    # How many tests were COLLECTED, which is not how many ran.
+    #
+    # MEASURED 2026-08-10: a `setUpClass` that raises `SkipTest` removes every
+    # test in the class from `testsRun` and records ONE skip entry -- an
+    # `_ErrorHolder`, not a test -- no matter how many tests the class holds.
+    # `PerHandSuperAura` alone is 10 tests, 0 `testsRun`, 1 skip. So both terms
+    # of `ran - skipped = executed`, the comparand this file's own handoff
+    # calls attribution-proof, are wrong whenever a class-level skip fires, and
+    # the arithmetic under-reports the loss rather than over-reporting it.
+    #
+    # Counted in the RUNNER, before the run, and this is not incidental:
+    # `TestSuite.run` drops each test as it finishes (`_removeTestAtIndex`) to
+    # release memory, so counting `_program.test` afterwards walks a suite that
+    # has been emptied behind you. The first version of this did exactly that
+    # and reported `collected 104` against `ran 830` -- a negative shortfall,
+    # which is the tell that the instrument, not the suite, was wrong.
+    class _CountingRunner(unittest.TextTestRunner):
+        collected = 0
+        #: class name -> collected test count, cached AT COLLECTION for the
+        #: same reason `collected` is: successes are unrecoverable from the
+        #: result object (only failures/errors/skips are retained), and the
+        #: suite empties behind the run. Per-class counts are what lets a
+        #: verdict PAIR be decomposed -- Parser's rosette case: a class that
+        #: skips wholesale on one install leaves both aggregates green while
+        #: contributing evidence on only one side.
+        by_class: dict = {}
+
+        def run(self, test):
+            counts: dict = {}
+
+            def n(t):
+                if isinstance(t, unittest.TestSuite):
+                    return sum(n(x) for x in t)
+                cls = type(t).__name__
+                counts[cls] = counts.get(cls, 0) + 1
+                return 1
+            _CountingRunner.collected = n(test)
+            _CountingRunner.by_class = counts
+            return super().run(test)
+
+    print(f"[test_viewer] START: {_measured_on()} -- a run is complete only "
+          f"when its closing summary prints. If this is the LAST [test_viewer] "
+          f"line you can see, the run died; that is not the same as passing.",
+          flush=True)
+    started = time.perf_counter()
+    _program = unittest.main(verbosity=2, exit=False,
+                             testRunner=_CountingRunner)
+    result = _program.result
+    elapsed = time.perf_counter() - started
+
+    ran, fails, errs = result.testsRun, len(result.failures), len(result.errors)
+    skipped, xfail = len(result.skipped), len(result.expectedFailures)
+
+    collected = _CountingRunner.collected
+    dropped = collected - ran
+    ok = result.wasSuccessful()
+
+    # The conventional unittest shape, so a runner grepping `^Ran ` or
+    # `^FAILED` -- which is what every existing script and handoff here does --
+    # keeps working unmodified instead of having to learn a new token. Emitted
+    # ONLY when stdout is a different destination from stderr: under `2>&1`
+    # both land in one stream and a duplicate would make anything *counting*
+    # matches double-count. Verified on this platform for all three shapes:
+    # separate files (False), `2>&1` (True), stderr discarded (False).
+    if not _stdout_is_stderr():
+        for kind, cases in (("FAIL", result.failures), ("ERROR", result.errors)):
+            for case, _ in cases:
+                print(f"{kind}: {case.id()}", flush=True)
+        bits = []
+        if fails:
+            bits.append(f"failures={fails}")
+        if errs:
+            bits.append(f"errors={errs}")
+        if skipped:
+            bits.append(f"skipped={skipped}")
+        if xfail:
+            bits.append(f"expected failures={xfail}")
+        print(f"\nRan {ran} tests in {elapsed:.3f}s\n", flush=True)
+        print("OK" if ok else f"FAILED ({', '.join(bits)})", flush=True)
+
+    # And the distinctive line, which survives `2>&1` and is greppable without
+    # colliding with unittest's own output.
+    print(f"[test_viewer] VERDICT: {'OK' if ok else 'FAILED'} -- ran {ran}, "
+          f"failures {fails}, errors {errs}, skipped {skipped}, "
+          f"expected failures {xfail}, collected {collected}", flush=True)
+    if dropped:
+        print(f"[test_viewer] NOTE: {dropped} collected test(s) never ran and "
+              f"are not in the skip count -- a setUpClass raised SkipTest, "
+              f"which drops a whole class from `ran` and records one entry. "
+              f"`ran - skipped` understates the loss by {dropped}.", flush=True)
+    # The figure travels; make its provenance travel with it. A count quoted
+    # without the tree it came from is incomplete AND perishable.
+    print(f"[test_viewer] measured on: {_measured_on()} -- a failure count "
+          f"expires when master moves AND is scoped to the install named "
+          f"above; a run on a different install is a different measurement, "
+          f"not a second opinion", flush=True)
+    # A skipped test is not a passing one, and 60+ skip in a normal run here.
+    print(f"[test_viewer] note: {skipped} skipped -- check the skip list, not "
+          f"just the failure list", flush=True)
+    # The machine-readable twin of the two lines above, so `verdictcheck` can
+    # COMPUTE expiry instead of a reader remembering to.  Never fatal: the
+    # record annotates the verdict, it must not be able to destroy it.
+    try:
+        rec = _verdict_record(result, collected, elapsed,
+                              _CountingRunner.by_class)
+        # A FILTERED run must not claim the slot a full suite earns. A
+        # three-test run once wrote a complete-looking record into the only
+        # 5517 slot, and was refused downstream only because the tree
+        # happened to be dirty -- luck, not a guard. Selector detection is
+        # positional args: `py -3 tools/test_viewer.py DdsSynthetic` is how
+        # this suite is filtered.
+        selectors = [x for x in sys.argv[1:] if not x.startswith("-")]
+        rec["filtered"] = bool(selectors)
+        if selectors:
+            rec["selectors"] = selectors
+        # Keyed by base_id: one slot per install, so "verified on 5517 AND
+        # 6090" is a representable state instead of last-writer-wins.  The
+        # single-slot version was safe (a mismatch REFUSED rather than
+        # silently comparing) and still could not express the thing the
+        # two-install flow exists to demonstrate -- a tool that refuses
+        # correctly but cannot express the required state gets routed
+        # around, and a routed-around gate is a widened one by a slower
+        # path.  `out/ci/` is GLOBAL in coroot, so the key lives in the
+        # FILENAME, same pattern as every other out/ci report naming what
+        # it verified.
+        stem = (f"viewer_verdict_{rec['base_id']}.partial"
+                if rec["filtered"] else f"viewer_verdict_{rec['base_id']}")
+        dest = coroot.derived_path(f"out/ci/{stem}.json")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not rec["filtered"] and dest.is_file():
+            # Keep exactly one predecessor. One slot per install meant a
+            # verdict could never be compared to what it replaced -- a CCO
+            # run matched a dated baseline's COUNT of 8 and the names were
+            # unrecoverable, because the run being checked had overwritten
+            # the only record. failure_labels are already stored, so one
+            # prior record turns every "same number" into "same tests".
+            prev = dest.with_name(
+                f"viewer_verdict_{rec['base_id']}.prev.json")
+            try:
+                prev.unlink(missing_ok=True)
+                dest.replace(prev)
+            except OSError:
+                pass
+        tmp = dest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, indent=1, sort_keys=True), "utf-8")
+        tmp.replace(dest)
+        kind_note = (" (PARTIAL -- filtered run, does not claim the slot)"
+                     if rec["filtered"] else "")
+        print(f"[test_viewer] verdict record: "
+              f"{dest.relative_to(PROJECT).as_posix()}{kind_note} -- check "
+              f"it against the current tree with "
+              f"`py -3 tools/verdictcheck.py`", flush=True)
+    except Exception as e:
+        print(f"[test_viewer] verdict record NOT WRITTEN ({e!r}) -- "
+              f"`verdictcheck` will answer NO-RECORD; the printed verdict "
+              f"above is unaffected", flush=True)
+    return 0 if ok else 1
+
+class MeshCopyEquivalence(unittest.TestCase):
+    r"""`c3phy.apply_matrix_copy` must equal `deepcopy` + `apply_matrix_to`.
+
+    That swap is a pure performance change on the hottest path in the viewer
+    -- `/api/mesh`, `/api/figure`, and the animation routes, which run it once
+    per frame -- and its whole justification is that the output does not move.
+    So the output is what gets pinned, exactly, not approximately.
+
+    **This class must never skip.** The mesh is built here, so it runs with no
+    game install, on any declared base, and on whatever machine the next perf
+    refactor happens on. The lesson is C21's: the guard that should have caught
+    it skipped unless two bases had an index, and so was silent in exactly the
+    situation the bug needed. A skipped test is not a passing test.
+    """
+
+    @staticmethod
+    def _mesh(n_verts=37, n_faces=23, matrix=None):
+        """A mesh with every field populated, so nothing the copy *shares*
+        can be dropped or aliased without this noticing."""
+        import random
+        rnd = random.Random(20260809)
+        m = c3phy.PhyMesh(tag=b"PHY5", name="v_body")
+        m.vertex_count_a, m.vertex_count_b = n_verts, 0
+        m.face_count_a, m.face_count_b = n_faces, 0
+        for i in range(n_verts):
+            m.vertices.append(c3phy.Vertex(
+                px=rnd.uniform(-50, 50), py=rnd.uniform(-50, 50),
+                pz=rnd.uniform(-50, 50),
+                u0=rnd.random(), v0=rnd.random(), unknown4=rnd.randrange(1 << 16),
+                bone0=i % 7, bone1=(i + 3) % 7,
+                weight0=rnd.random(), weight1=rnd.random(),
+                nx=rnd.random(), ny=rnd.random(), nz=rnd.random(),
+                u1=rnd.random(), v1=rnd.random(),
+                gap=bytes((i + k) % 256 for k in range(c3phy.LEGACY_GAP))))
+        for _ in range(n_faces):
+            m.faces.append(tuple(rnd.randrange(n_verts) for _ in range(3)))
+        m.matrix = matrix if matrix is not None else tuple(
+            rnd.uniform(-2, 2) for _ in range(16))
+        m.label, m.label_raw = "C3EXP_COLOR", b"C3EXP_COLOR"
+        m.is_c3exp_color = True
+        m.bbox_a, m.bbox_b = (-1.0, -2.0, -3.0), (4.0, 5.0, 6.0)
+        m.bbox_min, m.bbox_max = (-1.0, -2.0, -3.0), (4.0, 5.0, 6.0)
+        m.frame_count = 11
+        m.keys.alphas = [bytes(range(16))]
+        m.keys.draws = [bytes(range(16, 32))]
+        m.keys.change_texs = [bytes(range(32, 48))]
+        m.step, m.two_sided, m.billboard = (2, 3), True, 2
+        m.step1, m.step2 = (0.5, 1.5), (2.5, 3.5)
+        m.name_raw, m.phy5_raw, m.tail_raw = b"v_body\x00", b"STEP1zz", b"tail"
+        m.source_index = 4
+        return m
+
+    @staticmethod
+    def _old(m):
+        import copy
+        q = copy.deepcopy(m)
+        c3phy.apply_matrix_to(q)
+        return q
+
+    @staticmethod
+    def _fields(v):
+        return (v.px, v.py, v.pz, v.u0, v.v0, v.unknown4, v.bone0, v.bone1,
+                v.weight0, v.weight1, v.nx, v.ny, v.nz, v.u1, v.v1, v.gap)
+
+    def _assert_same(self, a, b, why=""):
+        self.assertEqual(len(a.vertices), len(b.vertices), why)
+        for i, (x, y) in enumerate(zip(a.vertices, b.vertices)):
+            # Exactly, not almost: both forms do the same multiplies in the
+            # same order, so any drift here is a real change of arithmetic.
+            self.assertEqual(self._fields(x), self._fields(y),
+                             f"vertex {i} differs {why}")
+        for attr in ("tag", "name", "faces", "label", "is_c3exp_color",
+                     "bbox_a", "bbox_b", "bbox_min", "bbox_max", "matrix",
+                     "frame_count", "step", "two_sided", "billboard",
+                     "step1", "step2", "name_raw", "label_raw", "phy5_raw",
+                     "tail_raw", "source_index", "vertex_count_a",
+                     "vertex_count_b", "face_count_a", "face_count_b"):
+            self.assertEqual(getattr(a, attr), getattr(b, attr),
+                             f"{attr} differs {why}")
+        self.assertEqual(a.keys.alphas, b.keys.alphas, why)
+        self.assertEqual(a.keys.draws, b.keys.draws, why)
+        self.assertEqual(a.keys.change_texs, b.keys.change_texs, why)
+
+    def test_output_is_identical_to_the_deepcopy_form(self):
+        m = self._mesh()
+        self._assert_same(self._old(m), c3phy.apply_matrix_copy(m))
+
+    def test_identity_and_degenerate_matrices_agree_too(self):
+        ident = (1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0)
+        for name, mat in (("identity", ident), ("zeros", (0.0,) * 16)):
+            m = self._mesh(matrix=mat)
+            self._assert_same(self._old(m), c3phy.apply_matrix_copy(m), name)
+
+    def test_a_mesh_with_no_matrix_is_returned_untransformed(self):
+        """`apply_matrix_to` returns early on a short matrix; so must this, or
+        a malformed chunk would silently move instead of being left alone."""
+        m = self._mesh()
+        m.matrix = ()
+        self._assert_same(self._old(m), c3phy.apply_matrix_copy(m), "no matrix")
+        self.assertEqual([v.position for v in c3phy.apply_matrix_copy(m).vertices],
+                         [v.position for v in m.vertices])
+
+    def test_an_empty_mesh_does_not_raise(self):
+        m = c3phy.PhyMesh(tag=b"PHY4")
+        m.matrix = tuple(float(i) for i in range(16))
+        self.assertEqual(c3phy.apply_matrix_copy(m).vertices, [])
+
+    def test_the_source_mesh_is_not_mutated(self):
+        """The entire reason the deepcopy was there. If this regresses, a
+        shared or cached mesh gets its positions transformed twice."""
+        m = self._mesh()
+        before = [self._fields(v) for v in m.vertices]
+        faces_before = list(m.faces)
+        q = c3phy.apply_matrix_copy(m)
+        self.assertEqual([self._fields(v) for v in m.vertices], before)
+        # ...and mutating the copy must not reach back into the original
+        q.vertices[0].px = 12345.0
+        q.faces.append((0, 0, 0))
+        self.assertEqual([self._fields(v) for v in m.vertices], before)
+        self.assertEqual(m.faces, faces_before)
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_it_holds_across_real_shipped_meshes(self):
+        """The synthetic mesh proves the arithmetic; this proves it against
+        the PHY variants the configured client actually ships."""
+        import coviewer
+        cat = coviewer.Catalog(ROOT)
+        try:
+            paths = sorted(p for p in cat.all_paths if p.endswith(".c3"))
+            # Strided, not the first N: the corpus is sorted by path and the
+            # first few hundred meshes are all one PHY variant, so taking a
+            # prefix would have tested a fifth of the parser and looked
+            # thorough. Deterministic, so a failure is reproducible.
+            stride = max(1, len(paths) // 400)
+            paths = paths[::stride]
+            checked, variants = 0, set()
+            for logical in paths:
+                try:
+                    meshes = c3phy.meshes_from_c3(cat.read(logical))
+                except Exception:                         # noqa: BLE001
+                    continue
+                for m in meshes:
+                    variants.add(m.tag)
+                    self._assert_same(self._old(m), c3phy.apply_matrix_copy(m),
+                                      f"{logical} {m.name!r}")
+                    checked += 1
+                if checked >= 250:
+                    break
+        finally:
+            cat.close()
+        self.assertGreaterEqual(checked, 50,
+                                "too few real meshes reached to mean anything")
+        self.assertGreaterEqual(len(variants), 2,
+                                f"only saw {variants}; want several PHY variants")
+
+
+class TextureBundle(unittest.TestCase):
+    r"""The DXT bundle must ship the file's own blocks, unaltered.
+
+    The whole claim of the DXT path is *the bytes the GPU gets are the bytes
+    on disk*. A bundle that quietly re-encoded, mis-sliced, or shipped the
+    wrong mip level would still render something plausible, so the assertions
+    are on bytes rather than on whether a picture appears.
+
+    The core cases build their own DDS files, so they run without an install.
+    """
+
+    class _Assets:
+        """The `.read(path)` contract `BundleWriter` takes."""
+
+        def __init__(self, table):
+            self.table = table
+
+        def read(self, path):
+            return self.table[path]
+
+    def test_a_dxt_payload_is_sliced_out_verbatim(self):
+        import tileset
+        for name, fourcc, block in (("DXT1", b"DXT1", 8),
+                                    ("DXT3", b"DXT3", 16),
+                                    ("DXT5", b"DXT5", 16)):
+            with self.subTest(fmt=name):
+                w = h = 16
+                size = (w // 4) * (h // 4) * block
+                payload = bytes((i * 7 + 3) % 256 for i in range(size))
+                # a trailing mip chain the bundle must NOT include
+                data = make_dds(w, h, fourcc, payload + b"\xAB" * 64, mips=3)
+                bw = tileset.BundleWriter()
+                idx = bw.add_dds(self._Assets({"t.dds": data}), "t.dds")
+                self.assertEqual(idx, 0)
+                e = bw.entries[0]
+                self.assertEqual((e["w"], e["h"], e["fmt"]), (w, h, name))
+                self.assertEqual(e["size"], size)
+                self.assertEqual(e["size"], tileset.dxt_payload_size(name, w, h))
+                self.assertEqual(bw.bundle(), payload,
+                                 "the bundle must be mip 0 and nothing else")
+
+    def test_offsets_are_dense_and_paths_dedup(self):
+        import tileset
+        a = make_dds(8, 8, b"DXT1", b"\x11" * 32)
+        b = make_dds(8, 8, b"DXT5", b"\x22" * 64)
+        bw = tileset.BundleWriter()
+        assets = self._Assets({"a.dds": a, "b.dds": b})
+        self.assertEqual(bw.add_dds(assets, "a.dds"), 0)
+        self.assertEqual(bw.add_dds(assets, "b.dds"), 1)
+        # Both hands holding the same weapon must not bundle it twice.
+        self.assertEqual(bw.add_dds(assets, "a.dds"), 0)
+        self.assertEqual(bw.add_dds(assets, "A.DDS"), 0, "dedup is case-folded")
+        off = 0
+        for e in bw.entries:
+            self.assertEqual(e["off"], off, "offsets must be dense")
+            off += e["size"]
+        self.assertEqual(len(bw.bundle()), off)
+        self.assertEqual(len(bw.entries), 2)
+
+    def test_a_truncated_payload_is_refused_rather_than_shipped_short(self):
+        import tileset
+        short = make_dds(16, 16, b"DXT3", b"\x00" * 32)   # wants 256
+        bw = tileset.BundleWriter()
+        self.assertIsNone(bw.add_dds(self._Assets({"s.dds": short}), "s.dds"))
+        self.assertEqual(bw.entries, [])
+
+    def test_an_unreadable_path_is_refused_not_invented(self):
+        import tileset
+        bw = tileset.BundleWriter()
+        self.assertIsNone(bw.add_dds(self._Assets({}), "nope.dds"))
+        self.assertEqual(bw.entries, [])
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_real_character_textures_bundle_byte_for_byte(self):
+        """Against the shipped corpus: each bundled entry equals the file's own
+        mip-0 slice, and decodes to the pixels the PNG route would have sent."""
+        import tileset
+        import coviewer
+        cat = coviewer.Catalog(ROOT)
+        try:
+            paths = [p for p in cat.all_paths
+                     if p.startswith("c3/texture/") and p.endswith(".dds")][:40]
+            if not paths:
+                self.skipTest("no c3/texture/*.dds reachable")
+            bw = tileset.BundleWriter()
+            kept = []
+            for p in paths:
+                if bw.add_dds(cat, p) is not None:
+                    kept.append(p)
+            blob = bw.bundle()
+            self.assertGreaterEqual(len(bw.entries), 10,
+                                    "corpus too small to mean much")
+            for e, p in zip(bw.entries, kept):
+                if e["fmt"] == "RGBA":
+                    continue
+                got = blob[e["off"]:e["off"] + e["size"]]
+                src = cat.read(p)
+                want = src[tileset.DDS_DATA_OFFSET:
+                           tileset.DDS_DATA_OFFSET + e["size"]]
+                self.assertEqual(got, want, f"{p} is not the file's own bytes")
+                w, h, ref = dds.decode(src, 0)
+                self.assertEqual((w, h), (e["w"], e["h"]), p)
+                _, _, again = dds.decode(src[:tileset.DDS_DATA_OFFSET] + got, 0)
+                self.assertEqual(again, ref,
+                                 f"{p} decodes differently from the bundle")
+        finally:
+            cat.close()
+
+
+class CoverAnchorConvention(unittest.TestCase):
+    """Which cell a COVER's `origin` names -- `docs/map_scenery.md` §10.
+
+    §10 recorded the question as unanswerable, and it was RIGHT about the
+    sample it had: 1,616 of the 2,380 covers it measured are 1x1, and the two
+    hypotheses differ by `(w-1, h-1)`, which is `(0, 0)` there. The first test
+    below pins that arithmetic so the reason stays visible; the rest use the
+    multi-cell covers, which are the only ones that can answer.
+    """
+
+    def _cover_mod(self):
+        import importlib.util
+        p = PROJECT / "routeb" / "verify_cover.py"
+        spec = importlib.util.spec_from_file_location("verify_cover", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_the_two_conventions_are_one_convention_on_a_1x1(self):
+        """No install needed: this is the shape of the hazard, not a corpus.
+
+        The footprints differ by exactly `16*((w-1)+(h-1))` pixels of screen
+        depth, so on a 1x1 they are the same rectangle -- and any measurement
+        taken only on 1x1 covers cannot separate them, however large it is.
+        """
+        class FakePuzzle:
+            k = 412
+
+            def corner_px(self, gx, gy):
+                return ((gx - gy + self.k) * 32, (gx + gy - self.k) * 16)
+
+            def window_rect(self, x0, y0, x1, y1):
+                return (int(self.corner_px(x0, y1 + 1)[0]),
+                        int(self.corner_px(x0, y0)[1]),
+                        int(self.corner_px(x1 + 1, y0)[0]),
+                        int(self.corner_px(x1 + 1, y1 + 1)[1]))
+
+        vc = self._cover_mod()
+        pm = FakePuzzle()
+        self.assertEqual(vc.footprint_rect(pm, 430, 380, 1, 1, "BR"),
+                         vc.footprint_rect(pm, 430, 380, 1, 1, "TL"))
+        self.assertEqual(list(vc.footprint_cells(430, 380, 1, 1, "BR")),
+                         list(vc.footprint_cells(430, 380, 1, 1, "TL")))
+        for w, h in ((2, 2), (1, 4), (3, 1), (4, 4)):
+            br = vc.footprint_rect(pm, 430, 380, w, h, "BR")
+            tl = vc.footprint_rect(pm, 430, 380, w, h, "TL")
+            self.assertEqual(tl[3] - br[3], 16 * ((w - 1) + (h - 1)),
+                             f"{w}x{h}: the conventions must differ by exactly "
+                             f"this much, or the discriminator is measuring "
+                             f"something else")
+
+    def test_the_sign_test_reports_no_evidence_when_every_pair_ties(self):
+        """The statistic must not manufacture significance out of ties.
+
+        Every 1x1 comparison is a tie, and a test that scored those as wins
+        would report a confident answer on the exact sample §10 says cannot
+        give one.
+        """
+        vc = self._cover_mod()
+        self.assertEqual(vc.sign_p(0, 0), 1.0)
+        self.assertLess(vc.sign_p(43, 5), 1e-6)
+        self.assertGreater(vc.sign_p(5, 43), 0.99)
+        # 2,159 non-ties overflowed a float denominator before this was fixed;
+        # a crash there reads as a failed measurement, not an overwhelming one.
+        self.assertLess(vc.sign_p(1573, 586), 1e-90)
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_bottom_right_wins_and_1x1_covers_cannot_tell_the_difference(self):
+        """The measurement, on `newbie` -- small, and it goes 6-0.
+
+        `newbie` has 18 covers: 12 are 1x1 and must score IDENTICALLY under both
+        conventions, and 6 are multi-cell and must all prefer bottom-right. The
+        first half is the instrument's control -- if the 1x1s ever separate,
+        this test is broken rather than informative.
+        """
+        import puzzle as puzzlemod
+        import scene as scenemod
+        vc = self._cover_mod()
+        plib = puzzlemod.PuzzleLibrary()
+        pm = plib.get("newbie")
+        self.assertIsNotNone(pm, plib.reason)
+        sc = scenemod.for_map(pm.name, root=plib.root)
+        cache = scenemod.SpriteCache(plib.root)
+        got = vc.score(pm, sc.covers,
+                       lambda c: cache.frame_blob(c.ani, c.title), vc.Sprites())
+
+        u = got["unit"]
+        self.assertEqual(u["n"], 12)
+        wb, wt, tie, _mb, _mt = vc.tally(u["pairsV"])
+        self.assertEqual((wb, wt, tie), (0, 0, 12),
+                         "1x1 covers were separated by the two conventions; "
+                         "that is impossible, so the instrument is wrong")
+        self.assertEqual(u["cell"]["BR"], u["cell"]["TL"])
+
+        m = got["multi"]
+        self.assertEqual(m["n"], 6)
+        wb, wt, _tie, _mb, _mt = vc.tally(m["pairsV"])
+        self.assertEqual((wb, wt), (6, 0),
+                         "bottom-right must be nearer on every multi-cell "
+                         "cover of newbie")
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_twin_city_cover_export_round_trips_with_its_layer_tag(self):
+        """The bytes the DX11 renderer is handed, read back.
+
+        The layer tag is the part worth a test: TERRAIN and COVER are drawn at
+        different points in §7's order, and a cover table loaded into the
+        terrain slot is a mis-ordered picture rather than a visible error.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "export_scenery", PROJECT / "routeb" / "export_scenery.py")
+        ex = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ex)
+
+        pm, meta, sprites, pl, dang = ex.gather_region(
+            "1002", 430, 380, 18, layer="cover")
+        got = ex.parse(ex.serialise(meta, sprites, pl, dang))
+        self.assertEqual(got["layerTag"], 4)
+        self.assertEqual(got["version"], 2)
+        self.assertEqual(got["bytesUnconsumed"], 0)
+        self.assertEqual(len(got["placements"]), 68)
+        self.assertEqual(len(got["sprites"]), 35)
+        depths = [p["depth"] for p in got["placements"]]
+        self.assertEqual(depths, sorted(depths), "not in painter's order")
+        # The same region on the TERRAIN layer is EMPTY, which is why the
+        # renderer got a cover consumer before a terrain one. Asserted so the
+        # justification stays measured rather than remembered.
+        _pm, meta2, spr2, pl2, dang2 = ex.gather_region(
+            "1002", 430, 380, 18, layer="terrain")
+        self.assertEqual(len(pl2), 0,
+                         "a TERRAIN part appeared in Twin City's rendered "
+                         "region; the reason COVER went first no longer holds")
+        # RBS1 must still read, or the .rbt lesson (a reader that rejected its
+        # own file) is about to repeat on a second format.
+        v1 = ex.MAGIC_V1 + ex.serialise(meta2, spr2, pl2, dang2)[4:-8]
+        old = ex.parse(v1)
+        self.assertEqual(old["version"], 1)
+        self.assertEqual(old["layerTag"], ex.LAYER_TAGS["terrain"])
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(_main())

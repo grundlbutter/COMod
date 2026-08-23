@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+r"""
+dbcshadow.py -- the one place that answers "is this ini shadowed by a compiled
+twin on **this** base?"
+
+WHY THIS IS AN ERROR AND NOT A WARNING
+--------------------------------------
+``GraphicData.dll`` reads the compiled ``ini/*.dbc`` tables.  **Where a
+compiled twin exists, the client reads the twin.**  A tool that opens the
+``.ini`` beside it is therefore reading a file the client ignores, and any
+number it produces is a *declaration* dressed up as a *measurement*.
+
+That argument is about **which file is authoritative**, and it does not depend
+on how far the two files have drifted.  Three established facts sharpen it but
+are not what it rests on (all recorded in ``core/dbc.py``'s docstring):
+
+* on the 6090 install the ``.ini`` files are stamped **2009** and the ``.dbc``
+  files **2015**;
+* the two are known to disagree *somewhere* -- which is not the same as knowing
+  by how much, on which table.  **No divergence figure is quoted here.**  It
+  was measured on ``comod/dbc-effe-emoi`` and landed in ``docs/effects.md``
+  §7a; the figures derived from it were re-taken against the compiled table on
+  ``comod/effe-definitions`` (§9a).  Deliberately still not quoted here --
+  this gate's argument must not acquire a dependency on the number;
+* the twins first appear at **5517**.  5017 / 5065 / 5165 and CCO ship none, so
+  on those bases the plaintext ini *is* the live table and this gate must stay
+  silent.
+
+THREE INDEPENDENT INSTANCES, IN THREE SUBSYSTEMS, ALL FOUND BY ACCIDENT
+------------------------------------------------------------------------
+The cost is not confined to one odd table, and **not one of the three was
+found by anyone looking for it**.  All three survived because the plaintext
+file *exists and parses cleanly*, so its authority was never questioned.
+
+* **``3DEffect``** -- on 6090, reading the ``.ini`` misses a large fraction of
+  the effect table and misreads rows it does share, some of which change which
+  mesh and texture is drawn.  Measured on ``comod/dbc-effe-emoi``; the figures
+  live in ``docs/effects.md`` §7a, and the coverage numbers derived from them
+  were re-taken against the compiled table in §9a.  Not restated here, and
+  **deliberately vague about the size** per the bullet above: this gate's
+  argument must not acquire a dependency on a number someone else owns.
+  Registered as ``docs/CORRECTIONS.md`` **C44**.  (An earlier revision cited
+  **C30**.  That was wrong -- C30 is an unrelated anchor-alignment refutation
+  -- and the cause is worth naming: this entry was renumbered C30 -> C36 ->
+  C44 with three branches in flight, so a citation taken from any of the three
+  moments points somewhere different.  The same revision said the register had
+  no entry for the shadow *class*; it now has one, ``C45-ini-shadow-class``,
+  and the note at the end of this section is corrected.)
+* **``3dmotion``** -- the one that shows it is a *class*.  The viewer's motion
+  rule matched **four of the sixteen** per-body-type motion families, because
+  ``3dmotion.ini`` names only four while ``3dmotion.dbc`` -- the client's own
+  table -- names all sixteen.  A categorisation rule was 75% wrong for an
+  unknown length of time and nothing indicated it.  Found by
+  ``comod/anim-toggle-viewer`` while doing something unrelated;
+  ``character/motion`` 1,739 -> 2,475, ``character/misc`` 780 -> 44.
+* **the whole effects asset path** -- the largest, and the one that shows the
+  two failure modes are different.  MEASURED here over the six path-valued
+  inis (``effects.PATH_INIS``), counting distinct C3 paths named::
+
+      CCO    12,600 -> 12,600     unchanged, no twins
+      5517    5,867 ->  8,898     +3,031   34.1% invisible
+      6090    5,867 -> 14,113     +8,246   58.4% invisible
+
+  On 6090 **more than half of every C3 the client can reach by name** was
+  unreachable to us, through tables we had been reading for months.
+
+THE ZERO-BYTE MODE IS NOT THE DISAGREEMENT MODE
+------------------------------------------------
+``miscmotion.ini`` and ``MountMotion.ini`` are **zero bytes** on both 5517 and
+6090, while their twins carry 218 and 784 (5517) / 218 and 8,758 (6090) rows.
+
+This is a *distinct* failure from "the two files disagree", and worse:
+
+* a disagreeing file produces wrong data, which can be caught by a comparison;
+* a **zero-byte** file produces *no* data, which reads as **"this table is
+  empty"** rather than **"you opened the wrong file"**.  Nothing errors,
+  nothing warns, every loop runs zero times, and every downstream count is
+  correspondingly smaller with no indication that anything happened.
+
+An empty table is indistinguishable from an absent feature.  A gate that only
+fired on *disagreement* would never fire here, which is why the gate keys on
+**twin existence** and not on content.
+
+IT ALSO MANUFACTURES FALSE EQUIVALENCE BETWEEN BASES
+------------------------------------------------------
+The shadow does not only hide data.  MEASURED by hashing::
+
+    every shadowed .ini      5517 vs 6090   BYTE-IDENTICAL  (8 of 8)
+    the .dbc twins           5517 vs 6090   differ          (7 of 8)
+
+The plaintext layer is a frozen 2009 snapshot shipped unchanged to both
+installs, so **any cross-base comparison performed on it returns "identical"
+as a tautology** -- not as a finding.  The path census above shows it: 5,867
+on both bases through the ini, 8,898 against 14,113 through the twins.
+
+This already produced one confident wrong conclusion.  ``ptclprove`` reported
+5517 and 6090 as a byte-identical particle corpus -- a *correct* refusal on the
+plaintext and **wrong by 2,303 chunks** on the real one.  So a shadowed read
+can yield a confident "these two clients are the same here" that is an
+artefact of both being read wrongly in the same way, and the two errors cancel
+into something that looks like a result.
+
+One table failing this way reads as a quirk of that table.  **Three unrelated
+tables, in three subsystems, found by three sessions who were not looking**,
+in two distinct failure modes, is a property of the shadowing itself.
+
+``3dmotion`` also corroborates the per-file, per-base rule from the opposite
+direction to ``EmotionIco``: CCO ships only the first four families **and no
+``.dbc``**, so on CCO the plaintext file is complete and correct.  The same
+file is authoritative on one base and a decoy on another.
+
+**The register now HAS an entry for this class: ``C45-ini-shadow-class``.**
+That is a correction to this paragraph, which said *"the register has no entry
+for this class yet"* and was written before the entry landed -- exactly the
+retraction-fails-to-travel pattern ``CORRECTIONS.md`` opens with, since the
+entry and this docstring were on different branches.  The reasoning that
+produced the gap was sound (**one** id owned by one person, the others citing
+it, rather than four parallel appends and a fifth collision), and it worked:
+five independent sightings, one id.  Cite ``C45-ini-shadow-class`` for the
+class; this docstring is the *mechanism*, not the register.
+
+Two instances of the class have their own entries because they carry their own
+measurements: **C44** for how far ``3DEffect``'s two files diverge, and
+**C50-effe-definitions** for what changed when the compiled table was actually
+put on the effect definitions path.  A fourth, **C49-effe-definitions-merge**,
+records a defect in the overlay in this file's sibling
+(``effects.read_flat_live``) found only because two teams implemented it
+independently.
+
+**If the two files were reported to agree, the gate would still be correct.**
+A diff of zero is a fact about today's content, not about which file the client
+loads; the ini could be re-stamped tomorrow and nothing would notice.  A
+surprise agreement also deserves a look at *how both sides were resolved*
+before it is believed -- a shared fallback can manufacture agreement (the C21
+corollary).
+
+PER BASE, PER CALL -- AND WHY THE SIGNATURE LOOKS LIKE THIS
+-----------------------------------------------------------
+Two entries in ``docs/CORRECTIONS.md`` are instances of the same mistake, and
+this module is shaped to make both unrepresentable.  Both are now marked fixed
+at their original sites, but the *class* keeps recurring -- three separate
+instances of C22 alone have been found and fixed since it was written
+(``meshtex --coverage``, ``inidb schemas -o``, ``effects --root --linkage``),
+each one a path argument honoured on one side of a tool and dropped on the
+other.  Treat them as live hazards, not closed tickets:
+
+* **C21** -- ``unify.py`` resolved a derived path into a module constant *at
+  import time*, so a base with no artefact of its own silently read **another
+  install's**.  So: **this module has no module-level constant derived from a
+  root, no default root, and no cache.**  Nothing here is computed at import.
+* **C22** -- ``meshtex.py`` accepted ``--root`` and discarded it, and reported
+  "wrote" against the wrong base.  So: **the base is never inferred.**  Every
+  entry point takes the ini's own path and answers from *that path's own
+  directory*.  There is no argument that can be passed and ignored, because the
+  answer is derived from the only argument there is.
+
+Re-resolving costs one ``os.scandir`` of ``ini/`` per call.  A cache is
+deliberately not offered: the failure mode it would buy back is exactly C21's.
+
+USAGE
+-----
+::
+
+    from dbcshadow import ShadowedIni, compiled_twin, check_ini
+
+    check_ini(root / "ini" / "3DEffect.ini")     # raises on 5517/6090
+    check_ini(root / "ini" / "itemtype.json")    # no twin possible -> None
+    check_ini(p, allow_stale=True)               # declared exception
+
+    compiled_twin(root / "ini" / "3dobj.ini")    # -> .../ini/3DObj.dbc | None
+    shadowed_inis(root)                          # {ini path: twin path}
+
+Matching is **case-insensitive on the stem**, which is required rather than
+tidy: the 6090 install pairs ``3dobj.ini`` with ``3DObj.dbc``,
+``3dtexture.ini`` with ``3DTexture.dbc`` and ``3DEffectObj.ini`` with
+``3DEffectobj.dbc``.
+
+MEASURED (2026-08-09), by pairing stems in each install's ``ini/``::
+
+    5017   0 .dbc     0 shadowed ini
+    5065   0 .dbc     0 shadowed ini
+    5165   0 .dbc     0 shadowed ini
+    5517  14 .dbc    14 shadowed ini
+    6090  15 .dbc    15 shadowed ini   (adds EmotionIco)
+    CCO    0 .dbc     0 shadowed ini   (77 files in ini/)
+
+Every ``.dbc`` in both later installs has an ini of the same stem; there is no
+compiled table without a plaintext decoy beside it.
+
+CLI::
+
+    py -3 core/dbcshadow.py report [--root PATH]
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+#: Suffix of the compiled twin.  A constant string, not a resolved path --
+#: nothing in this module may hold a value derived from an install.
+DBC_SUFFIX = ".dbc"
+
+#: Only these ini suffixes can have a compiled twin.  `.json`/`.dat`/`.TME`
+#: files in `ini/` are a different lineage and are never shadowed.
+SHADOWABLE_SUFFIXES = (".ini",)
+
+
+class ShadowedIni(RuntimeError):
+    """Raised when a caller reads an ini the client does not read.
+
+    Carries the twin so the message names it -- the whole point of the error
+    is telling the caller what to read instead.
+    """
+
+    def __init__(self, ini: Path, twin: Path, magic: Optional[bytes] = None):
+        self.ini = Path(ini)
+        self.twin = Path(twin)
+        self.magic = magic
+        tag = ""
+        if magic:
+            try:
+                tag = f" (magic {magic.decode('latin-1')!r})"
+            except Exception:                                   # noqa: BLE001
+                tag = f" (magic {magic!r})"
+        super().__init__(
+            f"{self.ini.name} is shadowed by its compiled twin "
+            f"{self.twin.name}{tag} in {self.twin.parent} -- the client reads "
+            f"the .dbc, so this .ini is not the live table on this base. "
+            f"Read {self.twin.name}, or pass allow_stale=True "
+            f"(CLI: --allow-stale-ini) to declare that you want the stale "
+            f"plaintext deliberately.")
+
+
+def _twin_in_dir(directory: Path, stem: str) -> Optional[Path]:
+    """Case-insensitive ``<stem>.dbc`` in ``directory``.
+
+    Scans on every call.  See the module docstring on why there is no cache.
+    """
+    want = f"{stem}{DBC_SUFFIX}".lower()
+    try:
+        with os.scandir(directory) as it:
+            for e in it:
+                if e.name.lower() == want and e.is_file():
+                    return Path(e.path)
+    except OSError:
+        return None
+    return None
+
+
+def compiled_twin(ini_path) -> Optional[Path]:
+    """The compiled ``.dbc`` twin of ``ini_path`` on that path's own base.
+
+    Returns ``None`` when there is no twin -- which is the whole of the
+    5017 / 5065 / 5165 / CCO lineage, where the plaintext ini *is* live.
+
+    The base is taken from ``ini_path``'s own parent directory and from
+    nothing else: there is no configured root, no ``CO_ROOT``, and no
+    process-global to leak one install's answer into another's (C21/C22).
+    """
+    p = Path(ini_path)
+    if p.suffix.lower() not in SHADOWABLE_SUFFIXES:
+        return None
+    return _twin_in_dir(p.parent, p.stem)
+
+
+def twin_magic(twin: Path) -> Optional[bytes]:
+    """The twin's four-byte magic, read fresh.
+
+    Deliberately not interpreted here and deliberately not imported from
+    ``core/dbc.py``: whether *we* can parse the compiled table has no bearing
+    on whether the *client* reads it, and the gate must not weaken as our
+    parser coverage changes.
+    """
+    try:
+        with open(twin, "rb") as fh:
+            m = fh.read(4)
+        return m or None
+    except OSError:
+        return None
+
+
+def is_shadowed(ini_path) -> bool:
+    """True when reading ``ini_path`` would read a file the client ignores."""
+    return compiled_twin(ini_path) is not None
+
+
+def twin_rows(ini_path) -> Optional["dict[str, str]"]:
+    """The twin's ``id -> path`` rows as ``{str(id): path}``, or ``None``.
+
+    A **convenience for callers that want the live table**, deliberately kept
+    apart from the gate above.  ``check_ini`` must not weaken as our parser
+    coverage changes -- whether *we* can read the compiled table has no bearing
+    on whether the *client* reads it -- so ``dbc`` is imported here, inside the
+    function, and only this helper depends on it.  Nothing resolves at import
+    time (C21).
+
+    Returns ``None`` when there is no twin, when its magic is not ``RSDB``, or
+    when it fails to parse.  ``RSDB`` is the only flat ``id -> path`` layout;
+    ``MESH`` / ``SIMO`` / ``EFFE`` are record tables whose callers want
+    structure rather than a flat map, so they are not served here.
+
+    **The keys are ``str(id)``, and that is not always the ini's spelling.**
+    It matches for ``3DEffectObj`` / ``3dtexture`` / ``3dobj``, whose ini keys
+    are plain integers.  It does **not** match ``WeaponMotion``, whose two
+    spellings differ by the WIDTH of the action field.
+
+    **That one is SOLVED (2026-08-09), and this helper still does not serve
+    it.**  ``dbc.weaponmotion_key`` composes the twin's id as
+    ``(appearance * 10_000 + action) mod 2**32`` -- verified 25,944 of 25,944
+    on 5517, 0 wrong -- so a caller wanting ``WeaponMotion`` should use
+    ``dbc.weaponmotion_join``, which re-keys into the ini's spelling and
+    **raises rather than returning an empty map** when nothing joins.  This
+    function keeps keying on ``str(id)`` deliberately: it is the generic
+    flat-twin helper, and silently special-casing one table here would hide
+    the thing worth knowing, which is that key spellings are per-table.
+
+    Do not overlay two maps whose key spaces you have not checked -- see
+    ``tools/effects.py::read_flat_live``, which refuses when they are disjoint.
+
+    **Note what the join exposed, before trusting either side of it:**
+    ``WeaponMotion.ini`` is byte-identical on all five official clients while
+    the twin is not, so the plaintext is frozen and the compiled table has
+    moved on without it.  On 6090 the ini resolves only 2,808 of its 25,944
+    rows and names **1.7%** of the twin.
+    """
+    twin = compiled_twin(ini_path)
+    if twin is None:
+        return None
+    if twin_magic(twin) != b"RSDB":
+        return None
+    try:
+        import dbc                                        # noqa: E402,PLC0415
+        return {str(k): v for k, v in
+                dbc.Rsdb.parse(twin.read_bytes()).paths.items()}
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def check_ini(ini_path, *, allow_stale: bool = False) -> Optional[Path]:
+    """Gate a raw ini read.  Returns the twin (or ``None``); raises otherwise.
+
+    ``allow_stale=True`` turns the gate into a lookup: the twin is still
+    returned so a caller can record which file it chose not to read.  Use it
+    only where reading the stale plaintext is the *intent* -- a Rosetta
+    comparison, or a table whose compiled form has no reader yet -- and say so
+    at the call site.
+    """
+    twin = compiled_twin(ini_path)
+    if twin is not None and not allow_stale:
+        raise ShadowedIni(Path(ini_path), twin, twin_magic(twin))
+    return twin
+
+
+def authoritative(ini_path) -> Path:
+    """The file the client actually reads for this table: twin if any."""
+    return compiled_twin(ini_path) or Path(ini_path)
+
+
+def shadowed_inis(root) -> "dict[Path, Path]":
+    """``{ini path: twin path}`` for one install's ``ini/`` directory.
+
+    Takes the root explicitly and resolves it here; holds nothing.
+    """
+    ini_dir = Path(root) / "ini"
+    out: dict[Path, Path] = {}
+    try:
+        names = sorted(os.listdir(ini_dir))
+    except OSError:
+        return out
+    dbcs = {n[:-len(DBC_SUFFIX)].lower(): n
+            for n in names if n.lower().endswith(DBC_SUFFIX)}
+    for n in names:
+        p = Path(n)
+        if p.suffix.lower() in SHADOWABLE_SUFFIXES and p.stem.lower() in dbcs:
+            out[ini_dir / n] = ini_dir / dbcs[p.stem.lower()]
+    return out
+
+
+def _main(argv=None) -> int:
+    import argparse
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import coroot                                              # noqa: E402
+
+    ap = argparse.ArgumentParser(
+        description="which ini/ tables are shadowed by a compiled .dbc twin")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("report")
+    coroot.add_root_argument(r)
+    a = ap.parse_args(argv)
+
+    root = coroot.root_from_args(a)
+    pairs = shadowed_inis(root)
+    print(f"{root}")
+    print(f"  kind      {coroot.kind_for_root(root)}")
+    print(f"  base_id   {coroot.base_id(root)}")
+    if not pairs:
+        print("  no compiled twins -- the plaintext ini/ tables are live here")
+        return 0
+    print(f"  {len(pairs)} shadowed ini table(s); the client reads the .dbc:")
+    for ini, twin in sorted(pairs.items()):
+        m = twin_magic(twin)
+        tag = m.decode("latin-1") if m else "?"
+        print(f"    {ini.name:<24} -> {twin.name:<24} {tag}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

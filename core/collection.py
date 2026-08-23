@@ -76,6 +76,13 @@ CATEGORIES: dict[str, str] = {
 INDEX_NAME = "collection.json"
 ROOT_NAME = "Collection"
 
+#: Part roles a **map** entry uses.  Unlike a figure's parts, each of these
+#: stages to its own logical path rather than under the target: the DMap
+#: names its `.pul`, and the `.ani` names its tiles, so moving any of them
+#: breaks the reference that made it part of the map.  They are also the
+#: roles that can be *shared* with other maps -- see `Collection.stage`.
+MAP_ROLES = ("puzzle", "ani", "art")
+
 #: The Collection browses like any imported client: it publishes a server
 #: profile of its own under this name, so it gets the viewer's tree,
 #: thumbnails, tags and model stage with no second code path.
@@ -169,7 +176,8 @@ def _is_flat_action(stem: str) -> bool:
     return len(stem) >= 9 and stem.isdigit() and stem.startswith("999")
 
 
-def actions_beside(list_under, mesh: str) -> list[tuple[str, str, bool]]:
+def actions_beside(list_under, mesh: str, *,
+                   record: "Optional[dict]" = None) -> list[tuple[str, str, bool]]:
     """``(code, logical, anchored)`` for every action file belonging to
     ``mesh``.
 
@@ -179,6 +187,25 @@ def actions_beside(list_under, mesh: str) -> list[tuple[str, str, bool]]:
     model's action set pulled 455 unrelated meshes into a single entry.  A
     prefix-anchored match cannot make that mistake, so capping it would only
     lose real animation.
+
+    **`MAX_ACTIONS` is a CLASSIFIER, not a truncation**, and the difference
+    is the whole reason this reads ``loose = []`` rather than ``loose[:40]``.
+    The count is evidence about *what kind of directory this is*
+    (`MAX_ACTIONS`' own comment: "a folder with more 4-digit .c3 files than
+    this is a content folder, not one model's action set"), and once it says
+    "content folder" every unanchored match in it is a false positive.
+    Keeping the first 40 would keep 40 arbitrary false positives and look
+    tidier doing it. **Do not "fix" this by truncating.**
+
+    Pass ``record`` -- a dict this fills in -- to hear the judgement when it
+    fires. Without it the discard is invisible: a caller cannot tell "this
+    directory has no unanchored actions" from "this directory was judged a
+    content folder and N candidates were thrown away", because both are an
+    empty list. The classification is correct; its *silence* was not, and it
+    was costing real directories (below).
+
+    ``record`` is keyword-only and defaults to None, so **every existing
+    caller receives exactly what it received before.**
     """
     key = (mesh or "").replace("\\", "/").lower()
     if not key.endswith(".c3"):
@@ -196,6 +223,13 @@ def actions_beside(list_under, mesh: str) -> list[tuple[str, str, bool]]:
             continue
         (anchored if is_anchored else loose).append((code, p, is_anchored))
     if len(loose) > MAX_ACTIONS:
+        if record is not None:
+            # The candidates, not just the count. "Which ones" is the next
+            # question anyone asks, and a bare number sends them to re-derive
+            # a list this function already had in its hand.
+            record.update(discarded=len(loose), reason="content-folder",
+                          threshold=MAX_ACTIONS, directory=d,
+                          candidates=[p for _c, p, _a in sorted(loose)])
         loose = []
     return sorted(anchored + loose)
 
@@ -303,6 +337,51 @@ def _has_geometry(blob: bytes) -> bool:
         return True
 
 
+#: An action code in the nested per-action layout. MEASURED over every
+#: cap-surviving numeric-named directory on 7878 and CCO: the codes are
+#: 3-digit (100, 101, 110, 121, 190, 250, 310, 401 ...) with a 4-digit tail
+#: (1114, 1501, 1560); 13,772 three-digit and 353 four-digit against 3,025
+#: one-digit and 284 two-digit. **The short stems are not actions** -- `1` is
+#: the model's own base mesh, and the 1-2 digit families are variant sets, not
+#: action sets (see `_directory_anchored`).
+_ACTION_CODE = re.compile(r"^\d{3,4}$")
+
+
+def _directory_anchored(logical: str) -> bool:
+    r"""True when the model's **own directory** is the anchor.
+
+    `c3/npc/2231/100.c3` -- a directory named for the model, holding that
+    model's action codes. That is a *stronger* anchor than any filename
+    convention: the directory is the model, so a sibling action code in it
+    cannot belong to anything else.
+
+    Both halves are load-bearing and **each blocks a measured counterexample**
+    that the other lets through. This is the guard `MAX_ACTIONS` was bought
+    for, at a size the cap cannot see -- 27 and 3 models, not 455:
+
+    ``c3/npc/10023/`` on 7878 -- 28 files, stems ``01 02 ... 11 12 ... 66``,
+        every one PHY+MOTI. A tile/domino set: **27 unrelated models inside
+        `c3/npc/<id>/`**, and 28 is under `MAX_ACTIONS`, so the cap never
+        fires. Blocked here by the code shape: 2-digit stems are not actions.
+        (This also refutes "the hazard cannot occur inside `c3/npc/<id>/`".)
+
+    ``c3/effect/bow/`` -- stems ``179 219 69-89``, all PHY+MOTI, three
+        unrelated bow effects with names that *are* action-shaped. Blocked
+        here by the directory: ``bow`` is not a model id.
+
+    And the original 455: the recovered garment archives browse as
+    ``zephyr/garments``, ``zephyr/garments1`` .. -- 1,217 / 567 / 462 / 527 /
+    425 four-digit models in flat, **non-numeric** directories. Refused twice
+    over: this predicate says no on the directory name, and `MAX_ACTIONS`
+    still condemns them exactly as before, because nothing here touches the
+    classifier or what it counts.
+    """
+    parts = logical.rsplit("/", 2)
+    if len(parts) < 3 or not parts[-2].isdigit():
+        return False
+    return bool(_ACTION_CODE.match(parts[-1][:-3]))
+
+
 def gather_parts(read, list_under, mesh: str,
                  effects: Iterable[str] = ()) -> list[tuple[str, str, str, bytes]]:
     """Everything that belongs with ``mesh`` beyond its own skin.
@@ -332,7 +411,15 @@ def gather_parts(read, list_under, mesh: str,
         # geometry rejected every action the storekeeper had. The test is
         # here to stop the UNANCHORED rule swallowing a folder of unrelated
         # models -- 455 of them, once -- and an anchored match cannot.
-        if not anchored and _has_geometry(blob):
+        #
+        # The NESTED layout is per-action meshes too, and had the same defect
+        # the flat family had: `c3/npc/2231/{100,101,190}.c3` are PHY+MOTI, so
+        # this test discarded all three and the owner collected an NPC that
+        # could not move. `_directory_anchored` is the third anchor -- the
+        # model's own directory -- and it is a *test on the path*, deliberately
+        # not a widening of `anchored`, so `MAX_ACTIONS` still classifies on
+        # exactly what it classified on before.
+        if not anchored and not _directory_anchored(p) and _has_geometry(blob):
             continue
         out.append(("motion", p.rsplit("/", 1)[-1], p, blob))
     for e in effects:
@@ -522,7 +609,15 @@ class Collection:
         # statue -- it was the whole point of collecting it that it moves.
         part_recs = []
         src_stem = Path(source_mesh or "").stem.lower()
-        for role, pname, psource, pbytes in parts:
+        for prec_in in parts:
+            # A 5th element carries per-file facts the collector measured and
+            # `stage` needs back -- whether a map's art is shared with other
+            # maps, whether a file is integrity-checked. It travels on the
+            # entry because `core/` is stdlib-only by test: it cannot re-derive
+            # them, and re-deriving at stage time would be a second answer to
+            # a question already answered.
+            role, pname, psource, pbytes = prec_in[:4]
+            extra = dict(prec_in[4]) if len(prec_in) > 4 and prec_in[4] else {}
             pext = Path(pname).suffix or ".c3"
             pstem = Path(pname).stem
             if role == "motion":
@@ -538,7 +633,8 @@ class Collection:
             fn = f"{stem}__{role}-{slugify(pstem)}{pext}"
             (folder / fn).write_bytes(pbytes)
             part_recs.append({"role": role, "file": f"{category}/{fn}",
-                              "source": psource, "sha": _sha(pbytes)})
+                              "source": psource, "sha": _sha(pbytes),
+                              **extra})
 
         entry = {
             "id": stem,
@@ -642,8 +738,9 @@ class Collection:
     # -- using it ----------------------------------------------------------
     def stage(self, ident: str, stage_dir: Path | str,
               swap_for: str = "", *, skin: bool = True, skin_to: str = "",
-              roles: Iterable[str] = ("motion", "effect", "sound"),
-              read_target=None, art_plan=None) -> dict:
+              roles: Iterable[str] = ("motion", "effect", "sound", *MAP_ROLES),
+              read_target=None, art_plan=None,
+              shared_policy: str = "skip-identical") -> dict:
         """Write one entry into a mod stage tree, under the path it replaces.
 
         This is what makes the collection usable rather than merely tidy:
@@ -699,6 +796,18 @@ class Collection:
         mesh_bytes = (self.root / e["mesh"]).read_bytes()
         mesh_dst.write_bytes(mesh_bytes)
         out["wrote"].append(str(target))
+        # Maps are the one area an install hashes. Measured on CCO 2.0:
+        # `integrity.json` sits at the install root and covers 136 `.DMap`
+        # plus 7 `.json` and no art file at all -- and it is absent from
+        # every official patch client. So a staged DMap is the one thing
+        # here that can trip a manifest, and it is worth saying at stage
+        # time rather than leaving to be discovered at install time.
+        if e.get("integrity"):
+            out.setdefault("integrity", []).append({
+                "path": str(target),
+                "why": ("this install hashes it in integrity.json, so "
+                        "replacing it is detectable"),
+            })
         if not skin and e.get("skins"):
             out["skipped"].append("skin (the target keeps its own)")
         # The skin must follow the TARGET, not the source: staging this
@@ -765,11 +874,49 @@ class Collection:
                 # derivation for anything the tables do not describe.
                 dst = motion_dst.get(code) or \
                     f"{tdir}/{action_target_name(tstem, code)}"
-            elif role in ("effect", "sound"):
-                # an effect lives at its own logical path, not the target's
+            elif role in ("effect", "sound") or role in MAP_ROLES:
+                # These live at their own logical path, not under the target.
+                # An effect is addressed by name; a map's background, scenery
+                # index and tiles are addressed by the paths the DMap and the
+                # `.ani` name, and moving any of them breaks the reference
+                # that made them part of the map.
                 dst = prec["source"]
             else:
                 continue
+
+            # Shared art: stage it only where it would actually change
+            # something, and never silently. Map tiles and the `.ani` index
+            # are referenced by other maps -- one index by 31 of them -- so
+            # overwriting one is a decision about all of them. Identical bytes
+            # are a no-op worth skipping rather than a risk worth taking.
+            if role in MAP_ROLES and prec.get("shared"):
+                if shared_policy == "never":
+                    out["skipped"].append(
+                        f"{role}: {dst} is shared and you asked to leave "
+                        "shared art alone")
+                    continue
+                old = None
+                if read_target is not None and shared_policy != "always":
+                    try:
+                        old = read_target(dst)
+                    except Exception:                    # pragma: no cover
+                        old = None
+                blob_now = (self.root / prec["file"]).read_bytes()
+                if old is not None and old == blob_now:
+                    out["skipped"].append(
+                        f"{role}: {dst} is shared and already identical")
+                    continue
+                others = prec.get("sharedWith") or []
+                out.setdefault("sharedArt", []).append({
+                    "path": dst, "role": role, "maps": others,
+                    "why": (f"{dst} is also used by {len(others)} other map(s); "
+                            "staging it changes them too"),
+                })
+            if prec.get("integrity"):
+                out.setdefault("integrity", []).append({
+                    "path": dst,
+                    "why": "this install hashes it in integrity.json",
+                })
             if dst.lower() == target.lower():
                 # In the per-action-mesh layout the target IS one of the
                 # action files, so its own code resolves back onto it. The

@@ -49,12 +49,17 @@
   <!-- ------------------------------------------------ centre: the map -->
   <section id="centre">
     <div id="mapwrap">
+      <!-- The art, composited on the GPU from the map's resident DXT tile
+           set (tilebake.js). It sits BEHIND the 2D canvas, which keeps the
+           overlays: selection outlines, pending edits, passability. -->
+      <canvas id="glcanvas"></canvas>
       <canvas id="mapcanvas"></canvas>
       <div id="mapmsg">Pick a map on the left.</div>
       <div id="maphud">
         <span>art <b id="hud-px">—</b></span>
         <span>cell <b id="hud-cell">—</b></span>
         <span>z <b id="hud-z">—</b></span>
+        <span>art <b id="hud-art">—</b></span>
       </div>
     </div>
   </section>
@@ -89,6 +94,24 @@
       <div id="editable-body" class="cardbody mut">nothing loaded</div>
     </section>
 
+    <!--
+      Import / export. A map is a closure, not a file, and the closure has
+      three surprises: its scenery is a small named subset of an index shared
+      with other maps, nearly all of its art lives inside the WDF rather than
+      on disk, and the DMap alone may be integrity-hashed. So this card shows
+      what collecting WOULD take before it takes it, and each toggle is one
+      of those facts rather than a preference.
+    -->
+    <section class="card" id="card-collect" data-card="mapedit-collect">
+      <h2>Collect this map</h2>
+      <div id="collect-body" class="cardbody mut">pick a map on the left</div>
+    </section>
+
+    <section class="card" id="card-export" data-card="mapedit-export">
+      <h2>Export a collected map</h2>
+      <div id="export-body" class="cardbody mut">nothing collected yet</div>
+    </section>
+
   </aside>
 </main>
 
@@ -121,6 +144,7 @@
 
 <script src="/ui/cards.js"></script>
 <script src="/ui/mapmodel.js"></script>
+<script src="/ui/tilebake.js"></script>
 <script src="/ui/mapedit.js"></script>
 <script src="/ui/pageshot.js"></script>
 </body>

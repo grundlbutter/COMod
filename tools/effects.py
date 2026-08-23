@@ -10,15 +10,26 @@ This module answers two questions the asset viewer needs:
 
   2. **How is that effect played back?**  ``ini/3DEffect.ini`` gives per-effect
      timing and a list of layers; each layer names a mesh through
-     ``ini/3DEffectObj.ini`` and a texture through ``ini/3dtexture.ini``.  The
+     ``ini/3DEffectObj.ini`` and a texture through ``ini/3dtexture.ini``.
+     **On 5517 and 6090 all three of those tables are read from their compiled
+     ``.dbc`` twins instead** -- the client reads the twin where one exists, so
+     `EffectDB` does too, per file and per base.  On 5017/5065/5165/CCO there
+     are no twins and the plaintext ini *is* the live table; that is the normal
+     answer on four of the six declared bases, not a broken install.
+     ``--coverage`` prints a ``tables_read`` block naming the file behind every
+     number, so "did this run see the live table?" is a line of output rather
+     than a question about the code.  The
      mesh is a C3 container holding one of three animation forms -- ``PHY``+
      ``MOTI`` (node/bone matrix track), ``SHAP``+``SMOT`` (a two-point blade line
      smeared into a ribbon trail), or ``PTCL``/``PTC3`` (particle system).
 
 Everything the module claims is marked VERIFIED or INFERRED in ``docs/effects.md``.
-The three binary parsers below (``parse_moti``, ``parse_shap``, ``parse_smot``) were
-recovered instruction-by-instruction from ``graphic.dll`` and consume their chunk to
-exactly the declared length on 100% of this install's corpus -- run ``--validate``.
+The four binary parsers below (``parse_moti``, ``parse_shap``, ``parse_smot`` and
+``parse_ptcl``) were recovered instruction-by-instruction from ``graphic.dll`` and
+consume their chunk to exactly the declared length on 100% of this install's corpus
+-- run ``--validate``.  Independent of that, ``tools/ptclprove.py`` mutation-tests
+the particle layout: consuming the right *number* of bytes does not prove the
+fields are in the right *order*, and that tool is what tells the two apart.
 
 CLI::
 
@@ -27,6 +38,12 @@ CLI::
     py -3 tools/effects.py --coverage             # the numbers in docs/effects.md
     py -3 tools/effects.py --validate             # re-derive the parser proof
     py -3 tools/effects.py --linkage              # write out/effects/linkage.json
+    py -3 tools/ptclprove.py --all-bases          # the particle LAYOUT proof
+
+Prefix any of these with ``CO_ROOT=<install>``.  ``--coverage`` and
+``--validate`` print the ``root`` and ``base_id`` they resolved as their first
+two keys: the numbers differ substantially between installs, and a figure
+quoted without its base has been wrong here before (docs/CORRECTIONS.md C33).
 """
 from __future__ import annotations
 
@@ -44,8 +61,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 from coassets import AssetRoot, C3File, DEFAULT_ROOT          # noqa: E402
 import coroot                                                  # noqa: E402
 import c3phy                                                   # noqa: E402
+import dbc                                                     # noqa: E402
+import dbcshadow                                               # noqa: E402
 
+#: The three-wide wildcard, which is what CCO writes in **every** key field.
+#:
+#: **This constant is a WIDTH as well as a value, and that is the trap.** The
+#: official clients write the *action* field four wide (`999.0100.130.300`),
+#: so their always-on rows are keyed `9999`, which is neither equal to this
+#: string nor numerically equal to it. `_field_matches` compares numerically
+#: and is right to refuse them: 9999 and 999 are different numbers.
+#:
+#: The fix is NOT to widen this constant or to make an all-nines value of any
+#: width read as the wildcard here. MEASURED (2026-08-09): treating any
+#: all-nines value as the wildcard changes **19,143** action-effect answers on
+#: 5517 and **30,942** on 6090 -- 19,041 and 30,840 of them turning "this
+#: action has no effect" into "this action has the always-on aura", i.e.
+#: serving the aura as if it were the per-attack trail. On CCO, where the
+#: sentinel already matches the field width, the same change moves **0** of
+#: 91,528 answers. Zero is what correct looks like here; five figures is not.
+#: See `is_always_on` for the narrow, measured fix and CORRECTIONS C35.
 WILDCARD = "999"
+
+
+def is_always_on(action: str) -> bool:
+    r"""Is this Action3DEffect action field the **always-on** (aura) group?
+
+    All-nines of *any width*, because the width is a per-client spelling and
+    the meaning is not: CCO writes `999`, 5517 and 6090 write `9999`. Asking
+    the question this way removes the sentinel from the caller entirely, which
+    is the point -- a literal `"999"` in a caller is the same bug one width
+    along, and this project has now hit that class three times.
+
+    MEASURED on the raw `ini/Action3DEffect.ini` of all three installs: the
+    always-on rows exist in every client and only the wildcard's spelling
+    moved -- CCO 826 rows keyed `999`, 5517 972 and 6090 2,604 keyed `9999`.
+    The earlier claim that 6090 ships none is refuted; see CORRECTIONS C35.
+
+    Note this is deliberately *narrower* than "is the wildcard": it says which
+    ACTION GROUP a row belongs to, not that the field matches every query.
+    `WILDCARD` explains why that distinction is load-bearing.
+    """
+    return _all_nines(action)
+
+
+def _all_nines(field: str) -> bool:
+    r"""Is this key field all nines, at whatever width the client writes it?
+
+    The one definition of the spelling, so a second one cannot drift from it.
+    `is_always_on` is this question asked about the action field, and
+    `specificity` is it asked about any of the four. Both used to spell it
+    themselves and one of them was three wide -- which is CORRECTIONS C35.
+
+    `len >= 3` because a bare `"9"` is a plausible *unpadded action code*, not
+    a wildcard; every client writes the sentinel at least three wide.
+    """
+    return bool(field) and len(field) >= 3 and set(field) == {"9"}
+
 
 # ---------------------------------------------------------------------------
 # tiny ini readers.  The 3D tables are not RFC-anything; they are three shapes:
@@ -78,6 +150,125 @@ def read_flat(path: Path) -> dict[str, str]:
     return out
 
 
+#: Filled by `read_flat_live` on every call, keyed by ini filename: what it
+#: actually read. A plain report, not a cache -- every entry is overwritten by
+#: the next call for that file, and nothing consults it to decide anything.
+#: Kept so `--linkage` and `--coverage` can state their own provenance.
+FLAT_SOURCES: dict[str, dict] = {}
+
+
+def read_flat_live(path: Path) -> dict[str, str]:
+    r"""`read_flat`, plus the compiled twin overlaid on top where one exists.
+
+    **This is the table the client reads.** `GraphicData.dll` reads the
+    compiled `ini/*.dbc`; from 5517 on, the plaintext beside it is a 2009
+    decoy. Reading only the ini here is what made every effect coverage figure
+    a floor rather than a count.
+
+    MEASURED on the id -> path tables (`ini keys` -> `twin keys`):
+
+        3DEffectObj   5517  3,268 -> 6,268     6090  3,268 ->  9,472
+        3dtexture     5517  8,793 -> 13,803    6090  8,793 -> 18,638
+        3dobj         5517  1,443 -> 2,125     6090  1,443 ->  2,985
+        miscmotion    both      0 -> 218
+        MountMotion   5517      0 -> 784       6090      0 ->  8,758
+
+    `miscmotion.ini` and `MountMotion.ini` are **zero bytes** on both installs.
+    That is the sharpest form of the trap: a plaintext crawl reads them as
+    *"this table is empty"* rather than *"you opened the wrong file"*, so the
+    failure looks like absence of data instead of a misread, and nothing
+    anywhere reports an error.
+
+    **The overlay is refused when the key spaces are disjoint.** The twin is
+    keyed `str(id)`, which is the ini's own spelling for the tables above but
+    not for `WeaponMotion` -- 25,944 ini keys against 169,968 twin keys with
+    zero in common on 6090. Merging those would build a map whose keys mean two
+    different things, and `EffectDB` matches weapon motion keys by *string
+    prefix*, so injected u32 ids would match spuriously rather than merely
+    uselessly. When nothing overlaps, this returns the ini unchanged and
+    records `overlaid: False` in `FLAT_SOURCES` for the caller to report.
+
+    **The ini's own keys are canonicalised before either question is asked,
+    and that is not tidiness -- an earlier edition of this function compared
+    raw strings and under-counted the overlap.** `ini/3dtexture.ini` spells 46
+    of its ids zero-padded (`001137360` where the twin has `1137360`) and
+    `ini/3dobj.ini` spells 48 that way. Against raw strings those keys match
+    nothing in the twin, so they survived the `update` **beside** the row they
+    are a spelling of: one logical id, two entries, and the padded one still
+    carrying the 2009 value. Measured on 5517 and 6090: `3dtexture` merged to
+    13,856 / 18,691 keys where the true count is 13,810 / 18,645, and `3dobj`
+    to 2,174 / 3,034 against 2,126 / 2,986. It is the key-width rule again
+    (docs/CORRECTIONS.md §2) -- **a width difference in a KEY reports absence,
+    confidently** -- and it reported 53 missing texture ids where there are 7.
+
+    Stated exactly, because the honest version is narrower than the alarming
+    one: **all 94 ghost pairs currently carry the same path under both
+    spellings**, so nothing was reading a stale value. It is C4's shape -- the
+    right bytes for the wrong reason -- and it would have started returning
+    the 2009 path the first time TQ re-pointed one of those ids. Registered as
+    `C49-effe-definitions-merge`.
+
+    Canonicalisation is applied **only where the twin has that id**, so a base
+    with no twin (the whole plaintext lineage) is returned byte-for-byte as
+    before, and a padded key with no compiled counterpart keeps its spelling.
+
+    Per file, per base, per call: the twin is located by `dbcshadow`, which
+    resolves from this path's own directory and holds nothing (C21/C22).
+    """
+    path = Path(path)
+    out = read_flat(path) if path.is_file() else {}
+    ini_keys = len(out)
+    rows = dbcshadow.twin_rows(path)
+    rec = {"ini": path.name, "ini_keys": ini_keys, "twin": None,
+           "twin_keys": 0, "overlaid": False, "shared": 0}
+    if rows:
+        twin = dbcshadow.compiled_twin(path)
+        rec["twin"] = twin.name if twin else None
+        rec["twin_keys"] = len(rows)
+        # Fold each padded ini key onto the canonical spelling the twin uses,
+        # BEFORE the intersection is measured and before the update -- doing it
+        # after would leave the ghost entry and only fix the count.
+        ghosts = [k for k in out
+                  if k not in rows and k.isdigit() and str(int(k)) in rows]
+        for k in ghosts:
+            out[str(int(k))] = out.pop(k)
+        rec["padded_ini_keys_folded"] = len(ghosts)
+        shared = len(set(out) & set(rows)) if out else 0
+        rec["shared"] = shared
+        # An empty ini cannot disagree with anything, so an empty-vs-N overlay
+        # is always right; the disjointness question only arises when both
+        # sides have keys.
+        if not out or shared:
+            out.update(rows)                    # the file the client reads wins
+            rec["overlaid"] = True
+        else:
+            # WeaponMotion reaches here, and reaches it *after* folding --
+            # which is the check that matters, because a normalisation that
+            # manufactured an overlap would silently re-enable the merge this
+            # branch exists to refuse. It does not: folding moves 0 of its
+            # 25,944 keys and the intersection is still empty.
+            rec["disjoint"] = True
+    rec["result_keys"] = len(out)
+    FLAT_SOURCES[path.name] = rec
+    return out
+
+
+def read_flat_live_reported(path: Path) -> tuple[dict[str, str], dict]:
+    """`read_flat_live`, returning its provenance record with the table.
+
+    `FLAT_SOURCES` is keyed by **filename**, so two `EffectDB`s for two
+    different installs in one process overwrite each other's entries and a
+    later snapshot of the global attributes one base's provenance to another.
+    That is C21's shape exactly, in the reporting layer rather than the data
+    layer -- and this project has already shipped one tool that reported the
+    wrong base with no error at all. Callers that keep the record should take
+    it from **their own call**, which is what this returns; `FLAT_SOURCES`
+    stays as the informal per-run report it was documented to be.
+    """
+    out = read_flat_live(path)
+    return out, dict(FLAT_SOURCES[Path(path).name])
+
+
 def read_sections(path: Path) -> dict[str, dict[str, str]]:
     """``[section]`` + ``key=value``."""
     out: dict[str, dict[str, str]] = {}
@@ -103,6 +294,62 @@ def read_dotted(path: Path) -> list[tuple[tuple[str, ...], str]]:
         k, v = line.split("=", 1)
         rows.append((tuple(p.strip() for p in k.strip().split(".")), v.strip()))
     return rows
+
+
+def read_weapon_skill_names(ini_dir: Path) -> dict[str, str]:
+    r"""``ini/WeaponSkillName`` -> ``{"410": "Blade", ...}``, either spelling.
+
+    The community client ships a pre-parsed ``WeaponSkillName.json``
+    (``[{"id": 410, "name": "Blade"}, ...]``); every official client ships
+    TQ's original ``WeaponSkillName.ini``, which is **not** sectioned ini at
+    all but a flat ``id,name`` list::
+
+        000,Boxing
+        410,Blade
+
+    Reading only the JSON left `weapon_type_names` **empty on all five
+    official clients** -- measured 48 rows on CCO against 0 on 5017, 5065,
+    5165, 5517 and 6090, each of which ships the ``.ini`` and never had it
+    opened. It failed inside a bare ``except Exception: pass``, so every
+    weapon rendered with a blank type name and nothing said why. Same shape
+    as ``docs/CORRECTIONS.md`` C-2026-08-09-ani-json-spelling, one table over.
+
+    MEASURED, and it is what makes the two spellings interchangeable rather
+    than merely similar: CCO's 48 JSON rows and 5017's 48 ini rows agree on
+    **all 48 ids and all 48 names, with no disagreement and no duplicate id
+    on any base**. Counts grow with the patch level (48, 48, 49, 50, 58) the
+    way a weapon table should.
+
+    Keys are zero-padded to three, which is the width `weapon_type_of` slices
+    an appearance id to and the width both sources already use; a wider id
+    would be left alone rather than truncated. Names are stripped -- 6090
+    ships ``610,PrayerBeads `` with a trailing space -- so a caller cannot
+    tell which source answered.
+    """
+    out: dict[str, str] = {}
+    js = Path(ini_dir) / "WeaponSkillName.json"
+    if js.is_file():
+        try:
+            rows = json.loads(js.read_text("utf-8-sig"))
+        except (OSError, ValueError):
+            rows = []
+        for row in rows if isinstance(rows, list) else ():
+            if isinstance(row, dict) and row.get("id") is not None:
+                out[str(row["id"]).strip().zfill(3)] = str(
+                    row.get("name", "")).strip()
+        if out:
+            return out
+    ini = Path(ini_dir) / "WeaponSkillName.ini"
+    if not ini.is_file():
+        return out
+    for line in _lines(ini):
+        if "," not in line:
+            continue
+        ident, name = line.split(",", 1)
+        ident = ident.strip()
+        if ident:
+            out[ident.zfill(3)] = name.strip()
+    return out
 
 
 def _int(d: dict[str, str], key: str, default: int = 0) -> int:
@@ -373,6 +620,254 @@ def parse_smot(body: bytes) -> SMotion:
     return SMotion(mats, 4 + 64 * n, len(body))
 
 
+# ---------------------------------------------------------------------------
+# PTCL / PTCX / PTC3 -- the particle systems
+#
+# Three generations, three loaders, one dispatcher.  ``sub_1A1E0`` (the C3
+# container walker that also drives Phy_Load / Motion_Load / Shape_Load /
+# SMotion_Load) compares the four tag bytes and hands the *open stream* to one
+# of the overloads -- so a reader has to consume exactly the chunk length or
+# every later chunk is misread:
+#
+#     'P','T','C','L' -> Ptcl_Load(C3Ptcl**,  void*)   RVA 0x61150   (0x1A567)
+#     'P','T','C','X' -> Ptcl_Load(C3Ptcl2**, void*)   RVA 0x60A50   (0x1A5C3)
+#     'P','T','C','3' -> Ptcl_Load(C3Ptcl3**, void*)   RVA 0x60CE0   (0x1A623)
+#
+# RVAs are into the 509-export ``bin/64/graphic.dll`` -- which is **AMD64**
+# (COFF machine 0x8664), not i386; see docs/CORRECTIONS.md C33.  Every offset
+# named below is a byte offset into the C3Ptcl* object as the loader writes it,
+# quoted so the read can be re-checked against the listing.
+# ---------------------------------------------------------------------------
+
+#: Chunk tag -> particle generation.  ``PTCX`` is the middle generation; it is
+#: named nowhere in the docs because this install ships none, but the
+#: dispatcher tests for it (0x1A58C ``cmp al, 0x58``) so a reader that omits it
+#: would silently mis-walk any file that has one.
+PTCL_TAGS: dict[bytes, int] = {b"PTCL": 1, b"PTCX": 2, b"PTC3": 3}
+
+#: The engine's own particle-system caps, read out of the loader/draw path.
+PTCL_VERTEX_STRIDE = 20        # 3 floats position + 2 floats UV (Ptcl_Draw)
+PTCL3_VERTEX_STRIDE = 24       # C3Ptcl3 allocates 0x18 per vertex (0x60F84)
+PTCL_VERTS_PER_PARTICLE = 4    # ``shl ecx, 2`` before the size multiply
+
+
+@dataclass
+class ParticleFrame:
+    """One frame of a baked particle simulation.
+
+    The engine does not *simulate*: `Ptcl_Draw` indexes this array with
+    ``ptcl->currentFrame`` (``movsxd rax,[rcx+0x20]``; stride 0x60 for PTCL,
+    0x68 for PTCX/PTC3) and emits one camera-facing quad per live particle.
+    Everything below is therefore per-particle-per-frame, already solved.
+    """
+    count: int
+    ids: tuple[int, ...] = ()            # PTCX/PTC3 only -- see `ids` note below
+    positions: list[tuple[float, float, float]] = field(default_factory=list)
+    cells: tuple[float, ...] = ()        # flipbook phase, [0,1)
+    sizes: tuple[float, ...] = ()        # half-extent, pre world scale
+    matrix: Mat4 = IDENTITY              # premultiplied onto the world matrix
+
+
+@dataclass
+class ParticleEnvelope:
+    """The `PTC3`-only header block.  Fields named from `Ptcl_Draw(C3Ptcl3*)`
+    (RVA 0x5F110); offsets are into the C3Ptcl3 object."""
+    billboard: int = 0          # +0x30, one byte; 100 is subtracted if >= 100
+    world_space: int = 0        # +0x34, one byte; non-zero skips the transform
+    roll: tuple[float, float] = (0.0, 0.0)              # +0x3C, +0x40
+    alpha: tuple[float, float, float] = (1.0, 1.0, 1.0)  # +0x44, +0x48, +0x4C
+    fade_frames: tuple[int, int] = (0, 0)                # +0x50, +0x54
+    particle_alpha: tuple[float, float, float] = (1.0, 1.0, 1.0)  # +0x58/5C/60
+    particle_life: tuple[float, float] = (0.0, 0.0)      # +0x64, +0x68
+
+
+@dataclass
+class Particle:
+    """A decoded ``PTCL`` / ``PTCX`` / ``PTC3`` chunk."""
+    generation: int             # 1, 2 or 3
+    tag: str = ""
+    name: str = ""
+    label: str = ""             # the 3DSMax source path; the loader Seeks past it
+    tex_grid: int = 1           # +0x14: the texture is a tex_grid x tex_grid atlas
+    max_particles: int = 0      # +0x10: the vertex buffer is sized off this
+    frames: list[ParticleFrame] = field(default_factory=list)
+    envelope: Optional[ParticleEnvelope] = None
+    stretch: Optional[float] = None    # PTC3 only, and it comes from `name`
+    consumed: int = 0
+    size: int = 0
+
+    @property
+    def exact(self) -> bool:
+        return self.consumed == self.size
+
+    @property
+    def frame_count(self) -> int:
+        """+0x24 -- the modulus in Ptcl_NextFrame/Ptcl_SetFrame, exactly as
+        `motion->frameCount` is for a PHY."""
+        return len(self.frames)
+
+    @property
+    def peak_particles(self) -> int:
+        return max([f.count for f in self.frames] or [0])
+
+    @property
+    def effective_frames(self) -> int:
+        """Playable length: one past the last frame that has any particle.
+
+        The same reasoning as the PHY alpha envelope (docs/effects.md §6.5)
+        applied to the channel particles actually have.  A particle system
+        habitually declares 101 frames and empties after a dozen -- 976 of
+        patch5517's 1,259 chunks carry an empty tail, 39,451 dead frames in
+        total -- and an empty frame draws nothing, exactly as alpha 0 does.
+        Unlike the alpha rule this one is not inferred: `Ptcl_Draw` returns
+        immediately when ``frame->count == 0`` (RVA 0x605CF).
+        """
+        last = -1
+        for i, f in enumerate(self.frames):
+            if f.count:
+                last = i
+        return last + 1
+
+    def cell(self, phase: float) -> tuple[int, int]:
+        """The flipbook cell a stored phase selects.
+
+        `Ptcl_Draw` 0x607D0-0x607F6: ``i = int(phase * N*N)`` then
+        ``col = i % N, row = i // N``, and the UV offset is
+        ``(col / N, row / N)`` with cell size ``1 / N``.  Same atlas
+        convention as the PHY ChangeTex channel (docs/effects.md §6.4), and
+        the same N-is-a-side-length reading.
+        """
+        n = self.tex_grid or 1
+        i = int(phase * n * n)
+        return (i % n, i // n)
+
+    def system_alpha(self, frame: int) -> float:
+        """The PTC3 whole-system alpha envelope, RVA 0x5F5BA-0x5F648.
+
+        Three levels and two frame thresholds: ramp to `alpha[1]` by frame
+        `fade_frames[0]`, hold, then ramp to `alpha[2]` over the remainder.
+        Clamped to [0,1].  Returns 1.0 for PTCL/PTCX, which have no envelope.
+        """
+        e = self.envelope
+        if e is None:
+            return 1.0
+        a0, a1, a2 = e.alpha
+        f0, f1 = e.fade_frames
+        total = self.frame_count
+        if f0 and frame < f0:
+            t = frame / f0
+            v = a0 * (1.0 - t) + a1 * t
+        elif frame < f1:
+            v = a1
+        elif total > f1:
+            t = (frame - f1) / (total - f1)
+            v = a1 * (1.0 - t) + a2 * t
+        else:
+            v = a2
+        return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+_STRETCH_TOKEN = "_C3EXP_STRETCH="
+
+
+def parse_ptcl(body: bytes, generation: int, tag: str = "") -> Particle:
+    r"""Decode a particle chunk.  VERIFIED against the three `Ptcl_Load`
+    overloads in ``bin/64/graphic.dll``.
+
+    All three share one shape.  ``TQFRead(dst, elemSize, count, file)`` and
+    ``TqFSeek(file, n, SEEK_CUR)`` are the only stream calls, so the byte
+    sequence is unambiguous::
+
+        u32 nameLen  ; char[nameLen] name    # gen 1/2 Seek past it; gen 3 KEEPS it
+        u32 labelLen ; char[labelLen] label  # all three Seek past it
+        u32 texGrid                          # -> +0x14
+        --- PTC3 only ------------------------------------------------------
+        u8   billboard                       # -> +0x30 (minus 100 if >= 100)
+        u8   worldSpace                      # -> +0x34
+        f32  roll[2] ; f32 alpha[3] ; u32 fadeFrame[2]
+        f32  particleAlpha[3] ; f32 particleLife[2]     # 12 dwords, +0x3C..+0x68
+        --------------------------------------------------------------------
+        u32 maxParticles                     # -> +0x10
+        u32 frameCount                       # -> +0x24
+        frameCount x {
+            u32 count                        # -> frame+0x00
+            if count:                        # count == 0 reads NOTHING further
+                u16   ids[count]             # PTCX/PTC3 only
+                f32x3 position[count]
+                f32   cellPhase[count]
+                f32   size[count]
+                f32   matrix[16]             # a D3DXMATRIX, 0x40 bytes
+        }
+
+    **The zero-count branch is the whole difficulty.** At 0x612B9 / 0x60BB5 /
+    0x61016 a count of 0 jumps straight to the null-pointer tail: no arrays and
+    **no matrix**.  Reading the 0x40 matrix unconditionally desynchronises the
+    stream, and 54,713 of patch5517's 115,561 particle frames are empty (47%)
+    -- so a reader that gets it wrong fails on most files, not a few.
+
+    ``generation`` is 1 (`PTCL`), 2 (`PTCX`) or 3 (`PTC3`); use `PTCL_TAGS`.
+    """
+    if generation not in (1, 2, 3):
+        raise ValueError(f"unknown particle generation {generation}")
+    off = 0
+    (n,) = struct.unpack_from("<I", body, off); off += 4
+    raw_name = bytes(body[off:off + n]); off += n
+    (n2,) = struct.unpack_from("<I", body, off); off += 4
+    label = bytes(body[off:off + n2]); off += n2
+    (grid,) = struct.unpack_from("<I", body, off); off += 4
+
+    env = None
+    if generation == 3:
+        env = ParticleEnvelope()
+        billboard = body[off]; off += 1
+        env.billboard = billboard - 100 if billboard >= 100 else billboard
+        env.world_space = body[off]; off += 1
+        fl = struct.unpack_from("<12f", body, off)
+        ui = struct.unpack_from("<12I", body, off)
+        off += 48
+        env.roll = (fl[0], fl[1])
+        env.alpha = (fl[2], fl[3], fl[4])
+        env.fade_frames = (ui[5], ui[6])
+        env.particle_alpha = (fl[7], fl[8], fl[9])
+        env.particle_life = (fl[10], fl[11])
+
+    (max_particles,) = struct.unpack_from("<I", body, off); off += 4
+    (frame_count,) = struct.unpack_from("<I", body, off); off += 4
+
+    frames: list[ParticleFrame] = []
+    for _ in range(frame_count):
+        (count,) = struct.unpack_from("<I", body, off); off += 4
+        if not count:
+            frames.append(ParticleFrame(0))
+            continue
+        ids: tuple[int, ...] = ()
+        if generation in (2, 3):
+            ids = struct.unpack_from(f"<{count}H", body, off); off += 2 * count
+        flat = struct.unpack_from(f"<{3 * count}f", body, off); off += 12 * count
+        positions = [(flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2])
+                     for i in range(count)]
+        cells = struct.unpack_from(f"<{count}f", body, off); off += 4 * count
+        sizes = struct.unpack_from(f"<{count}f", body, off); off += 4 * count
+        matrix = tuple(struct.unpack_from("<16f", body, off)); off += 64
+        frames.append(ParticleFrame(count, ids, positions, cells, sizes, matrix))
+
+    name = raw_name.decode(ENCODING, "replace")
+    stretch = None
+    if generation == 3 and _STRETCH_TOKEN in name:
+        # Ptcl_Load(C3Ptcl3**) 0x60D75: strstr(name, "_C3EXP_STRETCH="), then
+        # atof(match + 15) -> +0x38.  The authoring tool smuggles a render
+        # parameter through the object name; nothing else in the chunk carries
+        # it, and this install ships no instance of it.
+        try:
+            stretch = float(name.split(_STRETCH_TOKEN, 1)[1].split()[0])
+        except (ValueError, IndexError):
+            stretch = None
+    return Particle(generation, tag or "", name,
+                    label.decode(ENCODING, "replace"),
+                    grid or 1, max_particles, frames, env, stretch,
+                    off, len(body))
+
+
 # --- C3Key channels (the 16-byte C3Frame records c3phy keeps opaque) --------
 
 @dataclass
@@ -454,7 +949,8 @@ class EffectPart:
     motion: Optional[Motion] = None
     shape: Optional[Shape] = None  # kind == shape_trail
     smotion: Optional[SMotion] = None
-    raw_size: int = 0              # kind == particle: undecoded chunk size
+    particle: Optional[Particle] = None   # kind == particle
+    raw_size: int = 0              # chunk byte length, decoded or not
     alpha_keys: list[KeyFrame] = field(default_factory=list)
     draw_keys: list[KeyFrame] = field(default_factory=list)
     tex_keys: list[KeyFrame] = field(default_factory=list)
@@ -465,9 +961,22 @@ class EffectPart:
             return self.motion.frame_count
         if self.smotion:
             return self.smotion.frame_count
+        if self.particle:
+            return self.particle.frame_count
         if self.mesh is not None:
             return getattr(self.mesh, "frame_count", 0)
         return 0
+
+    @property
+    def decoded(self) -> bool:
+        """False only for a part whose chunk we could not decode -- today that
+        is a particle chunk that failed to parse.  `EffectObject.playable`
+        is built from this rather than from the chunk *kind*, so a new
+        undecodable form shows up as unplayable instead of silently counting
+        as geometry."""
+        if self.kind == PART_PARTICLE:
+            return self.particle is not None and self.particle.exact
+        return True
 
     @property
     def uv_grid(self) -> int:
@@ -513,6 +1022,8 @@ class EffectPart:
         the data plainly shows and it makes the impact effects come out at
         sensible lengths (m-b02 = 11 frames x 33 ms = 363 ms).
         """
+        if self.particle is not None:
+            return self.particle.effective_frames
         if len(self.alpha_keys) < 2:
             return self.frame_count
         last = max(self.alpha_keys, key=lambda k: k.frame)
@@ -541,6 +1052,16 @@ class EffectObject:
     @property
     def effective_frames(self) -> int:
         return max([p.effective_frames for p in self.parts] or [0])
+
+    @property
+    def undecoded(self) -> list[str]:
+        """Parts whose chunk this build cannot play.  Empty means every chunk
+        in the file has a reader."""
+        return [p.name or p.kind for p in self.parts if not p.decoded]
+
+    @property
+    def playable(self) -> bool:
+        return bool(self.parts) and not self.undecoded and not self.error
 
 
 def load_effect_object(root: AssetRoot, obj_id: str, logical: str) -> EffectObject:
@@ -586,9 +1107,15 @@ def load_effect_object(root: AssetRoot, obj_id: str, logical: str) -> EffectObje
                     pending_shape = None
                 else:
                     obj.parts.append(EffectPart(PART_SHAPE, smotion=sm))
-            elif ch.tag in (b"PTCL", b"PTC3"):
-                obj.parts.append(EffectPart(PART_PARTICLE, ch.tag.decode("latin1"),
-                                            raw_size=len(ch.body)))
+            elif ch.tag in PTCL_TAGS:
+                part = EffectPart(PART_PARTICLE, ch.tag.decode("latin1"),
+                                  raw_size=len(ch.body))
+                try:
+                    part.particle = parse_ptcl(ch.body, PTCL_TAGS[ch.tag],
+                                               ch.tag.decode("latin1"))
+                except Exception as exc:
+                    obj.error = f"{ch.name}: {exc}"
+                obj.parts.append(part)
             # CAME (camera) is authoring metadata; nothing to play.
         except Exception as exc:                              # pragma: no cover
             obj.error = f"{ch.name}: {exc}"
@@ -685,6 +1212,14 @@ class EffectDef:
     lev: Optional[int] = None
     layers: list[EffectLayer] = field(default_factory=list)
     source: str = "3DEffect.ini"
+    #: The compiled record's three unidentified bytes, on the same footing as
+    #: ``Rsdb.extra``: **preserved, not interpreted.**  Empty when the
+    #: definition came from the plaintext ini.  `unk63` is the only plausible
+    #: `ColorEnable` candidate and it is deliberately NOT mapped onto
+    #: `color_enable` -- it reads ~1 everywhere on both sides, so the check
+    #: would look identical if the identification were wrong (C44, and the
+    #: rule in docs/CORRECTIONS.md §2).
+    extra: dict = field(default_factory=dict)
 
     @property
     def fps(self) -> float:
@@ -734,9 +1269,107 @@ def _parse_effect_section(name: str, d: dict[str, str], source: str) -> EffectDe
     return e
 
 
+#: The plaintext ``Scale<i>`` is an integer **percent** and the compiled
+#: ``scale`` is the fraction.  Not assumed -- measured as a Rosetta on 5517,
+#: where the two tables otherwise agree: under ``ini/100`` **5,099 of 5,099
+#: shared layers match exactly**, and ``red-flower-small``'s ``Scale0=78``
+#: reads 0.78 compiled.  (On 6090 five disagree, and all five sit inside the
+#: 56 records §7a already reports as content edits.)  A field-offset or stride
+#: error cannot score 5,099/5,099 on a unit conversion nobody fitted, so this
+#: is also an independent check on the layer layout.
+EFFE_SCALE_PERCENT = 100
+
+
+def _effect_from_effe(rec: dict) -> EffectDef:
+    """One ``core/dbc.py::read_effe`` record as an `EffectDef`.
+
+    Deliberately **lossy in one direction and honest about it**: the compiled
+    record carries no field identified as ``ColorEnable``, ``Billboard`` or
+    ``Lev``, so those read as their defaults here rather than being invented
+    from ``unk62``/``unk63``/``unk64`` -- all three identifications are either
+    refuted or unfalsifiable from these files (C44).  The raw bytes travel in
+    `EffectDef.extra` so nothing is silently dropped.
+    """
+    e = EffectDef(
+        name=rec["name"],
+        amount=rec["amount"],
+        delay=rec["delay"],
+        loop_time=rec["loop_time"],
+        loop_interval=rec["loop_interval"],
+        frame_interval=rec["frame_interval"],
+        offset=rec["offset"],
+        source="3DEffect.dbc",
+        extra={"unk62": rec["unk62"], "unk63": rec["unk63"],
+               "unk64": rec["unk64"]},
+    )
+    for i, L in enumerate(rec["layers"]):
+        lay = EffectLayer(
+            index=i,
+            effect_id=str(L["effect"]),
+            texture_id=str(L["texture"]),
+            asb=L["asb"], adb=L["adb"])
+        # `Scale<i>` is absent from the ini whenever it is 1, so an explicit
+        # 1.0 here maps to None -- otherwise every compiled layer would appear
+        # to declare a scale the plaintext lineage never does, and the
+        # "27 layers" figure in §7 would jump for a formatting reason.
+        if abs(L["scale"] - 1.0) > 1e-6:
+            lay.scale = int(round(L["scale"] * EFFE_SCALE_PERCENT))
+        e.layers.append(lay)
+    return e
+
+
 # ---------------------------------------------------------------------------
 # the database
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableSource:
+    """Which file one table was *actually* read from, on this base.
+
+    Emitted beside every count `coverage()` produces.  The defect this exists
+    to make visible is the one that produced this class of bug in the first
+    place: a reader that exists, is not on the path, and leaves a number that
+    looks like a measurement.  With the source printed, "is this the live
+    table?" stops being a question about the code and becomes a line of
+    output.
+    """
+    table: str                       # stem, e.g. "3DEffect"
+    path: Optional[Path]             # the file read, or None when absent
+    form: str                        # "dbc" | "ini" | "missing"
+    rows: int = 0
+    twin: Optional[Path] = None      # the twin NOT read, when there is one
+    note: str = ""
+
+    def as_dict(self) -> dict:
+        d = {"form": self.form, "file": self.path.name if self.path else None,
+             "rows": self.rows}
+        if self.twin is not None:
+            d["shadowed_ini_not_read" if self.form == "dbc"
+              else "compiled_twin_not_read"] = self.twin.name
+        if self.note:
+            d["note"] = self.note
+        return d
+
+
+def _compiled_twin(ini_path: Path, want: bytes) -> tuple[Optional[Path], Optional[bytes]]:
+    """``(twin, bytes)`` when a compiled twin exists **and** carries ``want``.
+
+    Absence is the normal answer on four of the six declared bases, so it is
+    returned as ``(None, None)`` rather than raised.  The magic is checked
+    because twin-presence and twin-*parseability* are different questions:
+    a twin whose magic we do not know must not silently become an empty
+    table -- the caller keeps reading the plaintext and says so.
+    """
+    twin = dbcshadow.compiled_twin(ini_path)
+    if twin is None:
+        return None, None
+    try:
+        data = twin.read_bytes()
+    except OSError:                                           # pragma: no cover
+        return twin, None
+    return (twin, data) if dbc.magic(data) == want else (twin, None)
+
 
 @dataclass
 class WeaponImpact:
@@ -763,8 +1396,32 @@ class ActionEffectRule:
 
     @property
     def specificity(self) -> int:
+        r"""How many key fields this row pins down; ties go to file order.
+
+        `_all_nines`, **not `!= WILDCARD`**. This was the fourth site of C35's
+        three-wide sentinel: an official client's
+        aura row is keyed `9999`, which is not the literal `"999"`, so it used
+        to count as a *pinned* field and an aura row scored 3 where it pins 2.
+
+        **It was measured before it was changed, and it was inert.** Sweeping
+        every appearance x every non-all-nines action, this change moves **0**
+        answers on all three bases -- CCO 45,526, 5517 114,380, 6090 230,040 --
+        because `_field_matches` matches a `9999` rule only against an
+        all-nines query, so an aura row and an action row are never in one
+        candidate set and the inflated score was never compared against
+        anything. On CCO they do compete, and there the sentinel was already
+        the right width. Re-measured at 0 again *after* the change.
+
+        Fixed anyway, because inert is not the same as right and this file has
+        now paid four times for leaving one spelling behind. It stops being
+        inert the moment `_field_matches` is widened -- the refuted fix, where
+        the aura row ties the genuine action row and wins on file order,
+        overwriting 102 correct answers on 5517 and 132 on 6090. If you are
+        here because you are about to widen the sentinel, that measurement is
+        the answer: see `WILDCARD` and CORRECTIONS C35.
+        """
         return sum(1 for f in (self.shape, self.action, self.group_hi,
-                               self.group_lo) if f != WILDCARD)
+                               self.group_lo) if not _all_nines(f))
 
 
 @dataclass
@@ -779,7 +1436,15 @@ class ActionMapRule:
 
     @property
     def specificity(self) -> int:
-        return sum(1 for f in (self.shape, self.action, self.terrain) if f != WILDCARD)
+        """Same predicate as `ActionEffectRule.specificity`, and for the same
+        reason -- leaving the sibling on the literal is exactly the mistake
+        C35 records. **Currently unexercised on the official clients**, and not
+        because their sentinel is narrow: `EffectDB` drops every one of their
+        126 rows before this is ever reached (see `action_map`'s note), so
+        there is nothing here to measure yet. It is correct in advance rather
+        than a second thing to remember when that is fixed."""
+        return sum(1 for f in (self.shape, self.action, self.terrain)
+                   if not _all_nines(f))
 
 
 @dataclass
@@ -815,23 +1480,60 @@ class EffectDB:
         self.ini = self.root / "ini"
         self.assets = assets or AssetRoot(self.root)
 
-        # -- effect definitions.  3DEffect.ini is what the engine reads
-        # (GraphicData.dll holds the literal "ini/3DEffect.ini"); the shipped
-        # 3DEffect.json is a stale 2022 export.  Merge json-only names in so
-        # nothing referenced elsewhere is silently missing, ini always wins.
-        self.effects: dict[str, EffectDef] = {}
-        for name, d in read_sections(self.ini / "3DEffect.ini").items():
-            self.effects[name] = _parse_effect_section(name, d, "3DEffect.ini")
+        #: table stem -> the file this instance actually read.  See
+        #: `TableSource`; surfaced by `coverage()` as `tables_read`.
+        self.sources: dict[str, TableSource] = {}
+        #: ini filename -> `read_flat_live`'s record for *this instance's* call.
+        self._flat_records: dict[str, dict] = {}
+
+        # -- effect definitions.  GraphicData.dll names BOTH `ini/3DEffect.ini`
+        # (.rdata 0x921A8) and `ini/3DEffect.dbc` (0x369A8); where the compiled
+        # twin exists the client reads the twin, so this reads the twin too.
+        # On 5017/5065/5165/CCO there is none and the plaintext ini IS the live
+        # table -- absence is the normal answer on four of the six declared
+        # bases, not a broken install.
+        self.effects, self.duplicate_effect_names = self._load_effects()
+        # The shipped 3DEffect.json is a stale 2022 export of the *plaintext*
+        # lineage; merge in names neither source has so nothing referenced
+        # elsewhere is silently missing.  It ships on CCO only (15 names) and
+        # does not exist on any official client, so this is a no-op wherever
+        # the compiled table is in play.
         self.json_only: list[str] = []
         for e in self._load_effect_json():
             if e.name not in self.effects:
                 self.effects[e.name] = e
                 self.json_only.append(e.name)
 
-        self.objs: dict[str, str] = read_flat(self.ini / "3DEffectObj.ini")
-        self.textures: dict[str, str] = read_flat(self.ini / "3dtexture.ini")
-        self.meshes: dict[str, str] = read_flat(self.ini / "3dobj.ini")
-        self.weapon_motion: dict[str, str] = read_flat(self.ini / "WeaponMotion.ini")
+        # The id -> path tables, read as the client reads them: the compiled
+        # twin overlaid on the plaintext where one exists. Before this, every
+        # layer that resolved through these was resolved against 2009 data on
+        # any 5517/6090 root, and every coverage figure derived from them was
+        # a floor. See `read_flat_live` -- including why the ini's padded keys
+        # are folded onto the twin's spelling before the overlay.
+        self.objs = self._load_path_table("3DEffectObj.ini")
+        self.textures = self._load_path_table("3dtexture.ini")
+        self.meshes = self._load_path_table("3dobj.ini")
+        # STALE-INI: weaponmotion.dbc shadows this, and `read_flat_live`
+        # declines to overlay it -- the two key spaces are disjoint (25,944 vs
+        # 169,968, zero shared on 6090, and still zero after the padded-key
+        # fold) and `effects_for_weapon` matches these keys by string prefix,
+        # so injected u32 ids would match spuriously rather than merely
+        # uselessly. The refusal is a *mechanism*, not a name check: any table
+        # whose twin cannot be keyed takes the same path. The rows do
+        # correspond -- within one mesh the ini's low three digits track the
+        # twin's exactly, a constant +456 -- so what is missing is the
+        # composition, not the data. The twin is exposed unmerged below rather
+        # than hidden; docs/effects.md §9a tracks it as OPEN.
+        self.weapon_motion = self._load_path_table("WeaponMotion.ini")
+        self.weapon_motion_twin: dict[str, str] = (
+            dbcshadow.twin_rows(self.ini / "WeaponMotion.ini") or {})
+        #: What each flat table was actually read from, for callers that
+        #: report numbers derived from them. Built from **this instance's own
+        #: calls**, not from a snapshot of the module-level `FLAT_SOURCES`:
+        #: that dict is keyed by filename, so two installs in one process
+        #: overwrite each other and a snapshot attributes one base's
+        #: provenance to another (C21).
+        self.table_sources: dict[str, dict] = self._flat_records
 
         # -- weapon impact
         self.weapon_impact: dict[str, WeaponImpact] = {}
@@ -855,11 +1557,34 @@ class EffectDB:
             self._by_appearance.setdefault(r.appearance, []).append(r)
 
         self.action_map: list[ActionMapRule] = []
+        # The key is shape+action+terrain with NO separators, so its total
+        # length is the only thing that says how to cut it -- and the action
+        # field is four wide on the official clients, exactly as in
+        # `Action3DEffect.ini`. `len(sec) != 9` therefore used to drop **every
+        # row** on 5517 and 6090: CCO/5017/5065 ship 60 keys and 5165 ships 62,
+        # all 9 chars, while 5517 and 6090 ship 126 each at **10**. The whole
+        # table was dark on both official clients and `lookup_action_map`
+        # answered None for every query. Fifth site of C35's four-wide action
+        # field; the widening lands between 5165 and 5517, the same place all
+        # the others do.
+        #
+        # WHICH cut, MEASURED rather than assumed -- `104|0330|999` and
+        # `1040|330|999` are the same ten digits, so the split was chosen on
+        # evidence, not on the field order in the file's header:
+        #   * every one of CCO's 60 keys has an exact official counterpart
+        #     under "insert a 0 at index 3", and all 60 agree on `Effect`;
+        #   * index 3 is `0` on all 126, which is what zero-padding a 3-digit
+        #     action to 4 looks like and what a widened SHAPE would not do;
+        #   * decisively, against this client's own `Action3DEffect.ini`
+        #     vocabularies: 3/4/3 puts 116 of 126 shapes and 102 of 126 actions
+        #     in them, while 4/3/3 puts **0 and 0**.
+        # See CORRECTIONS C35.
         for sec, d in read_sections(self.ini / "ActionMap3DEffect.ini").items():
-            if len(sec) != 9 or not sec.isdigit():
+            if not sec.isdigit() or len(sec) not in (9, 10):
                 continue
+            act_end = len(sec) - 3                    # terrain is always 3
             self.action_map.append(ActionMapRule(
-                sec[0:3], sec[3:6], sec[6:9], d.get("Effect", ""),
+                sec[0:3], sec[3:act_end], sec[act_end:], d.get("Effect", ""),
                 _int(d, "ShowTime"), _int(d, "DirEnable")))
 
         # -- ancillary
@@ -869,17 +1594,100 @@ class EffectDB:
                                       ("WoundDelay", "BlockDelay", "DieDelay")}
         self.flying: dict[str, dict[str, str]] = read_sections(self.ini / "3DFlyingObj.ini")
         self.media_effect: dict[str, dict[str, str]] = read_sections(self.ini / "MediaEffect.ini")
-        self.weapon_type_names: dict[str, str] = {}
-        try:
-            for row in json.loads((self.ini / "WeaponSkillName.json")
-                                  .read_text("utf-8-sig")):
-                self.weapon_type_names[str(row["id"]).zfill(3)] = row["name"]
-        except Exception:                                     # pragma: no cover
-            pass
+        # Both spellings, because reading only the JSON left this empty on
+        # every official client -- and the bare `except: pass` that used to
+        # be here is what made it silent. See `read_weapon_skill_names`.
+        self.weapon_type_names: dict[str, str] = read_weapon_skill_names(self.ini)
         self.weapon_appearances: dict[str, dict[str, str]] = read_sections(
             self.ini / "weapon.ini")
 
     # -- loading helpers ---------------------------------------------------
+
+    def _load_effects(self) -> tuple[dict[str, EffectDef], list[str]]:
+        """The effect definitions, from the compiled twin where there is one.
+
+        Returns ``(effects, duplicate_names)``.  **Names are not unique in the
+        compiled table** -- 6090 ships 4,483 records under 4,472 names -- so a
+        name-keyed dict has to pick.  It picks **the last record**, which is
+        what `read_sections` does for a repeated ``[section]`` and therefore
+        keeps the two paths consistent; the duplicates are returned rather
+        than swallowed, because which one the client uses is **not decidable
+        from this file** and a silent choice would look like knowledge.
+
+        The compiled table is **substituted, not unioned**, with the ini --
+        and that is the opposite of what `_load_path_table` does two methods
+        down, deliberately, because they answer different questions.  Here the
+        question is *what does the client define*, and where a twin exists the
+        client reads the twin, so an ini-only definition is one the client
+        does not have.  There (and in `asset_paths`) the question is *what
+        assets exist*, where an ini-only row still names a real file and
+        dropping it trades one blind spot for another.  Measured cost of
+        substituting here: **0 names on 5517, 1 on 6090**
+        (``red-flower-smallrain``).
+        """
+        p = self.ini / "3DEffect.ini"
+        twin, data = _compiled_twin(p, b"EFFE")
+        out: dict[str, EffectDef] = {}
+        dupes: list[str] = []
+        if data is not None:
+            seen: set[str] = set()
+            for rec in dbc.read_effe(data):
+                if rec["name"] in seen:
+                    dupes.append(rec["name"])
+                seen.add(rec["name"])
+                out[rec["name"]] = _effect_from_effe(rec)
+            self.sources["3DEffect"] = TableSource(
+                "3DEffect", twin, "dbc", len(out), twin=p,
+                note=f"{len(seen) + len(dupes)} records, {len(out)} names")
+        else:
+            for name, d in read_sections(p).items():
+                out[name] = _parse_effect_section(name, d, "3DEffect.ini")
+            self.sources["3DEffect"] = TableSource(
+                "3DEffect", p, "ini" if p.is_file() else "missing",
+                len(out), twin=twin)
+        return out, dupes
+
+    def _load_path_table(self, ini_name: str) -> dict[str, str]:
+        """An ``id -> asset path`` table, read the way the client reads it.
+
+        Thin wrapper over `read_flat_live` -- **the overlay itself lives
+        there**, including the disjoint-key refusal and the padded-key fold.
+        This adds only the per-instance provenance record, taken from *this
+        call* rather than from the module-level `FLAT_SOURCES` snapshot.
+
+        The overlay is a **union with the twin winning**, not a substitution.
+        Two teams built it independently and measured the same growth
+        (`3DEffectObj` 3,268 -> 6,268 / 9,472, `3dtexture` 8,793 -> 13,803 /
+        18,638, `3dobj` 1,443 -> 2,125 / 2,985), and the union is the right
+        half of the two: an ini-only row still names a real asset, and the
+        twin still wins wherever both have the id, so the six paths that
+        changed between the two files resolve to the compiled value either
+        way. Measured cost of preferring union over substitution on the
+        effect path: **0 layers resolve differently** on either base.
+
+        `form` in the record is `"dbc"` when the overlay happened, `"ini"`
+        when there was no twin **or the overlay was refused**, which is the
+        `WeaponMotion` case -- a twin that exists and cannot be keyed reads
+        as plaintext here on purpose, and the record says `disjoint` so the
+        reason is in the output rather than in a comment.
+        """
+        p = self.ini / ini_name
+        out, rec = read_flat_live_reported(p)
+        self._flat_records[p.name] = rec
+        twin = dbcshadow.compiled_twin(p)
+        note = ""
+        if rec.get("disjoint"):
+            note = (f"twin present but its key space is disjoint "
+                    f"({rec['ini_keys']} ini vs {rec['twin_keys']} twin ids, "
+                    f"0 shared); overlay refused, plaintext kept")
+        elif rec.get("padded_ini_keys_folded"):
+            note = (f"{rec['padded_ini_keys_folded']} zero-padded ini keys "
+                    f"folded onto the twin's spelling")
+        self.sources[p.stem] = TableSource(
+            p.stem, twin if rec["overlaid"] else p,
+            "dbc" if rec["overlaid"] else ("ini" if p.is_file() else "missing"),
+            len(out), twin=(p if rec["overlaid"] else twin), note=note)
+        return out
 
     def _load_effect_json(self) -> list[EffectDef]:
         p = self.ini / "3DEffect.json"
@@ -945,7 +1753,12 @@ class EffectDB:
         for r in self.rules_for_appearance(appearance):
             if r.shape not in (WILDCARD, shape):
                 continue
-            if r.action == WILDCARD:
+            # `is_always_on`, not `== WILDCARD`: on both official clients the
+            # aura rows are keyed `9999` and this branch used to miss every
+            # one of them, filing 972 (5517) / 2,604 (6090) always-on rows in
+            # `attack` under a bogus action code and reporting **0 of 4,828**
+            # weapon auras where CCO reports 1,286 of 5,384.
+            if is_always_on(r.action):
                 if not es.aura or r.effect.lower() != "none":
                     es.aura = r.effect
             else:
@@ -998,27 +1811,93 @@ class EffectDB:
                 best = r
         return best.effect if best else None
 
+    def always_on_effect(self, appearance: str,
+                         shape: str = WILDCARD) -> Optional[str]:
+        r"""The always-on (aura) row for an appearance, **width-agnostic**.
+
+        `lookup_action_effect` needs the caller to spell the action, and the
+        always-on action is the one field whose spelling changes between
+        clients (`999` on CCO, `9999` on 5517 and 6090). Every caller that
+        spelled it itself was silently returning nothing on both official
+        clients. Asking here instead means no caller carries the sentinel.
+
+        Identical to `lookup_action_effect(appearance, <that client's
+        spelling>)` on all three bases -- asserted in
+        `test_viewer::AlwaysOnSentinelWidth`, not assumed -- because the
+        candidate set is the same set either way. The difference is only that
+        this one cannot be given the wrong width.
+        """
+        hi, lo = self.split_appearance(appearance)
+        best: Optional[ActionEffectRule] = None
+        for r in self.action_rules:
+            if not is_always_on(r.action):
+                continue
+            if not self._field_matches(r.shape, shape):
+                continue
+            if not self._field_matches(r.group_hi, hi):
+                continue
+            if not self._field_matches(r.group_lo, lo):
+                continue
+            if best is None or r.specificity > best.specificity:
+                best = r
+        return best.effect if best else None
+
+    def always_on_rules(self) -> list[ActionEffectRule]:
+        """Every always-on row, whatever this client's wildcard width is."""
+        return [r for r in self.action_rules if is_always_on(r.action)]
+
     def lookup_action_map(self, shape: str, action: str,
                           terrain: str) -> Optional[ActionMapRule]:
         """Most specific matching ActionMap3DEffect row, or None.
 
         Key format, from the file's own GBK header comment: nine digits in three
         groups of three -- shape (外形), action (动作), terrain (地形).  "999" is
-        a wildcard and two wildcards may appear at once.
+        a wildcard and two wildcards may appear at once.  **The header is the
+        CCO-era shape**; 5517 and 6090 write the action group four wide, so the
+        key is ten digits there.  `EffectDB.__init__` cuts it accordingly.
+
+        `_field_matches`, not a literal `in (WILDCARD, ...)`, for the same
+        reason `lookup_action_effect` uses it: a caller spelling the action
+        `330` must reach a rule spelling it `0330`.  Getting the rows parsed
+        without this would have been a fix that changed the row count and not
+        the answers.  MEASURED on all three bases -- see CORRECTIONS C35.
+
+        Note the action group here is never all-nines on any base (0 of 60 on
+        CCO, 0 of 126 on both official clients), so the *sentinel* half of C35
+        does not arise in this table; shape and terrain wildcards are `999`
+        everywhere and `WILDCARD` is right for them.
         """
         best: Optional[ActionMapRule] = None
         for r in self.action_map:
-            if r.shape not in (WILDCARD, str(shape)):
+            if not self._field_matches(r.shape, str(shape)):
                 continue
-            if r.action not in (WILDCARD, str(action)):
+            if not self._field_matches(r.action, str(action)):
                 continue
-            if r.terrain not in (WILDCARD, str(terrain)):
+            if not self._field_matches(r.terrain, str(terrain)):
                 continue
             if best is None or r.specificity > best.specificity:
                 best = r
         return best
 
     # -- effect resolution -------------------------------------------------
+
+    @staticmethod
+    def _table_get(table: dict[str, str], key: str) -> str:
+        """One id looked up so a **padding difference cannot read as absence.**
+
+        The gate is per file, so a base may legitimately serve the effect
+        definitions compiled (ids as plain ints) and the path tables plaintext
+        (ids sometimes zero-padded, 46 of them in `3dtexture.ini`), or the
+        reverse.  A raw string lookup across that boundary misses every padded
+        row and reports "the table does not have it" -- the failure mode
+        docs/CORRECTIONS.md §2 records four separate instances of.  Try the
+        literal spelling first, then the canonical integer one.
+        """
+        if key in table:
+            return table[key]
+        if key.isdigit():
+            return table.get(str(int(key)), "")
+        return ""
 
     def resolve(self, name: str) -> Optional[EffectDef]:
         """Return a copy of the effect definition with asset paths filled in."""
@@ -1028,10 +1907,10 @@ class EffectDB:
         e = EffectDef(**{**asdict(base), "layers": []})
         for lay in base.layers:
             L = EffectLayer(**asdict(lay))
-            raw_mesh = self.objs.get(L.effect_id, "")
+            raw_mesh = self._table_get(self.objs, L.effect_id)
             L.mesh_path = raw_mesh.replace("\\", "/")
             L.mesh_found = bool(L.mesh_path) and self.assets.exists(L.mesh_path)
-            raw_tex = self.textures.get(L.texture_id, "")
+            raw_tex = self._table_get(self.textures, L.texture_id)
             L.texture_path = raw_tex.replace("\\", "/")
             L.texture_found = bool(L.texture_path) and self.assets.exists(L.texture_path)
             e.layers.append(L)
@@ -1078,9 +1957,26 @@ class EffectDB:
 # reporting
 # ---------------------------------------------------------------------------
 
+def _base_identity(db: EffectDB) -> dict:
+    """Which install these numbers are *about*, emitted beside every number.
+
+    A tool that resolves a root silently reports the wrong base's answer with
+    no error at all (docs/CORRECTIONS.md C21, C22, C33).  Stating the resolved
+    root and its `base_id` in the output turns that into something a reader
+    can catch: two bases with identical counts *and* an identical `root` are
+    one measurement printed twice.
+    """
+    try:
+        base = coroot.base_id(db.root)
+    except Exception as exc:                                  # pragma: no cover
+        base = f"<unavailable: {exc}>"
+    return {"root": str(db.root), "base_id": base,
+            "tables_read": {k: v.as_dict() for k, v in sorted(db.sources.items())}}
+
+
 def coverage(db: EffectDB) -> dict:
     """The numbers quoted in docs/effects.md."""
-    out: dict = {}
+    out: dict = dict(_base_identity(db))
 
     types = sorted(db.weapon_impact)
     out["weapon_types_with_impact"] = len(types)
@@ -1149,84 +2045,208 @@ def coverage(db: EffectDB) -> dict:
     out["effects_partially_resolved"] = partial
     out["effects_unresolved"] = broken
     out["json_only_effect_names"] = len(db.json_only)
+    # Names are unique in the plaintext table and in 5517's compiled one, and
+    # NOT in 6090's -- printed so a name-keyed count is never mistaken for a
+    # record count.
+    out["duplicate_effect_names"] = len(db.duplicate_effect_names)
 
     # which animation form backs each 3DEffectObj entry
     kinds: dict[str, int] = {}
     obj_kind: dict[str, set[str]] = {}
+    obj_ok: dict[str, bool] = {}
+    obj_undecoded: dict[str, bool] = {}
+    ptcl_chunks = ptcl_exact = 0
     for oid, path in db.objs.items():
         o = load_effect_object(db.assets, oid, path)
         obj_kind[oid] = o.kinds
+        obj_ok[oid] = o.playable
+        obj_undecoded[oid] = bool(o.undecoded)
+        for p in o.parts:
+            if p.kind == PART_PARTICLE:
+                ptcl_chunks += 1
+                ptcl_exact += bool(p.particle and p.particle.exact)
         k = "+".join(sorted(o.kinds)) or ("missing" if o.error else "empty")
         kinds[k] = kinds.get(k, 0) + 1
     out["effect_objects_total"] = len(db.objs)
     out["effect_objects_by_animation_form"] = dict(sorted(kinds.items()))
+    out["particle_chunks_in_effect_objects"] = ptcl_chunks
+    out["particle_chunks_exact"] = ptcl_exact
 
-    # and what that means for the effects that reference them
-    playable = particle_only = mixed = unknown = 0
+    # and what that means for the effects that reference them.
+    #
+    # Two classifications are emitted from ONE pass, deliberately.  The
+    # `*_geometry_only` numbers reproduce the pre-particle-reader definition
+    # -- "playable" meant "has no particle layer" -- so the before/after
+    # comparison in docs/effects.md §9 is two numbers from one run of one
+    # build, rather than two runs of two builds against a moving corpus.
+    playable = geom_only = particle_only = mixed = unknown = undecoded = 0
+    reader_gap = asset_gap = 0
     for name in sorted(db.effects):
         e = db.resolve(name)
         ks: set[str] = set()
+        ok = True
+        gap_reader = gap_asset = False
         for L in e.layers:
             ks |= obj_kind.get(L.effect_id, set())
+            if L.effect_id in obj_ok and not obj_ok[L.effect_id]:
+                ok = False
+                if obj_undecoded.get(L.effect_id):
+                    gap_reader = True
+                else:
+                    gap_asset = True
         if not ks:
             unknown += 1
-        elif ks == {PART_PARTICLE}:
+            continue
+        if ks == {PART_PARTICLE}:
             particle_only += 1
         elif PART_PARTICLE in ks:
             mixed += 1
         else:
+            geom_only += 1
+        if ok:
             playable += 1
+        else:
+            undecoded += 1
+            reader_gap += gap_reader
+            asset_gap += gap_asset and not gap_reader
     out["effects_playable_today"] = playable
+    out["effects_playable_geometry_only"] = geom_only
     out["effects_particle_only"] = particle_only
     out["effects_partly_particle"] = mixed
+    out["effects_needing_particles"] = particle_only + mixed
+    # **This key conflates two unrelated failures and is kept as it was so the
+    # before/after in docs/effects.md §9 compares like with like.**  It counts
+    # an effect that has *some* decodable geometry and *some* unplayable
+    # layer -- and a layer whose C3 is simply absent from the install counts
+    # here too, which the name does not say.  6090's single hit is exactly
+    # that: `800540` names eight layers, seven of whose C3s do not exist and
+    # one of which points at `800530/8.c3`, another effect's file.  A data
+    # bug, not a reader gap.  The two causes are split out below; quote those.
+    out["effects_with_undecoded_chunk"] = undecoded
+    out["effects_blocked_by_undecoded_chunk"] = reader_gap
+    out["effects_blocked_by_missing_asset"] = asset_gap
     out["effects_no_geometry"] = unknown
 
     # the subset the viewer actually needs: effects reachable from a weapon
     weapon_effects: set[str] = set()
     for a in apps:
         weapon_effects.update(db.effects_for_weapon(a).effect_names)
-    wp = wpart = wmiss = 0
+    wp = wgeom = wpart = wmiss = 0
     for n in sorted(weapon_effects):
         e = db.resolve(n)
         if e is None:
             wmiss += 1
             continue
         ks: set[str] = set()
+        ok = True
         for L in e.layers:
             ks |= obj_kind.get(L.effect_id, set())
+            if L.effect_id in obj_ok and not obj_ok[L.effect_id]:
+                ok = False
         if not ks:
             wmiss += 1
-        elif PART_PARTICLE in ks:
+            continue
+        if PART_PARTICLE in ks:
             wpart += 1
         else:
-            wp += 1
+            wgeom += 1
+        wp += ok
     out["weapon_reachable_effects"] = len(weapon_effects)
     out["weapon_reachable_playable"] = wp
+    out["weapon_reachable_geometry_only"] = wgeom
     out["weapon_reachable_partly_particle"] = wpart
     out["weapon_reachable_unresolved"] = wmiss
     return out
 
 
 #: Every ini in this install whose values are asset paths.  Together they name
-#: every C3 the client can reach by name.
+#: every C3 the client can reach by name -- **on a base that has no compiled
+#: twins**.  See `PATH_DBCS` and `asset_paths`: on patch5517/6090 this set is
+#: badly incomplete, and two of its members are zero bytes long.
 PATH_INIS = ("3DEffectObj.ini", "WeaponMotion.ini", "3dobj.ini", "3dmotion.ini",
              "miscmotion.ini", "MountMotion.ini")
 
+#: The compiled `RSDB` twins of the same tables.  `core/dbc.py` states the rule
+#: this exists to honour: *where a compiled twin exists the client reads the
+#: twin, and the `.ini` beside it is a decoy* -- per file and per base, never
+#: per client.  Filenames differ in case from their ini partners in the
+#: shipped installs, so the lookup below is case-insensitive.
+#:
+#: **This list is used for its VALUES only** -- `asset_paths` wants the set of
+#: paths an install names, and never looks up a row by id.  That is why
+#: `weaponmotion.dbc` is safe here and is *not* safe on the definitions path:
+#: its key encoding is undecoded and joins 0 of 25,944 ini ids.  See
+#: `EffectDB.__init__`.
+PATH_DBCS = ("3DEffectobj.dbc", "weaponmotion.dbc", "3DObj.dbc",
+             "3dmotion.dbc", "miscmotion.dbc", "mountmotion.dbc")
+
+
+def asset_paths(root: Path | str) -> list[str]:
+    """Every asset path this install names, from the ini tables **and their
+    compiled twins**.
+
+    MEASURED, and it is not a rounding error.  On `patch5517` the plaintext
+    tables name 13,533 distinct paths and the `.dbc` twins name 21,993, of
+    which **8,493 appear in no ini at all**; 4,324 of those are C3 files that
+    exist, and they hold 328 `PTCL`, 1,610 `PTC3` and **all 6 of that
+    install's `PTCX` chunks**.  `ini/miscmotion.ini` and `ini/MountMotion.ini`
+    are **zero bytes** there while their twins hold 218 and 784 rows.
+    Enumerating the plaintext alone reports `PTCX` as a form no install ships
+    -- which is how this was found, and is exactly wrong.
+
+    CCO is the mirror case: it ships **no `.dbc` at all** and its plaintext is
+    complete.  So twin-presence and twin-absence both have to be checked, per
+    file and per base, rather than inferred from the client.
+
+    The two sets are **unioned**, not substituted: `.dbc` is the client's
+    source of truth where it exists, but an ini-only row still names a real
+    asset and dropping it would trade one blind spot for another.
+    """
+    root = Path(root)
+    ini = root / "ini"
+    out: dict[str, None] = {}
+    for name in PATH_INIS:
+        p = ini / name
+        if p.is_file():
+            for v in read_flat(p).values():
+                out.setdefault(v.replace("\\", "/"), None)
+    lower = {p.name.lower(): p for p in ini.glob("*.dbc")} if ini.is_dir() else {}
+    for name in PATH_DBCS:
+        p = lower.get(name.lower())
+        if p is None:
+            continue
+        try:
+            data = p.read_bytes()
+            if dbc.magic(data) != b"RSDB":
+                continue
+            for v in dbc.Rsdb.parse(data).paths.values():
+                out.setdefault(v.replace("\\", "/"), None)
+        except Exception:                                     # pragma: no cover
+            continue
+    return list(out)
+
 
 def validate(db: EffectDB, limit: Optional[int] = None) -> dict:
-    """Re-derive the parser proof: every MOTI/SHAP/SMOT chunk in every C3 named
-    by a path-valued ini must consume exactly its declared chunk length."""
+    """Re-derive the parser proof: every MOTI/SHAP/SMOT/PTCL/PTCX/PTC3 chunk in
+    every C3 this install names must consume exactly its declared chunk length.
+
+    The corpus comes from `asset_paths`, i.e. the ini tables **unioned with
+    their compiled `.dbc` twins**.  Enumerating the plaintext alone misses
+    4,324 existing C3 files on patch5517 and every `PTCX` chunk in the
+    project; see `asset_paths` for the measurement.
+    """
     seen: set[str] = set()
-    stats = {k: 0 for k in ("files", "missing", "MOTI", "MOTI_exact", "SHAP",
-                            "SHAP_exact", "SMOT", "SMOT_exact", "PTCL", "PTC3",
-                            "errors")}
+    stats: dict = dict(_base_identity(db))
+    stats |= {k: 0 for k in ("files", "missing", "MOTI", "MOTI_exact", "SHAP",
+                            "SHAP_exact", "SMOT", "SMOT_exact",
+                            "PTCL", "PTCL_exact", "PTCX", "PTCX_exact",
+                            "PTC3", "PTC3_exact",
+                            "particle_frames", "particle_frames_empty",
+                            "particle_peak", "errors")}
     enc: dict[str, int] = {}
     problems: list[str] = []
-    paths: list[str] = []
-    for name in PATH_INIS:
-        p = db.ini / name
-        if p.is_file():
-            paths.extend(read_flat(p).values())
+    paths = asset_paths(db.root)
+    stats["paths_named"] = len(paths)
     for lg in paths:
         lg = lg.replace("\\", "/")
         key = lg.lower()
@@ -1266,8 +2286,18 @@ def validate(db: EffectDB, limit: Optional[int] = None) -> dict:
                     stats["SMOT_exact"] += s.exact
                     if not s.exact:
                         problems.append(f"{lg} SMOT {s.consumed}/{s.size}")
-                elif ch.tag in (b"PTCL", b"PTC3"):
-                    stats[ch.tag.decode()] += 1
+                elif ch.tag in PTCL_TAGS:
+                    tag = ch.tag.decode()
+                    p = parse_ptcl(ch.body, PTCL_TAGS[ch.tag], tag)
+                    stats[tag] += 1
+                    stats[tag + "_exact"] += p.exact
+                    stats["particle_frames"] += p.frame_count
+                    stats["particle_frames_empty"] += sum(
+                        1 for f in p.frames if not f.count)
+                    stats["particle_peak"] = max(stats["particle_peak"],
+                                                 p.peak_particles)
+                    if not p.exact:
+                        problems.append(f"{lg} {tag} {p.consumed}/{p.size}")
             except Exception as exc:
                 stats["errors"] += 1
                 problems.append(f"{lg} {ch.name}: {exc}")
@@ -1367,7 +2397,10 @@ def build_linkage(db: EffectDB, *, with_geometry: bool = True) -> dict:
             entry = {"path": obj.logical, "kinds": sorted(obj.kinds),
                      "frames": obj.frame_count,
                      "effective_frames": obj.effective_frames,
-                     "parts": len(obj.parts)}
+                     "parts": len(obj.parts),
+                     "playable": obj.playable}
+            if obj.undecoded:
+                entry["undecoded"] = obj.undecoded
             if obj.error:
                 entry["error"] = obj.error
             if obj.source:
@@ -1403,6 +2436,10 @@ def build_linkage(db: EffectDB, *, with_geometry: bool = True) -> dict:
             "target_effect": v.get("TargetEffect", "")}
         for k, v in sorted(db.flying.items())}
 
+    # Which file each of these came from. On a base with compiled twins the
+    # ini alone is a floor, so an artefact built from it has to say which it
+    # read -- the same reason a derived index carries its base id.
+    doc["table_sources"] = {k: dict(v) for k, v in sorted(db.table_sources.items())}
     doc["effect_objects"] = {k: v.replace("\\", "/") for k, v in sorted(db.objs.items())}
     doc["effect_textures"] = {k: v.replace("\\", "/") for k, v in sorted(db.textures.items())}
     doc["weapon_motion"] = {k: v.replace("\\", "/") for k, v in sorted(db.weapon_motion.items())}
@@ -1461,7 +2498,20 @@ def _print_effect(db: EffectDB, name: str) -> None:
                       f" segments={p.shape.segments}"
                       f" smot_frames={p.smotion.frame_count if p.smotion else 0}")
             elif p.kind == PART_PARTICLE:
-                print(f"          {p.name:<5}{'':<14} {p.raw_size} bytes (undecoded)")
+                q = p.particle
+                if q is None:
+                    print(f"          {p.name:<5}{'':<14} {p.raw_size} bytes"
+                          f" (UNDECODED)")
+                    continue
+                env = ""
+                if q.envelope is not None:
+                    e3 = q.envelope
+                    env = (f" billboard={e3.billboard} world={e3.world_space}"
+                           f" alpha={e3.alpha} fade={e3.fade_frames}")
+                print(f"          {p.name:<5}{q.name[:14]:<14}"
+                      f" frames={q.frame_count} peak={q.peak_particles}"
+                      f" max={q.max_particles} atlas={q.tex_grid}x{q.tex_grid}"
+                      f" {q.consumed}/{q.size} bytes{env}")
     ms = db.duration_ms(name)
     if ms is not None:
         print(f"  duration   {ms:.0f} ms")
@@ -1531,8 +2581,13 @@ def main(argv: list[str]) -> int:
     if args.validate:
         print(json.dumps(validate(db), indent=2, ensure_ascii=False))
     if args.linkage:
+        # `derived_path` with no root resolves the *configured* install, not
+        # the one `--root` just made us read -- so `--root <B> --linkage`
+        # used to read B and write into A's namespace, reporting "wrote"
+        # either way.  Same defect class as docs/CORRECTIONS.md C22; measured
+        # and registered as C33.  Pass the root we actually read.
         out = (Path(args.out) if args.out
-               else coroot.derived_path("out/effects/linkage.json"))
+               else coroot.derived_path("out/effects/linkage.json", args.root))
         out.parent.mkdir(parents=True, exist_ok=True)
         doc = build_linkage(db)
         text = (json.dumps(doc, indent=1, ensure_ascii=False) if args.pretty

@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import os
 import re
 import statistics
 import sys
@@ -48,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import c3phy                                              # noqa: E402
+import dbcshadow                                          # noqa: E402
 import effects as fx                                      # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, parse_ini   # noqa: E402
 
@@ -102,14 +104,37 @@ SLOT_SOCKET = {
 #: form `1480100 = c3/0001/410/100.c3` -- and the dominant non-`000` folder
 #: per set is unambiguous (480 -> 410, 350 -> 560, 370 -> 500, 380 -> 741).
 #:
-#: **6090 ships none of those rows** in either the stale ini or the compiled
-#: dbc, so a lookup for `<shape>480<action>` misses and falls through to the
-#: unarmed folder -- which posed every armed character empty-handed. The
-#: folders themselves all still ship (6090 keys 18 of them), so the mapping
-#: is what went missing, not the motions.
+#: A lookup for `<shape>480<action>` misses on 6090 and falls through to the
+#: unarmed folder, which posed every armed character empty-handed. The folders
+#: themselves all still ship (6090 keys 18 of them), so the mapping is what
+#: went missing, not the motions.
 #:
 #: RECOVERED, not inferred: this is TQ's pairing, read out of a client of
 #: the same lineage. Applied only when the aliased target actually exists.
+#:
+#: **CORRECTION (CORRECTIONS C27, and this comment is its home).** Every
+#: version of this note, and four documents citing it, said *"6090 ships none
+#: of those rows in either the stale ini or the compiled dbc"*. Half wrong,
+#: and wrong in this project's most familiar way -- a padding mismatch read as
+#: absent content. **The rows are in every official plaintext `3dmotion.ini`,
+#: spelled ten wide and zero-padded**::
+#:
+#:     CCO           1480100 = c3/0001/410/100.c3
+#:     5017..6090 0001480100 = c3/0001/410/100.c3      1480100 -> None
+#:
+#: What is absent is the *seven-wide* spelling every caller builds. Measured
+#: against this table on shape 001 action 100: the padded ini agrees with it
+#: on **108 of 122** weapon sets on 5017 (109 on 5165/5517/6090), disagrees on
+#: exactly one (`672`, where the ini says folder 611 and this table says 612),
+#: and is silent on the other 13.
+#:
+#: **This table is still right for 5517 and 6090**, where that ini is a stale
+#: decoy and the live `.dbc` genuinely does drop the alias rows -- it rebuilds
+#: keys from paths, so an alias cannot survive there even in principle. It is
+#: **not** needed on 5017/5065/5165, where the plaintext table is live and
+#: answers the question itself; `Catalogue._load_flat` now indexes the padded
+#: spelling, so the client's own data is consulted first and this table is the
+#: fallback rather than the source. See `plugins/plaintext.py`.
 WEAPON_MOTION_SET = {
     "350": "560",
     "360": "410",
@@ -242,6 +267,16 @@ def motion_set_for(weapon_type: str) -> str:
     return WEAPON_MOTION_SET.get(ws, ws)
 
 
+#: A body-motion row's value: `c3/<shape4>/<set3>/<action1-3>.c3`. The path
+#: spells all three fields of the lookup key, which is why a key can be
+#: rebuilt from it when the container spells the key some other way -- the
+#: compiled twin stores an integer id that cannot round-trip the shape's
+#: leading zeros, and the official plaintext ini pads the key to ten wide.
+#: Shared by both loaders so the two cannot drift apart, which they have
+#: before (`docs/parser_plugins.md`, "a second motion reader").
+BODY_MOTION_PATH = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
+
+
 #: Sockets a body may not carry; fall back to these in order.
 SOCKET_FALLBACK = {
     "v_head": ("v_armet",),
@@ -290,6 +325,15 @@ class PartMesh:
     chunks: list[Chunk] = field(default_factory=list)
     #: extra chunk tags seen (CAME, PTCL, ...), for reporting only
     other: list[bytes] = field(default_factory=list)
+    #: **The install these bytes came from**, so socket classification asks
+    #: THIS client's `[Dumy]` vocabulary and not `DEFAULT_ROOT`'s. `load()`
+    #: knows it and sets it; `parse()` is handed bare bytes and cannot, so it
+    #: stays None and the module default applies -- which is the old behaviour,
+    #: preserved deliberately rather than guessed at. Callers that hold a root
+    #: and parse bytes (`parts.moti_sockets`, `thumbs.mesh_geometry`,
+    #: `superfx._bbox`) still get `DEFAULT_ROOT`; threading it to them is the
+    #: other half of this fix and is not done here.
+    root: Optional[Path] = None
 
     # -- loading ----------------------------------------------------------
     @classmethod
@@ -324,7 +368,15 @@ class PartMesh:
 
     @classmethod
     def load(cls, root: AssetRoot, logical: str) -> "PartMesh":
-        return cls.parse(root.read(logical), logical)
+        m = cls.parse(root.read(logical), logical)
+        m.root = getattr(root, "root", None)
+        return m
+
+    def _root(self) -> Path:
+        """This mesh's install, or the module default when it was parsed from
+        bare bytes. Never None, so every socket test has a root to name in the
+        exception if the vocabulary turns out to be unreadable."""
+        return self.root if self.root is not None else DEFAULT_ROOT
 
     # -- the engine's own accessors ---------------------------------------
     def find(self, name: str) -> int:
@@ -359,10 +411,9 @@ class PartMesh:
         matrix that `C3Mesh::SetMatrix` (`0x27B30`) hands each phy.
         """
         for c in self.bind_chunks():
-            if skip_sockets and is_socket_name(c.name):
+            if skip_sockets and is_socket_name(c.name, self._root()):
                 continue
-            q = copy.deepcopy(c.phy)
-            c3phy.apply_matrix_to(q)         # the chunk's own 4x4, as Phy_Load does
+            q = c3phy.apply_matrix_copy(c.phy)         # the chunk's own 4x4, as Phy_Load does
             for v in q.vertices:
                 yield transform_vertex(v, c.motion, world, frame)
 
@@ -387,10 +438,72 @@ class _EmptyPhy:
         self.vertex_count = 0
 
 
-#: The 52 `[Dumy]` names, lowercased.  Filled from `ini/RolePart.ini` the first
-#: time it is needed; the literal fallback is that file's contents in this build.
-_DUMY: set[str] = set()
+class DumyVocabularyUnavailable(RuntimeError):
+    r"""The `[Dumy]` socket vocabulary could not be read for a root.
 
+    **This is deliberately an exception and not an empty set**, and the
+    precedent is `clientlock.running_clients()`, which was made to raise
+    `ClientProbeError` for the same reason: *"I could not tell" must not read
+    as "the box is empty."*  Here the collapse is *"no socket"* reading as
+    *"this mesh has no glow anchor"* -- and the reader who believes it goes
+    and looks at the mesh, which is not the problem.
+
+    So the message names all three things a reader needs to not do that: the
+    **root** it read from, the **count** it got, and -- when the caller was
+    asking about a specific chunk -- the **socket** that was missing.  A bare
+    `FileNotFoundError` names only a path and sends the next reader to the
+    art.  Requested verbatim by Render Correctness and adopted as a
+    requirement, not a nicety.
+
+    Attributes are kept as fields (`root`, `count`, `socket`, `reason`) so a
+    handler can branch on them without parsing the string.
+    """
+
+    def __init__(self, root, count: int = 0, socket: Optional[str] = None,
+                 reason: str = ""):
+        self.root = str(root)
+        self.count = int(count)
+        self.socket = socket
+        self.reason = reason
+        msg = "read `[Dumy]` from %s: %d names" % (self.root, self.count)
+        if socket:
+            msg += ", `%s` not among them" % socket
+        if reason:
+            msg += " -- " + reason
+        msg += ("; the socket VOCABULARY is unavailable, so membership cannot "
+                "be decided. This says nothing about the mesh.")
+        super().__init__(msg)
+
+
+#: `ini/RolePart.ini [Dumy]` per root, lowercased. **Keyed by root**, because a
+#: single global was the defect: `dumy_names(root=X)` returned whatever the
+#: FIRST caller had loaded, so a second install in the same process silently
+#: got the first one's vocabulary.
+#:
+#: Only successful reads are cached. A failure is not cached (an install that
+#: gets fixed mid-process must be re-read) and neither is the `fallback=True`
+#: answer (a permissive answer must never leak into a later strict call --
+#: that is the whole bug class this cache is being fixed for).
+_DUMY_CACHE: dict[str, set[str]] = {}
+
+#: **CCO's and 7878's `[Dumy]` list, which happen to be set-identical** -- NOT
+#: a universal vocabulary, and measurably not most installs': 5017, 5065, 5165,
+#: 5517, 6090, 6609 and Zephyr-1057 each declare **7** names
+#: (`v_armet v_l_shield v_l_weapon v_misc v_mount v_r_shield v_r_weapon`), so
+#: applying these 52 to one of those over-accepts by 45.
+#:
+#: **Never the silent default.** It used to be returned on ANY read failure,
+#: which is why a nonexistent root, and an empty directory, both confidently
+#: reported a 52-name vocabulary they did not have. It now requires an explicit
+#: `fallback=True` from a caller that has decided it wants CCO's list.
+#:
+#: MEASURED 2026-08-15: **no caller needs it.** All eight installs declared on
+#: this box -- the seven official patches plus `cco` (the root `coroot`
+#: resolves for that kind; `coroot.CONVENTIONAL_ROOT` on this one) -- ship a
+#: readable `ini/RolePart.ini` with a non-empty `[Dumy]`, the real CCO
+#: install included.
+#: It is kept only because removing a lifeline in the same change that arms a
+#: raise is two changes; if a later pass finds it still unused, delete it.
 _DUMY_FALLBACK = """V_ARMET_EFFECT01 V_ARMET_EFFECT02 v_armet v_back v_head
 v_l_flap v_l_foot v_l_forearm v_l_leg v_l_shield v_l_shoulder v_l_weapon
 v_mantle v_misc v_mount v_pelvis v_pet v_r_leg v_r_flap v_r_foot v_r_forearm
@@ -399,25 +512,69 @@ v_zero v_mount_01 v_slot v_r_slot01 v_r_slot02 v_l_slot01 v_l_slot02 v_l_arm
 v_r_arm""".split() + [f"v_extend{i}" for i in range(1, 16)]
 
 
-def dumy_names(root: Path | str = DEFAULT_ROOT) -> set[str]:
-    """`ini/RolePart.ini [Dumy]`, lowercased.  52 entries in this build."""
-    global _DUMY
-    if _DUMY:
-        return _DUMY
+def _dumy_cache_key(root: Path | str) -> str:
+    """Normalised so `5517`, `5517/`, and `5517` in the other case are one key
+    on Windows, and two different installs are never one key anywhere."""
+    return os.path.normcase(os.path.abspath(str(root)))
+
+
+def dumy_names(root: Path | str = DEFAULT_ROOT, *,
+               fallback: bool = False) -> set[str]:
+    r"""`ini/RolePart.ini [Dumy]` for **this** root, lowercased.
+
+    MEASURED per install, 2026-08-15, and the spread is the point -- there is
+    no single answer to cache::
+
+        5017 5065 5165 5517 6090 6609 Zephyr-1057-local   [Dumy] =  7
+        7878                                              [Dumy] = 52
+        cco  (whatever root `coroot` resolves for it)      [Dumy] = 52
+
+    Raises `DumyVocabularyUnavailable` when the file cannot be read or declares
+    nothing. It used to return `_DUMY_FALLBACK` there, silently -- see that
+    constant, and the exception's own docstring, for why silence was the bug.
+
+    `fallback=True` is the explicit opt-in for a caller that has decided CCO's
+    52 names are the right guess for its input. Nothing in this repo passes it;
+    it exists so an unforeseen caller has a documented escape that is visible
+    in a grep rather than a default nobody can see.
+    """
+    key = _dumy_cache_key(root)
+    hit = _DUMY_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    ini = Path(root) / "ini" / "RolePart.ini"
+    names: set[str] = set()
+    reason = ""
     try:
-        cfg = parse_ini(Path(root) / "ini" / "RolePart.ini")
+        cfg = parse_ini(ini)
         vals = [v for k, v in cfg.get("Dumy", {}).items()
                 if k.lower() != "count" and v]
-        _DUMY = {v.lower() for v in vals}
-    except Exception:
-        _DUMY = set()
-    if not _DUMY:
-        _DUMY = {n.lower() for n in _DUMY_FALLBACK}
-    return _DUMY
+        names = {v.lower() for v in vals}
+        if not names:
+            reason = "%s declares no non-empty [Dumy] entries" % ini
+    except FileNotFoundError:
+        reason = "%s does not exist" % ini
+    except Exception as e:                                # noqa: BLE001
+        # Anything else the reader can throw, including `dbcshadow.ShadowedIni`
+        # if a future client ever ships a compiled RolePart twin. Measured
+        # 2026-08-15: none of the eight installs here does, so this arm is
+        # unexercised -- named rather than assumed absent.
+        reason = "%s could not be read: %s: %s" % (ini, type(e).__name__, e)
+
+    if not names:
+        if fallback:
+            # Deliberately NOT cached: see `_DUMY_CACHE`.
+            return {n.lower() for n in _DUMY_FALLBACK}
+        raise DumyVocabularyUnavailable(root, 0, reason=reason)
+
+    _DUMY_CACHE[key] = names
+    return names
 
 
-def is_socket_name(name: str) -> bool:
-    """True for a `[Dumy]` marker chunk, i.e. an attachment point rather than
+def is_socket_name(name: str, root: Path | str = DEFAULT_ROOT, *,
+                   fallback: bool = False) -> bool:
+    r"""True for a `[Dumy]` marker chunk, i.e. an attachment point rather than
     visible geometry.
 
     Membership of the `[Dumy]` list is the test, not a `v_` prefix: hair meshes
@@ -427,9 +584,42 @@ def is_socket_name(name: str) -> bool:
     `Mesh::Draw` (graphic.dll `0x25F53`) and exposed as vtable slot `+0x38`
     (`0x26AC0`) -- but that flag is set by the packed exe, so a name test is
     the best available reconstruction.
+
+    **`root` MUST be the install the mesh came from.** It used to be fixed at
+    module-level `DEFAULT_ROOT` whatever the caller was holding, and the
+    consequence is measured, narrow, and worth stating precisely:
+
+    > **On 7878 bodies read under a 5517 vocabulary, and nowhere else.**
+    > A 5517 root declares 7 names; 7878 meshes carry chunks named `v_back`,
+    > `v_head`, `v_zero`, `v_slot`, `v_mantle`, `v_pet`, `v_pelvis`,
+    > `v_l_arm`, `v_r_arm`, `v_l_leg`, `v_r_leg`, `v_l_foot`, `v_l_slot01/02`
+    > and `v_r_slot01` (counted over a 353-mesh sweep of 7878's `3dobj.ini`),
+    > none of which a 7-name vocabulary contains. `parts.moti_sockets` keeps a
+    > chunk only if this function accepts it, so each of those is **dropped,
+    > not reported unknown**: the mesh carries the anchor, the anchor has a
+    > matrix, and the resolver never sees it. In `world_vertices` the same
+    > miss goes the other way and draws the socket as geometry.
+    >
+    > **This is not a fact about the client family.** It is a fact about a
+    > root/mesh mismatch, and it disappears the moment the caller passes the
+    > root the mesh came from.
+
+    Raises `DumyVocabularyUnavailable` when the vocabulary cannot be read,
+    re-raised with the chunk name attached so the message says *which* lookup
+    died rather than just which file was missing.
+
+    `v_body` short-circuits before the vocabulary is consulted, exactly as it
+    did before, so that one answer never depends on a readable install.
     """
     n = (name or "").lower()
-    return n != "v_body" and n in dumy_names()
+    if n == "v_body":
+        return False
+    try:
+        vocab = dumy_names(root, fallback=fallback)
+    except DumyVocabularyUnavailable as e:
+        raise DumyVocabularyUnavailable(e.root, e.count, socket=name,
+                                        reason=e.reason) from None
+    return n in vocab
 
 
 # ---------------------------------------------------------------------------
@@ -566,25 +756,61 @@ class Catalogue:
         The dbc keys are rebuilt from each row's path, not its integer id,
         for the reason `anim.MotionIndex` documents: the ini key space
         strips the shape's leading zeros and `int()` cannot round-trip it.
+
+        THE SAME REBUILD IS NEEDED FROM THE INI, FOR THE OPPOSITE REASON
+        ----------------------------------------------------------------
+        **The official plaintext `3dmotion.ini` spells the body-motion key
+        TEN WIDE AND ZERO-PADDED where CCO spells it seven wide**, and
+        `idle_motion` builds the seven-wide form. MEASURED, the same lookup
+        against every install on this machine::
+
+            5017..6090 ini   0001410100 = c3/0001/410/100.c3   1410100 -> None
+            CCO        ini      1410100 = c3/0001/410/100.c3
+
+        On 5517 and 6090 that never showed, because the compiled twin
+        rebuilds the seven-wide key from the path and lands on top. On
+        5017/5065/5165 there is no twin, so **every body-motion lookup
+        missed** -- both readers, 100%, silently: `parts.idle_motion`
+        returned None for ws=000 and ws=480 on all three and
+        `anim.AnimDB.clip` returned None, after which a static preview falls
+        back to the mesh's embedded MOTI, which on shape 004 is a T-pose.
+        Nothing raised. That is the padding trap `docs/parser_plugins.md`
+        warns about, living in a reader rather than in a plugin.
+
+        `setdefault`, deliberately: an explicit key in the file always wins
+        over one derived from a path, so this can only ADD keys and cannot
+        change an answer any base gives today. The dbc pass still runs after
+        it and still overwrites, so a compiled twin stays authoritative
+        wherever one exists and no stale ini row can shadow a live one.
         """
         p = self.root / "ini" / ini_name
         if p.is_file():
             for line in p.read_text("latin-1", errors="replace").splitlines():
                 if "=" in line:
                     k, v = line.split("=", 1)
-                    into[k.strip()] = v.strip().replace("\\", "/")
-        twin = p.with_suffix(".dbc")
-        if not twin.is_file():
+                    k, v = k.strip(), v.strip().replace("\\", "/")
+                    into[k] = v
+                    m = BODY_MOTION_PATH.match(v)
+                    if m:
+                        into.setdefault(
+                            str(int(m.group(1))) + m.group(2)
+                            + m.group(3).zfill(3), v)
+        # `p.with_suffix(".dbc")` used to spell the twin's name itself, which
+        # only ever worked because NTFS is case-insensitive: this install
+        # pairs `3dobj.ini` with `3DObj.dbc` and `3dtexture.ini` with
+        # `3DTexture.dbc`. `dbcshadow` matches the stem case-insensitively and
+        # is the single place that answers this question.
+        twin = dbcshadow.compiled_twin(p)
+        if twin is None:
             return
         try:
             import dbc as dbcmod
             rows = dbcmod.Rsdb.parse(twin.read_bytes()).paths
         except Exception:                                 # pragma: no cover
             return
-        pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
         for rid, val in rows.items():
             val = val.replace("\\", "/")
-            m = pat.match(val)
+            m = BODY_MOTION_PATH.match(val)
             if m:
                 into[str(int(m.group(1))) + m.group(2) +
                      m.group(3).zfill(3)] = val
@@ -592,9 +818,17 @@ class Catalogue:
                 into[str(rid)] = val
 
     def table(self, ini: str) -> dict:
+        # STALE-INI: armor/armet/weapon/mount have a compiled MESH twin from
+        # 5517 on, and `coassets.PartIni` already reads it. This Catalogue
+        # still reads the plaintext, so on 5517/6090 it describes the 2009
+        # tables rather than the ones the client loads. Converting it is a
+        # behaviour change to the preview pipeline -- it moves ident padding
+        # and row counts -- and belongs with attach's owner, not with the
+        # gate. Declared, greppable, and listed in docs/gamedata.md.
         if ini not in self._tables:
             p = self.root / "ini" / ini
-            self._tables[ini] = parse_ini(p) if p.is_file() else {}
+            self._tables[ini] = (parse_ini(p, allow_stale=True)
+                                 if p.is_file() else {})
         return self._tables[ini]
 
     def mesh_path(self, mesh_id: str) -> Optional[str]:
@@ -752,7 +986,7 @@ def cmd_sockets(cat: Catalogue, body_id: str, frame: int, action: bool) -> None:
     for c in fig.body.chunks:
         if not c.name:
             continue
-        role = "socket" if is_socket_name(c.name) else "geometry"
+        role = "socket" if is_socket_name(c.name, cat.root) else "geometry"
         mo = c.motion
         S = socket_matrix(fig.body, c.name, frame, fig.body_motion)
         sc = mat_scale_rot(S) if S else None
@@ -910,7 +1144,7 @@ def cmd_validate(cat: Catalogue, limit: Optional[int]) -> int:
                   if c.name.lower() == "v_body"), None)
         if c is None or c.motion is None:
             continue
-        q = copy.deepcopy(c.phy); c3phy.apply_matrix_to(q)
+        q = c3phy.apply_matrix_copy(c.phy)
         raw = [-v.pz for v in q.vertices]
         sk = [-transform_vertex(v, c.motion, IDENTITY, 0)[2] for v in q.vertices]
         d = sorted(abs(a - b) for a, b in zip(raw, sk))
@@ -954,9 +1188,9 @@ def cmd_validate(cat: Catalogue, limit: Optional[int]) -> int:
         size = max(1e-6, max(bb[1][i] - bb[0][i] for i in range(3)))
         disp = 0.0
         for c in part.bind_chunks():
-            if is_socket_name(c.name):
+            if is_socket_name(c.name, cat.root):
                 continue
-            q = copy.deepcopy(c.phy); c3phy.apply_matrix_to(q)
+            q = c3phy.apply_matrix_copy(c.phy)
             for v in q.vertices[::7]:
                 a1 = transform_vertex(v, c.motion, S2, 0)
                 a0 = fx.transform_point(S2, (v.px, v.py, v.pz))
@@ -1093,9 +1327,9 @@ def _bbox_no_motion(part: PartMesh, world: Mat4):
     hi = [-1e30] * 3
     n = 0
     for c in part.bind_chunks():
-        if is_socket_name(c.name):
+        if is_socket_name(c.name, part._root()):
             continue
-        q = copy.deepcopy(c.phy); c3phy.apply_matrix_to(q)
+        q = c3phy.apply_matrix_copy(c.phy)
         for v in q.vertices:
             p = fx.transform_point(world, (v.px, v.py, v.pz))
             n += 1

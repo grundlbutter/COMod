@@ -7,15 +7,31 @@
  * half: it measures the viewport, moves pixels, issues requests and builds
  * nodes. If you find yourself doing arithmetic here, it belongs next door.
  *
- * WHY A 2D CANVAS AND NOT gl.js
- * -----------------------------
- * `tools/coplay.py` draws the map on a mesh because it also has a *character*
+ * TWO CANVASES, AND WHY
+ * ---------------------
+ * `#glcanvas` draws the art; `#mapcanvas`, on top of it, draws the overlays.
+ *
+ * The 2D canvas is still the right renderer for the *geometry* of this page.
+ * `tools/coplay.py` draws the map on a mesh because it also has a character
  * standing on it, and one renderer for both is what keeps the two in step.
- * This page has no character: it is looking at flat art through the locked
- * camera, and `docs/map_scenery.md` §6 measures that camera as an exact
- * scale-and-translate of the painted image. So the honest renderer for it is
- * a scale and a translate. Nothing here can express a projection the game
- * does not use, which is a feature.
+ * This page has no character: it is flat art through the locked camera, and
+ * `docs/map_scenery.md` §6 measures that camera as an exact scale-and-
+ * translate of the painted image. Selection outlines, pending passability
+ * edits and the cell diamonds are all that arithmetic and nothing more.
+ *
+ * What changed is where the ART comes from, and it is a performance fact
+ * rather than a geometric one (`docs/asset_decode_perf.md`). Asking the
+ * server for an RGBA PNG per 256-px tile per layer per zoom meant decoding
+ * the same `.dds` once per tile that used it -- MEASURED 72 s to open
+ * `newplain` at fit zoom. `tilebake.js` uploads the map's whole distinct
+ * tile set ONCE, still DXT-compressed, and composites the visible rectangle
+ * on the GPU; the projection it applies is the same scale-and-translate,
+ * expressed as a rect. So this file still cannot express a projection the
+ * game does not use.
+ *
+ * The PNG tile path below is NOT dead code. It is the fallback for a browser
+ * without S3TC and the only path for `passability`, which is drawn from the
+ * cell grid and has no texture in it at all.
  *
  * WHAT IT NEVER DOES
  * ------------------
@@ -50,7 +66,147 @@ const app = {
   previewToken: null,
   previewPath: '',
   dirty: false,
+  gl: null,            // WebGL context for the art layer, once created
+  baker: null,         // TileGround.Baker holding the map's resident DXT
+  bakerMap: '',        // which map the baker currently holds
+  bakerState: 'off',   // off | loading | ready | fallback
+  bakerWhy: '',        // why it fell back; shown in the HUD
+  bakerStats: null,    // { tiles, sprites, bytes, fetchMs, loadMs }
 };
+
+// -------------------------------------------------- the resident art layer
+//
+// `docs/asset_decode_perf.md`. The server used to render one RGBA PNG per
+// 256-px tile per layer per zoom level, decoding the same `.dds` again for
+// every one of them. This is coplay's model instead (`docs/map_memory.md`):
+// fetch the map's whole distinct art set ONCE, still DXT-compressed, upload
+// it to the GPU with no decode anywhere, and composite the visible rectangle
+// locally every frame. After that one bundle no pixel crosses the wire for
+// this map again -- panning, zooming and layer toggles stop being network
+// operations entirely.
+//
+// It degrades rather than fails. No WebGL, no S3TC, or a map with no
+// placeable art each set `bakerState = 'fallback'`, and the PNG tile pyramid
+// further down runs exactly as it did before.
+
+function glContext() {
+  if (app.gl !== null) return app.gl;
+  const c = $('#glcanvas');
+  // premultipliedAlpha MUST be true. tilebake blends SRC_ALPHA /
+  // ONE_MINUS_SRC_ALPHA into a framebuffer that starts fully transparent, so
+  // what lands in it is `rgb * a` with `a` in the alpha channel -- which is
+  // premultiplied by definition. Declaring otherwise makes the compositor
+  // divide nothing out and every partially transparent texel renders dark by
+  // exactly its own alpha. MEASURED before this was set: opaque texels
+  // matched the server renderer to 0.21/255, and alpha-204 texels came out at
+  // exactly 0.8x its value.
+  //
+  // `alpha: true` is separate and also required: the wrapper's checkerboard
+  // has to show through wherever the map paints nothing.
+  const opts = { alpha: true, premultipliedAlpha: true,
+                 antialias: false, depth: false };
+  app.gl = c.getContext('webgl', opts)
+        || c.getContext('experimental-webgl', opts) || false;
+  return app.gl;
+}
+
+async function loadTileset(name) {
+  const fallback = why => {
+    app.bakerState = 'fallback';
+    app.bakerWhy = why;
+    app.bakerMap = '';
+    schedule();
+  };
+  app.bakerState = 'loading';
+  app.bakerWhy = '';
+  app.bakerStats = null;
+  if (typeof TileGround === 'undefined')
+    return fallback('tilebake.js did not load');
+  const gl = glContext();
+  if (!gl) return fallback('this browser has no WebGL');
+  if (!app.baker) app.baker = new TileGround.Baker(gl);
+  if (!app.baker.supported)
+    return fallback('no WEBGL_compressed_texture_s3tc, so DXT cannot be ' +
+                    'uploaded without decoding it');
+
+  const t0 = performance.now();
+  let manifest, buffer;
+  try {
+    const q = '?name=' + encodeURIComponent(name);
+    const [mr, br] = await Promise.all([fetch('/api/mapedit/puzzle' + q),
+                                        fetch('/api/mapedit/tileset' + q)]);
+    if (!mr.ok) return fallback('no tile manifest: ' + (await mr.text()));
+    if (!br.ok) return fallback('no tile bundle: ' + (await br.text()));
+    manifest = await mr.json();
+    buffer = await br.arrayBuffer();
+  } catch (e) {
+    return fallback('tileset fetch failed: ' + e.message);
+  }
+  if (!app.info || app.info.name !== name) return;   // map changed in flight
+  const fetchMs = performance.now() - t0;
+  try {
+    app.baker.load(manifest, buffer);
+  } catch (e) {
+    return fallback('tile upload failed: ' + e.message);
+  }
+  app.bakerMap = name;
+  app.bakerState = 'ready';
+  app.bakerStats = { tiles: app.baker.stats.tiles,
+                     sprites: app.baker.stats.sprites || 0,
+                     bytes: buffer.byteLength, fetchMs,
+                     loadMs: app.baker.stats.loadMs };
+  schedule();
+}
+
+/** Everything the map's art is cached in, dropped together.
+ *
+ *  Staging or unstaging a `.dds` changes the art, and there are now TWO
+ *  caches of it: the page's PNG tile images and the GPU-resident tile set.
+ *  Dropping one and not the other is how a staged texture would appear on
+ *  some layers and not others -- so there is one call, and it does both. */
+function refreshArt() {
+  app.tiles.clear();
+  app.bakerState = 'off';
+  app.bakerMap = '';
+  app.bakerStats = null;
+  clearGL();
+  if (app.info && app.info.ok) loadTileset(app.info.name);
+}
+
+/** True when the GL layer is drawing this map's art -- so the PNG tile path
+ *  must not fetch it as well. */
+function bakerLive() {
+  return app.bakerState === 'ready' && !!app.baker && !!app.info
+      && app.bakerMap === app.info.name;
+}
+
+/** The art rectangle the viewport is showing, in painted-image pixels. */
+function viewRect(state, r) {
+  return [state.ox, state.oy,
+          state.ox + r.w / state.zoom, state.oy + r.h / state.zoom];
+}
+
+function drawGL(state, r) {
+  const gl = app.gl;
+  const c = $('#glcanvas');
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.w * dpr));
+  const h = Math.max(1, Math.round(r.h * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  return app.baker.drawInto(viewRect(state, r),
+                            { layers: state.layers, timeMs: state.t });
+}
+
+function clearGL() {
+  if (!app.gl) return;
+  const c = $('#glcanvas');
+  app.gl.viewport(0, 0, c.width, c.height);
+  app.gl.clearColor(0, 0, 0, 0);
+  app.gl.clear(app.gl.COLOR_BUFFER_BIT);
+}
 
 // ------------------------------------------------------------------ network
 
@@ -223,6 +379,10 @@ async function openMap(name) {
   app.tiles.clear();
   app.pick = null;
   app.pending = [];
+  app.bakerState = 'off';
+  app.bakerMap = '';
+  app.bakerStats = null;
+  clearGL();
   setPaint(false);
   let info;
   try {
@@ -249,6 +409,16 @@ async function openMap(name) {
   renderInspector();
   renderTexCard();
   renderPassCard();
+  // A new map means a new closure. Dropped rather than re-resolved: the
+  // shared-art walk is 13 s, and browsing maps should not pay it once per
+  // click. The card offers the button.
+  co.closure = null;
+  renderCollectCard();
+  loadEntries();
+  // The one fetch this map's art costs. Not awaited: the grid, the HUD and
+  // the inspector are usable immediately, and the art appears when it lands.
+  if (info.ok) loadTileset(info.name);
+  else { app.bakerState = 'fallback'; app.bakerWhy = info.why || 'no art'; }
   if (!info.ok) {
     $('#mapmsg').textContent =
       `${name} has no drawable ground art — ${info.why}`;
@@ -298,11 +468,22 @@ function draw() {
   // seen through a fixed camera, and smoothing it is a lie about the asset.
   g.imageSmoothingEnabled = app.state.zoom < 1;
 
-  const tiles = M.visibleTiles(app.state, r.w, r.h);
-  for (const t of tiles) {
-    const im = tile(t);
-    if (im && im.complete && im.naturalWidth) {
-      g.drawImage(im, t.x, t.y, t.w, t.h);
+  // The four art layers come off the GPU when the map's tile set is resident,
+  // and off the server as PNG tiles when it is not. `passability` is not art
+  // -- it is drawn from the cell grid, has no DXT anywhere in it, and stays
+  // on the tile path in both cases.
+  const onGpu = bakerLive() && drawGL(app.state, r);
+  if (!onGpu) clearGL();
+  // `undefined` means "every enabled layer", which is the original behaviour.
+  const layers = onGpu
+    ? ['passability'].filter(l => app.state.layers[l])
+    : undefined;
+  if (!layers || layers.length) {
+    for (const t of M.visibleTiles(app.state, r.w, r.h, layers)) {
+      const im = tile(t);
+      if (im && im.complete && im.naturalWidth) {
+        g.drawImage(im, t.x, t.y, t.w, t.h);
+      }
     }
   }
   drawSelection(g);
@@ -375,6 +556,34 @@ function updateHud() {
   const s = app.state;
   $('#hud-z').textContent = s ? `${(s.zoom * 100).toFixed(0)}% (level ${M.tileLevel(s.zoom)})` : '—';
   $('#zoom-label').textContent = s ? `${(s.zoom * 100).toFixed(0)}%` : '—';
+  const a = $('#hud-art');
+  if (a) { a.textContent = artStatus(); a.title = artStatusDetail(); }
+}
+
+/** Which path is drawing the art. Worth a permanent readout rather than a
+ *  console line: "the map looks the same but is slow again" is otherwise
+ *  indistinguishable from "the map looks the same". */
+function artStatus() {
+  if (!app.info || !app.info.ok) return '—';
+  if (app.bakerState === 'ready') {
+    const b = app.bakerStats;
+    return b ? `GPU · ${(b.bytes / 1e6).toFixed(1)} MB DXT` : 'GPU';
+  }
+  if (app.bakerState === 'loading') return 'loading…';
+  if (app.bakerState === 'fallback') return 'server PNG';
+  return '—';
+}
+
+function artStatusDetail() {
+  const b = app.bakerStats;
+  if (app.bakerState === 'ready' && b)
+    return `${b.tiles} ground tiles + ${b.sprites} sprites resident, ` +
+           `${(b.bytes / 1e6).toFixed(2)} MB fetched in ${b.fetchMs.toFixed(0)} ms, ` +
+           `uploaded in ${b.loadMs.toFixed(0)} ms. Nothing is fetched per ` +
+           `pan, zoom or layer toggle.`;
+  if (app.bakerState === 'fallback')
+    return 'falling back to server-rendered PNG tiles: ' + app.bakerWhy;
+  return '';
 }
 
 // ------------------------------------------------------------------ input
@@ -642,9 +851,9 @@ function renderTexCard() {
       const r = await api(`/api/stage?path=${encodeURIComponent(path)}` +
                           `&token=${app.previewToken}`, { method: 'POST' });
       toast('staged → ' + r.logical);
-      // The map draws through mods/stage, so the tiles that used this texture
-      // are now wrong. Drop them and let them come back changed.
-      app.tiles.clear();
+      // The map draws through mods/stage, so every cache of this texture is
+      // now wrong. Drop them and let the art come back changed.
+      refreshArt();
       schedule();
       openDrawer();
     } catch (e) {
@@ -761,7 +970,7 @@ async function stagePassability() {
   toast(`staged ${res.changedCount} cell(s); ${res.rowsRechecksummed} row ` +
         `checksum(s) recomputed, ${res.rowChecksumsBad} bad`, 5000);
   app.pending = [];
-  app.tiles.clear();
+  refreshArt();
   app.info = await api('/api/mapedit/map?name=' + encodeURIComponent(app.info.name));
   renderMapCard();
   renderPassCard();
@@ -834,7 +1043,7 @@ async function refreshStage() {
       await api('/api/unstage?path=' + encodeURIComponent(r.logical),
                 { method: 'POST' });
       await refreshStage();
-      app.tiles.clear();
+      refreshArt();
       if (app.info) {
         app.info = await api('/api/mapedit/map?name=' +
                              encodeURIComponent(app.info.name));
@@ -881,6 +1090,258 @@ async function savePage(name) {
   } catch (e) { toast('snapshot failed: ' + e.message, 4000); return null; }
 }
 window.saveShot = savePage;
+
+// ---------------------------------------------- collect / export a map
+//
+// A map is a closure, not a file. Three things about that closure are
+// surprising enough that this shows them BEFORE anything is taken, and
+// every toggle is one of those facts rather than a preference:
+//
+//   * its scenery is a small named subset of an index shared with other
+//     maps -- 09christmas01 takes 15 tiles from an index of 363, and that
+//     index is used by 31 other maps;
+//   * nearly all of its art lives inside c3.wdf/data.wdf, so a file count
+//     taken from the filesystem is wrong by an order of magnitude;
+//   * the .DMap alone can be hashed by the install's integrity manifest.
+//
+// `co.shared` is the expensive one: resolving who else uses each file walks
+// every map on the install (~13 s). It defaults on, because without it the
+// entry cannot record what it shares and export cannot warn -- but it is a
+// toggle, because a quick look should not cost a full walk.
+
+const co = { closure: null, busy: false, shared: true,
+             roles: { puzzle: true, ani: true, art: true },
+             withShared: true, entries: [] };
+
+async function loadClosure() {
+  const i = app.info;
+  if (!i || !i.name) { co.closure = null; renderCollectCard(); return; }
+  co.busy = true; renderCollectCard();
+  try {
+    co.closure = await api('/api/keep/map?name=' + encodeURIComponent(i.name) +
+                           (co.shared ? '' : '&fast=1'));
+  } catch (e) {
+    co.closure = { error: e.message };
+  }
+  co.busy = false;
+  renderCollectCard();
+}
+
+function chosenCount() {
+  const c = co.closure;
+  if (!c || !c.parts) return 0;
+  return c.parts.filter(p => {
+    if (p.role === 'dmap' || p.role === 'effect' || p.missing) return false;
+    if (!co.roles[p.role]) return false;
+    if (p.sharedWith && p.sharedWith.length && !co.withShared) return false;
+    return true;
+  }).length;
+}
+
+function coCheck(label, on, onChange, note) {
+  const w = el('label', 'co-check');
+  const b = document.createElement('input');
+  b.type = 'checkbox'; b.checked = !!on;
+  b.addEventListener('change', () => onChange(b.checked));
+  w.appendChild(b);
+  w.appendChild(el('span', '', ' ' + label));
+  if (note) w.appendChild(el('div', 'note', note));
+  return w;
+}
+
+function renderCollectCard() {
+  const b = $('#collect-body');
+  if (!b) return;
+  b.innerHTML = '';
+  b.classList.remove('mut');
+  const i = app.info;
+  if (!i || !i.name) {
+    b.classList.add('mut'); b.textContent = 'pick a map on the left'; return;
+  }
+  if (co.busy) { b.classList.add('mut'); b.textContent = 'resolving…'; return; }
+  const c = co.closure;
+  if (!c) {
+    const go = el('button', 'ghost', 'Show what this map is made of');
+    go.addEventListener('click', loadClosure);
+    b.appendChild(go);
+    return;
+  }
+  if (c.error) { b.classList.add('mut'); b.textContent = c.error; return; }
+
+  const s = c.summary || {};
+  const byRole = s.counts || {};
+  const kb = (n) => (n > 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+                                 : Math.round(n / 1024) + ' KB');
+  const rows = [
+    ['Closure', `${s.files} files · ${kb(s.totalBytes || 0)}` +
+                (byRole.effect ? ` · ${byRole.effect} effects` : '')],
+    ['Breakdown', Object.entries(byRole)
+      .map(([k, v]) => `${k} ×${v}`).join('  ')],
+  ];
+  if (s.sharedResolved) {
+    rows.push(['Shared with other maps', `${s.shared} of ${s.files} files`,
+               s.shared ? 'staging these changes those maps too' : '']);
+  } else {
+    rows.push(['Shared with other maps', 'not resolved',
+               'turn on "resolve sharing" to find out — without it the entry ' +
+               'cannot record what it shares and export cannot warn']);
+  }
+  if (s.integrity) {
+    rows.push(['Integrity-hashed', `${s.integrity} file(s)`,
+               'this install hashes the .DMap, so replacing it is detectable']);
+  }
+  if (s.missing) {
+    rows.push(['Unresolved keys', String(s.missing),
+               'layers naming art this client’s index does not resolve — ' +
+               'reported, never dropped']);
+  }
+  if (s.unreadable) rows.push(['Unreadable', String(s.unreadable)]);
+  b.appendChild(rowList(rows));
+
+  const opts = el('div', 'co-opts');
+  opts.appendChild(el('div', 'note',
+    'The .DMap always travels — it is what the map is.'));
+  opts.appendChild(coCheck(`Background (.pul) ×${byRole.puzzle || 0}`,
+    co.roles.puzzle, v => { co.roles.puzzle = v; renderCollectCard(); }));
+  opts.appendChild(coCheck(`Scenery index (.ani) ×${byRole.ani || 0}`,
+    co.roles.ani, v => { co.roles.ani = v; renderCollectCard(); }));
+  opts.appendChild(coCheck(`Tiles ×${byRole.art || 0}`,
+    co.roles.art, v => { co.roles.art = v; renderCollectCard(); }));
+  opts.appendChild(coCheck('Include art shared with other maps',
+    co.withShared, v => { co.withShared = v; renderCollectCard(); },
+    'off leaves it behind; the map still draws from the install’s own copies'));
+  opts.appendChild(coCheck('Resolve sharing (walks every map, ~13 s)',
+    co.shared, v => { co.shared = v; loadClosure(); }));
+  b.appendChild(opts);
+
+  b.appendChild(el('div', 'note',
+    `Will collect the .DMap + ${chosenCount()} file(s).`));
+
+  const row = el('div', 'row');
+  const dry = el('button', 'ghost', 'Preview');
+  dry.addEventListener('click', () => doCollect(true));
+  const go = el('button', '', 'Collect');
+  go.addEventListener('click', () => doCollect(false));
+  row.appendChild(dry); row.appendChild(go);
+  b.appendChild(row);
+  const out = el('pre', 'out'); out.id = 'collect-out';
+  b.appendChild(out);
+}
+
+async function doCollect(dry) {
+  const i = app.info;
+  const out = $('#collect-out');
+  out.textContent = dry ? 'previewing…' : 'collecting…';
+  try {
+    const r = await api('/api/keep/map', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        map: i.name, dryRun: !!dry, fast: !co.shared,
+        roles: Object.keys(co.roles).filter(k => co.roles[k]),
+        shared: co.withShared,
+      }),
+    });
+    if (dry) {
+      const w = r.would || [];
+      out.textContent =
+        `would collect ${w.length} item(s), leaving ${(r.dropped || []).length} behind\n` +
+        w.slice(0, 14).map(x => `  ${x.role.padEnd(7)} ${x.rel}`).join('\n') +
+        (w.length > 14 ? `\n  … ${w.length - 14} more` : '');
+    } else {
+      const e = r.entry || {};
+      const lines = ['collected ' + e.id];
+      if ((r.dropped || []).length) {
+        lines.push(`  ${r.dropped.length} file(s) left behind by your toggles`);
+      }
+      if (e.integrity) lines.push('  the .DMap is integrity-hashed here');
+      if (e.unresolved) lines.push(`  ${e.unresolved.length} unresolved key(s)`);
+      if (e.unread) lines.push(`  ${e.unread.length} file(s) unreadable`);
+      out.textContent = lines.join('\n');
+      toast('collected ' + e.id);
+      loadEntries();
+    }
+  } catch (e) {
+    out.textContent = 'failed: ' + e.message;
+  }
+}
+
+async function loadEntries() {
+  try {
+    const d = await api('/api/keep');
+    co.entries = (d.entries || []).filter(e => e.category === 'Maps');
+  } catch (e) { co.entries = []; }
+  renderExportCard();
+}
+
+function renderExportCard() {
+  const b = $('#export-body');
+  if (!b) return;
+  b.innerHTML = '';
+  b.classList.remove('mut');
+  if (!co.entries.length) {
+    b.classList.add('mut'); b.textContent = 'no maps collected yet'; return;
+  }
+  const sel = document.createElement('select');
+  for (const e of co.entries) {
+    const o = document.createElement('option');
+    o.value = e.id;
+    const n = (e.parts || []).length;
+    o.textContent = `${e.name || e.id}  (${n} file${n === 1 ? '' : 's'})`;
+    sel.appendChild(o);
+  }
+  b.appendChild(sel);
+
+  const opts = el('div', 'co-opts');
+  opts.appendChild(el('div', 'note',
+    'Staged into mods/stage/ only. Nothing touches the install until you ' +
+    'press Install in Mod staging.'));
+  const policy = document.createElement('select');
+  for (const [v, t] of [
+    ['skip-identical', 'Shared art: write only where it differs (recommended)'],
+    ['always', 'Shared art: always write it'],
+    ['never', 'Shared art: never write it'],
+  ]) {
+    const o = document.createElement('option'); o.value = v; o.textContent = t;
+    policy.appendChild(o);
+  }
+  opts.appendChild(policy);
+  b.appendChild(opts);
+
+  const row = el('div', 'row');
+  const go = el('button', '', 'Stage');
+  go.addEventListener('click', () => doExport(sel.value, policy.value));
+  row.appendChild(go);
+  b.appendChild(row);
+  const out = el('pre', 'out'); out.id = 'export-out';
+  b.appendChild(out);
+}
+
+async function doExport(id, policy) {
+  const out = $('#export-out');
+  out.textContent = 'staging…';
+  try {
+    const r = await api('/api/keep/stage', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, sharedPolicy: policy }),
+    });
+    const lines = [];
+    for (const w of (r.wrote || [])) lines.push('staged      ' + w);
+    for (const s of (r.skipped || [])) lines.push('left alone  ' + s);
+    for (const w of (r.sharedArt || [])) {
+      const m = w.maps || [];
+      lines.push(`SHARED      ${w.path} — also used by ${m.length} other map(s)` +
+                 (m.length ? ': ' + m.slice(0, 8).join(', ') +
+                             (m.length > 8 ? ', …' : '') : ''));
+    }
+    for (const w of (r.integrity || [])) {
+      lines.push(`INTEGRITY   ${w.path} — ${w.why}`);
+    }
+    out.textContent = lines.join('\n') || 'nothing to do';
+    toast('staged ' + id);
+  } catch (e) {
+    out.textContent = 'failed: ' + e.message;
+  }
+}
 
 boot().catch(e => {
   $('#statusline').textContent = 'startup failed: ' + e.message;

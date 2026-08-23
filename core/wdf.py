@@ -7,7 +7,7 @@ Archive layout (VERIFIED against c3.wdf and data.wdf, see docs/assets.md):
     offset 0   u32 magic        = 0x57444650  ('PFDW' when read as LE bytes)
     offset 4   u32 fileCount
     offset 8   u32 indexOffset  -> byte offset of the index table
-    offset 12  ... payload blob, entries stored back-to-back in index order ...
+    offset 12  ... payload blob, entries back-to-back in OFFSET order (see below) ...
     indexOffset .. EOF : fileCount * 16 bytes of index entries
 
 Index entry (16 bytes, little-endian) -- field ORDER verified empirically:
@@ -17,9 +17,51 @@ Index entry (16 bytes, little-endian) -- field ORDER verified empirically:
     u32 size        payload length in bytes
     u32 space       always 0 in both shipped archives (reserved / "allocated size")
 
-Entries are sorted strictly ascending by nameHash (binary-searchable), and the
-payloads are laid out contiguously with no padding: offset[i] + size[i] ==
-offset[i+1] for every i, and sum(size) == indexOffset - 12 exactly.
+Entries are sorted strictly ascending by nameHash **in the official archives**,
+and the payloads tile the region [12, indexOffset) exactly -- no padding, no
+overlap: sum(size) == indexOffset - 12, and sorting entries **by offset** gives
+offset[i] + size[i] == offset[i+1] for every consecutive pair.  That tiling
+holds in every archive measured so far, official and private alike.
+
+**INDEX ORDER IS NOT LAYOUT ORDER.** This paragraph previously claimed
+offset[i] + size[i] == offset[i+1] *in index order*, which is false for the
+very archives it was written from -- worse than the ordering claim below,
+which was at least true of the shipped ones.  MEASURED 2026-08-11 with
+`validate()` plus an offset-sorted pass (`C-2026-08-10-quickfix-wdf-contiguity`):
+
+    contiguous pairs           index order        offset order
+    6090/c3.wdf                  1 / 10,273     10,273 / 10,273
+    6090/data.wdf                2 / 14,738     14,738 / 14,738
+    5517/c3.wdf                  1 / 10,273     10,273 / 10,273
+    Zephyr garments*.wdf       all n-1 / n-1       all n-1 / n-1
+
+The official index is hash-sorted while payloads sit in write order, so the
+two claims this paragraph used to make -- hash-ascending AND index-order
+contiguity -- are jointly satisfiable only by an archive *written* in hash
+order.  Each half of the corpus falsifies one: the official archives falsify
+index-order contiguity, Zephyr's falsify hash-ascending.  Neither is a format
+property; the offset-order tiling is the only layout claim that has survived
+every archive it was tested against.
+
+**DO NOT BINARY-SEARCH THE INDEX.** The ordering is a property of the archives
+TQ shipped, not of the format, and this docstring previously claimed it as
+"(binary-searchable)" without qualification. MEASURED 2026-08-11:
+
+    6090/c3.wdf     10,274 entries   strictly ascending
+    6090/data.wdf   14,739           strictly ascending
+    5517/c3.wdf     10,274           strictly ascending
+    Zephyr garments.wdf   5,253      NOT ascending
+    Zephyr garments1.wdf  2,341      NOT ascending
+    Zephyr garments2.wdf  1,943      NOT ascending
+    Zephyr garments3.wdf  2,493      NOT ascending
+    Zephyr garments4.wdf  2,021      NOT ascending
+
+All five of a private server's garment archives violate it; their hashes spread
+across all sixteen top-nibble buckets unordered. **Nothing binary-searches these
+today, which is why the false claim has never bitten** -- it is the claim that
+was the defect, not any behaviour. Surfaced while disproving the 173 garment
+"names" (`C-2026-08-10-quickfix-hash-checkable`) and correctly kept out of that
+retraction as a separate finding.
 
 Usage:
     python core/wdf.py index   <archive.wdf> [-o out.json]

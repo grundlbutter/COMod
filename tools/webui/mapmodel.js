@@ -356,8 +356,16 @@ const MapModel = (() => {
     pux: 'ground art is map/PuzzleSave/*.pux (TqTerrain), undecoded',
     mismatch: 'the art and the .DMap disagree about the map size',
     noart: 'no usable .pul',
-    missing: 'GameMap.json names it but no .DMap ships',
+    // Spelling-neutral, like the server's own message. The registry is
+    // GameMap.json on the community client and the binary GameMap.dat on
+    // every official one -- no install ships both -- so naming one sends the
+    // reader of the other to a file they do not have. `mapedit.py` was
+    // corrected and this copy, which is what the user actually reads, was
+    // not: the second reader of the same fact.
+    missing: 'the map registry names it but no .DMap ships',
     broken: 'the .DMap did not parse',
+    stale: 'this .DMap is not what the .7z beside it holds -- a previous '
+         + "client's map",
   };
 
   /** The picker list, filtered and annotated. Sorting is the server's (largest
@@ -373,7 +381,11 @@ const MapModel = (() => {
         size: r.width ? `${r.width} x ${r.height}` : '—',
         area: r.area,
         state: r.state,
-        drawable: r.state === 'ok' || r.state === 'mismatch',
+        // `stale` draws: the file is a valid map and the user can see it in
+        // their own folder, so refusing would look like a bug. The note is
+        // what carries the warning.
+        drawable: r.state === 'ok' || r.state === 'mismatch'
+                  || r.state === 'stale',
         note: r.why || STATE_NOTE[r.state] || '',
       }));
   }

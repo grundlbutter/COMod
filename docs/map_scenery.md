@@ -52,17 +52,40 @@ records *mean*. All three place art in the painted image's pixel space.
 | 4 | `COVER` | one `.ani` sprite drawn *in front of* the player | no |
 | 10 / 15 | `EFFECT` / `SOUND` | a `3DEffect.ini` key / a sound file | no; still not drawn |
 
-Corpus-wide (`py -3 tools/scene.py --verify`):
+Corpus-wide (`py -3 tools/scene.py --verify`), **RE-DERIVED 2026-08-11 per
+install**, because the previous figures were a count over a population we now
+know was not the corpus:
 
-```
-136 maps: 27 place TERRAIN scene objects, 111 place COVER sprites
-9,415 scene parts, 17,364 covers
-scene passability: 11,578 cells opened, 6,264 cells blocked, 0 off the map
-11 maps gain a larger walkable component once the scene layers are applied
-```
+| install | maps | place TERRAIN | place COVER | scene parts | covers | opened | blocked | off map |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 5517 | 192 | 45 | 164 | 11,374 | 57,708 | 20,094 | 7,930 | 0 |
+| 6090 | 247 | 63 | 215 | 11,365 | 85,268 | 20,531 | 8,818 | 49 |
+| 6609 | 297 | 73 | 257 | 11,461 | 92,073 | 20,632 | 9,399 | 49 |
 
-So the owner's "this is done a lot" is right about covers — **82 % of maps use
-them** — and scene objects are rarer but decisive where they appear.
+**What moved, and why — the numbers are auditable rather than merely current:**
+
+* **The old line said `136 maps`.** That is CCO's corpus, from an install no
+  longer on this machine, and it had been quoted through two clients that never
+  had 136 maps. Nothing recorded which install it was measured on, which is the
+  whole reason it survived.
+* **The survey walked `map/map/*.DMap`.** It now enumerates `dmap.map_names`
+  and reads each map from the file its registry row names, so it covers the
+  113 maps on 6609 that ship only as a `.7z` and reads current content for the
+  77 whose loose file is a previous client's
+  (`C-2026-08-10-claude-explorer-map-archive-alarm`).
+* **The old survey could not tell 6090 from 6609.** Both returned *identical*
+  passability totals, because all 184 of their loose `.DMap` files are
+  byte-for-byte the same. The three rows above differ, which is the first time
+  this measurement has discriminated between two clients at all.
+* **`0 off the map` was true of the smaller corpus and is not a rule.** All 49
+  cells belong to **one map, `bp-club`**, which ships archive-only and had
+  therefore never been surveyed. 296 of 297 place every scene cell on the grid,
+  so §2's footprint rule is unaffected — this is one map's content, named
+  rather than averaged away.
+
+So the owner's "this is done a lot" is right about covers, and by a wider margin
+than the old figure showed: **85 % of maps use them on 5517, 87 % on 6090 and
+6609.** Scene objects are rarer and decisive where they appear.
 
 ## 2. The footprint rule — VERIFIED
 
@@ -197,9 +220,21 @@ from the base grid and cyan from a scene layer:
 in the file's trailer**, which is why the ground pipeline never loaded it.
 
 `core/dmap.py` already decoded that trailer as "6 × u32 then a `char[260]`
-path"; what it is, is the background list. **VERIFIED:** 57 of the 136 maps
-carry 109 such records and every well-formed one names a `map/puzzle/*.pul`.
-`tools/puzzle.PuzzleLibrary.backdrops()` returns them.
+path"; what it is, is the background list, and it is **groups** of planes rather
+than a flat run (`core/dmap.parse_trailer`). **VERIFIED**, and RE-DERIVED
+2026-08-11 over `dmap.map_names` rather than a `*.DMap` glob:
+
+| install | maps carrying backdrops | records |
+|---|---:|---:|
+| 5517 | 80 | 187 |
+| 6090 | 84 | 193 |
+| 6609 | 87 | 196 |
+
+Every well-formed record names a `map/puzzle/*.pul`.
+`tools/puzzle.PuzzleLibrary.backdrops()` returns them. **The old figure of
+`57 of the 136 maps / 109 records` was CCO's**, carried through two clients
+that never had 136 maps; the counts rose here because the corpus did, not
+because the reading changed.
 
 | field | reading | status |
 |---|---|---|
@@ -211,6 +246,77 @@ carry 109 such records and every well-formed one names a `map/puzzle/*.pul`.
 Three maps (`luckytree01_new`, `luckytree02_new`, `luckytree03_new`) have a
 desynchronised trailer whose "paths" are fragments of an `.ani` filename; a
 record whose path is not a `.pul` that exists is dropped rather than guessed at.
+
+> **RESOLVED 2026-08-10 — the trailer is GROUPS of planes, not a flat run of
+> records.** The whole open question below is answered, and the answer is that
+> both candidate strides were right about their own maps because neither was a
+> stride:
+>
+> ```
+> u32 n_groups
+> per group:  u32 v0, v1, v2, v3        <- shared draw index + parallax
+>             u32 n_planes
+>             n_planes x { u32 flag(8); char[260] path }
+> ```
+>
+> `20 + 264 == 284`. **A group holding exactly one plane is byte-for-byte a
+> 284-byte record**, which is why the flat model read 171 of 181 maps
+> correctly and why `2009-7x` and `icecrypt-lev5` — two groups of one plane
+> each — appeared to validate it. The flat model's `values[4]` was the plane
+> count: it reads **1** on all 66 single-plane records and **7, 8, … 16** on
+> exactly `star01`..`star10`.
+>
+> MEASURED over all 181 maps with a trailer on 5517:
+>
+> | | |
+> |---|---|
+> | group walk ends exactly at EOF | **181 / 181**, 0 misfits |
+> | `bytes_unconsumed != 0` | **0** (was 10) |
+> | `extra_count != len(extra)` | 0 |
+> | recovered paths that are not `.pul` | 0 |
+> | maps whose output is unchanged | 171 |
+> | maps that gain planes | 10 (7…16, one per map) |
+>
+> One dangling reference surfaced and is unrelated to the parse: `hq.DMap`
+> names `map\puzzle\hqbg.pul`, which is on no install — not loose, not in any
+> archive on 5017/5517/6090. It read identically under the old model and
+> `puzzle.py` already drops it. Pinned in `DMapTrailingSection.KNOWN_DANGLING`
+> so a *second* one fails.
+>
+> `core/dmap.py::parse_trailer`, `tools/test_viewer.py::DMapTrailingSection`
+> (7 tests, two of them controls), `docs/CORRECTIONS.md`
+> `C-2026-08-10-dmap-plane-groups`.
+>
+> <details><summary>The original OPEN entry, kept because the reasoning in it
+> is what nearly bought the wrong fix</summary>
+>
+> **OPEN (2026-08-10) — `star01`..`star10` leave the trailer half-read, and
+> the model above does not explain them.** `dmap.parse` finishes with
+> `bytes_unconsumed` non-zero on exactly these ten maps and nowhere else
+> (181 parsed, 0 raised). On `star01` the count reads **1** and **seven**
+> records follow; the unread remainder is 6 × 264 bytes, every one naming a
+> real `map/puzzle/starbg*.pul`. So six of seven background planes are
+> dropped, growing to fifteen of sixteen on `star10`.
+>
+> **Do not "fix" this by setting `EXTRA_RECORD = 264`.** That is the obvious
+> reading — `values[5]` is constant 8 above, and every unread record begins
+> with 8, which looks exactly like a stride 20 bytes too long. Measured
+> across every map with a trailer, it is wrong: at 284 `2009-7x` and
+> `icecrypt-lev5` give **2/2 real paths and end exactly at EOF**, and at 264
+> they give 1/2 with 40 bytes over. One fixed stride does not fit both
+> families.
+>
+> The likelier shape is that the star family's section does not **begin**
+> where the parser thinks it does — a count of 1 in front of seven records is
+> a misplaced start, not a wrong stride. Nobody has taken it.
+> `tools/test_viewer.py::DMapTrailingSection` pins all of the above,
+> including a test that fails the 264 fix specifically.
+>
+> Nothing had noticed because `d.bytes_unconsumed` — the parser's own audible
+> channel — has no reader in the suite for `dmap`; the only assertion on that
+> field is `scene.parse_scene`'s.
+>
+> </details>
 
 This is what turns the black void around `newbie`'s islands into sea, cloud and
 farmland — compare `out/viewer/shots/scene-newbie-full.png` (no backdrop) with
@@ -319,6 +425,26 @@ which is exactly the proportion seen in retail footage.
 
 #### What this corrects in our client
 
+> **SUPERSEDED 2026-08-15 — the arithmetic below is sound; the premise it rests
+> on is not. Do not delete it, and do not re-derive it.** `tools/terrain.py:106`
+> is **`CELL = 64.0`** today, and `tools/webui/play.js:37` carries the same
+> 64.0. See `C-2026-08-15-claude-vibeco-gl-openlist`.
+>
+> **Which premise failed — and it is not the projection.** §6's geometry is
+> untouched: a one-cell step really is 32 px right and 16 px down, so
+> `CELL = 32*sqrt(2)` really is the value that makes **one world unit one pixel
+> of the painted image**. What failed is the step *before* the arithmetic —
+> reading `CPuzzleBlockX::Create`'s block width `w` as *the painted image's
+> pixel width*. That is an **assumption**, never a measurement;
+> `docs/ground_art.md` §6 has always listed it as OPEN, because the caller is
+> inside the packed exe. Held against the real game, `32*sqrt(2)` makes
+> characters roughly **1.5× too large**.
+>
+> So the derivation below is kept **as a correct piece of projection
+> arithmetic resting on an unproven premise about `w`**. Anyone who re-derives
+> 45.2548 and concludes the code is wrong has re-derived the sound half and
+> skipped the premise that broke.
+
 `tools/terrain.py`'s `CELL = 100.0` world units per cell is one of the two
 "chosen, not recovered" constants (the other is `ZSCALE`). It is **wrong**,
 and the right value follows from the projection in §6: a one-cell step must
@@ -336,8 +462,18 @@ pixels outright (preferred — it makes every other placement number
 literal), or keep `CELL = 100` and scale figures by 2.21. Verified live by
 scaling the figure by 2.21 in the running client: the character then stands
 about one cell wide and two-and-a-half cells tall on Twin City's paving,
-matching the footage. **Not yet applied** — it touches `terrain.py`,
-`gl.js`'s camera framing and the viewer tests together.
+matching the footage.
+
+**What was actually applied — the scale went on the MAP, not the character.**
+The "not yet applied" this paragraph used to end on is stale: a value *was*
+applied, and it is not this one. `tools/terrain.py:106` is **`CELL = 64.0`**,
+which draws the painted ground `sqrt(2)` **larger** than its own pixels, paired
+with **`FIGURE_SCALE = 1.0`** — characters at the size they were authored,
+which is what `ini/AdditiveSize.json` says the engine does. `tools/terrain.py`'s
+module docstring (§SCALE) is the **home** of that reasoning, including the
+cell-widths a body then stands at and the cost (the art is sampled above its
+native resolution); this section cites it rather than restating it.
+`tools/webui/play.js:37` carries the same 64.0.
 
 ### 6.2 The oblique tilt — how a 3D role stands on a 2D map
 
@@ -390,6 +526,16 @@ pitch**, which was derived from the art's 2:1 diamond alone. Two unrelated
 routes — the painted tile geometry and a constant in `.data` — give the same
 30°.
 
+A third, from pixels: Route B's DX11 renderer measures **30.04°** off its own
+backbuffer, by sliding and lifting a marker of known world position and fitting
+the centroid slopes (`routeb/repro_entity_scale.py`, 2026-08-15). That gate also
+re-reads the −30 out of the install's own `graphic.dll` rather than citing the
+RVAs above — which is worth knowing, because **the RVAs in this section do not
+resolve in 5065 or 5517**. The accessor is found through the export table
+instead, and the global's address taken from `mov eax,[imm32]`'s own operand:
+5517 `0x13fa0 → 0x100441c4`, 5065 `0x0b150 → 0x10024300`, both initialised −30.
+See `docs/routeb_entity_scale_2026-08-15.md`.
+
 #### The trap, which this project fell into
 
 Applying the oblique tilt *on top of* a pitched camera **double-counts it**.
@@ -440,6 +586,16 @@ Only 197 of the 26,779 placed sprites have more than one frame (19 maps, led by
 `qiling` with 34), so `/api/game/cover?t=<ms>` is only re-fetched on a timer
 when the map actually animates.
 
+> **The DX11 renderer shares the mapping, not the mesh.** `routeb/render.cpp`
+> places each cover as its own quad, whose corners come from **inverting the
+> ground's own vertex rule** `corner_px(gx,gy)` at the sprite's corner pixels
+> rather than evaluating it at lattice points. That preserves the property the
+> shallow clone existed for — one cell↔pixel mapping, so a cover cannot land
+> half a cell off — without compositing the layer into an RGBA image, which
+> would have forced a CPU DXT decode. Measured agreement between the two
+> derivations of a quad's screen rect: **0.000 px** over 68 quads.
+> `docs/routeb_cover_layer_2026-08-15.md` §4.
+
 ## 8. Verified against a running server
 
 Both a local `client/simserver.py` and **CoEmu**, at patch 5017, on loopback:
@@ -470,16 +626,156 @@ weakening the other.
 
 ## 10. Still open
 
-* **`EFFECT` and `SOUND` layers** are decoded and not used.
+* ~~**`EFFECT` and `SOUND` layers** are decoded and not used.~~ — **split
+  2026-08-15, and only half of it was ever true. `C-2026-08-15-claude-vibeco-gl-openlist`.**
+
+  * **`EFFECT` is DRAWN — this bullet is closed.** `tools/coplay.py`'s
+    `_map_effects` reads the `.DMap` EFFECT records and converts them to cells,
+    `MAPFX_DRAW_LIMIT = 48` caps how many are drawn near the player, and the
+    route is `/api/game/mapfx` (`api_mapfx`). `docs/world_effects.md` §2 is the
+    home of the coordinate space and the corpus (**2,504 EFFECT records across
+    45 of 136 maps**, all 2,504 landing inside their map's grid).
+  * **`SOUND` is genuinely open — and note WHY, because it is a different
+    state from EFFECT's.** It is not "decoded but not wired up": **there is no
+    audio subsystem in this client at all.** `client/settings.py:148-152` says
+    so in the settings themselves — the sound sliders store a number and
+    nothing reads it, *"There is no audio path"* — and the tables are read
+    (`ActionSound.ini`, `docs/animation.md` §3) while nothing plays. "Not
+    drawn" and "there is nowhere to draw it" are different problems: EFFECT
+    needed a route, SOUND needs a subsystem first.
 * **The backdrop's true drawing space** (§5) and the `rollSpeedX/Y` scrollers.
 * **`thickness`** on a scene part, and the per-cell `elevation` a scene carries.
   Both are read; neither is applied. Elevation is the interesting one — a
   bridge deck at a different height than the water is what `offsetElevation`
   would be for, and it is uninitialised too often to trust.
-* **`map/PuzzleSave/*.pux`** (`TqTerrain\0`), used by 4 maps, still undecoded.
-* **Whether a cover's `origin` is its footprint's top-left or bottom-right.**
-  The two differ by `(w−1, h−1)` cells and *no* measurement here can separate
-  them, because every metric available moves with the anchor. Bottom-right is
-  used, for consistency with the scene rule and because it gives 3–8 % less
-  overlap between cover art rectangles on every map tested. 1,616 of the 2,380
-  covers measured are 1 × 1, where the question does not arise.
+* **`map/PuzzleSave/*.pux`** (`TqTerrain\0`) — **the header is decoded; the
+  payload is NOT, and the negative is the useful part.**
+
+  > **REACHABILITY, measured 2026-08-15 — 237 was the corpus AT THE TIME OF
+  > MEASUREMENT; 169 is what is reachable today.** The difference is entirely
+  > CCO's 68: `CCO-local` has **no `map/` directory and zero `.pux`**, because
+  > CCO's corpus came from an install no longer on this machine — a caveat §1
+  > already carries and this figure did not inherit. Reachable today: **6609 20,
+  > 7878 136, Zephyr-1057-local 13 = 169**, and 237 − 169 = 68 exactly.
+  > **Control: the same sweep returns 20 on 6609, so it is not a broken scan.**
+  > The older figure is **not wrong, it is unreachable** — and those are
+  > different. Anyone re-deriving the corpus gets 169 and should not read that
+  > as contradicting the 237. `C-2026-08-15-claude-vibeco-gl-openlist`.
+
+  **Corpus, RE-DERIVED 2026-08-11:** 237 files across four installs — 6609 20
+  (in *two* directories), 7878 136, Zephyr 13, CCO 68 — and **160 maps** name
+  one as their puzzle path. The *"used by 4 maps"* this bullet used to carry
+  was **CCO's** figure, and CCO is the only install where it is still true.
+
+  **Header** (`core/dmap.read_pux`, verified on all 237):
+
+        +0   char[10]  "TqTerrain\0"
+        +16  u32  1000      constant on all 237
+        +20  u32  width     in tiles
+        +24  u32  height    in tiles
+        +28  u32  1000      constant on all 237
+
+  **The tile is 256 px, and `GameMap.dat` disagrees.** §4's placement identity
+  ties a puzzle's tile dimensions to the map's own cell grid, so the grid size
+  can be **solved rather than looked up**: `G = W_cells / (pux_w/64 + pux_h/32)`
+  comes out **256.0 on all 160, no spread**. The registry says
+  `PuzzleGridSize` **128** for **113** of those maps; forcing 256 satisfies the
+  identity **160 of 160**, and every registry-128 failure is out by **exactly
+  2×**, never anything else — the signature of a wrong constant rather than a
+  wrong parse. Whether the registry's 128 is wrong or means something else for
+  a `.pux` is **not claimed**; only which number the geometry demands.
+  `dmap.PUX_GRID`.
+
+  > **DO NOT DECODE THE PAYLOAD AS A TILE INDEX — it is not one, and this is
+  > measured.** Over 14 files on 7878 the size runs **20.8 to 172.2 bytes per
+  > tile**, and a linear fit of file size against tile count is out by
+  > **17,725 bytes** at worst. A flat index cannot do that. `PuzzleSave` is
+  > what the name says: an **editor save**, far richer than the compiled
+  > `.pul` it stands in for. This negative cost a measurement and is recorded
+  > so the next person does not spend a day rediscovering it.
+
+  `tools/puzzle.py` still refuses these 160 maps — it has no tiles to draw —
+  but its refusal now carries the geometry it *does* have (`15x11 tiles at
+  256 px, implying a 148-cell map`), because *"not decoded"* sent every reader
+  back to the format when the answer was already in hand. See
+  `C-2026-08-11-claude-explorer-pux`.
+* **What a cell `mask` of 2, 4 or 5 MEANS — open, and TWO instruments have
+  already been spent on it. Read this before spending a third.**
+
+  The row checksum uses the **raw** `mask` (`core/dmap.row_checksum`), and the
+  corpus carries `0`, `1`, and then **2 (668 cells, Zephyr only) · 4 (366,347)
+  · 5 (31,230)**. `5 = 4|1`. The obvious model is a bitfield with **bit 0 as
+  "blocked"**, which would make `2` and `4` *walkable* — and every consumer in
+  this repo tests `== 0` / `!= 0`, so it would mean 353,326 cells on 7878 are
+  being blocked that are not.
+
+  > **CONNECTIVITY DOES NOT DISCRIMINATE THIS. Do not spend an afternoon on
+  > it.** Promoting mask-4 cells to walkable merges components — 18→15, 8→4,
+  > **10→1** on three maps — and it looks conclusive. It is not: a control
+  > promoting an *equal number of arbitrary blocked cells that touch open
+  > ground* merges **better** on `2020tsf_new` (baseline 40, mask-4 → 30,
+  > **control → 18**). §2's footprint rule was strong because the *wrong*
+  > reading joined nothing; here the wrong reading sometimes joins more. The
+  > asymmetry is the evidence, and this class of question does not have it.
+
+  **The painted art is the instrument that does discriminate**, and it gives
+  the strongest evidence available today. On-art rates, by cell value:
+
+        7878 + 6609    mask 0  100.0%   mask 1  17.8%   mask 4  100.0%  (n=557)
+        Zephyr         mask 0  100.0%   mask 1  40.5%   mask 2  100.0%  (n=668)
+
+  **Two bit-0-clear values, on two corpora that do not share them, both
+  tracking walkable cells exactly and unlike blocked cells.** Note which
+  corpus is which: **7878 holds 96% of all mask-4 cells**, so it corroborates
+  nothing about `4`; **Zephyr is the only install with a `2`** and has zero
+  fives, which is what makes it independent.
+
+  **This is NOT settled, and the limit is precise: "on painted art" is
+  necessary for walkable, not sufficient** — an interior wall is on the art
+  too. What is shown is that `2` and `4` are *interior*, not that they are
+  *walkable*. **And `mask 5` — the one value with bit 0 SET — has zero
+  testable samples.**
+
+  **Why it has zero samples is the finding that reorders this list: the maps
+  carrying high masks are overwhelmingly `.pux` maps**, and `tools/puzzle.py`
+  refuses those for want of a tile payload — so only **2 of 7878's maps** can
+  run the art instrument at all. **Decoding the `.pux` payload turns a 2-map
+  sample into a 160-map one and settles bit 0 either way.** The two items
+  above are one item with a dependency, not two.
+
+* ~~**Whether a cover's `origin` is its footprint's top-left or bottom-right.**~~
+  **CLOSED 2026-08-15 — it is BOTTOM-RIGHT, and now measured rather than
+  assumed.** `docs/routeb_cover_layer_2026-08-15.md` §3; re-derive with
+  `py -3 routeb/verify_cover.py --anchor`.
+
+  This bullet used to say *no measurement here can separate them, because every
+  metric available moves with the anchor*, and *1,616 of the 2,380 covers
+  measured are 1 × 1, where the question does not arise.* **The second half is
+  exactly right and is the reason the first half was wrong.** The two
+  hypotheses differ by `16·((w−1)+(h−1))` px of screen depth — identically zero
+  on a 1 × 1 — so the corpus that had been measured could not answer, but the
+  **multi-cell** covers can, and there are 2,160 of them across
+  `newplain`/`newbie`/`p-arena`/`desert`.
+
+  §4's own cover metric (opaque bounding box vs footprint bounding box), paired
+  per cover and decided by a sign test:
+
+  | axis | n | median \|err\| BR | TL | paired wins BR–TL | sign p |
+  |---|---:|---:|---:|---:|---:|
+  | vertical | 2,160 | 12 px | 35 px | 1,573–586 | 5.9 × 10⁻¹⁰⁴ |
+  | horizontal (only `w ≠ h` can speak) | 479 | 15 px | 46 px | 389–90 | 1.3 × 10⁻⁴⁵ |
+
+  and the margin **grows with footprint size** — 2×2: 10 vs 28 px; 3×3: 3.5 vs
+  67; 4×4: 12 vs 108 — which is what a right convention against a wrong one
+  looks like, and what noise does not do.
+
+  The control is the old caveat turned into an assertion: **1,234 of 1,234
+  one-cell covers tie exactly**, on both metrics and both axes.
+  `verify_cover.py` FAILS if they ever separate, because on a 1 × 1 the two
+  conventions are one convention and an instrument that told them apart there
+  would be broken rather than informative.
+
+  Nothing in `tools/scene.py` changed: the convention tested is the one already
+  in use. The old justification (*"consistency with the scene rule … 3–8 % less
+  overlap"*) was an aesthetic argument for an untested choice, and it happens to
+  have been right.

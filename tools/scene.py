@@ -375,13 +375,18 @@ def for_map(name_or_dmap, *, root: Optional[Path] = None,
     if isinstance(d, (str, Path)):
         import dmap as dmapmod                              # noqa: PLC0415
         p = Path(d)
-        if not p.is_file():
+        if p.is_file():
+            d = dmapmod.parse(p, want_cells=False, verify=False)
+        else:
             if lib.root is None:
                 return Scenery(str(d))
-            p = lib.root / "map" / "map" / f"{Path(str(d)).stem}.DMap"
-        if not p.is_file():
-            return Scenery(str(d))
-        d = dmapmod.parse(p, want_cells=False, verify=False)
+            # By name: the registry decides which file, not the extension we
+            # happen to guess.
+            parsed, _why = dmapmod.parse_map(lib.root, Path(str(d)).stem,
+                                             want_cells=False, verify=False)
+            if parsed is None:
+                return Scenery(str(d))
+            d = parsed
     sc = gather(d.layers, lib)
     sc.name = Path(str(getattr(d, "path", ""))).stem or str(name_or_dmap)
     return sc
@@ -573,6 +578,48 @@ class SpriteCache:
             v = [v]
         return [norm(x) for x in v if isinstance(x, str)]
 
+    @staticmethod
+    def frame_candidates(rel: str) -> list[str]:
+        """The asset paths to try for one `.ani` frame, best first.
+
+        THE `.msk` SUBSTITUTION RULE, in one place. 14 of the 2,621
+        `MapScene.ani` frames name a `.msk` rather than a `.dds` (see
+        `frames()` for why the sibling `.dds` is the right sprite and not an
+        approximation). Both `frames()`, which decodes, and `frame_blob()`,
+        which deliberately does not, resolve through here.
+
+        Kept as a separate rule rather than inlined for the reason
+        `frame_index()` records: a second consumer that copies the arithmetic
+        is how two callers end up disagreeing about the same asset.
+        """
+        return [rel] if not rel.endswith(".msk") else [rel[:-4] + ".dds", rel]
+
+    def frame_blob(self, ani_path: str, key: str,
+                   index: int = 0) -> Optional[tuple[str, bytes]]:
+        """One frame's asset path and its bytes **as shipped** -- no decode.
+
+        Returns `(logical_path, raw_bytes)`, or None if nothing resolves.
+
+        This exists for consumers that want the texture GPU-ready. The shipped
+        art is DXT and the engine uploads it compressed; `frames()` hands back
+        decoded RGBA, which is right for compositing a PNG and wrong for a
+        renderer that would only have to re-compress it -- throwing away the
+        4-8x memory and bandwidth advantage the format is for.
+        """
+        ar = self.assets
+        if ar is None:
+            return None
+        paths = self.frame_paths(ani_path, key)
+        if not paths:
+            return None
+        rel = paths[index % len(paths)]
+        for cand in self.frame_candidates(rel):
+            try:
+                return cand, ar.read(cand)
+            except Exception:                               # noqa: BLE001
+                continue
+        return None
+
     def frames(self, ani_path: str, key: str) -> list:
         """[(w, h, rgba), ...] for every frame of one sprite.
 
@@ -594,8 +641,7 @@ class SpriteCache:
         if ar is not None:
             import dds                                      # noqa: PLC0415
             for rel in self.frame_paths(ani_path, key):
-                for cand in ([rel] if not rel.endswith(".msk")
-                             else [rel[:-4] + ".dds", rel]):
+                for cand in self.frame_candidates(rel):
                     try:
                         out.append(dds.decode(ar.read(cand)))
                         break
@@ -698,6 +744,39 @@ def _decimate(rgba: bytes, w: int, h: int, scale: int):
     return bytes(out), nw, nh
 
 
+def frame_index(p, frame_count: int, time_ms: int) -> int:
+    """Which frame of placement `p` is on screen at `time_ms`.
+
+    Extracted so that **the renderer and anyone caching the render agree by
+    construction**.  A cover layer is not a function of `time_ms`; it is a
+    function of this index, which is cyclic and small.  Caching on the raw
+    clock instead is a cache that can never hit -- `tools/coplay.py`'s cover
+    cache did exactly that, keyed on a free-running `Date.now() - start`
+    against the single most expensive endpoint in the viewer.
+
+    Splitting the rule out rather than copying it is the standing lesson from
+    `read_ani`: that parser was moved into COre precisely to stop this shape,
+    and it did not help, because only the parser moved and the choice of which
+    file to open stayed in the callers.  So callers take the *rule*, not a
+    copy of the arithmetic.
+    """
+    if p.frame_interval > 0 and frame_count > 1 and time_ms:
+        return (time_ms // p.frame_interval) % frame_count
+    return 0
+
+
+def cover_frame_signature(covers, cache: SpriteCache, time_ms: int) -> tuple:
+    """Everything `cover_layer`'s output takes from `time_ms`, and no more.
+
+    A correct cache key for a rendered cover layer.  Placements do NOT share
+    one clock -- each carries its own `frame_interval` and its own frame
+    count -- so quantising the millisecond value by any single interval would
+    be wrong for every placement that disagrees with it.
+    """
+    return tuple(frame_index(p, len(cache.frames(p.ani, p.title) or ()), time_ms)
+                 for p in sorted(covers, key=lambda q: q.depth()))
+
+
 def cover_layer(pm, rect: tuple[int, int, int, int], covers, cache: SpriteCache,
                 *, scale: int = 1, time_ms: int = 0) -> tuple[int, int, bytes]:
     """The COVER sprites alone, as RGBA -- the layer that draws over the player.
@@ -713,10 +792,7 @@ def cover_layer(pm, rect: tuple[int, int, int, int], covers, cache: SpriteCache,
         fr = cache.frames(p.ani, p.title)
         if not fr:
             continue
-        idx = 0
-        if p.frame_interval > 0 and len(fr) > 1 and time_ms:
-            idx = time_ms // p.frame_interval
-        sw, sh, rgba = fr[idx % len(fr)]
+        sw, sh, rgba = fr[frame_index(p, len(fr), time_ms)]
         sx, sy = p.sprite_origin(pm)
         if scale != 1:
             rgba, sw, sh = _decimate(rgba, sw, sh, scale)
@@ -727,7 +803,39 @@ def cover_layer(pm, rect: tuple[int, int, int, int], covers, cache: SpriteCache,
 
 def _blit_rgba(dst: bytearray, dw: int, dh: int, src, sw: int, sh: int,
                x: int, y: int) -> None:
-    """Source-over onto an RGBA buffer, preserving the destination's alpha."""
+    r"""Source-over onto an RGBA buffer, in STRAIGHT alpha throughout.
+
+    Both sides are straight (un-premultiplied) alpha and so is the result:
+    `dds.decode` emits straight alpha, `encode_png_rgba` writes a PNG, and
+    every consumer -- `drawImage`, a WebGL upload with
+    `UNPACK_PREMULTIPLY_ALPHA_WEBGL` false, `tilebake.js`'s
+    `SRC_ALPHA / ONE_MINUS_SRC_ALPHA` -- reads it as straight alpha.
+
+    ⚠ **This used to composite with the PREMULTIPLIED formula** and it is worth
+    knowing why that survived, because the shape recurs. The old line was::
+
+        out.rgb = (src.rgb * a + dst.rgb * (255 - a)) // 255
+
+    which is exactly right when the destination is OPAQUE -- and `blit()`
+    above, whose destination is an opaque RGB ground, still uses it and is
+    still correct. Over a TRANSPARENT destination the same line emits
+    ``src.rgb * a / 255``: a straight-alpha pixel whose colour has been
+    multiplied by its own alpha, i.e. darker than the asset by exactly its
+    alpha. Opaque texels (a=255) and invisible ones (a=0) are unaffected, so
+    the symptom is only soft edges being too dark -- and every sprite in this
+    corpus is opaque in the middle. `CORRECTIONS.md`
+    C-2026-08-09-comod-entity-followups has the arithmetic and the blast
+    radius.
+
+    The correct composite in straight alpha needs the destination's own alpha
+    in the weights AND a division by the result's alpha, and it is that second
+    term the premultiplied form gets to skip::
+
+        out.a   = sa + da*(1 - sa)
+        out.rgb = (src.rgb*sa + dst.rgb*da*(1 - sa)) / out.a
+
+    `out.a` was already right; only the colour was wrong.
+    """
     x0, y0 = max(0, x), max(0, y)
     x1, y1 = min(dw, x + sw), min(dh, y + sh)
     if x1 <= x0 or y1 <= y0:
@@ -738,8 +846,18 @@ def _blit_rgba(dst: bytearray, dw: int, dh: int, src, sw: int, sh: int,
         d = _np.frombuffer(bytes(dst), dtype=_np.uint8).reshape(dh, dw, 4).copy()
         win = d[y0:y1, x0:x1].astype(_np.uint16)
         sa = s[:, :, 3:4]
-        out = (s * sa + win * (255 - sa) + 127) // 255
-        out[:, :, 3] = (sa[:, :, 0] * 255 + win[:, :, 3] * (255 - sa[:, :, 0]) + 127) // 255
+        # The destination's surviving share, alpha included. Rounded the same
+        # way the scalar branch rounds so the two agree bit for bit.
+        keep = (win[:, :, 3:4] * (255 - sa) + 127) // 255
+        oa = sa + keep
+        den = _np.maximum(oa, 1)
+        out = _np.empty_like(s)
+        out[:, :, :3] = (s[:, :, :3] * sa + win[:, :, :3] * keep + den // 2) // den
+        out[:, :, 3:4] = oa
+        # A fully transparent result has no colour of its own. Keeping the
+        # destination's is not cosmetic: a later blit reads it back.
+        clear = (oa == 0)[:, :, 0]
+        out[clear] = win[clear]
         d[y0:y1, x0:x1] = out.astype(_np.uint8)
         dst[:] = d.tobytes()
         return
@@ -750,9 +868,20 @@ def _blit_rgba(dst: bytearray, dw: int, dh: int, src, sw: int, sh: int,
             if not al:
                 continue
             di = (yy * dw + xx) * 4
+            da = dst[di + 3]
+            if al == 255 or not da:
+                # Opaque source, or nothing underneath: the source colour IS
+                # the answer. This is the case the premultiplied formula got
+                # wrong -- over transparency it emitted `rgb * a / 255`.
+                dst[di:di + 3] = src[si:si + 3]
+                dst[di + 3] = al + (da * (255 - al) + 127) // 255
+                continue
+            keep = (da * (255 - al) + 127) // 255
+            oa = al + keep
             for c in range(3):
-                dst[di + c] = (src[si + c] * al + dst[di + c] * (255 - al)) // 255
-            dst[di + 3] = al + (dst[di + 3] * (255 - al)) // 255
+                dst[di + c] = (src[si + c] * al + dst[di + c] * keep
+                               + oa // 2) // oa
+            dst[di + 3] = oa
 
 
 def encode_png_rgba(width: int, height: int, rgba: bytes) -> bytes:
@@ -787,12 +916,18 @@ def survey(root: Optional[Path] = None) -> dict:
     tot = {"maps": 0, "withScene": 0, "withCover": 0, "sceneParts": 0,
            "covers": 0, "opened": 0, "blocked": 0, "offMap": 0,
            "joinedMaps": 0}
-    for p in sorted((lib.root / "map" / "map").glob("*.DMap")):
-        try:
-            d = dmapmod.parse(p, want_cells=True, verify=False)
-        except Exception as e:                              # noqa: BLE001
-            rows.append({"map": p.stem, "error": str(e)[:80]})
+    # The corpus is `dmap.map_names`, not a `*.DMap` glob, and each map is read
+    # from the file its registry row names.  A glob surveys the LOOSE files,
+    # which on 6090 and 6609 are byte-identical to each other -- so the survey
+    # returned the same passability totals for two different clients and could
+    # not have told them apart.  See `docs/map_twin_precedence.md`.
+    for name in dmapmod.map_names(lib.root):
+        d, why = dmapmod.parse_map(lib.root, name, want_cells=True,
+                                   verify=False)
+        if d is None:
+            rows.append({"map": name, "error": why[:80]})
             continue
+        p = Path(name)
         sc = gather(d.layers, lib)
         tot["maps"] += 1
         tot["sceneParts"] += len(sc.scenes)
@@ -866,11 +1001,10 @@ def _cmd_map(a) -> int:
     if lib.root is None:
         print(lib.reason, file=sys.stderr)
         return 1
-    p = lib.root / "map" / "map" / f"{a.map}.DMap"
-    if not p.is_file():
-        print(f"no such map: {p}", file=sys.stderr)
+    d, why = dmapmod.parse_map(lib.root, a.map, want_cells=True, verify=False)
+    if d is None:
+        print(why, file=sys.stderr)
         return 1
-    d = dmapmod.parse(p, want_cells=True, verify=False)
     sc = gather(d.layers, lib)
     sc.name = a.map
     print(f"{a.map}  {d.width}x{d.height}  {len(d.layers)} layers")

@@ -12,7 +12,10 @@ This module is the only thing allowed to decide it.
 Resolution order (first hit wins, and every answer records *how* it was found):
 
     1. explicit      an argument passed in code, or ``--root`` on any CLI
-    2. environment   the ``CO_ROOT`` environment variable
+    2. environment   the ``CO_ROOT`` environment variable.  Set but not a
+                     valid install is a **refusal** (`RootNotHonoured`), never
+                     a fall-through to step 3 -- naming a base and being
+                     answered about a different one is worse than no answer.
     3. config        ``<repo>/.co-root`` (gitignored) then the per-user config
                      at ``%APPDATA%\\co-client-re\\config.json``
     4. discovery     conventional install paths, then the Windows uninstall
@@ -20,17 +23,30 @@ Resolution order (first hit wins, and every answer records *how* it was found):
     5. failure       ``RootNotFound``, carrying the full list of what was tried
 
 A candidate is only accepted if it *contains the files that must exist* --
-``c3.wdf``, ``data.wdf``, ``ini/`` and ``bin/64/``.  A path is never trusted
+the asset archives (``c3.wdf``/``c3.tpd``, ``data.wdf``/``data.tpd``) and
+``ini/`` (see `REQUIRED`, and the notes there about the ``bin/64/`` entry
+that used to be in it and refused every client but one, and about the TPD
+alternatives that keep 7878 from being the next).  A path is never trusted
 because it looks right.
 
 Nothing here writes to the game install.  The only file this module ever
 writes is its own config, and only when something explicitly asks it to.
 
-One repo-side question is also answered here: where a derived artefact
-(``out/...``, gitignored, built from the install) can be *read* from.
-``find_derived`` looks in this checkout first, then -- in a linked ``git
-worktree`` -- in the primary checkout, so a fresh worktree inherits the
-``out/`` tree it cannot have yet instead of silently starting without it.
+Two repo-side questions are also answered here, both about derived artefacts
+(``out/...``, gitignored, built from the install):
+
+*Where can one be read from?*  ``find_derived`` looks in this checkout first,
+then -- in a linked ``git worktree`` -- in the primary checkout, so a fresh
+worktree inherits the ``out/`` tree it cannot have yet instead of silently
+starting without it.
+
+*Which install does one belong to?*  A derived index is only valid for the
+client it was built from, and this machine holds eight.  ``base_id`` names
+that client and ``find_derived`` resolves per-base trees (`PER_BASE`) inside
+``out/indexes/<base-id>/``, so pointing the tools at another install cannot
+serve the previous one's facts.  Nothing recorded this before, and it showed:
+``out/dll/rtti.md`` is still titled for one client over a body describing
+another.
 
 CLI::
 
@@ -55,12 +71,18 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 __all__ = [
-    "ENV_VAR", "CONVENTIONAL_ROOT", "REQUIRED", "RootNotFound", "Found",
+    "ENV_VAR", "CONVENTIONAL_ROOT", "REQUIRED", "RootNotFound",
+    "RootNotHonoured", "env_refusal", "Found",
     "missing_parts", "looks_like_root", "describe_root",
     "user_config_path", "repo_config_path", "config_root", "save_root",
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
+    "PER_BASE", "GLOBAL", "GLOBAL_EXCEPTIONS", "UndeclaredDerived",
+    "INDEX_ROOT", "base_fingerprint",
+    "base_id", "derived_rel", "derived_path", "declare_kind", "KINDS_KEY",
+    "forget_kind", "declared_kinds",
     "iter_candidates", "discover", "search_report",
     "find", "resolve", "game_root", "default_root", "bin_dir",
+    "binaries", "THIRD_PARTY_BINARIES",
     "add_root_argument", "root_from_args", "invalidate_cache",
 ]
 
@@ -72,13 +94,57 @@ ENV_VAR = "CO_ROOT"
 CONVENTIONAL_ROOT = r"C:\Program Files\Classic Conquer 2.0"
 
 #: What a real install must contain.  ``(relative path, kind)`` where kind is
-#: "file" or "dir".  These four are what every tool in the repo actually opens:
-#: the two WDF archives, the ini/ game database, and the 64-bit binaries.
+#: "file" or "dir".
+#:
+#: **`bin/64/` used to be here and was wrong.** It was described as "what
+#: every tool in the repo actually opens", and nothing opens it -- a grep for
+#: it across every `.py` finds only this table and its own error message. It
+#: is an artefact of the one install this project started from: measured over
+#: the official lineage, *none* of 5017, 5065, 5165, 5517 or 6090 has it, and
+#: neither does Zephyr. So it rejected every client except the one it was
+#: written from, which is the third gate this project has had tuned to that
+#: install and the third to refuse a legitimate client.
+#:
+#: What is left is what a client genuinely cannot work without and what the
+#: tools genuinely read: the asset archives and the ini/ database.
+#:
+#: **An entry may list alternatives separated by ``|``, and an alternative
+#: may join co-required files with ``+`` -- any one alternative, ALL of its
+#: parts.**  ``|`` cannot appear in a Windows filename so that split is
+#: always safe; ``+`` can, but no entry here names a file containing one.
+#: Added 2026-08-10 for 7878, which ships ``c3.tpd`` (1,076,058,840 bytes)
+#: and ``data.tpd`` (896,279,080) and **no ``.wdf`` archives at all** -- a
+#: later archive format whose grammar `core/tpd.py` already reads, not a
+#: broken install.
+#:
+#: **The TPD alternative requires the PAIR** (``.tpd`` payload + ``.tpi``
+#: index) because the two always ship together -- measured on 7878
+#: (``c3/c31/data/data1``, all paired) and Zephyr (both pairs) -- and a
+#: ``.tpd`` with no ``.tpi`` is a payload with no index, which a
+#: marker-only check would admit as a complete install.  A check that
+#: passes because it cannot express the distinction is the defect class
+#: `docs/quickfix_false_claim_sweep_2026-08-10.md` indexes.
+#:
+#: **A root is a SET of archives, each with its own reader -- not a WDF
+#: root or a TPD root.**  Zephyr carries ``c3.tpd``/``c3.tpi`` AND five
+#: ``garments*.wdf`` in one install.  This table is a presence check and
+#: handles that fine; do not rebuild it as a two-way container switch,
+#: because the mixed client exists and will refuse to be either.
+#:
+#: Without the alternatives this table would have been the FOURTH gate
+#: tuned to a narrow corpus refusing correct input -- the first three are
+#: tabulated in `docs/handoff_6090_and_first_run.md` §4: this table's own
+#: ``bin/64/`` (fixed `b66cd5b`), `comod` refusing Zephyr via
+#: `looks_like_root` (fixed `4d1fa20`), and `coassets.AssetRoot` hardcoding
+#: ``ARCHIVES = ("c3.wdf", "data.wdf")`` (still open, and older than it
+#: looks: `core/tpd.py` was verified against Zephyr's own TPD archives, so
+#: **the reader has existed all along for a container the asset layer will
+#: not open** -- that fix is scoped to `coassets.py` and is Parser's, not
+#: this file's).  `C-2026-08-10-quickfix-required-tpd`.
 REQUIRED: tuple[tuple[str, str], ...] = (
-    ("c3.wdf", "file"),
-    ("data.wdf", "file"),
+    ("c3.wdf|c3.tpd+c3.tpi", "file"),
+    ("data.wdf|data.tpd+data.tpi", "file"),
     ("ini", "dir"),
-    ("bin/64", "dir"),
 )
 
 #: Directory names an install has been seen under, or plausibly could be.
@@ -133,6 +199,72 @@ class Found:
                 "detail": self.detail}
 
 
+class RootNotHonoured(RuntimeError):
+    r"""``CO_ROOT`` was set to something that is not an install.
+
+    **This used to fall through, and falling through is the worst available
+    answer.**  Resolution tries the environment, then config, then discovery,
+    so a ``CO_ROOT`` naming a path that does not validate quietly handed back
+    *the configured install* -- and every tool then reported real, plausible,
+    entirely wrong numbers for a base nobody was looking at.
+
+    Measured 2026-08-09 on this machine::
+
+        CO_ROOT="C:/definitely/not/a/real/path"  ->  patch5517-76c7f4499934
+
+    Not hypothetical.  A quoting slip in a six-base gate audit sent four of the
+    runs to the configured install; each printed a plausible pass/fail split
+    under another base's name, and the only reason it was caught is that two
+    bases produced byte-identical numbers.  ``--root`` is discarded outright by
+    several tools (C22), which makes ``CO_ROOT`` *the* documented way to target
+    a base -- so this silently invalidated base-targeted measurement in
+    general, not merely that one audit.
+
+    An explicitly requested root that cannot be honoured is an **error**, not a
+    default.  Same rule as ``offsets_cache.json`` refusing a foreign cache and
+    `derived_rel` raising `UndeclaredDerived`: where the honest answer is
+    unavailable, raise rather than substitute a different one in silence.
+    """
+
+    def __init__(self, value, missing):
+        self.value = str(value)
+        self.missing = list(missing)
+        super().__init__(self.message())
+
+    def message(self) -> str:
+        what = (", ".join(self.missing) if self.missing
+                else "it is not a readable directory")
+        return (
+            f"{ENV_VAR} is set to {self.value!r}, which is not a Conquer "
+            f"Online install: missing {what}.\n\n"
+            f"Refusing to fall back to the configured install. {ENV_VAR} is an "
+            f"explicit request for ONE base, and answering it with a different "
+            f"base is how a measurement gets filed under the wrong client with "
+            f"numbers that look right.\n\n"
+            f"Fix the path, or unset {ENV_VAR} to use the configured install.\n"
+            f"  py -3 core/coroot.py       # what is configured now\n"
+            f"A valid install root contains: "
+            + ", ".join(n + ("/" if k == "dir" else "") for n, k in REQUIRED))
+
+
+def env_refusal() -> Optional[RootNotHonoured]:
+    """The refusal owed to an unusable ``CO_ROOT``, or None.
+
+    One predicate so `find`, `search_report` and every caller agree about what
+    "set but unusable" means; two implementations of this rule is how the
+    diagnostic ends up describing a root the resolver did not return.  An unset
+    or empty variable is not a request and is not refused.
+    """
+    raw = os.environ.get(ENV_VAR)
+    if raw is None:
+        return None
+    value = raw.strip().strip('"')
+    if not value:
+        return None
+    missing = missing_parts(value)
+    return RootNotHonoured(value, missing) if missing else None
+
+
 class RootNotFound(RuntimeError):
     """No install root could be resolved.  Carries the full search trail."""
 
@@ -182,14 +314,18 @@ def missing_parts(path) -> list[str]:
         return [n for n, _ in REQUIRED]
     if not base.is_dir():
         return [n for n, _ in REQUIRED]
+    def _present(name: str, kind: str) -> bool:
+        p = base.joinpath(*name.split("/"))
+        try:
+            return p.is_dir() if kind == "dir" else p.is_file()
+        except OSError:
+            return False
+
     missing = []
     for rel, kind in REQUIRED:
-        p = base.joinpath(*rel.split("/"))
-        try:
-            ok = p.is_dir() if kind == "dir" else p.is_file()
-        except OSError:
-            ok = False
-        if not ok:
+        # any one |-alternative, ALL of its +-parts
+        if not any(all(_present(part, kind) for part in alt.split("+"))
+                   for alt in rel.split("|")):
             missing.append(rel + ("/" if kind == "dir" else ""))
     return missing
 
@@ -204,7 +340,22 @@ def describe_root(path) -> dict:
     base = Path(path)
     out = {"root": str(base), "isDir": base.is_dir(), "parts": []}
     for rel, kind in REQUIRED:
-        p = base.joinpath(*rel.split("/"))
+        # Alternatives ("a|b+c"): report the first alternative whose parts
+        # ALL exist, else the first alternative, under the requirement's
+        # full name -- one row per requirement, not one per spelling.  For
+        # a multi-part alternative the probed path is its first absent part
+        # (so the row points at what is wrong), else its first part.
+        def _hit(name: str) -> bool:
+            q = base.joinpath(*name.split("/"))
+            try:
+                return q.is_dir() if kind == "dir" else q.is_file()
+            except OSError:
+                return False
+        alts = [a.split("+") for a in rel.split("|")]
+        chosen = next((a for a in alts if all(_hit(part) for part in a)),
+                      alts[0])
+        probe = next((part for part in chosen if not _hit(part)), chosen[0])
+        p = base.joinpath(*probe.split("/"))
         rec: dict = {"name": rel + ("/" if kind == "dir" else ""),
                      "kind": kind, "path": str(p), "exists": False,
                      "readable": False, "bytes": None, "error": None}
@@ -415,7 +566,592 @@ def _find_primary_checkout() -> Optional[Path]:
     return primary
 
 
-def find_derived(rel: str) -> Optional[Path]:
+#: Derived trees that are **built from one install and valid only for it**.
+#: A path under any of these is rewritten into ``out/indexes/<base-id>/...``
+#: so two clients cannot share an answer.
+#:
+#: Everything not listed stays where it is, and each omission is a claim:
+#:
+#: * ``out/wdf/`` -- hash-to-name maps.  The key *is* the archive content, so
+#:   an entry recovered from one client cannot be served for another unless
+#:   the archives are the same file, which across the official lineage they
+#:   are (identical md5 in all five).
+#: * ``out/offsets_cache.json`` -- already refuses a foreign cache; it keys on
+#:   the sha256 of the module bytes.  This is the pattern, not the exception.
+#: * ``out/opcodes.json`` -- protocol, not assets.
+#: * ``out/health.json``, ``out/client/``, ``out/recon/``, ``out/sessions/``,
+#:   ``out/clientdiff/`` -- reports and captures, named for what they describe.
+#: * ``out/dll/`` -- **KEYED, as of `comod/known-debt`.**  It is in
+#:   ``PER_BASE`` below, with ``out/dll/wdf_name_recovery`` carved out as the
+#:   one global exception (the TQ hash is a pure function of the filename, so
+#:   that table is true in any install and keying it would strand `meshtex`
+#:   and `health`).  The worked example that motivated it: `rtti.md` sat
+#:   titled "Classic Conquer 2.0 game DLLs" over a body describing 6090's,
+#:   because a second client overwrote it in place and nothing recorded which
+#:   install either version came from.
+#:
+#:   This bullet previously read *"not keyed, and it should be ... left alone
+#:   deliberately"*, and stayed that way **after the code was changed to key
+#:   it** -- prose contradicting the list ten lines below it, on both sides of
+#:   a merge, which is why neither side's diff showed it.  Corrected
+#:   2026-08-09.  See ``docs/handoff_5517_base_prep.md``.
+#: ``out/thumbs/servers/<name>/`` is exempt and stays global: those are
+#: COmmunity Library server views, which have nothing to do with whichever
+#: install happens to be configured.  They were already namespaced by hand --
+#: the ad-hoc version of this key.
+PER_BASE: tuple[str, ...] = (
+    "out/meshtex/", "out/artcrawl/", "out/thumbs/", "out/effects/",
+    "out/skins/", "out/browse/", "out/c3/", "out/ini/",
+    # Static analysis of the install's own binaries. Keyed for the same
+    # reason as the rest, and with a worked example of the cost: `rtti.md`
+    # sat titled "Classic Conquer 2.0 game DLLs" over a body describing
+    # 6090's, because a second client overwrote it in place and nothing
+    # recorded which install either version came from.
+    "out/dll/",
+    # The viewer's own derived art. Declarative for now: `coviewer` builds
+    # these from a literal (`OUTDIR = PROJECT / "out" / "viewer"`) and does
+    # not route them through here, so nothing changes today -- but the
+    # decision is recorded, so whoever routes them finds an answer instead of
+    # making one up.
+    "out/viewer/texcache/",     # decoded textures for ONE install's bytes
+    "out/viewer/terrain",       # terrain.json + terrain_<map>.png, per install
+    # `core/dcache.py` -- decoded `tq-stream` tables. Per-install for the same
+    # reason as texcache above: these are one client's BYTES, not a fact about
+    # the format. Two builds ship an `itemtype.dat` that differ in content
+    # while agreeing in grammar.
+    #
+    # It is declared here rather than in GLOBAL for a second reason worth
+    # keeping: dcache's key already carries the resolved source path, so
+    # correctness never depended on this line. But its docstring CLAIMED
+    # per-install separation, and a cache whose correctness rests on one of two
+    # mechanisms while its documentation credits the other is one nobody can
+    # reason about. The claim is now true where it says it is.
+    "out/cache/",
+    # `core/weaponswap.py` -- sha256 of one install's weapon MESH FILES, so the
+    # displacement warning can compare art without re-hashing thousands of
+    # meshes per page render. Per-install by definition: the whole finding it
+    # serves is that two installs ship DIFFERENT BYTES under the same
+    # `c3/mesh/<id>.c3` -- 3,762 of 4,718 shared weapon ids, 6609 vs CCO -- so a
+    # digest served across bases would answer the exact question it exists to
+    # ask, wrongly, in the direction that destroys art.
+    #
+    # `base_id` alone is NOT sufficient here, and the module does not rely on it
+    # alone: `base_fingerprint` hashes only the top level of `ini/`, and the swap
+    # page this serves WRITES MESHES -- so an install can change the very bytes
+    # this index describes without moving its key. Each entry therefore also
+    # carries the size and mtime of the file backing it (the loose file, or the
+    # archive), and a mismatch is a miss. This line is the outer lock and the
+    # stamp is the inner one; neither is redundant.
+    "out/weaponswap/",
+)
+
+#: Derived paths that are **not about one install**, each with the reason it
+#: is not.  Checked before `PER_BASE`, so a longer path opts back out.
+#:
+#: This list and `PER_BASE` together must cover every ``out/`` path: anything
+#: in neither raises `UndeclaredDerived` rather than being guessed at in
+#: either direction.  See `derived_rel`, and `docs/derived_classification.md`
+#: for how each entry below was decided.
+GLOBAL: tuple[str, ...] = (
+    "out/thumbs/servers/",
+    # Name recovery for the WDF archives: `{hash: name}`, and the TQ hash is
+    # a pure function of the filename string -- so an entry is true in *any*
+    # install, whatever that install's archives contain. Same reason
+    # `out/wdf/` is global, and by the same rule: **the sharing boundary is
+    # whatever the artefact is about, and a name table is about strings.**
+    # (`f0328a2` measures it: 5,000 sampled entries recomputed, 5,000 agree.)
+    #
+    # It sits under `out/dll/` only because the wordlist came from DLL
+    # strings. Keying it strands `meshtex` and `health`, which resolve it
+    # through `find_derived` and get None rather than a fallback.
+    "out/dll/wdf_name_recovery",
+
+    # -- the twelve that used to reach the fallthrough ---------------------
+    # Classified by reading what writes each one and what it contains;
+    # `docs/derived_classification.md` carries the evidence. Eleven were
+    # already correct by luck, and three would be actively damaged by keying.
+
+    # Name recovery: `{hash: name}`, and the TQ hash is a pure function of the
+    # filename string, so an entry is true in ANY install. Keying costs a
+    # ~380 s rebuild each AND degrades coverage.
+    "out/wdf/",
+    # The protocol, built from refs/, not from an install.
+    "out/opcodes.json",
+    # Self-guarding: keyed on the sha256 of the module bytes, and returns None
+    # on mismatch. The shape everything else is being moved towards.
+    "out/offsets_cache.json",
+    # Deliberately CROSS-patch: msglayouts.json is keyed by patch inside the
+    # file -- {"1001": {"5017": ..., "5065": ...}} -- so keying it would
+    # shatter one table into five partial copies, each missing the comparison
+    # it exists to make. walkprobe.json is a server probe, not an install.
+    "out/client/",
+    # About a PAIR of installs, and it says which in its own body (`old`,
+    # `new`). A pair has no single base_id.
+    "out/clientdiff/",
+    # About a named library measured against a baseline, both recorded inside.
+    "out/zephyr/",
+    # A running process, NOT the configured asset root -- heropath.json
+    # targets `imconquer.exe`, structfind.json records a pid, and the RE
+    # target has been a different client from `game_root` throughout. Keying
+    # would file ImConquer pointer paths under `patch5517-...`: authoritative
+    # and wrong. Its own key would be the target module's hash, not base_id.
+    "out/recon/",
+    # Runtime, per run rather than per install.
+    "out/sessions/",
+    "out/companion-logs/",
+    # Runtime, and it holds character names. `out/` is gitignored so
+    # `tests/test_sanitization.py` never scans it -- which is correct, and is
+    # also why this must never move anywhere publishable.
+    "out/companion-arenas.json",
+    # A report about this checkout, rewritten on every run.
+    "out/health.json",
+    # `tools/companionci.py` reports. About a RUNNING CLIENT PROCESS and a
+    # server row, not about the configured asset root -- same reasoning as
+    # `out/client/` below, and the same as `out/offsets_cache.json`: each report
+    # names the build it verified inside its own body, keyed on the sha256 of
+    # the module bytes. Keying the directory by `base_id` would file a 5065
+    # memory verdict under whichever install happened to be configured when the
+    # harness ran, which is authoritative and wrong.
+    "out/ci/",
+    # The viewer's runtime output and the user's OWN data. `tags.json` is not
+    # derived at all: keying it would fragment one person's tags across bases
+    # and lose them on a base switch -- data loss, not a rebuild, and the only
+    # unrecoverable case in this list.
+    "out/viewer/tags.json",
+    "out/viewer/shots/",
+    "out/viewer/preview/",
+    "out/viewer/serverviews/",
+    # Per-LIBRARY texture caches, already namespaced by hand in the directory
+    # name (`texcache-<server>`) -- the ad-hoc version of this key, same as
+    # `out/thumbs/servers/`.
+    "out/viewer/texcache-",
+
+    # The keyed tree itself. Without this, resolving an already-keyed path
+    # would raise, and a caller that round-trips one would key it twice.
+    "out/indexes/",
+)
+
+#: Historical name.  `GLOBAL` is no longer a list of *exceptions* -- it is
+#: half of a complete declaration -- but the old name is kept because other
+#: worktrees and docs refer to it.
+GLOBAL_EXCEPTIONS = GLOBAL
+
+
+class UndeclaredDerived(KeyError):
+    """An ``out/`` path that is in neither `PER_BASE` nor `GLOBAL`.
+
+    Raised rather than guessed, because the two possible guesses fail in
+    opposite and unequal ways: sharing an install-specific artefact serves one
+    client's facts as another's *silently*, and keying a genuinely shared one
+    costs a rebuild and can make it worse (`out/wdf/`) or lose user data
+    (`out/viewer/tags.json`).  Neither default is safe, so the answer has to
+    be written down.
+
+    The fix is one line in whichever list is right, **with the reason** --
+    that is the whole point of the change.  `docs/derived_classification.md`
+    shows the form.
+    """
+
+
+#: Where keyed artefacts live.
+INDEX_ROOT = "out/indexes"
+
+#: Files in ``ini/`` the **client itself rewrites**, excluded from
+#: `base_fingerprint`.  Lower-case, matched by exact name.
+#:
+#: The fingerprint answers *"which client is this?"*.  These files answer
+#: *"what did the user last do?"* -- window positions, resolution, the last
+#: account typed -- so including them made the answer change every time
+#: anyone shut a client down.
+#:
+#: **Measured, not guessed** (2026-08-09).  Three CCO index namespaces existed
+#: simultaneously: ``cco-a1954ac41d00`` (13 MB, dead), ``cco-ff8ca45988fc``
+#: (400 KB, dead), and the live id with no index at all -- each stranded by a
+#: shutdown.  ``GameSetUp.ini`` is the newest file in *five* installs
+#: (5017, 5065, 5165, 5517, Zephyr); CCO uses ``cqgui.ini`` + ``setup.json``;
+#: 5065 also writes ``GUI.ini``.  ``GameSetUp.ini`` additionally stores
+#: ``AccountRecord``, so hashing it mixed a personal identifier into a key.
+#:
+#: **This is a denylist, and that is a real weakness**: a client that writes a
+#: runtime file not named here re-keys its install once, before someone adds
+#: it.  Chosen knowingly -- the failure mode is a rebuild, never a wrong
+#: answer, which is the direction `docs/derived_classification.md` argues for.
+#: Add a name here with its evidence rather than widening this to a pattern;
+#: `*setup*` and `*gui*` would swallow real tables.
+VOLATILE_INI: frozenset[str] = frozenset({
+    "gamesetup.ini",   # TQ client settings; also holds AccountRecord (PII)
+    "gui.ini",         # UI layout state (5065 and siblings)
+    "cqgui.ini",       # the same, in the modern CCO client
+    "setup.json",      # CCO client settings
+})
+
+#: Files in ``ini/`` **our own tooling rewrites** to prepare an install for the
+#: rig, excluded from `base_fingerprint`.  Lower-case, matched by exact name.
+#:
+#: `VOLATILE_INI` answers *"what did the user last do?"*.  These answer
+#: *"what did we do to make this client usable?"* -- a different question with
+#: the same consequence, and one `VOLATILE_INI` deliberately does not cover
+#: because its own docstring scopes it to what **the client itself** rewrites.
+#:
+#: **Measured, not guessed** (2026-08-09).  `tools/clientsidecar.py` rewrote
+#: ``ini/StartGame.ini`` on the 5517 install at 15:01 -- correctly, with a
+#: backup, its reason in the file and a restore command -- and that single
+#: sanctioned edit moved the install's key, stranding **346 MB** under
+#: ``patch5517-d3ba8e7aa082`` while the live namespace held nothing.  Four
+#: sessions then measured four different viewer failure sets on nominally one
+#: root, and two of them diagnosed the same three reds as *"never built"* and
+#: *"orphaned"* -- both correct, for their own tree.
+#:
+#: **This is the second instance of that coupling, not a recurrence.**  The
+#: first (`docs/handoff_fingerprint_stability.md`) excluded what the *client*
+#: writes.  Client modification is an owner-granted, scoped exception for local
+#: test clients, so the rig is *expected* to patch these -- which makes an
+#: identity that changes when it does the wrong identity, not a misuse.
+#:
+#: Same denylist weakness as `VOLATILE_INI`, same knowing trade: a tool that
+#: rewrites a table not named here re-keys its install once.  Add a name with
+#: its writer, not a pattern.
+TOOL_WRITTEN_INI: frozenset[str] = frozenset({
+    "startgame.ini",    # tools/clientsidecar.py -- disables the TQAT sidecar
+    "gui800x600.ini",   # tools/clientdisplay.py --rescale-gui, low screen mode
+})
+
+#: Suffixes our client-modifying tools leave beside a file they patch.
+#:
+#: Excluded because **creating a backup adds a file to ``ini/``**, so a tool
+#: that carefully preserves the original re-keys the install by doing so --
+#: the exclusion of the patched file alone would not have helped.
+#:
+#: Safe as a pattern where `VOLATILE_INI`'s docstring warns against one:
+#: ``*setup*``/``*gui*`` would swallow real tables, but no shipped table uses
+#: these.  Verified across the corpus -- 5017 and CCO, the two installs our
+#: tools have not patched, carry **zero** backup-suffixed files in ``ini/``,
+#: while every install the rig has touched carries one or two.
+#:
+#: **Every entry names its writer, and the list is not a pattern.**
+#: ``.oracle-orig`` was missed for exactly one character: it ends in ``-orig``,
+#: not ``.orig``, so ``str.endswith((".orig", ...))`` did not match it and
+#: `tools/datoracle.py`'s two backups became the ENTIRE fingerprint difference
+#: between the two 5065 lineages -- 101 common ``ini/`` files, zero differing
+#: in content.  Widening to a bare ``-orig`` suffix is refused on the same
+#: grounds this docstring already gives for ``*setup*``: it would swallow a
+#: real table the day one is named that way.  ``tests/test_backup_suffixes.py``
+#: discovers writers by the AST idiom ``with_suffix(suffix + SUFFIX)`` and
+#: fails closed on any it cannot account for.
+#:
+#:   ``.bak``          ``tools/clientdisplay.py``  (``.res.bak``)
+#:   ``.orig``         ``tools/clientsidecar.py``
+#:   ``.oracle-orig``  ``tools/datoracle.py``      (``BACKUP_SUFFIX``, line 158)
+TOOL_BACKUP_SUFFIXES: tuple[str, ...] = (".orig", ".bak", ".oracle-orig")
+
+
+def fingerprint_skips(name: str) -> bool:
+    """Is ``name`` excluded from `base_fingerprint`?
+
+    One predicate, because `base_fingerprint` and `fingerprint_inputs` must
+    agree about this and previously each restated it.  Two implementations of
+    one rule is how a diagnostic ends up describing a hash it did not take.
+    """
+    low = name.lower()
+    return (low in VOLATILE_INI
+            or low in TOOL_WRITTEN_INI
+            or low.endswith(TOOL_BACKUP_SUFFIXES))
+
+
+def fingerprint_inputs(root=None) -> tuple[list[str], list[str]]:
+    """``(hashed, skipped)`` file names for `base_fingerprint`, for diagnosis.
+
+    Exposed because a fingerprint is twelve opaque characters, and the first
+    question anyone asks when one moves unexpectedly is *what went into it*.
+    """
+    try:
+        d = Path(root) if root is not None else game_root()
+    except RootNotHonoured:
+        # A refused CO_ROOT must not degrade into a blank fingerprint: that
+        # keys the whole derived tree as `unkeyed` and shares one namespace
+        # between every install anyone mistypes. Refusal propagates.
+        raise
+    except Exception:
+        return ([], [])
+    ini = Path(d) / "ini"
+    if not ini.is_dir():
+        return ([], [])
+    try:
+        names = sorted((p.name for p in ini.iterdir() if p.is_file()),
+                       key=str.lower)
+    except OSError:
+        return ([], [])
+    return ([n for n in names if not fingerprint_skips(n)],
+            [n for n in names if fingerprint_skips(n)])
+
+
+def base_fingerprint(root=None) -> str:
+    """A short content hash of the install's table layer, or ``""``.
+
+    **What it is:** sha256 over every file directly in ``ini/``, in
+    name order, contents included -- 250 files and 37 MB at 6090, about
+    50 ms.  Cheap enough to ask for on demand and decisive enough to
+    separate clients that no other cheap test can: all five official patch
+    clients ship byte-identical ``c3.wdf`` and ``data.wdf``, so the archives
+    discriminate nothing, and ``version.dat`` is absent from private-server
+    repacks.  The table layer is what a parser plugin is *about*, and it is
+    where the clients actually differ (91 of 176 shared ``ini/`` files differ
+    between 5517 and 6090).
+
+    **What it is not:** proof of identity.  It reads only the top level of
+    ``ini/``, so two installs differing solely in loose art or in a
+    subdirectory hash the same.  That is the right trade for choosing an
+    index namespace -- the cost of a collision is a shared index between two
+    installs whose tables agree exactly, and the cost of hashing the loose
+    layer instead would be minutes per call.
+
+    **What it deliberately ignores**, via `fingerprint_skips`:
+
+    * the files the client rewrites at shutdown (`VOLATILE_INI`).  Hashing
+      those made the identity of an install depend on whether anyone had *run*
+      it, which orphaned the whole index namespace on every launch -- three
+      dead CCO namespaces before it was caught, and getting worse as unattended
+      launches became routine.  An install is the same client before and after
+      you play it.
+    * the files our own tooling rewrites to prepare a client for the rig
+      (`TOOL_WRITTEN_INI`), and the backups it leaves beside them
+      (`TOOL_BACKUP_SUFFIXES`).  Client modification is a sanctioned exception
+      for local test clients, so an identity that moves when we exercise it is
+      the wrong identity.  One correct, backed-up, documented edit to
+      ``StartGame.ini`` stranded 346 MB of 5517 index and left four sessions
+      measuring four different failure sets on one root.  **An install is the
+      same client before and after we prepare it.**
+
+    Both are the same rule seen twice: *the fingerprint answers "which client
+    is this?", and neither playing it nor preparing it changes the answer.*
+
+    **Changing this function re-keys every install**, so every existing
+    `out/indexes/<base-id>/` is orphaned and rebuilds.  Nothing is lost that
+    cannot be rebuilt, but it is not a quiet change; see
+    `docs/handoff_fingerprint_stability.md`.
+    """
+    try:
+        d = Path(root) if root is not None else game_root()
+    except RootNotHonoured:
+        # A refused CO_ROOT must not degrade into a blank fingerprint: that
+        # keys the whole derived tree as `unkeyed` and shares one namespace
+        # between every install anyone mistypes. Refusal propagates.
+        raise
+    except Exception:
+        return ""
+    ini = Path(d) / "ini"
+    if not ini.is_dir():
+        return ""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        files = sorted((p for p in ini.iterdir()
+                        if p.is_file() and not fingerprint_skips(p.name)),
+                       key=lambda p: p.name.lower())
+        for p in files:
+            h.update(p.name.lower().encode("utf-8"))
+            h.update(p.read_bytes())
+    except OSError:
+        return ""
+    return h.hexdigest()[:12]
+
+
+def base_id(root=None) -> str:
+    """The namespace a derived artefact belongs to: ``<kind>-<fingerprint>``.
+
+    The kind half is the declared ``game_kind`` -- the user's own statement
+    of what this folder is -- so the directory name is readable
+    (``patch5517-113d8413ee90``) rather than opaque.  The fingerprint half is
+    what makes it *correct*: a declaration can be stale or absent, and a
+    repack of 6090 declares itself 6090 while shipping different tables.
+
+    **Re-declaring a folder deliberately changes the namespace**, even though
+    the bytes did not move.  An index is what a *plugin* concluded *about* an
+    install, so a different parse profile is a different index -- declaring a
+    6090 repack "myserver" instead of "patch6090" must not keep serving
+    answers derived under the other one's conventions.  The rebuild is the
+    point, not a cost.
+
+    Store the plugin's canonical ``name`` here, not an alias: ``for_kind``
+    accepts both and they would key two directories from one install.  The
+    setup page already writes ``plug.name``.
+
+    A missing directory means "build me", never "borrow another base's
+    answers".  Falls back to ``unknown-<fingerprint>`` with no declaration,
+    and to ``unkeyed`` when even the fingerprint fails -- which keeps a
+    broken install from silently sharing whatever was built last.
+    """
+    fp = base_fingerprint(root)
+    if not fp:
+        return "unkeyed"
+    return f"{_declared_kind(root)}-{fp}"
+
+
+#: Settings key: ``{absolute root: plugin name}``, every folder the user has
+#: ever declared.  ``game_kind`` alone cannot answer for more than one
+#: install, and this machine has eight.
+KINDS_KEY = "kinds"
+
+
+def declare_kind(root, kind: str) -> Path:
+    """Remember that ``root`` is a ``kind`` of client.  Returns the file written.
+
+    Writes both the single ``game_kind`` (what the app reads for the *current*
+    install) and an entry in `KINDS_KEY`, so the declaration survives pointing
+    the tools somewhere else and back.  Without the map, switching roots with
+    ``CO_ROOT`` or ``--root`` drops to ``unknown`` and silently opens a second,
+    empty index namespace for a client you already declared.
+    """
+    doc = read_settings()
+    kinds = dict(doc.get(KINDS_KEY) or {})
+    try:
+        kinds[str(Path(root).resolve())] = str(kind)
+    except OSError:
+        kinds[str(root)] = str(kind)
+    return write_settings(game_kind=str(kind), **{KINDS_KEY: kinds})
+
+
+def forget_kind(root) -> bool:
+    """Drop ``root``'s declaration.  True if there was one to drop.
+
+    The counterpart `declare_kind` never had. Without it a mistyped or moved
+    path stays in the map forever, and every consumer that walks declared
+    installs -- `tools/wdf_recover.py`'s wordlist discovery, the picker --
+    keeps opening a directory that is not there.
+
+    Deliberately does NOT touch ``game_kind``: that is which client the tools
+    are pointed at now, and forgetting what a folder *is* should not silently
+    change what you are working on.
+    """
+    doc = read_settings()
+    kinds = dict(doc.get(KINDS_KEY) or {})
+    try:
+        key = str(Path(root).resolve())
+    except OSError:
+        key = str(root)
+    hit = kinds.pop(key, None)
+    if hit is None:
+        # Tolerate a path given in a different spelling to the one stored.
+        want = key.lower().replace("\\", "/")
+        for k in list(kinds):
+            if k.lower().replace("\\", "/") == want:
+                hit = kinds.pop(k)
+                break
+    if hit is None:
+        return False
+    write_settings(**{KINDS_KEY: kinds})
+    return True
+
+
+def declared_kinds() -> dict:
+    """``{root: kind}`` for every declaration, as stored."""
+    return dict(read_settings().get(KINDS_KEY) or {})
+
+
+def kind_for_root(root=None) -> str:
+    """The plugin name the user declared for ``root``, or ``""``.
+
+    Ask this rather than reading ``game_kind`` directly.  ``game_kind`` is a
+    single value and this machine has eight installs, so it answers for
+    whichever root the config names and for no other: resolve a different one
+    and it hands back a plugin for a client you are not looking at.  That is
+    not theoretical -- running the suite with ``CO_ROOT`` pointed at 6090
+    while the config named 5517 loaded the 5517 plugin against 6090's assets,
+    and the only reason it surfaced was a provenance label changing.
+    """
+    kind = _declared_kind(root)
+    return "" if kind == "unknown" else kind
+
+
+def _declared_kind(root=None) -> str:
+    """What the user said this root is, or ``unknown``.
+
+    The per-root map (`KINDS_KEY`) answers first, because it is the only
+    record that can be about more than one install.  ``game_kind`` is the
+    fallback and is only evidence for the root it was saved beside: resolve a
+    different one -- via ``CO_ROOT``, ``--root``, or an explicit argument --
+    and it describes some other folder, so using it would file one client's
+    index under another's name.
+
+    Never guesses.  Detection is the app's job and the user's declaration
+    outranks it; a wrong name here would be baked into a directory.
+    """
+    doc = read_settings()
+    try:
+        here = Path(Path(root) if root is not None else game_root()).resolve()
+    except RootNotHonoured:
+        raise                      # same rule as `base_fingerprint`
+    except Exception:
+        return "unknown"
+
+    def clean(k: str) -> str:
+        k = str(k).strip().lower()
+        return "".join(c if c.isalnum() or c in "-_" else "-" for c in k)
+
+    for path, kind in (doc.get(KINDS_KEY) or {}).items():
+        try:
+            if Path(str(path)).resolve() == here and str(kind).strip():
+                return clean(kind)
+        except OSError:
+            continue
+    kind = str(doc.get("game_kind", "")).strip()
+    declared_for = doc.get("game_root")
+    if not kind or not declared_for:
+        return "unknown"
+    try:
+        if Path(str(declared_for)).resolve() != here:
+            return "unknown"
+    except OSError:
+        return "unknown"
+    return clean(kind)
+
+
+def derived_rel(rel: str, root=None) -> str:
+    """Rewrite a derived path into its per-base namespace, if it has one.
+
+    ``out/meshtex/coverage.json`` -> ``out/indexes/<base-id>/meshtex/coverage.json``
+    ``out/wdf/c3_names.json``     -> unchanged
+
+    Callers keep writing the plain literal they always wrote; this is the one
+    place that knows which trees are per-install.
+
+    ``root`` names *which* install to resolve for, and defaults to the
+    configured one.  It matters whenever a process holds more than one
+    catalogue at a time -- the viewer serving 6090 and 5517 side by side is
+    the case this exists for.  Without it the answer would be per-process,
+    and the second base would silently read the first's index, which is the
+    whole failure this key was built to stop.
+    """
+    r = str(rel).replace("\\", "/")
+    for pref in GLOBAL:
+        if r == pref.rstrip("/") or r.startswith(pref):
+            return r
+    for pref in PER_BASE:
+        if r == pref.rstrip("/") or r.startswith(pref):
+            return f"{INDEX_ROOT}/{base_id(root)}/{r[len('out/'):]}"
+    if r.startswith("out/") and len(r) > len("out/"):
+        raise UndeclaredDerived(
+            f"{r!r} is under out/ but is in neither coroot.PER_BASE nor "
+            f"coroot.GLOBAL. Decide which it is and add the prefix there, "
+            f"with a comment saying why -- see docs/derived_classification.md. "
+            f"It is not guessed at: sharing an install-specific artefact is "
+            f"silently wrong, and keying a shared one costs a rebuild or "
+            f"loses data.")
+    return r
+
+
+def derived_path(rel: str, root=None) -> Path:
+    """Where a **writer** should put ``rel``, in this checkout, keyed.
+
+    Never falls back to another checkout: everything that builds an artefact
+    builds it here.  Creates no directories -- the caller decides when.
+    """
+    repo = _repo_dir()
+    base = repo if repo is not None else Path.cwd()
+    return base / derived_rel(rel, root)
+
+
+def find_derived(rel: str, root=None) -> Optional[Path]:
     """Locate a derived artefact (an ``out/...`` path) for **reading**.
 
     This checkout first; failing that, the primary checkout when running in
@@ -424,7 +1160,16 @@ def find_derived(rel: str) -> Optional[Path]:
     on with less (``meshtex.scan_meshes`` is the cautionary tale).  Never
     used for writing: everything that builds an artefact writes into its own
     checkout.
+
+    Per-base trees (`PER_BASE`) resolve inside ``out/indexes/<base-id>/``, so
+    switching installs cannot serve one client's facts as another's -- the
+    failure that cost four visible bugs in the 6090 rebase.  **There is no
+    fallback to the unkeyed path**: a missing index must read as "build me".
+
+    Pass ``root`` when the caller knows which install it is asking about;
+    anything holding two catalogues at once must.
     """
+    rel = derived_rel(rel, root)
     repo = _repo_dir()
     if repo is not None and (repo / rel).exists():
         return repo / rel
@@ -647,6 +1392,15 @@ def search_report(explicit=None) -> dict:
     if env:
         if consider(env, "env", f"{ENV_VAR} environment variable"):
             return {"found": found.as_dict(), "tried": tried}
+        # Set but unusable: STOP.  Continuing to config and discovery is what
+        # made the report agree with a resolver that had silently answered for
+        # a different install -- the diagnostic must not describe a fallback
+        # that no longer happens.
+        refusal = env_refusal()
+        if refusal is not None:
+            return {"found": None, "tried": tried, "refused": {
+                "var": ENV_VAR, "value": refusal.value,
+                "missing": refusal.missing, "why": refusal.message()}}
 
     cfg = config_root()
     if cfg:
@@ -680,13 +1434,25 @@ def invalidate_cache() -> None:
 
 
 def find(explicit=None, *, use_cache: bool = True) -> Optional[Found]:
-    """Resolve the install root, or None.  Never raises, never prompts."""
+    """Resolve the install root, or None.  Never prompts.
+
+    Raises `RootNotHonoured` -- and *only* that -- when ``CO_ROOT`` is set to
+    something that is not an install.  "Returns None on failure" is still the
+    contract for *not finding* a root; this is the different case of having
+    been told exactly which root to use and being unable to comply, where the
+    old behaviour was to answer for a different install without saying so.
+    An explicit argument still wins over the environment, because a caller
+    that names a path is not asking about ``CO_ROOT`` at all.
+    """
     if explicit:
         p = Path(explicit)
         if looks_like_root(p):
             return Found(p.resolve() if p.exists() else p, "explicit",
                          "path given on the command line or in code")
         return None
+    refusal = env_refusal()
+    if refusal is not None:
+        raise refusal
     if use_cache and "found" in _cache:
         return _cache["found"]
     rep = search_report()
@@ -698,11 +1464,20 @@ def find(explicit=None, *, use_cache: bool = True) -> Optional[Found]:
 
 
 def last_report(explicit=None) -> dict:
-    """The search report for the current process, computing it if needed."""
+    """The search report for the current process, computing it if needed.
+
+    Never raises: this is the *diagnostic*, and the health check calls it
+    precisely when resolution has gone wrong.  A refused ``CO_ROOT`` comes
+    back as ``report["refused"]`` rather than an exception, so the page that
+    exists to explain the failure can still render it.
+    """
     if explicit:
         return search_report(explicit)
     if "report" not in _cache:
-        find()
+        try:
+            find()
+        except RootNotHonoured:
+            return search_report()
     return _cache.get("report") or search_report()
 
 
@@ -720,21 +1495,69 @@ def game_root(explicit=None) -> Path:
 
 
 def default_root() -> Path:
-    """A Path that is always safe to use as a default argument value.
+    """A Path that is safe to use as a default argument value.
 
     Returns the discovered root when there is one, and the conventional path
     otherwise -- so importing a module never fails on a machine without the
     game, and the failure instead lands where the assets are actually opened,
     with a message naming the missing files.
+
+    **`RootNotHonoured` deliberately propagates**, including out of the
+    import-time ``DEFAULT_ROOT = coroot.default_root()`` in `coassets`.  The
+    "never fails on import" guarantee is about a machine that has *no* install;
+    a ``CO_ROOT`` pointing at nothing is the opposite case -- somebody named a
+    base -- and quietly substituting the conventional path there would re-open
+    the fall-through this refusal exists to close, one layer further out.
     """
     got = find()
     return got.path if got else Path(CONVENTIONAL_ROOT)
 
 
+#: Redistributables that ship with any Windows build and answer no question
+#: about the game.  Dropped by `binaries` so a discovered set stays signal.
+THIRD_PARTY_BINARIES: frozenset = frozenset({
+    "d3dcompiler_47.dll", "d3dx10_43.dll", "d3dx9_43.dll",
+    "xaudio2_9redist.dll", "discord_game_sdk.dll", "crashpad_handler.exe",
+    "mfc42.dll", "msvcp60.dll", "msvcrt.dll", "msvcp90.dll", "msvcr90.dll",
+})
+
+
 def bin_dir(root=None) -> Path:
-    """``$ROOT/bin/64`` -- where the game DLLs and executables live."""
+    """Where this install keeps its executables and engine DLLs.
+
+    **Discovered, not assumed.**  The two families disagree: Classic Conquer
+    2.0 keeps them under ``bin/64``, and *no* official patch client
+    (5017-6090) has that directory at all -- theirs sit at the install root.
+
+    Returning ``bin/64`` unconditionally is why the whole `dump_*` family
+    analysed nothing under a patch client while reporting success six times,
+    and why ``out/dll/exports.json`` was once truncated from 273,983 bytes to
+    ``{}`` by a run whose only mistake was that the configured root had moved
+    on.  Thirteen tools resolve their target directory through this function,
+    so it is the one place worth teaching.
+    """
     base = Path(root) if root else default_root()
-    return base / "bin" / "64"
+    nested = base / "bin" / "64"
+    return nested if nested.is_dir() else base
+
+
+def binaries(root=None) -> list:
+    """Every PE worth analysing in this install, name-sorted.
+
+    Discovered rather than enumerated.  A hardcoded target list is the other
+    half of what made `dump_*` CCO-only: it named six modules, and five of
+    the six official installs ship none of them.  Discovery also picks up the
+    ones that matter per client -- ``Conquer.exe``, ``RoleView.dll``,
+    ``C3_CORE_DLL.dll`` -- which no CCO-era list would ever have mentioned.
+    """
+    d = bin_dir(root)
+    if not d.is_dir():
+        return []
+    return sorted((p for p in d.iterdir()
+                   if p.is_file()
+                   and p.suffix.lower() in (".dll", ".exe")
+                   and p.name.lower() not in THIRD_PARTY_BINARIES),
+                  key=lambda p: p.name.lower())
 
 
 # ---------------------------------------------------------------------------

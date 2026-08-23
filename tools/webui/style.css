@@ -244,6 +244,20 @@ table.stage th { color: var(--mut); font-weight: 600; font-size: 11px; }
 .cat-row .cat-head .n { color: var(--mut); font-size: 11px; font-variant-numeric: tabular-nums; }
 .cat-row .blurb { color: var(--mut); font-size: 10.5px; margin-top: 1px; }
 .cat-subs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+/* A filter that hides entries has to stay visible *while it is on*, not just
+ * at the moment you click it -- a ticked checkbox is easy to miss on a later
+ * visit, and this one persists across navigation. `#motion-note` carries the
+ * count that was removed and is un-hidden only when the filter is applied.
+ * `label.chk.hidden` near the top of this file is the cautionary tale for the
+ * specificity used here: `div.filter-note.hidden` has to out-specify
+ * `.filter-note`, or `classList.toggle('hidden')` would do nothing at all. */
+#motion-label.on { color: var(--warn); }
+.filter-note {
+  border: 1px solid #e6b45555; background: #e6b4551f; color: var(--warn);
+  border-radius: 5px; padding: 5px 8px; font-size: 11px; line-height: 1.35;
+}
+div.filter-note.hidden { display: none; }
+
 #cat-crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 #cat-crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
 #cat-crumbs a:hover { text-decoration: underline; }
@@ -465,8 +479,18 @@ body.builder aside { background: var(--panel); }
 .bigtoggle b { font-size: 12.5px; }
 .bigtoggle span { margin-left: auto; }
 .bigtoggle.nofx { border-color: var(--line); background: transparent; opacity: .75; }
-#aura-label.on { color: #ffd479; }
-#aura-label.nofx { opacity: .5; }
+/* One aura switch per weapon hand — both can be lit at once. */
+#aura-label-r_weapon.on, #aura-label-l_weapon.on { color: #ffd479; }
+#aura-label-r_weapon.nofx, #aura-label-l_weapon.nofx { opacity: .5; }
+
+/* The Weapon effects card holds one block per hand, so the two need a visible
+   boundary: without it the second hand's switch reads as another control for
+   the first. */
+.handfx + .handfx { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.handfx > h3 {
+  margin: 0 0 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--mut);
+}
 
 .card .note, .card .pending { font-size: 10.5px; line-height: 1.5; margin-top: 6px; }
 .card .note { color: var(--mut); }

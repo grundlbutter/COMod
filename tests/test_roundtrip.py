@@ -120,6 +120,12 @@ def main(argv=()):
             print(f"  {f[0]}  [{f[1]}]  {f[2]}")
     else:
         print("\nPASS - every PHY chunk re-serializes byte-exactly.")
+    # A `RESULT:` line with its counts on it, in the same shape as the other
+    # script gates. Before this the only verdict was the prose "PASS - ..."
+    # above, printed on success only -- so nothing could be grepped for a
+    # verdict, and nothing could check the verdict against the work done.
+    print(f"\nRESULT: {'FAIL' if fails else 'PASS'} -- {containers} container(s) "
+          f"scanned, {total} PHY chunk(s), {good} byte-exact, {len(fails)} failure(s)")
     return 0 if not fails else 1
 
 

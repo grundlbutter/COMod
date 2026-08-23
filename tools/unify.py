@@ -73,16 +73,44 @@ from coassets import DEFAULT_ROOT                        # noqa: E402
 import coroot                                            # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-COVERAGE = coroot.derived_path("out/meshtex/coverage.json")
 
-#: Where task #21's batch renderer puts its output.
-THUMB_DIR = coroot.derived_path("out/thumbs")
+#: DELETED: `COVERAGE = coroot.derived_path("out/meshtex/coverage.json")`.
+#: C21 removed the code path that read it, because a constant resolved at
+#: import names whichever install was configured *then* -- 6090 and 5517 both
+#: reported the same 5042 meshes out of `patch5517-.../coverage.json`. The
+#: constant itself was left behind, referenced by nothing but the comment
+#: saying not to use it, which is an invitation to the next person. Resolve
+#: per call through `coroot.find_derived`; it is a SAME-BASE fallback.
+
+#: DELETED: `THUMB_DIR = coroot.derived_path("out/thumbs")`. Where the batch
+#: renderer puts its output is per-install, so it is resolved per instance from
+#: `self.root` -- see `_thumb_dir` in `__init__`, which already did. The module
+#: constant survived beside it and was still read in two places: a comparison
+#: that was false for every base but the one configured at import (so a
+#: worktree inheritance never ran), and a texture-manifest read that served one
+#: base's manifest for another. C55.
 #: `manifest_meshes.json` is the 3.5 MB mesh-only slice of the 23 MB
 #: `manifest.json`, same schema. The mesh slice is loaded eagerly because every
 #: list row wants it; the full one only when a *texture* thumbnail is asked for.
 THUMB_MESH_MANIFEST = "manifest_meshes.json"
 THUMB_MANIFEST_NAMES = (THUMB_MESH_MANIFEST, "manifest.json", "thumbs.json",
                         "index.json")
+
+
+def _describe(p: Path) -> str:
+    """`p` relative to this checkout, or its full path when it is elsewhere.
+
+    `coroot.find_derived` **deliberately** falls back to the primary checkout
+    when a linked worktree has not built an artefact of its own, so the path
+    it hands back is routinely outside `REPO` -- and `relative_to` raises on
+    exactly that case.  This is only a label, so it reports the absolute path
+    rather than failing: a worktree that is reading the primary checkout's
+    index should say so, not pretend it built one.
+    """
+    try:
+        return p.relative_to(REPO).as_posix()
+    except ValueError:
+        return p.as_posix()
 
 
 @dataclass
@@ -106,7 +134,9 @@ class UnifiedIndex:
     def __init__(self, root: Path = DEFAULT_ROOT,
                  exists: Optional[Callable[[str], bool]] = None,
                  coverage: Optional[Path] = None,
-                 thumb_dir: Optional[Path] = None):
+                 thumb_dir: Optional[Path] = None,
+                 build: bool = True,
+                 progress: Optional[Callable[[int, int], None]] = None):
         self.root = Path(root)
         #: where thumbnail manifests live; a server view passes its own
         #: out/thumbs/servers/<name>/ so the base install's renders (same
@@ -123,10 +153,37 @@ class UnifiedIndex:
         self.mesh_matches: dict[str, list[dict]] = {}
         self.source = ""
         self.error = ""
-        # a linked worktree reads the primary checkout's coverage.json
-        self._load(coverage
-                   or coroot.find_derived("out/meshtex/coverage.json", self.root)
-                   or COVERAGE)
+        # A linked worktree reads the primary checkout's coverage.json --
+        # `find_derived` handles that, and it is a SAME-BASE fallback.
+        #
+        # There is deliberately no fallback to a module-level constant, and
+        # since 2026-08-09 there is no such constant left to fall back to --
+        # it was deleted (see the note where it used to live, above). One
+        # resolved at import names whichever install was configured *then*,
+        # so a base with no coverage file of its own silently loaded ANOTHER
+        # install's index: 6090 and 5517 both reported the same 5042 meshes
+        # out of `patch5517-.../coverage.json`. MEASURED --
+        # `docs/CORRECTIONS.md` C21.
+        #
+        # `_load(None)` builds live from `meshtex` for THIS root instead:
+        # slower, and correct. A missing per-base index means "build me",
+        # never "borrow another base's answers" (`coroot.base_id`'s own rule).
+        #: `build=False` yields a **legitimately empty** index rather than a
+        #: half-built one: `available` is False, so every consumer takes the
+        #: branch it already takes when `meshtex` is unavailable and each file
+        #: stays its own row. It exists so a caller that must answer NOW can
+        #: hand back a real object while the true index is still being built
+        #: elsewhere -- see `coviewer.Catalog.unified_now`. The distinction
+        #: matters and is kept in `source`: "not built yet" is a state that
+        #: will change, "unavailable" is one that will not.
+        self.built = build
+        if build:
+            self._load(coverage
+                       or coroot.find_derived("out/meshtex/coverage.json",
+                                              self.root),
+                       progress=progress)
+        else:
+            self.source = f"not built yet for {self._base()}"
 
         #: texture -> [(mesh, match)] over every *owning* pairing
         self.texture_owners: dict[str, list[tuple[str, dict]]] = {}
@@ -144,27 +201,65 @@ class UnifiedIndex:
         self._thumbs: Optional[dict] = None
 
     # -- loading -----------------------------------------------------------
-    def _load(self, coverage: Path) -> None:
-        if coverage.is_file():
+    def _base(self) -> str:
+        """This index's install, for the `source` readout. Never raises.
+
+        `source` is what tells a caller *which* index answered -- it is
+        served on `/api/unified` and printed in the viewer -- so two indexes
+        over two installs must not describe themselves identically. The
+        file-backed case already distinguishes them, because the path it
+        names contains `out/indexes/<base-id>/`. The two fallbacks did not:
+        both said "built live", which made the readout unable to tell 5517's
+        answers from 6090's at exactly the moment there is no index file to
+        name. A readout is an instrument (`docs/handoff_5517_base_prep.md`
+        §8.5), and this one was blind in the case that needs it most.
+        """
+        try:
+            return coroot.base_id(self.root)
+        except Exception:                                 # pragma: no cover
+            return "unkeyed"
+
+    def _load(self, coverage: Path | None,
+              progress: Optional[Callable[[int, int], None]] = None) -> None:
+        """Load this base's coverage index, or build one for this base.
+
+        ``None`` means no per-base index exists yet. That is a legitimate
+        state -- it is what a freshly keyed install looks like -- and it must
+        NOT be resolved by reading some other base's file (C21).
+        """
+        if coverage is not None and coverage.is_file():
             try:
                 data = json.loads(coverage.read_text("utf-8"))
                 self.mesh_matches = {k: v.get("matches", [])
                                      for k, v in (data.get("meshes") or {}).items()}
-                self.source = f"{coverage.relative_to(REPO).as_posix()} " \
-                              f"({len(self.mesh_matches)} meshes)"
-                return
             except Exception as e:                        # pragma: no cover
                 self.error = f"{coverage.name}: {e}"
+            else:
+                # Cosmetic, and deliberately outside the guard above: this
+                # label must never be able to discard a parse that worked.
+                self.source = (f"{_describe(coverage)} "
+                               f"({len(self.mesh_matches)} meshes)")
+                return
         try:
             import meshtex                                # imported, never edited
             idx = meshtex.MeshTextureIndex(self.root)
-            for mesh in idx.all_meshes():
+            # `progress(done, total)` exists because this loop is 30-60 s on a
+            # large client and the only honest thing to show someone waiting
+            # is the renderer's OWN count, not an animation. Ticked every 250
+            # meshes: often enough for a moving bar, rarely enough that the
+            # callback is not measurable against the work.
+            meshes = list(idx.all_meshes())
+            total = len(meshes)
+            for i, mesh in enumerate(meshes):
                 self.mesh_matches[mesh] = [m.as_dict() for m in idx.matches(mesh)]
-            self.source = "tools/meshtex.py, built live"
+                if progress is not None and (i % 250 == 0 or i + 1 == total):
+                    progress(i + 1, total)
+            self.source = f"tools/meshtex.py, built live for {self._base()}"
         except Exception as e:                            # pragma: no cover
             self.error = (self.error + "; " if self.error else "") + \
                 f"meshtex unavailable: {e}"
-            self.source = "unavailable — every file stays its own entry"
+            self.source = (f"unavailable for {self._base()} "
+                           "— every file stays its own entry")
 
     @property
     def available(self) -> bool:
@@ -382,9 +477,13 @@ class UnifiedIndex:
                 # checkout's render, same name priority.  Never for a
                 # server-specific dir -- another checkout's *base* renders
                 # would be the wrong bytes.
-                if self._thumb_dir == THUMB_DIR:
+                # Resolved for THIS instance's root, not at import. Against a
+                # module constant this comparison was false for every base but
+                # whichever was configured when the module loaded, so the
+                # inheritance below silently never ran for the others. C55.
+                if self._thumb_dir == coroot.derived_path("out/thumbs", self.root):
                     for name in THUMB_MANIFEST_NAMES:
-                        p = coroot.find_derived("out/thumbs/" + name)
+                        p = coroot.find_derived("out/thumbs/" + name, self.root)
                         if p is not None and p.is_file():
                             self._thumbs = self._read_manifest(p)
                             break
@@ -395,9 +494,14 @@ class UnifiedIndex:
     def texture_thumbs(self) -> dict[str, dict]:
         """The texture half of the manifest, loaded lazily (23 MB, ~0.2 s)."""
         if self._tex_thumbs is None:
-            p = THUMB_DIR / "manifest.json"
+            # This instance's own thumb dir. It was `THUMB_DIR`, resolved at
+            # import, so a viewer holding 6090 beside 5517 read ONE of them's
+            # texture manifest for both -- the same shape as C21, in the same
+            # file, one attribute over. C55.
+            p = self._thumb_dir / "manifest.json"
             if not p.is_file():
-                p = coroot.find_derived("out/thumbs/manifest.json") or p
+                p = coroot.find_derived("out/thumbs/manifest.json",
+                                        self.root) or p
             self._tex_thumbs = self._read_manifest(p) if p.is_file() else {}
         return self._tex_thumbs
 

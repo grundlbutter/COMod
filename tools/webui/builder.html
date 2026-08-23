@@ -16,7 +16,7 @@
             title="Monsters, NPCs, ghosts, mounts, roles and effects — one model, one action list (M)">Models</button>
   </div>
   <label id="path-label" class="hidden"
-         title="What this stage is drawing from — an installed client, or a server in your COmmunity Library. The parser plugin follows the path, so the tables, id conventions and socket map all change with it. Your loadout, action and frame are kept across the switch, which is how you tell a regression in this tool from a difference between the clients.">
+         title="What this stage is drawing from — an installed client, or a private server's own client. The parser plugin follows the path, so the tables, id conventions and socket map all change with it. Your loadout, action and frame are kept across the switch, which is how you tell a regression in this tool from a difference between the clients.">
     Path
     <select id="path-select"></select>
   </label>
@@ -101,9 +101,14 @@
         <input type="checkbox" id="chk-lock"> lock camera</label>
       <label class="chk"><input type="checkbox" id="chk-grid" checked> grid</label>
       <label class="chk"><input type="checkbox" id="chk-wire"> wireframe</label>
-      <label class="chk hidden" id="aura-label"
-             title="The always-on glow a Super weapon carries (A)">
-        <input type="checkbox" id="chk-aura"> super aura</label>
+      <!-- One switch per weapon hand. A character can hold a weapon in each
+           hand and each aura is its own control: both, either, or neither. -->
+      <label class="chk hidden" id="aura-label-r_weapon"
+             title="The always-on glow a Super weapon carries, right hand (A)">
+        <input type="checkbox" id="chk-aura-r_weapon"> aura R</label>
+      <label class="chk hidden" id="aura-label-l_weapon"
+             title="The always-on glow a Super weapon carries, left hand (Shift+A)">
+        <input type="checkbox" id="chk-aura-l_weapon"> aura L</label>
       <button id="btn-focus" class="ghost" title="Zoom to the head (F)">Focus head</button>
       <button id="btn-reset" class="ghost" title="Re-frame the character (R)">Reset view</button>
       <button id="btn-shot" class="ghost" title="Save the current frame to out/viewer/shots/">Save PNG</button>
@@ -214,8 +219,11 @@
       <tr><td><kbd>R</kbd></td><td>re-frame the character</td></tr>
       <tr><td><kbd>F</kbd></td><td>zoom to the head</td></tr>
       <tr><td><kbd>G</kbd> <kbd>W</kbd></td><td>grid · wireframe</td></tr>
-      <tr><td><kbd>A</kbd></td><td>the Super weapon aura on / off</td></tr>
-      <tr><td><kbd>Q</kbd></td><td>step the weapon up a quality (shift-<kbd>Q</kbd> down)</td></tr>
+      <tr><td><kbd>A</kbd></td><td>the right hand&#39;s Super aura on / off (shift-<kbd>A</kbd> the left hand&#39;s &mdash; they are independent)</td></tr>
+      <!-- Q and shift-Q are up and down, so unlike the aura they cannot spare
+           a key for the second hand. They step whichever slot the Colour &
+           variants panel is showing instead: 3 / 4 move it between the hands. -->
+      <tr><td><kbd>Q</kbd></td><td>step the weapon in the <b>Colour &amp; variants</b> panel up a quality (shift-<kbd>Q</kbd> down) &mdash; <kbd>3</kbd> / <kbd>4</kbd> point that panel at the right or left hand, and <kbd>Q</kbd> still works with that picker open</td></tr>
       <tr><td><kbd>C</kbd></td><td>collapse / expand every panel on the right</td></tr>
       <tr><td>drag / wheel / shift-drag</td><td>orbit · zoom · pan</td></tr>
     </table>

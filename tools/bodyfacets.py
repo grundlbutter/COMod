@@ -144,7 +144,11 @@ class BodyRecord:
 class BodyFacets:
     """Builds the class/gender/size classification for every body appearance.
 
-    Construction cost is dominated by loading ini/itemtype.json (8.3 MB) once.
+    Construction cost is dominated by loading the item table once --
+    `ini/itemtype.json` (8.3 MB) on CCO, the TQ-cipher-encrypted
+    `ini/itemtype.dat` on every official client. `coassets.load_items` picks
+    between them, so nothing here has to know which answered; that
+    indirection is the only reason this module works on an official base.
     """
 
     def __init__(self, root: Path = DEFAULT_ROOT, part_tables: Optional[dict] = None,

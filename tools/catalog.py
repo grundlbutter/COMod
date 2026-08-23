@@ -32,7 +32,15 @@ selectable bucket -- nothing is ever hidden for failing to fit.
 
 `c3/0001` .. `c3/0004` are not four mystery folders: they line up exactly with
 the four player body types (see docs/appearance_ids.md), so they fold into
-Characters as per-body-type motion sets.
+Characters as per-body-type motion sets.  **There are sixteen such families,
+not four** -- `c3/1001..1004`, `2001..2004` and `3001..3004` are the same
+shape and are named by `ini/3dmotion.dbc`; they were landing in
+`character/misc` until the rule's pattern was widened.  See the `RULES` entry
+for the evidence.
+
+`animation_buckets()` below is the one place that answers "which of these
+buckets is animation the Asset Viewer cannot preview", and the viewer's
+"hide animation assets" toggle is built on it.
 
 Slots left for the sibling workstreams: `related_for_*` returns a list of
 groups, and `effects.py` / `meshtex.py` are imported if present and skipped if
@@ -52,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import DEFAULT_ROOT                       # noqa: E402
+from wdf import detect_magic                            # noqa: E402
 
 try:
     import bodyfacets                                   # noqa: E402
@@ -118,6 +127,73 @@ SUBCATEGORY_ORDER: dict[str, list[str]] = {
     "other": ["other"],
 }
 
+#: The name this taxonomy uses for an animation bucket. One string, so the
+#: set below is a *query against the taxonomy* rather than a second list that
+#: can drift away from it.
+ANIMATION_SUBCATEGORY = "motion"
+
+
+def animation_buckets() -> set[tuple[str, str]]:
+    r"""Every ``(category, subcategory)`` the taxonomy itself calls animation.
+
+    **DERIVED, not declared.** It is read out of `SUBCATEGORY_ORDER` above --
+    the taxonomy's own statement of which buckets exist -- by asking which of
+    them are named `motion`. Today that is `character/motion` and
+    `weapon/motion`; a category that gains a `motion` bucket later is covered
+    without editing anything here, and a hand-written list would not have been.
+
+    The bucket is filled by one rule, which says what it is in its own `why`:
+    `^c3/[0-3]00[1-4]/` -> the per-body-type motion sets.
+
+    WHAT THIS IS FOR, AND WHAT IT IS NOT
+    ------------------------------------
+    The Asset Viewer cannot preview an animation -- only the Builder / model
+    view binds a motion over a mesh and plays it -- so these entries are noise
+    in that mode and the viewer offers a toggle that hides them.  MEASURED on
+    `patch5517-d3ba8e7aa082`, all 2,475 paths in `character/motion`, by reading
+    each container's chunk tags:
+
+        2,100   carry no PHY-family chunk at all -- `/api/mesh` returns
+                `meshes: []` and the viewport draws literally nothing
+          375   carry PHY + MOTI (+ CAME) and *do* draw a static pose
+
+    So hiding the bucket is not free: 375 of them would have rendered
+    something.  They are still frames of an action set rather than assets in
+    their own right, and neither half can be previewed *as animation* here,
+    which is the distinction the toggle is named for.  It is off by default and
+    it says how many entries it removed -- see `coviewer.api_categories`.
+
+    KNOWN GAP, measured rather than assumed.  Monster, mount and NPC families
+    keep their motion-only action files in their `mesh` bucket, because the
+    taxonomy files art by *who it belongs to* and only `c3/N00M/` announces
+    itself as a motion set in the path.  Same sweep, same base:
+
+        monster/mesh    1,024 of 1,127 carry no PHY
+        mount/mesh        189 of   193
+        npc/mesh           70 of   238
+        effect/mesh     1,838 of 4,547  -- NOT unpreviewable: the effect
+                                          player draws these, so "no PHY" is
+                                          not a synonym for "cannot preview"
+
+    Telling those apart needs `models.ModelCatalogue.has_geometry` per file,
+    not the taxonomy, so they are **out of scope for this toggle** rather than
+    silently half-covered.  OPEN.
+    """
+    return {(cid, sub)
+            for cid, subs in SUBCATEGORY_ORDER.items()
+            for sub in subs
+            if sub == ANIMATION_SUBCATEGORY}
+
+
+#: Materialised once: the taxonomy is a module-level constant, so this is too.
+ANIMATION_BUCKETS: set[tuple[str, str]] = animation_buckets()
+
+
+def is_animation(category: str, subcategory: str) -> bool:
+    """True for an entry the Asset Viewer cannot preview as animation."""
+    return (category, subcategory) in ANIMATION_BUCKETS
+
+
 #: Role is orthogonal to category: what *kind* of file it is. It is what lets
 #: the map view separate "the big map" from "the sprites that go on it".
 ROLE_BY_EXT = {
@@ -127,6 +203,54 @@ ROLE_BY_EXT = {
     ".part": "mapdata", ".ani": "mapdata", ".wav": "sound", ".mp3": "sound",
     ".ogg": "sound", ".ini": "data", ".json": "data", ".txt": "data",
 }
+
+
+# ---------------------------------------------------------------------------
+# the weapon-effect linkage artefact, and why it might not be there
+# ---------------------------------------------------------------------------
+
+#: `AssetCatalog.linkage_status()["state"]`.  Four values because an empty
+#: `weapon_linkage()` has four causes and only one of them is a fact about the
+#: game data; collapsing them is what let a missing artefact be reported as
+#: "Flash4102 does not resolve" for as long as it was.
+LINKAGE_OK = "ok"                  # loaded, with content
+LINKAGE_MISSING = "missing"        # find_derived found nothing to read
+LINKAGE_UNREADABLE = "unreadable"  # there, but did not parse into an object
+LINKAGE_EMPTY = "empty"            # parsed, and holds no linkage at all
+
+#: How to build it.  No ``--out``: the artefact is per-base (`coroot.PER_BASE`
+#: carries ``out/effects/``), so `--out out/effects/linkage.json` writes the
+#: unkeyed literal, which `find_derived` never reads -- there is deliberately
+#: no fallback from the keyed path to the unkeyed one.
+LINKAGE_BUILD_CMD = "py -3 tools/effects.py --root {root} --linkage"
+
+
+def _linkage_reason(st: dict) -> str:
+    """One line naming the state, the keyed path, and the base it was keyed to.
+
+    The path and the base id travel together on purpose. "Not built yet" and
+    "built, then orphaned when the install re-keyed" are indistinguishable
+    without both, and telling them apart is the difference between a 30-second
+    answer and re-deriving a 346 MB index (`docs/CORRECTIONS.md` C18).
+    """
+    where = f"{st.get('rel', '?')} (base {st.get('base_id') or 'undeclared'})"
+    state = st.get("state")
+    if state == LINKAGE_OK:
+        return (f"linkage loaded from {where}: "
+                f"{st.get('effects', 0)} effects, {st.get('weapons', 0)} weapon "
+                f"appearances")
+    build = LINKAGE_BUILD_CMD.format(root=st.get("root") or "<install>")
+    if state == LINKAGE_MISSING:
+        return (f"no weapon-effect linkage: {where} is in neither this checkout "
+                f"nor the primary one. Nothing was loaded, so every effect "
+                f"lookup answers empty for want of a table, not for want of a "
+                f"row. Build it with: {build}")
+    if state == LINKAGE_UNREADABLE:
+        return (f"weapon-effect linkage at {where} did not parse "
+                f"({st.get('detail') or 'unknown error'}); nothing was loaded. "
+                f"Rebuild it with: {build}")
+    return (f"weapon-effect linkage at {where} parsed but is empty -- no "
+            f"effects and no weapon appearances. Rebuild it with: {build}")
 
 
 @dataclass
@@ -182,8 +306,25 @@ RULES: list[Rule] = [
     Rule("data/minimap/", "map", "minimap", "minimap art"),
 
     # ---- characters ----
-    Rule("^c3/000[1-4]/", "character", "motion",
-         "c3/000N/ is the motion/equipment set for player body type N", 1),
+    # `c3/0001..0004` are the four player body types (docs/appearance_ids.md).
+    # `c3/1001..1004`, `2001..2004` and `3001..3004` are the SAME shape --
+    # `<family>/<group>/<action>.c3` -- and were landing in `character/misc`
+    # because the pattern only allowed a leading `0`. Three sources agree they
+    # are motion sets, so the pattern now covers all sixteen:
+    #   1. the client's own motion table names them. `ini/3dmotion.ini` has
+    #      not heard of them (0 references), but `ini/3dmotion.dbc` names all
+    #      twelve, on both 5517 and 6090.
+    #   2. MEASURED: 736/736 of their `.c3` files on 5517 and 1,516/1,528 on
+    #      6090 carry no PHY-family chunk -- pure motion, nothing to draw.
+    #      (The `000N` families are mixed the same way: 375 of 1,739 do have
+    #      geometry, so a stray PHY here is the normal pattern, not a
+    #      counter-example.)
+    #   3. CCO ships only `0001..0004` and no `.dbc` at all, so the widened
+    #      pattern cannot match anything there. Checked on all three declared
+    #      bases rather than the two that were to hand.
+    Rule("^c3/[0-3]00[1-4]/", "character", "motion",
+         "c3/N00M/ is a motion set for player body type M; ini/3dmotion.dbc "
+         "names it and its files carry no geometry", 1),
     Rule("c3/body/", "character", "body", "c3/body/ character body art"),
     Rule("c3/hair/", "character", "hair", "c3/hair/ hair meshes and skins"),
     Rule("data/playerface/", "character", "face", "player portrait art"),
@@ -268,8 +409,54 @@ TABLE_CATEGORY: dict[str, tuple[str, str]] = {
 }
 
 
-def role_of(path: str) -> str:
-    return ROLE_BY_EXT.get(Path(path).suffix.lower(), "data")
+#: Roles whose file format this module can actually recognise from its first
+#: bytes (`wdf.detect_magic`). Only these may be overruled by a sniff: a
+#: `.DMap`, `.ani` or `.pul` has no magic here, so "unrecognised" says nothing
+#: about it and must not demote it.
+SNIFFABLE_ROLES = frozenset({"mesh", "texture"})
+
+
+def role_of(path: str, head: bytes = b"") -> str:
+    """The asset's role. With ``head``, the CONTENT decides; without it, the
+    extension does.
+
+    **On this client family the extension lies, and the viewer believed it.**
+    MEASURED in Zephyr's `c3.tpd`, over all 53,536 `.c3`/`.dds` entries:
+
+        20  .c3  files that are really DDS       (a texture called a mesh)
+         8  .dds files that are really MAXF C3   (a mesh called a texture)
+        24  .dds files that are really PNG
+         5  .dds files that are really JPEG
+         3  .c3  files with an unrecognised magic
+         1  .c3  file that is plain ini text (`c3/npc/006/2000.c3`)
+
+    61 assets, and every one of them was unreadable: `role_of` sent them to a
+    decoder chosen by extension, and `dds.decode` / `C3File` reject a payload
+    whose magic disagrees. `c3/0004/615/120.c3` is a perfectly good DDS that
+    **decodes fine** once it reaches the right decoder -- the file was never
+    broken, the routing was.
+
+    Two deliberate limits, because a sniff that overrides too much is worse
+    than one that overrides too little:
+
+    * only `SNIFFABLE_ROLES` may be overruled -- an unrecognised magic on a
+      `.DMap` means "this module does not know that format", not "the
+      extension is wrong";
+    * a recognised magic wins outright, which is what fixes the 57 files
+      above whose real format IS one we know.
+
+    `tools/assetdiff.py` has sniffed unnamed WDF payloads this way since it
+    was written; this brings the catalogue's *named* path into line with it.
+    """
+    by_ext = ROLE_BY_EXT.get(Path(path).suffix.lower(), "data")
+    if not head:
+        return by_ext
+    label, ext = detect_magic(head)
+    if label != "UNKNOWN":
+        return ROLE_BY_EXT.get(ext, by_ext)
+    # Unrecognised bytes: only meaningful where we would have recognised the
+    # real thing. `c3/npc/006/2000.c3` is ini text under a mesh's name.
+    return "data" if by_ext in SNIFFABLE_ROLES else by_ext
 
 
 class AssetCatalog:
@@ -283,15 +470,31 @@ class AssetCatalog:
                  table_membership: Optional[Callable[[str], list]] = None,
                  exists: Optional[Callable[[str], bool]] = None,
                  list_under: Optional[Callable[[str], list]] = None,
-                 npc_membership: Optional[Callable[[str], bool]] = None):
+                 npc_membership: Optional[Callable[[str], bool]] = None,
+                 peek: Optional[Callable[[str], bytes]] = None):
         self.root = Path(root)
         self._tables = table_membership or (lambda p: [])
         self._exists = exists or (lambda p: (self.root / p).is_file())
         self._list_under = list_under or (lambda prefix: [])
         self._npc = npc_membership or (lambda p: False)
+        #: First bytes of a logical path, for `role_of`'s content sniff, or
+        #: b"" when they cannot be had cheaply. Injected because only the
+        #: caller knows how to reach into its archives.
+        #:
+        #: **The default does NOT peek, and that is deliberate.**
+        #: `coviewer.category_index` classifies every path in the install in
+        #: one pass -- 77k of them -- and a peek there costs one filesystem
+        #: probe each. MEASURED: a default that stats the loose file made
+        #: classification **6x slower** (0.22s -> 1.28s per 40k paths) to
+        #: correct 61 files, in an index used for *browsing*, where the role
+        #: only picks a folder. The 61 files break at **decode**, one at a
+        #: time, where the bytes are already in hand and the sniff is free --
+        #: so that is where a caller should pass `peek`.
+        self._peek = peek or (lambda p: b"")
         self._cache: dict[str, Classification] = {}
         self._weapon_motion: Optional[dict[str, str]] = None
         self._linkage: Optional[dict] = None
+        self._linkage_status: Optional[dict] = None
 
     # -- classification ----------------------------------------------------
     def classify(self, path: str) -> Classification:
@@ -303,8 +506,24 @@ class AssetCatalog:
         self._cache[p] = c
         return c
 
+    def _peek_loose(self, p: str) -> bytes:
+        """First bytes of a loose file, or b"". Never raises: a sniff that
+        fails must degrade to the extension, not break classification."""
+        try:
+            q = self.root / p
+            if q.is_file():
+                with open(q, "rb") as f:
+                    return f.read(16)
+        except OSError:
+            pass
+        return b""
+
     def _classify(self, p: str) -> Classification:
-        role = role_of(p)
+        try:
+            head = self._peek(p) or b""
+        except Exception:
+            head = b""
+        role = role_of(p, head)
 
         # (1) strongest evidence: the client's own appearance tables
         refs = self._tables(p)
@@ -484,8 +703,13 @@ class AssetCatalog:
                     "ini/WeaponMotion.ini — the weapon swaps mesh per action, "
                     "it does not deform")
                 items, ready = self._effect_items(ident, table)
+                # When the linkage did not load, the note says which keyed
+                # path was missing and for which base -- an empty slot that
+                # explains itself, rather than one that looks like "this
+                # weapon has no effects".
                 add("Effects", items,
-                    "weapon effect linkage (tools/effects.py)",
+                    ("weapon effect linkage (tools/effects.py)" if ready
+                     else self.linkage_status().get("reason", "")),
                     pending=not ready or not items)
 
         if path:
@@ -503,17 +727,79 @@ class AssetCatalog:
         return [g for g in groups if g["items"] or g["pending"]]
 
     def weapon_linkage(self) -> dict:
-        """`out/effects/linkage.json` from task #13. Loaded once, lazily."""
+        r"""`out/effects/linkage.json` from task #13. Loaded once, lazily.
+
+        Empty is **four different facts**, and `linkage_status` is how a caller
+        tells them apart:
+
+        * `LINKAGE_MISSING`  -- nothing was loaded; the artefact has not been
+          built for this base.
+        * `LINKAGE_UNREADABLE` -- it is there and did not parse.
+        * `LINKAGE_EMPTY`    -- it parsed and holds no linkage.
+        * `LINKAGE_OK`       -- it loaded, and an empty *answer* from it is the
+          table saying no.
+
+        This used to `except Exception: return {}` and say nothing, so
+        `effect_assets` answered `[]` and `weapon_effects` answered `{}` for
+        both "the table says no" and "there is no table" -- and two viewer
+        tests read as content refutations ("Flash4102 does not resolve") when
+        the truth was "nothing was loaded". That is exactly the degradation
+        `coroot.find_derived`'s docstring forbids: *"a caller that would
+        degrade without the artefact must then say so out loud rather than
+        carry on with less"*.
+
+        **Resolved against `self.root`, not the configured install.** The
+        catalogue knows which client it is describing and the process may hold
+        two of them at once -- the read side of the C22 / C41(c) rule, and the
+        same instruction `coviewer._derived_text` already carries.
+        """
         if self._linkage is None:
             self._linkage = {}
             import coroot
-            p = coroot.find_derived("out/effects/linkage.json")
+            rel = coroot.derived_rel("out/effects/linkage.json", self.root)
+            st = {"state": LINKAGE_MISSING, "rel": rel, "path": "",
+                  "base_id": coroot.base_id(self.root), "root": str(self.root),
+                  "effects": 0, "weapons": 0, "detail": ""}
+            p = coroot.find_derived("out/effects/linkage.json", self.root)
             if p is not None:
+                st["path"] = str(p)
                 try:
-                    self._linkage = json.loads(p.read_text("utf-8"))
-                except Exception:
-                    self._linkage = {}
+                    doc = json.loads(p.read_text("utf-8"))
+                except (OSError, ValueError) as exc:
+                    st["state"] = LINKAGE_UNREADABLE
+                    st["detail"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    if not isinstance(doc, dict):
+                        st["state"] = LINKAGE_UNREADABLE
+                        st["detail"] = (f"top level is {type(doc).__name__}, "
+                                        f"expected an object")
+                    else:
+                        self._linkage = doc
+                        st["effects"] = len(doc.get("effects") or {})
+                        st["weapons"] = len(doc.get("weapon_appearances") or {})
+                        st["state"] = (LINKAGE_OK
+                                       if (st["effects"] or st["weapons"])
+                                       else LINKAGE_EMPTY)
+            st["reason"] = _linkage_reason(st)
+            self._linkage_status = st
         return self._linkage
+
+    def linkage_status(self) -> dict:
+        """Why `weapon_linkage` holds what it holds -- loaded, or why not.
+
+        Always populated (loading is forced if it has not happened), so a
+        caller never has to guess whether the blank it is looking at is an
+        answer or an absence. `reason` is a one-line sentence naming the
+        **keyed** path that was looked for and the base it was keyed to,
+        which is the pair that identifies a "never built here" from an
+        "orphaned by a re-key" without any further digging.
+        """
+        self.weapon_linkage()
+        return dict(self._linkage_status or {})
+
+    def linkage_ready(self) -> bool:
+        """True when the linkage artefact loaded with content in it."""
+        return self.linkage_status().get("state") == LINKAGE_OK
 
     def weapon_effects(self, ident: str) -> dict:
         r"""The three separate effects a weapon has, per docs/effects.md.
@@ -626,12 +912,13 @@ class AssetCatalog:
     def _effect_items(self, ident: str, table: str) -> tuple[list[dict], bool]:
         """Weapon -> effect linkage, from task #13's `out/effects/linkage.json`.
 
-        Returns `(items, ready)`. `ready` is False only when the linkage file is
-        missing, so the group stays on screen as an explicit placeholder rather
-        than silently vanishing.
+        Returns `(items, ready)`. `ready` is False when the linkage artefact did
+        not load -- missing, unreadable, or empty -- so the group stays on screen
+        as an explicit placeholder rather than silently vanishing, and the
+        caller can put `linkage_status()["reason"]` on it. `ready` True with no
+        items is the other fact: the table loaded and this weapon has none.
         """
-        link = self.weapon_linkage()
-        if not link:
+        if not self.linkage_ready():
             return [], False
         eff = self.weapon_effects(ident)
         if not eff:

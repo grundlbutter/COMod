@@ -36,8 +36,10 @@ told apart by their separator:
 * space-separated under an ``Amount=N`` header line (classic; the 5065
   file): 39 fields on 6,864 of 6,865 rows, and N matches the row count
   exactly.  This layout has NO ``data`` column -- the magic block is one
-  field shorter than 5517's -- and its four fields after attackSpeed are
-  unestablished, preserved unnamed.
+  field shorter than 5517's.  Its four fields after attackSpeed were long
+  unestablished; they are now named ``frayMode``, ``repairMode``,
+  ``typeMask``, ``emoneyPrice`` on cross-version correlation evidence, and
+  no 5065 column is left unnamed.  See ``FIELDS_SPACE`` for the numbers.
 
 Rows are returned as dicts keyed like CCO's ``itemtype.json`` so they are a
 drop-in for ``coassets.load_items``.  Column meanings were VERIFIED against
@@ -167,6 +169,28 @@ _FIELDS_COMMON = (
 #: The @@ layout (5517+): the wiki's 59 columns.  A ``None`` entry is a
 #: column whose meaning is unestablished; its value is preserved under the
 #: row's ``unnamed`` dict rather than given a guessed name.
+#:
+#: 6090 carries SEVEN MORE columns (59..65) that no source names: the wiki
+#: documents patch 5517 and stops, and Zephyr-1057 -- the only other 66-column
+#: client here -- shares 6090's layout, so it cannot name them either.  They are
+#: therefore left unnamed, but the 6090 data alone settles four of them:
+#:
+#:   col 61 / 62  carried ONLY by HeavenFan (7 rows, the fan quality tiers)
+#:   col 63 / 64  carried ONLY by StarTower (7 rows, the tower quality tiers)
+#:
+#: col 62 equals ``magicAttack`` on all 7 fan rows and col 64 equals
+#: ``magicDefense`` on all 7 tower rows -- exact, not approximate.  col 61 is
+#: strictly greater than col 62 on every fan row and col 63 strictly greater
+#: than col 64 on every tower row, so each pair is (larger companion, the named
+#: stat).  Reading the larger one as a CAP is the obvious inference [I] and is
+#: not proven -- 7 rows is a small sample and nothing here shows what the client
+#: does with it.  The remaining three resist the data: col 59 is high-cardinality
+#: with no match to any named column (best 28%, which is just the shared-zero
+#: floor), col 60 is 500 on 22,643 of 24,269 rows, and col 65 is zero on every
+#: row and so cannot be named from this file at all.
+#:
+#: Pinning these properly needs the oracle half -- planting sentinels and
+#: watching a running 6090 client -- and there is no 6090 server here to do it.
 FIELDS_AT = _FIELDS_COMMON + (
     "magic3", "data", "magicAttack", "magicDefense", "attackRange",
     "attackSpeed", "frayMode", "repairMode", "typeMask", "emoneyPrice",
@@ -177,12 +201,72 @@ FIELDS_AT = _FIELDS_COMMON + (
     "dragonsoulPhase", "dragonsoulReq", "cropQuality",
 )
 
-#: The classic space layout (5065): no ``data`` column, and the four fields
-#: after attackSpeed are unestablished.
+#: The classic space layout (5065): no ``data`` column.  The four columns after
+#: attackSpeed were long unestablished; they are now NAMED, by joining the 5065
+#: table to the 5517 one on item id (6,748 shared ids) and correlating each
+#: unknown column against all 59 named columns -- scored over the rows where the
+#: value is NON-ZERO, because on the full set every near-constant-zero column
+#: agrees with every other at ~97% and the comparison says nothing:
+#:
+#:   col 33 frayMode     100%  of 122 informative rows (5517); 100%  (6090)
+#:   col 34 repairMode   100%  of 129 informative rows (5517); 100%  (6090)
+#:   col 35 typeMask     94.7% of 169 (5517, next best 17.8%); 91.7% (6090)
+#:   col 36 emoneyPrice  96.6% of 174 (5517, next best 41.4%); top match (6090)
+#:
+#: A THIRD independent witness confirms all four: Redux's own ``itemtype`` table
+#: (an unrelated server implementation) carries this exact 39-column layout and
+#: names them FrayMode, RepairMode, TypeMask, PriceCP -- and its row for garment
+#: 181525 holds 2 / 2 / 1 / 675, matching this parse field for field.  PriceCP
+#: settles ``emoneyPrice`` as the CP (Conquer Points) price.
+#:
+#: typeMask BEHAVIOUR -- **SETTLED: it does NOT drive the status icon.** [V]
+#: An early claim here said typeMask gates a status icon in the top-left strip
+#: (icon at 1, gone at 0, back at 1). It was retracted, and is now REFUTED by a
+#: proper two-sided test rather than by argument. Same character, same equipped
+#: garment (181525), the flag READ BACK OUT OF THE LIVE CLIENT each sample
+#: instead of assumed from the .dat, three samples per side:
+#:
+#:     typeMask measured 1 -> icon metric 0.314 / 0.277 / 0.264
+#:     typeMask measured 0 -> icon metric 0.299 / 0.286 / 0.271
+#:
+#: Identical, fully overlapping. The indicator tracks the ACCOUNT, not this
+#: field: it is present on the merchant-flagged character in both conditions and
+#: absent on a Commoner character in both. Anything built on "typeMask enables a
+#: garment-slot indicator" should be revisited -- see
+#: docs/handoff_dat_oracle_and_typemask.md §5e.
+#:
+#: What typeMask actually DOES is still OPEN. What is now closed is the icon.
+#:
+#: frayMode and repairMode are near-duplicates and BOTH scored 100% against
+#: col 33, so they were separated on the 7 shared rows where 5517 disagrees with
+#: itself (fray=0, repair=3): col 33 tracked frayMode 7/7 and repairMode 0/7,
+#: col 34 the exact reverse.  Semantically coherent too -- the items carrying
+#: these fields are the Garments, cash-shop cosmetics with a CP price
+#: (emoneyPrice 675/980) and fray/repair behaviour unlike normal equipment.
+#: Independently, ``tools/datoracle.py`` proved each one's slot and WIDTH in the
+#: client's own parsed record (+0x50 u8, +0x51 u8, +0x52 u16, +0x54 u32), and
+#: those widths fit the names: two small modes, a mask, and a price.
 FIELDS_SPACE = _FIELDS_COMMON + (
     "magic3", "magicAttack", "magicDefense", "attackRange", "attackSpeed",
-    None, None, None, None, "itemType", "description",
+    "frayMode", "repairMode", "typeMask", "emoneyPrice",
+    "itemType", "description",
 )
+
+#: The same space layout with one more column, which is what **5165** ships:
+#: 40 fields against 5017's and 5065's 39.  The 40th is ``qualityColor``, and
+#: it is named rather than left unnamed because a join settles it -- 5165 and
+#: 5517 share 8,177 item ids at full width, and 5165's column 39 equals
+#: 5517's ``qualityColor`` on **8,157** of them.  The controls are what make
+#: that worth believing: the three neighbouring columns of the 5517 layout
+#: (``itemType``, ``description``, ``dragonsoulPhase``) each agree on **0 of
+#: 8,177**, so this is not the shared-zero floor that made four other columns
+#: look identical to everything (see ``FIELDS_SPACE``'s own note).  Value
+#: distribution is a small enum -- 5 on 7,942 rows, then 8, 6, 9, 7 -- which
+#: is what a quality tier looks like and what a price or a mask does not.
+#:
+#: Selected by width, not by patch level: `parse_itemtype` counts the columns
+#: the file actually carries.  A client that ships 39 is unaffected.
+FIELDS_SPACE_QC = FIELDS_SPACE + ("qualityColor",)
 
 #: Fields that stay strings even when their value happens to be digits.
 _STRING_FIELDS = {"name", "itemType", "description"}
@@ -243,6 +327,12 @@ def parse_itemtype(text: str) -> list[dict]:
             f"header says Amount={amount}, file carries {len(split_rows)} rows")
     widths = Counter(len(f) for f in split_rows)
     mode = widths.most_common(1)[0][0] if widths else 0
+    # 5165 ships the space layout with a 40th column, `qualityColor`. Chosen
+    # by the width the file actually has rather than by patch level, so a
+    # 39-column client is untouched and a wider one degrades to `unnamed`
+    # exactly as before instead of mislabelling.
+    if names is FIELDS_SPACE and mode == len(FIELDS_SPACE_QC):
+        names = FIELDS_SPACE_QC
     return [_row(f, names if len(f) == mode else names[:2])
             for f in split_rows]
 
@@ -323,13 +413,26 @@ def parse_monster(text: str) -> list[dict]:
 # file loaders
 # ---------------------------------------------------------------------------
 
-def _read_text(path: Path, seed: int) -> str:
-    plain = decrypt(Path(path).read_bytes(), seed)
+def decrypt_table(data: bytes, seed: int = SEED, what: str = "<bytes>") -> str:
+    """Decrypted table text, or ``ValueError`` -- never plausible garbage.
+
+    The bytes-in entry point, for callers that resolve a logical path through
+    an archive (`coassets.AssetRoot.read`, `colibrary.ServerView`) rather than
+    opening a file.  It carries the same `looks_like_text` guard as the
+    path-taking readers do, and deliberately shares it rather than
+    duplicating: a wrong-seed decryption still *parses*, so the only thing
+    standing between it and a table of nonsense is this check.
+    """
+    plain = decrypt(data, seed)
     if not looks_like_text(plain):
         raise ValueError(
-            f"{path}: decryption with seed {seed} did not yield text -- "
+            f"{what}: decryption with seed {seed} did not yield text -- "
             f"wrong seed, or not a TQ-cipher file (Server.dat is RSA)")
     return plain.decode("latin-1")
+
+
+def _read_text(path: Path, seed: int) -> str:
+    return decrypt_table(Path(path).read_bytes(), seed, str(path))
 
 
 def read_itemtype(path: Path | str, seed: int = SEED) -> list[dict]:

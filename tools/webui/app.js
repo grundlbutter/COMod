@@ -33,6 +33,13 @@ const state = {
   /** Category browsing: the taxonomy tree and where we are in it. */
   categories: [],
   cat: { id: null, sub: null, role: null, group: null },
+  /** "hide animation assets": the motion buckets cannot be previewed in this
+   *  mode. Restored from localStorage below, alongside the panel-collapse and
+   *  folder-tree state, so it survives a trip to the builder and back. */
+  hideMotion: false,
+  /** The server's count of what the filter removed, catalogue-wide. `null`
+   *  until it has answered -- a filter banner must not invent a number. */
+  motionHidden: null,
   maps: [],
   mapName: null,
   /** The end goal is "this body + this left weapon + this right weapon".
@@ -894,6 +901,13 @@ function bindControls() {
     if (!fx.playing) fxPlay();
   });
 
+  const hideBox = $('#chk-hide-motion');
+  if (hideBox) {
+    hideBox.checked = state.hideMotion;
+    hideBox.addEventListener('change', e => setHideMotion(e.target.checked));
+  }
+  showMotionNote();
+
   $('#cat-search').addEventListener('input', debounce(loadCategoryFiles, 240));
   $('#map-search').addEventListener('input', debounce(renderMapList, 200));
 
@@ -1134,13 +1148,97 @@ function groupRow(g, index) {
 // appearance-table membership first and directory layout second. Nothing is
 // hardcoded here except the presentation.
 
+// ---- "hide animation assets" -------------------------------------------
+//
+// The reported want: "since animations can't be previewed in the asset viewer
+// mode, only in character/model mode, can we have a toggle that hides them".
+// They can't -- `/api/mesh` on `c3/0001/000/001.c3` returns `meshes: []`,
+// because the file is four MOTI chunks and no geometry. The builder and the
+// model view bind a motion over a mesh and play it; this page does not.
+//
+// Three rules this obeys, in order of how badly they would be missed:
+//
+//  1. OFF BY DEFAULT. A browser whose job is "every asset the client can see"
+//     must not start by hiding a bucket. The user asked for a toggle, which is
+//     not the same as asking for the filtered view to be the normal one.
+//  2. VISIBLE WHILE ON. The checkbox goes amber and `#motion-note` states the
+//     count that is being withheld, every render, not just on the click.
+//  3. THE COUNTS FOLLOW THE LIST. Nothing is filtered here: the flag goes to
+//     the server, which drops the buckets before it counts anything. A chip
+//     reading 2,475 above a list that no longer holds those files would be
+//     the readout disagreeing with the instrument.
+//
+// Persistence matches the page's other view state -- `coviewer.collapsed`
+// (panels) and `coviewer.dirsClosed` (folder tree) -- one localStorage key,
+// read once at load, written on change.
+const HIDE_MOTION_KEY = 'coviewer.hideMotion';
+try { state.hideMotion = localStorage.getItem(HIDE_MOTION_KEY) === '1'; }
+catch (e) { /* private mode: the toggle still works, just not across loads */ }
+
+function saveHideMotion() {
+  try { localStorage.setItem(HIDE_MOTION_KEY, state.hideMotion ? '1' : '0'); }
+  catch (e) { /* ignore */ }
+}
+
+/** Add the flag to a catalogue request. One place, so the tree and the file
+ *  list can never end up filtered differently. */
+function motionParam(p) {
+  if (state.hideMotion) p.set('hideMotion', '1');
+  return p;
+}
+
+/** Say what is being withheld, in the list, for as long as it is withheld.
+ *
+ *  The number is always `/api/categories`' own `motionHidden` -- the whole
+ *  catalogue's total, cached in `state.motionHidden` -- and never one computed
+ *  here, which could drift from what the server actually did. `null` means
+ *  "not answered yet", and then the banner says so rather than printing a
+ *  zero it has not earned. The per-category figure is a different number and
+ *  belongs on the per-category line (`#cat-more`), not here.
+ */
+function showMotionNote() {
+  const note = $('#motion-note');
+  const label = $('#motion-label');
+  if (label) label.classList.toggle('on', !!state.hideMotion);
+  if (!note) return;
+  note.classList.toggle('hidden', !state.hideMotion);
+  if (!state.hideMotion) return;
+  const n = state.motionHidden;
+  note.textContent =
+    'Filtered: ' +
+    (n === null ? 'animation entries are being hidden'
+                : `${n.toLocaleString()} animation entries hidden`) +
+    '. Counts shown exclude them. Motion sets preview in the character ' +
+    'builder and the model view.';
+}
+
+function setHideMotion(on) {
+  state.hideMotion = !!on;
+  saveHideMotion();
+  const box = $('#chk-hide-motion');
+  if (box) box.checked = state.hideMotion;
+  state.motionHidden = null;          // unknown until the server answers
+  showMotionNote();
+  // The tree caches its rows in `state.categories`; both views have to be
+  // rebuilt from the server or the one you are not looking at keeps the old
+  // counts and shows them the next time you open it.
+  state.categories = [];
+  loadCategories();
+  if (state.cat.id) loadCategoryFiles();
+}
+
 async function loadCategories() {
   const host = $('#cat-tree');
   host.innerHTML = '<div class="mut small" style="padding:10px">classifying…</div>';
   let data;
-  try { data = await api('/api/categories'); }
+  try {
+    data = await api('/api/categories?' +
+                     motionParam(new URLSearchParams()).toString());
+  }
   catch (e) { host.innerHTML = ''; host.appendChild(el('div', 'err', e.message)); return; }
   state.categories = data.categories;
+  state.motionHidden = data.motionFilter ? (data.motionHidden || 0) : null;
+  showMotionNote();
   host.innerHTML = '';
   for (const c of data.categories) {
     const row = el('div', 'cat-row');
@@ -1182,7 +1280,8 @@ function closeCategory() {
 async function loadCategoryFiles() {
   const list = $('#cat-list');
   list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
-  const p = new URLSearchParams({ category: state.cat.id, limit: '300' });
+  const p = motionParam(
+    new URLSearchParams({ category: state.cat.id, limit: '300' }));
   if (state.cat.sub) p.set('sub', state.cat.sub);
   if (state.cat.role) p.set('role', state.cat.role);
   if (state.cat.group) p.set('group', state.cat.group);
@@ -1240,10 +1339,18 @@ async function loadCategoryFiles() {
     items.push({ path: r.path, el: row });
   }
   navSet('category', items);
+  showMotionNote();
+  // `data.total` is the server's count *after* the filter, so this line is
+  // true either way; the hidden entries are named separately rather than
+  // quietly subtracted and never mentioned. This figure is the one for THIS
+  // category; the banner carries the catalogue-wide one.
   $('#cat-more').textContent =
     `${data.rows.length} shown of ${data.total.toLocaleString()}` +
     (data.total > data.rows.length ? ' — narrow with the filters' : '') +
-    (data.foldedAway ? ` · ${data.foldedAway.toLocaleString()} skins merged into their mesh` : '');
+    (data.foldedAway ? ` · ${data.foldedAway.toLocaleString()} skins merged into their mesh` : '') +
+    (data.motionFilter
+      ? ` · ${(data.motionHidden || 0).toLocaleString()} animation entries in this category hidden by the filter`
+      : '');
 }
 
 // ------------------------------------------------------------------ maps
@@ -2023,10 +2130,13 @@ async function renderFigure() {
     frameOn: fig.bodyBounds,
     keepFraming: !bodyChanged,
   });
-  await applyNamedTexture('body', fig.body.texture);
-  for (const part of fig.parts) {
-    await applyNamedTexture('slot:' + part.slot, part.texture);
-  }
+  // One /api/texbundle instead of 1 + N serial <img> loads, with the bytes
+  // staying DXT from the archive to the GPU. Falls back to the PNG route per
+  // texture -- see Viewer.applyTextureBundle in gl.js.
+  await viewer.applyTextureBundle(
+    [{ key: 'body', path: fig.body.texture }].concat(
+      fig.parts.map(p => ({ key: 'slot:' + p.slot, path: p.texture }))),
+    { pngUrl: p => texUrl(p, {}), isCurrent: () => stillCurrent(tk) });
   if (!stillCurrent(tk)) return;
   state.anchors = fig.anchors;
   // setMeshes() clears the GL state, effects included; re-attach whatever was
@@ -2598,6 +2708,16 @@ async function loadMesh(meshPath, texPath, { guessTexture = false } = {}) {
 
 async function applyTexture(texPath, previewToken) {
   const tk = tokenNow();
+  // No preview override: take the DXT path, which skips the server's
+  // decode+PNG-encode and the browser's PNG decode. With one, stay on the PNG
+  // route -- a staged preview is the one case where the user is deliberately
+  // looking at bytes that are not the archive's, and it is not hot.
+  if (!previewToken) {
+    const r = await viewer.applyTextureBundle([{ key: 'main', path: texPath }],
+      { pngUrl: p => texUrl(p, {}), isCurrent: () => stillCurrent(tk) });
+    if (stillCurrent(tk)) renderModelViewerLink();
+    return r.uploaded > 0 || r.fallback.length > 0;
+  }
   return new Promise(resolve => {
     const img = new Image();
     img.onload = () => {

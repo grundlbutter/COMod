@@ -52,6 +52,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import coroot                                      # noqa: E402
+import provenance                                  # noqa: E402
 
 REPORT_PATH = REPO / "out" / "health.json"
 
@@ -290,12 +291,20 @@ def check_local_server() -> dict:
     }
 
 
-def check_derived() -> dict:
+def check_derived(root=None) -> dict:
     """Which generated artefacts a fresh clone is still missing.
 
     An artefact counts as present when `coroot.find_derived` can read it --
     from this checkout, or from the primary checkout when this is a linked
     git worktree.  Inherited artefacts are reported as such.
+
+    ``root`` names **which install** to ask about, and passing it is not
+    optional for anything that browses more than one.  Most of `DERIVED` is
+    per-base (`coroot.PER_BASE`), so without a root this resolves every
+    artefact against whatever install is *configured* -- which is how the
+    viewer came to report "Derived data: built" while showing a client that
+    had no index at all, and no way to say so.  The user was told everything
+    was fine and then waited 56 s for a list.  MEASURED on 7878.
 
     "Inherited" means *another checkout*, so the comparison has to be against
     the same keyed path `find_derived` resolved (`coroot.derived_rel`), not
@@ -304,13 +313,20 @@ def check_derived() -> dict:
     printed on the first run after the change."""
     artefacts = []
     for rel, argv, cost, why in DERIVED:
-        p = coroot.find_derived(rel)
+        p = coroot.find_derived(rel, root)
         found = p is not None and p.is_file()
+        # The command has to name the install too, for the same reason the
+        # lookup does: `py -3 tools/meshtex.py --coverage` builds for the
+        # CONFIGURED root, which is not necessarily the one being browsed.
+        cmd = "py -3 " + " ".join(argv)
+        if root is not None:
+            cmd += f' --root "{root}"'
         artefacts.append({
             "path": rel, "exists": found,
-            "inherited": found and not (REPO / coroot.derived_rel(rel)).is_file(),
+            "inherited": found and not (
+                REPO / coroot.derived_rel(rel, root)).is_file(),
             "bytes": p.stat().st_size if found else 0,
-            "command": "py -3 " + " ".join(argv), "cost": cost, "why": why,
+            "command": cmd, "cost": cost, "why": why,
         })
     missing = [a for a in artefacts if not a["exists"]]
     return {
@@ -323,6 +339,32 @@ def check_derived() -> dict:
                 "(about 6-10 minutes, once). Or run each command listed in "
                 "the report, in order."),
     }
+
+
+def check_provenance(explicit=None) -> dict:
+    """Which derived artefacts can say what install they were built from.
+
+    Reports rather than judges, and that is deliberate for now.  On the day
+    this lands *every* artefact in the tree is unstamped, so failing on
+    "unstamped" would make `health.py` red for everyone immediately -- and a
+    check people have to switch off to get work done has stopped being a
+    check.  Only `foreign` is treated as a fault, because it is the one
+    verdict backed by positive evidence: the artefact itself says it came
+    from another client.
+
+    `unclassified` is the number worth watching. Those artefacts live in a
+    namespace that cannot distinguish installs at all, so nothing about them
+    can ever be checked -- ``out/dll/`` is the standing example, holding two
+    installs' answers under one set of filenames.
+    """
+    try:
+        rep = provenance.audit(REPO, explicit)
+    except Exception as e:                           # pragma: no cover
+        return {"ok": True, "available": False,
+                "error": f"{type(e).__name__}: {e}", "scanned": 0,
+                "foreign": [], "unclassified": [], "unstamped": []}
+    rep["available"] = True
+    return rep
 
 
 def bootstrap(only_missing: bool = True) -> int:
@@ -528,16 +570,33 @@ def should_prompt(state: Optional[dict] = None) -> bool:
 # the whole report
 # ---------------------------------------------------------------------------
 
+def _base_id_safe(root=None) -> str:
+    try:
+        return coroot.base_id(root)
+    except Exception:                                    # pragma: no cover
+        return "unkeyed"
+
+
 def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
+    inst = check_install(explicit)
+    # Ask about the install that was actually RESOLVED, not the one that was
+    # requested: a rejected override would otherwise key the whole per-base
+    # half of this report to a root nothing is reading.
+    resolved = Path(inst["path"]) if inst.get("found") and inst.get("path")         else None
     rep: dict = {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "repo": str(REPO),
         "platform": f"{platform.system()} {platform.release()}",
-        "install": check_install(explicit),
+        "install": inst,
         "python": check_python(),
         "packages": check_packages(),
-        "derived": check_derived(),
+        "derived": check_derived(resolved),
+        "provenance": check_provenance(explicit),
         "localServer": check_local_server(),
+        # Which index namespace this report is about. Two clients' reports are
+        # otherwise indistinguishable, which is what made the missing index
+        # invisible.
+        "baseId": _base_id_safe(resolved),
     }
     if with_thumbnails:
         try:
@@ -581,6 +640,44 @@ def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
                     "files — the .wdf archives store a hash of each "
                     "filename, not the name, and the recovery has not run.",
             "fix": der["fix"]})
+    # Called out separately from the count above, because this one has a
+    # symptom the user will otherwise blame on the viewer: without it the
+    # mesh<->texture relation is rebuilt in-process on every open of this
+    # client, and that is 32-56 s during which the lists cannot collapse a
+    # mesh and its skins into one row. MEASURED on 7878 (37,856 meshes);
+    # 6090, which has the file, loads it in 1.6 s.
+    if "out/meshtex/coverage.json" in (der.get("missing") or []):
+        problems.append({
+            "severity": "warning",
+            "what": "This client has no mesh<->texture index "
+                    f"(out/indexes/{rep.get('baseId', '?')}/meshtex/"
+                    "coverage.json). Every time it is opened the viewer "
+                    "rebuilds that relation in memory -- tens of seconds "
+                    "during which asset lists show one row per FILE instead "
+                    "of one per asset.",
+            "fix": "Build it once from the Health & thumbnails panel, or on "
+                   "the command line: "
+                   + next((a["command"] for a in der["artefacts"]
+                           if a["path"] == "out/meshtex/coverage.json"),
+                          "py -3 tools/meshtex.py --coverage")})
+
+    prov = rep.get("provenance") or {}
+    if prov.get("foreign"):
+        problems.append({
+            "severity": "error",
+            "what": f"{len(prov['foreign'])} derived artefact(s) were built "
+                    "from a different install than the one configured, and "
+                    "say so. Reading them serves one client's facts as "
+                    "another's.",
+            "fix": "Rebuild them against this install, or point the tools "
+                   "back at the install they came from."})
+    elif prov.get("unclassified"):
+        problems.append({
+            "severity": "info",
+            "what": f"{len(prov['unclassified'])} derived artefact(s) live in "
+                    "a namespace that cannot record which install they "
+                    "describe, so nothing can check them.",
+            "fix": prov.get("fix", "")})
 
     ls = rep.get("localServer") or {}
     if not ls.get("ready"):
@@ -675,6 +772,44 @@ def render_text(rep: dict) -> str:
             + (f"  {a['bytes'] / 1e6:,.1f} MB" if a["exists"]
                else f"   <- {a['command']}   (~{a['cost']})"))
 
+    prov = rep.get("provenance") or {}
+    if prov.get("available"):
+        mark = " warn " if prov.get("foreign") else _MARK[True]
+        add(f"{mark}provenance   ({prov.get('base_id', '?')})")
+        add(f"           {prov.get('scanned', 0)} artefact(s) scanned; "
+            f"{len(prov.get('foreign', []))} foreign, "
+            f"{len(prov.get('unclassified', []))} in an unkeyed namespace, "
+            f"{len(prov.get('unstamped', []))} unstamped")
+        orph = prov.get("orphaned") or []
+        if orph:
+            mb = sum(o["bytes"] for o in orph) / 1e6
+            add(f"           {len(orph)} orphaned index namespace(s), "
+                f"{mb:,.0f} MB -- no declared install claims them")
+            for o in orph[:6]:
+                add(f"             {o['name']:<28} {o['bytes']/1e6:8.1f} MB")
+            try:
+                plan = provenance.migration_plan(REPO)
+            except Exception:                            # pragma: no cover
+                plan = []
+            for e in plan:
+                if e["action"] == "rename":
+                    add(f"             MIGRATE  {e['from']}")
+                    add(f"                  ->  {e['to']}   ({e['why']})")
+                elif e["action"] == "ambiguous":
+                    add(f"             DECIDE   {len(e['from'])} orphans could be "
+                        f"{e['to']}: {', '.join(e['from'])}")
+                else:
+                    add(f"             STALE    {e['from']} ({e['why']})")
+            if plan:
+                add("           A rename keeps the index -- it describes the same "
+                    "install under a new name, and rebuilding may not be "
+                    "possible (the entity crawl needs a server dump).")
+            else:
+                add("           Safe to delete once you have confirmed the "
+                    "install they came from is gone or re-keyed; they rebuild.")
+        for rel in prov.get("foreign", [])[:10]:
+            add(f"           FOREIGN    {rel}")
+
     ls = rep.get("localServer") or {}
     if ls:
         mark = _MARK[True] if ls.get("ready") else " info "
@@ -738,7 +873,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "(one-off, about 6-10 minutes on a fresh clone)")
     ap.add_argument("--bootstrap-all", action="store_true",
                     help="rebuild all of it, even what already exists")
+    ap.add_argument("--provenance", action="store_true",
+                    help="only audit which derived artefacts can say what "
+                         "install they were built from, and exit")
     a = ap.parse_args(argv)
+
+    if a.provenance:
+        return provenance.main(["--root", str(a.root)] if a.root else [])
 
     if a.bootstrap or a.bootstrap_all:
         rc = bootstrap(only_missing=not a.bootstrap_all)

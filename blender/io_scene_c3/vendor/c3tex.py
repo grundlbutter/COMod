@@ -59,16 +59,27 @@ class TextureResolver:
         self.cache = Path(cache_dir) if cache_dir else default_cache_dir()
         self.cache.mkdir(parents=True, exist_ok=True)
         self._mesh2tex: Optional[dict[str, list[str]]] = None
+        #: extra table providers, consulted after the primary assets' own.
+        #: A server view passes the baseline's tables here: a client that
+        #: ships a mesh and its skins but resolves the part in code (no
+        #: armet.ini) still deserves the pairing -- existence is checked
+        #: against the view either way.
+        self.extra_tables: list = []
 
     # -- index -------------------------------------------------------------
     def _index(self) -> dict[str, list[str]]:
         if self._mesh2tex is not None:
             return self._mesh2tex
         idx: dict[str, list[str]] = {}
-        try:
-            tables = self.assets.part_tables()
-        except Exception:
-            tables = {}
+        sources = [self.assets.part_tables] + list(self.extra_tables)
+        merged: dict = {}
+        for get in sources:
+            try:
+                for part, ini in get().items():
+                    merged.setdefault(f"{len(merged)}:{part}", ini)
+            except Exception:
+                continue
+        tables = merged
         for ini in tables.values():
             for app in ini:
                 for pr in app.parts:
@@ -76,7 +87,12 @@ class TextureResolver:
                         continue
                     if not pr.texture or pr.texture == "0":
                         continue
-                    for key in self._id_forms(pr.mesh):
+                    keys = self._id_forms(pr.mesh)
+                    if "/" in pr.mesh or "\\" in pr.mesh:
+                        # synthesised old-client tables reference meshes by
+                        # full path, not bare id
+                        keys = [pr.mesh.replace("\\", "/").lstrip("/").lower()]
+                    for key in keys:
                         lst = idx.setdefault(key, [])
                         if pr.texture not in lst:
                             lst.append(pr.texture)
@@ -96,12 +112,32 @@ class TextureResolver:
         """Texture ids worth trying for this mesh file, best first."""
         stem = Path(str(c3_path)).stem
         out: list[str] = []
+        full = str(c3_path).replace("\\", "/").lstrip("/").lower()
+        for t in self._index().get(full, ()):
+            if t not in out:
+                out.append(t)
+        # mirrored subtree: c3/mesh/<sub>/X.c3 <-> c3/texture/<sub>/X.dds
+        # (community clients lay garments/special out this way, exactly)
+        if full.startswith("c3/mesh/") and "/" in full[len("c3/mesh/"):]:
+            out.append("c3/texture/" + full[len("c3/mesh/"):-3] + ".dds")
+        # look-directory conventions: the parent directory *is* the look id,
+        # its base colourway lives in c3/texture/ (bodies) or beside it
+        # (mounts; the same-dir fallback covers that half)
+        import re as _re
+        m = _re.match(r"c3/(?:\d{4}|mount)/(\d+)/", full)
+        if m:
+            look = m.group(1)
+            out.append(look + "000")
+            out.append(look + "0000")
         if _NUM.match(stem):
             for key in self._id_forms(stem):
                 for t in self._index().get(key, ()):
                     if t not in out:
                         out.append(t)
-        if stem not in out:
+        # A bare short-numeric stem inside a look directory is an action
+        # number; offering it as a texture id pairs bodies with unrelated art.
+        looky = _re.match(r"c3/(?:\d{4}|mount)/\d+/", full) is not None
+        if stem not in out and not (looky and stem.isdigit() and len(stem) < 5):
             out.append(stem)
         return out
 

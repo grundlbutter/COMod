@@ -30,6 +30,8 @@ Usage:
 
 from __future__ import annotations
 
+import copy as _copy
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Optional
@@ -384,6 +386,65 @@ def apply_matrix_to(m: PhyMesh) -> None:
         v.pz = x * r0[2] + y * r1[2] + z * r2[2] + r3[2]
 
 
+def apply_matrix_copy(m: PhyMesh) -> PhyMesh:
+    """`apply_matrix_to` on a COPY, without deep-copying the whole mesh.
+
+    Every caller of `apply_matrix_to` in this tree wants the transformed
+    positions and must not clobber the mesh it was handed, so the idiom was
+    uniformly::
+
+        q = copy.deepcopy(c.phy)
+        c3phy.apply_matrix_to(q)
+
+    MEASURED (`v_body` of `c3/mesh/002135260.c3`, 672 vertices / 916 faces,
+    median of 20): **deepcopy 4.200 ms, this 0.512 ms** -- 8.2x, and the
+    output is bit-identical (positions compared exactly, every other vertex
+    field compared exactly, `faces` compared equal). `copy.deepcopy` was
+    **67% of the whole /api/figure body path** in cProfile: 417,650 recursive
+    calls for 30 top-level copies, because a `PhyMesh` is a graph of ~700
+    `Vertex` dataclasses plus ~900 face tuples plus the `C3Key` channels, and
+    `deepcopy` walks and memoises every node of it.
+
+    What this does instead: shallow-copy the container, then rebuild
+    `vertices` as fresh `Vertex` objects carrying the transformed position and
+    the *same* values for every other field. That is sound because a
+    `Vertex`'s other fields are all immutable scalars or `bytes`, so sharing
+    them cannot leak a mutation. `faces` is copied as a new list (cheap: it is
+    a list of tuples) so a caller that reorders it cannot reach back into the
+    original. `keys`, `matrix` and the verbatim `*_raw` captures stay shared:
+    they are tuples/bytes/dataclass-of-lists that nothing on this path writes.
+
+    **Only use this where the copy is read-only afterwards, or where the
+    caller mutates nothing but vertex fields.** If you need to mutate
+    `q.keys` or `q.tail_raw`, deepcopy is still the right tool.
+
+    Row-vector convention, identical to `apply_matrix_to`: `v' = v * M`.
+    A mesh with no 16-float matrix is returned as an untransformed copy, which
+    is what `apply_matrix_to` does for the same input.
+    """
+    q = _copy.copy(m)
+    q.faces = list(m.faces)
+    a = m.matrix
+    if len(a) != 16:
+        q.vertices = list(m.vertices)
+        return q
+    r0, r1, r2, r3 = a[0:3], a[4:7], a[8:11], a[12:15]
+    r00, r01, r02 = r0[0], r0[1], r0[2]
+    r10, r11, r12 = r1[0], r1[1], r1[2]
+    r20, r21, r22 = r2[0], r2[1], r2[2]
+    r30, r31, r32 = r3[0], r3[1], r3[2]
+    V = Vertex
+    q.vertices = [
+        V(v.px * r00 + v.py * r10 + v.pz * r20 + r30,
+          v.px * r01 + v.py * r11 + v.pz * r21 + r31,
+          v.px * r02 + v.py * r12 + v.pz * r22 + r32,
+          v.u0, v.v0, v.unknown4, v.bone0, v.bone1, v.weight0, v.weight1,
+          v.nx, v.ny, v.nz, v.u1, v.v1, v.gap)
+        for v in m.vertices
+    ]
+    return q
+
+
 def generate_normals(m: PhyMesh) -> None:
     """Reproduce the engine's normal generation for "PHY " / "PHY4"
     (RVA 0x5A8C0): accumulate the un-normalised cross product of each face's
@@ -442,6 +503,61 @@ def meshes_from_c3(data: bytes, **kw) -> list[PhyMesh]:
             m.source_index = len(out)      # its ordinal among the PHY chunks
             out.append(m)
     return out
+
+
+# --------------------------------------------------------------------------
+# shipped placeholders
+# --------------------------------------------------------------------------
+
+#: 3ds Max's default names for its primitive objects. An artist who creates a
+#: box and never renames it ships `Box01`. TQ did: NPC 2202 "SeeFlower" on 7878
+#: resolves to `c3/npc/997/1.c3`, one submesh named `Box01`, 14 verts, extents
+#: 30x30x30 -- which is why the owner reported "a texture applied to a square".
+#: The renderer was faithful; the ASSET is a placeholder.
+_MAX_PRIMITIVE = re.compile(
+    r"^(Box|Sphere|GeoSphere|Cylinder|Tube|Torus|Pyramid|Plane|Cone|Teapot"
+    r"|Prism|Capsule|ChamferBox|Spindle)\d{2,}$")
+
+#: A placeholder is a primitive nobody bothered to build on. Real content that
+#: happens to be simple is not a placeholder, so the name is required -- the
+#: vertex bound alone would promote every low-poly prop in the game.
+PLACEHOLDER_MAX_VERTS = 64
+
+
+def placeholder_reason(meshes: "list[PhyMesh]") -> "Optional[str]":
+    r"""Why these meshes look like a SHIPPED PLACEHOLDER, or ``None``.
+
+    **The distinction this exists to protect.** An appearance can be in three
+    states and collapsing the last two is the error this is named for:
+
+    * **resolved** -- geometry found, real content;
+    * **resolved to a shipped placeholder** -- geometry found, and it is a
+      default primitive TQ shipped without replacing. Drawing it is CORRECT;
+      presenting it as content is what misleads;
+    * **unresolved** -- no geometry at all. We have nothing.
+
+    A viewer that shows a box for the middle case and a box for the last case
+    has told the user the same thing about two different facts.
+
+    The test is a CONJUNCTION so it cannot promote real content: a single
+    submesh, a 3ds Max default primitive name, and a vertex count under
+    ``PLACEHOLDER_MAX_VERTS``. The name is load-bearing -- dropping it would
+    claim every low-poly prop in the game. Returns a reason string (for a
+    badge or a log line) rather than a bool, because "why" is what the owner
+    needs and a bool is what gets collapsed.
+    """
+    if len(meshes) != 1:
+        return None
+    m = meshes[0]
+    name = (m.name or "").strip()
+    if not _MAX_PRIMITIVE.match(name):
+        return None
+    verts = len(m.vertices) or m.vertex_count_a
+    if verts > PLACEHOLDER_MAX_VERTS:
+        return None
+    ext = tuple(round(m.bbox_max[i] - m.bbox_min[i], 3) for i in range(3))
+    return (f"shipped placeholder: 3ds Max default primitive {name!r}, "
+            f"{verts} verts, extents {ext[0]}x{ext[1]}x{ext[2]}")
 
 
 # --------------------------------------------------------------------------

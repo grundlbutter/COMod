@@ -465,8 +465,7 @@ def socket_anchors(body_c3: bytes, motion_set=None,
     body = _body_chunk(meshes)
     if body is None:
         return {}
-    body = copy.deepcopy(body)
-    c3phy.apply_matrix_to(body)
+    body = c3phy.apply_matrix_copy(body)
     if not body.vertices:
         return {}
 
@@ -698,8 +697,7 @@ def body_bounds(body_c3: bytes, motion_set=None, frame: int = 0) -> Optional[dic
                     continue
                 if attachmod.is_socket_name(c.name):
                     continue
-                q = copy.deepcopy(c.phy)
-                c3phy.apply_matrix_to(q)
+                q = c3phy.apply_matrix_copy(c.phy)
                 mo = c.motion
                 if motion_set is not None:
                     mo = motion_set.motion_for(c.index) or mo
@@ -712,15 +710,24 @@ def body_bounds(body_c3: bytes, motion_set=None, frame: int = 0) -> Optional[dic
                         hi[i] = max(hi[i], val)
             if n:
                 return {"min": lo, "max": hi}
+        except attachmod.DumyVocabularyUnavailable:
+            # NOT swallowed, and this narrow arm exists only to say so. The
+            # broad `except` below would turn "I cannot read this install's
+            # [Dumy]" into a silent fall-through to the socket-blind estimate
+            # -- bounds computed with the socket chunks counted as geometry,
+            # which is a wrong answer wearing a right answer's shape. That is
+            # the exact collapse `attach.dumy_names` was just made to raise
+            # about, and re-swallowing it one layer out would undo the fix.
+            raise
         except Exception:                                 # pragma: no cover
             pass
     meshes = c3phy.meshes_from_c3(body_c3)
     if not meshes:
         return None
-    body = copy.deepcopy(_body_chunk(meshes))
+    body = _body_chunk(meshes)
     if body is None:
         return None
-    c3phy.apply_matrix_to(body)
+    body = c3phy.apply_matrix_copy(body)
     if not body.vertices:
         return None
     xs = [v.px for v in body.vertices]

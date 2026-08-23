@@ -17,6 +17,15 @@ gives you a uniform way to load it:
                           graphic.ini) and the binary .TME/.dat blobs, which are
                           reported but not parsed
 
+COMPILED TWINS ARE A HARD GATE.  From 5517 onward an install ships some of
+these tables **twice**: the plaintext `.ini` and a compiled `.dbc`, and the
+client reads the `.dbc`.  Profiling the `.ini` there describes a file the
+client ignores, so `load()` **raises** `dbcshadow.ShadowedIni` naming the twin
+and `schemas` refuses to profile the shadowed files and exits non-zero.  The
+check is `core/dbcshadow.py`, resolved from each file's own path on every call
+-- so it is silent on 5017/5065/5165/CCO, which ship no `.dbc` and where the
+plaintext ini IS the live table.  `--allow-stale-ini` declares the exception.
+
 ENCODING (verified): `codepage.ini` contains the single byte '0'.  Every .json
 file decodes as strict UTF-8.  No .ini file in this build contains a byte above
 0x7F, so the codepage never actually comes into play here -- but the loader
@@ -25,12 +34,20 @@ original TQ clients shipped GBK data and a future patch could reintroduce it.
 
 Usage:
     python tools/inidb.py schemas -o out/ini/schemas.json
-    python tools/inidb.py show itemtype.json --limit 3
-    python tools/inidb.py show armor.ini --limit 3
+    python tools/inidb.py show itemtype.json --limit 3      # CCO only
+    python tools/inidb.py show armor.ini --limit 3          # any client
 
 As a module:
     from inidb import load, load_all, classify
-    rows = load(root / "ini" / "itemtype.json")
+    rows = load(root / "ini" / "itemtype.json")             # CCO only
+
+NOTE on the `.json` examples: `ini/*.json` is the COMMUNITY client's
+pre-parsed form and **no official client ships any of them** -- CCO has 25,
+5017/5065/5165/5517/6090 have zero. `load` reads whatever file it is handed
+and is right to; it is the *caller* that must not assume the json is there.
+For the item table specifically use `coassets.load_items`, which falls back
+to the encrypted `itemtype.dat`. See `docs/CORRECTIONS.md`
+`C-2026-08-09-comod-json-official-sweep`.
 """
 from __future__ import annotations
 
@@ -44,6 +61,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import coroot                            # noqa: E402
+import dbcshadow                         # noqa: E402
+from dbcshadow import ShadowedIni        # noqa: E402  (re-exported for callers)
 
 ROOT_DEFAULT = coroot.default_root()
 
@@ -107,8 +126,43 @@ def classify(path: Path, raw: bytes | None = None) -> str:
 
 
 def parse_sectioned(txt: str) -> "OrderedDict[str, OrderedDict[str, str]]":
-    """[Section] / key=value.  Duplicate keys keep the LAST value, matching the
-    behaviour of GetPrivateProfileString."""
+    """[Section] / key=value.
+
+    **The claim that used to be here was wrong in both halves, and it named
+    the wrong authority for it.** It read: *"Duplicate keys keep the LAST
+    value, matching the behaviour of GetPrivateProfileString."*
+
+    `GetPrivateProfileString` returns the **FIRST**. That is not an argument
+    from the documentation -- `tools/itemart.py` verified it by **calling the
+    API on a shipped file**: `[Item121223]` yields `121090.dds`, not
+    `121220.dds`, and its `selftest` locks that in. `tools/clientsidecar.py`
+    independently does the same thing, returning on the first match.
+
+    So of the three readers of this format in the tree, **two take FIRST and
+    are verified; this one takes neither**, and cited the API those two
+    measured as its reason. What it actually does, MEASURED:
+
+        duplicate KEY in one section   ->  LAST wins   ("second")
+        duplicate SECTION              ->  MERGED      (`setdefault`)
+
+    A merge is a **third** policy. Win32 first-wins would ignore the second
+    `[B]` entirely; last-wins would replace the first; this keeps the union,
+    with the later keys winning any overlap. On the file `itemart` measured,
+    where 230 section names repeat and **191 of the repeats give a different
+    frame**, those three answers are three different tables.
+
+    **Behaviour deliberately UNCHANGED here.** Nothing in the tree consumes
+    it: `parse_sectioned` has one caller (`load`, below) and `inidb` is
+    imported only by its own `__main__` and by three tests. So the live
+    defect was the *claim*, which is the thing that travels -- and changing
+    a profiler's output near a sprint close, to match an API it may not be
+    trying to emulate, is a decision rather than a patch. Filed as OPEN:
+    `docs/CORRECTIONS.md` `C-2026-08-10-asstdir-inidb-duplicate-policy`.
+
+    `tools/test_viewer.py::IniDbDuplicatePolicy` pins all three behaviours,
+    so that taking that decision is a visible change rather than a silent
+    one.
+    """
     out: OrderedDict[str, OrderedDict[str, str]] = OrderedDict()
     cur: OrderedDict[str, str] | None = None
     for line in txt.splitlines():
@@ -146,8 +200,15 @@ def parse_records(txt: str) -> list[list[str]]:
     return rows
 
 
-def load(path: Path, codepage: int = 0):
-    """Load one ini/ file into native Python data."""
+def load(path: Path, codepage: int = 0, *, allow_stale: bool = False):
+    """Load one ini/ file into native Python data.
+
+    Raises `dbcshadow.ShadowedIni` when the file has a compiled `.dbc` twin on
+    its own base: the client reads the twin, so returning the plaintext would
+    be handing back a table the game ignores.  `allow_stale=True` declares that
+    the stale plaintext is what you actually want.
+    """
+    dbcshadow.check_ini(path, allow_stale=allow_stale)
     raw = path.read_bytes()
     kind = classify(path, raw)
     if kind in ("json_list", "json_dict"):
@@ -164,12 +225,19 @@ def load(path: Path, codepage: int = 0):
     return None
 
 
-def load_all(root: Path) -> dict[str, object]:
+def load_all(root: Path, *, allow_stale: bool = False) -> dict[str, object]:
+    """Every file under `root/ini`.
+
+    Propagates `ShadowedIni` rather than skipping: a caller asking for "the
+    whole database" on a 5517/6090 root must not silently receive the stale
+    half of it.
+    """
     cp = read_codepage(root)
     out = {}
     for p in sorted((root / "ini").rglob("*")):
         if p.is_file():
-            out[p.relative_to(root / "ini").as_posix()] = load(p, cp)
+            out[p.relative_to(root / "ini").as_posix()] = load(
+                p, cp, allow_stale=allow_stale)
     return out
 
 
@@ -249,12 +317,31 @@ def profile_columns(rows, max_enum: int = 24) -> dict:
     return out
 
 
-def profile_file(path: Path, codepage: int = 0) -> dict:
+def profile_file(path: Path, codepage: int = 0, *,
+                 allow_stale: bool = False) -> dict:
     raw = path.read_bytes()
+    twin = dbcshadow.compiled_twin(path)
+    if twin is not None and not allow_stale:
+        # Refuse rather than describe. A schema profiled off the shadowed ini
+        # is a profile of a file the client never loads, and it would be
+        # indistinguishable in the output from a real one.
+        m = dbcshadow.twin_magic(twin)
+        return {"kind": "shadowed_by_dbc", "bytes": len(raw),
+                "shadowed": True, "twin": twin.name,
+                "twin_magic": m.decode("latin-1") if m else None,
+                "twin_bytes": twin.stat().st_size if twin.is_file() else None,
+                "not_profiled": "the client reads the .dbc twin; profiling "
+                                "this .ini would describe a file the client "
+                                "ignores. Re-run with --allow-stale-ini to "
+                                "profile it anyway."}
     kind = classify(path, raw)
     rec: dict = {"kind": kind, "bytes": len(raw)}
+    if twin is not None:
+        rec["shadowed"] = True
+        rec["twin"] = twin.name
+        rec["stale_ini_allowed"] = True
     try:
-        data = load(path, codepage)
+        data = load(path, codepage, allow_stale=True)
     except Exception as ex:  # noqa: BLE001
         rec["error"] = str(ex)
         return rec
@@ -311,21 +398,39 @@ def cmd_schemas(a) -> int:
     files = sorted(p for p in ini.rglob("*") if p.is_file())
     out = {"_meta": {"root": str(ini), "codepage_ini": cp,
                      "codepage_fallback": CODEPAGE_FALLBACK.get(cp, "cp1252"),
-                     "file_count": len(files)},
+                     "file_count": len(files),
+                     "allow_stale_ini": bool(a.allow_stale_ini)},
            "files": {}}
     kinds = Counter()
+    shadowed: list[str] = []
     for p in files:
         rel = p.relative_to(ini).as_posix()
         try:
-            rec = profile_file(p, cp)
+            rec = profile_file(p, cp, allow_stale=a.allow_stale_ini)
         except Exception as ex:  # noqa: BLE001
             rec = {"error": str(ex)}
         kinds[rec.get("kind", "?")] += 1
+        if rec.get("shadowed"):
+            shadowed.append(f"{rel} -> {rec.get('twin')}")
         out["files"][rel] = rec
     out["_meta"]["kind_counts"] = dict(kinds)
-    a.out.parent.mkdir(parents=True, exist_ok=True)
-    a.out.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
+    out["_meta"]["shadowed_by_dbc"] = shadowed
+    # Resolved from the root that was actually asked for, not from whatever
+    # install happens to be configured in this process (C22).
+    dest = a.out or coroot.derived_path("out/ini/schemas.json", root=a.root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
     print(json.dumps(out["_meta"], indent=2))
+    print(f"wrote {dest}")
+    if shadowed and not a.allow_stale_ini:
+        print(f"\nERROR: {len(shadowed)} ini table(s) on this base are "
+              f"shadowed by a compiled .dbc twin and were NOT profiled -- "
+              f"the client reads the .dbc, so their plaintext schema is not "
+              f"this base's schema. Read the twin, or pass --allow-stale-ini "
+              f"to profile the stale plaintext deliberately.", file=sys.stderr)
+        for s in shadowed:
+            print(f"  {s}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -334,24 +439,52 @@ def cmd_show(a) -> int:
     if not p.exists():
         p = Path(a.name)
     cp = read_codepage(a.root)
-    print(json.dumps(profile_file(p, cp), indent=2, default=str)[:a.limit * 2000])
+    # An explicit single-file request refuses outright rather than printing a
+    # placeholder: the caller named this file and must be told it is not live.
+    dbcshadow.check_ini(p, allow_stale=a.allow_stale_ini)
+    print(json.dumps(profile_file(p, cp, allow_stale=True),
+                     indent=2, default=str)[:a.limit * 2000])
+    return 0
+
+
+def cmd_shadowed(a) -> int:
+    pairs = dbcshadow.shadowed_inis(a.root)
+    print(f"{a.root}  base_id={coroot.base_id(a.root)}")
+    if not pairs:
+        print("  no compiled twins -- the plaintext ini/ tables are live here")
+        return 0
+    for i, t in sorted(pairs.items()):
+        m = dbcshadow.twin_magic(t)
+        print(f"  {i.name:<24} -> {t.name:<24} "
+              f"{m.decode('latin-1') if m else '?'}")
+    print(f"  {len(pairs)} shadowed")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="ini/ database loader + profiler")
     ap.add_argument("--root", type=Path, default=ROOT_DEFAULT)
+    ap.add_argument("--allow-stale-ini", action="store_true",
+                    help="profile ini tables that are shadowed by a compiled "
+                         ".dbc twin. The client reads the .dbc; this declares "
+                         "that you want the stale plaintext anyway.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("schemas")
-    p.add_argument("-o", "--out", type=Path,
-                   default=coroot.derived_path("out/ini/schemas.json"))
+    # Default deliberately left as None and resolved after parsing, against
+    # `a.root`. Computing it here would bake in the *configured* install and
+    # mis-file another base's profile under it (C22).
+    p.add_argument("-o", "--out", type=Path, default=None)
     p.set_defaults(func=cmd_schemas)
 
     p = sub.add_parser("show")
     p.add_argument("name")
     p.add_argument("--limit", type=int, default=3)
     p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("shadowed",
+                       help="list ini tables shadowed by a .dbc twin")
+    p.set_defaults(func=cmd_shadowed)
 
     a = ap.parse_args()
     return a.func(a)

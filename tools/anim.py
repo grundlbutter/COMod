@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import c3phy                                              # noqa: E402
+import dbcshadow                                          # noqa: E402
 import effects as fx                                      # noqa: E402
 import attach                                             # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, parse_ini    # noqa: E402
@@ -366,7 +367,9 @@ class MotionIndex:
         self.duplicate_rows = 0
         self.conflicting_rows = 0
         p = self.root / "ini" / "3dmotion.ini"
+        pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
         if p.is_file():
+            rebuilt: list = []
             for line in p.read_text("latin-1", errors="replace").splitlines():
                 if "=" not in line:
                     continue
@@ -380,6 +383,26 @@ class MotionIndex:
                     self.duplicate_rows += 1
                     self.conflicting_rows += (self.raw[k] != v)
                 self.raw[k] = v
+                m = pat.match(v)
+                if m:
+                    rebuilt.append((str(int(m.group(1))) + m.group(2)
+                                    + m.group(3).zfill(3), v))
+            # **The official plaintext ini pads the body-motion key to TEN
+            # wide** -- `0001410100 = c3/0001/410/100.c3` -- where CCO writes
+            # it seven, `1410100 = c3/0001/410/100.c3`, and `key()` builds the
+            # seven-wide form. On 5517/6090 the dbc overlay below rebuilds
+            # that spelling from the path and the difference never shows; on
+            # 5017/5065/5165 there is no dbc, so **every body-motion lookup
+            # missed**, silently, and `AnimDB.clip` returned None for both the
+            # bare and the armed idle on all three. Index the path-derived
+            # spelling too.
+            #
+            # `setdefault`: a key the file states explicitly is never replaced
+            # by one derived from a path, so this can only add rows and cannot
+            # change an answer any base gives today. Not counted in
+            # `row_count`, which reports what the file itself carries.
+            for k, v in rebuilt:
+                self.raw.setdefault(k, v)
         # Official 6090-era clients keep that ini as a 2009 stale decoy and
         # ship the live table as 3dmotion.dbc (core/dbc.py). Overlay it so
         # the live rows win: reading only the ini is what left every 6090
@@ -390,10 +413,13 @@ class MotionIndex:
         # fields. Rows that are not that layout (chained "-N" stems, the
         # flat NPC family) are left to the ini and to npcart, which resolve
         # them by other means.
-        pdbc = self.root / "ini" / "3dmotion.dbc"
-        if pdbc.is_file():
+        # Asked through `dbcshadow`, the one place that answers "is this ini
+        # shadowed on this base", rather than spelling the twin's name here.
+        # The pairing is case-insensitive and per base, and a second local
+        # copy of the rule is how it drifts out of step.
+        pdbc = dbcshadow.compiled_twin(p)
+        if pdbc is not None:
             import dbc as dbcmod
-            pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
             for mv in dbcmod.Rsdb.parse(pdbc.read_bytes()).paths.values():
                 mv = mv.replace("\\", "/")
                 m = pat.match(mv)
@@ -722,8 +748,7 @@ class Clip:
             return []
         idx = chunk.index
         mo = self.motion.motion_for(idx) or chunk.motion
-        q = copy.deepcopy(chunk.phy)
-        c3phy.apply_matrix_to(q)
+        q = c3phy.apply_matrix_copy(chunk.phy)
         verts = q.vertices[::sample] or q.vertices
         out = []
         for f in range(self.frame_count):
@@ -804,8 +829,13 @@ class AnimDB:
         own fallback chain ends at the unarmed set 000 and reports success, so
         an armed key that misses comes back looking answered while posing the
         character empty-handed. That is what left a club-wielding body in the
-        idle stance -- 6090 ships none of CCO's per-(set, action) alias rows,
-        so `2480100` simply is not there while `2410100` is.
+        idle stance: `2480100` is not there on 6090 while `2410100` is.
+
+        **Not because the rows were dropped** -- that reading is corrected at
+        `attach.WEAPON_MOTION_SET` (CORRECTIONS C27). The official plaintext
+        ini spells them `0002480100`, ten wide; 6090's live `.dbc` is what
+        lacks them, and on 5017/5065/5165 the padded rows are live and answer
+        this without the alias table.
         """
         exact = self.index.key(shape, weaponset, action, distance)
         if exact in self.index.raw:
@@ -1024,8 +1054,7 @@ def _pose_distance(a: Clip, fa: int, b: Clip, fb: int,
         return None
     ma = a.motion.motion_for(chunk.index) or chunk.motion
     mb = b.motion.motion_for(chunk.index) or chunk.motion
-    q = copy.deepcopy(chunk.phy)
-    c3phy.apply_matrix_to(q)
+    q = c3phy.apply_matrix_copy(chunk.phy)
     worst = 0.0
     for v in q.vertices[::sample]:
         pa = attach.transform_vertex(v, ma, attach.IDENTITY, fa)

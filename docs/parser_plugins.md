@@ -12,6 +12,15 @@ the app assumed one client's habits held for another it produced confident
 wrong answers — monsters in another monster's skin, characters T-posing,
 names seven years stale.
 
+> **"Not derivable from the bytes" is a test to run, not a description to
+> agree with.** `docs/map_twin_precedence.md` is the worked example: two
+> proposals for new hooks — the map registry's spelling, then which of a map's
+> two shipped twins is live — both passed the eyeball test, and **measuring
+> the criterion refuted both**. The registry's own `FileName` field turns out
+> to name the form the client opens on 100% of rows on every install, private
+> repack included, so the rule is `core`'s. Run the test before writing the
+> hook; the measurement took less time than the write-up would have.
+
 ## Writing one
 
 Drop a module in `plugins/` with a module-level `PLUGIN`:
@@ -49,6 +58,149 @@ specification. The ones that matter most in practice:
 | `colour_provenance()` | How to label the skin `default_colour` picked. |
 | `socket_correction(socket, body)` | A socket this client ships broken. **Viewer-only — never port it.** |
 | `import_plan(root, exists)` | What importing this client involves. |
+
+### The three parse families, and why the third one inverts a rule
+
+| family | plugins | entity tables | compiled twins |
+|---|---|---|---|
+| CCO | `cco` | `npc.json`, `itemtype.json`, plaintext ini lookups | none |
+| **plaintext** | `plaintext`, `patch5017`, `patch5065`, `patch5165`, `patch7878` | `npc.ini`, TQ-cipher `.dat`, **plaintext ini lookups — LIVE on 5017/5065/5165, ABANDONED on 7878** | **none** |
+| compiled | `patch5517`, `patch6090`, `patch6609` | `npc.ini`, TQ-cipher `.dat`, `.dbc` | 14, 15 and 12 |
+
+**The container is a separate axis from the family.** Every client in this
+table ships WDF except `patch7878` (four DatPkg pairs) and Zephyr-1057 (a
+DatPkg pair *and* five garment WDFs, both in one install). A client's
+container says nothing about which family it is in: 7878 is
+plaintext-family in TPD, Zephyr is CCO-family in a mixed root. See
+`coassets.AssetRoot._discover_archives`. (The liveness vocabulary — LIVE /
+ABANDONED / shadowed — is defined in *"Liveness is per table, not per
+family"* below: on 7878, `npc.ini` grew to 900,246 bytes while the four art
+lookup tables it points at are byte-identical to 6090's, so 1,827 of 4,087
+npc rows resolve to nothing and nothing raises.)
+
+`core/dbc.py` opens by warning that an official client's plaintext `ini`
+tables are *"stale decoys"* the client no longer reads. **That is true from
+5517 onward and false before it.** 5017, 5065 and 5165 ship **no `.dbc` at
+all**, so those same files are the only tables that exist.
+
+What settles it is a two-sided measurement, because the wrong profile never
+raises — it answers, with paths the install does not ship:
+
+```
+                OFFICIAL ok      PLAINTEXT ok    plaintext paths that exist
+    5017          0 / 503          503 / 503          2000 / 2000
+    5065          0 / 575          575 / 575          2000 / 2000
+    5165          0 / 880          855 / 880          1970 / 1970
+    5517       1123 / 1123        1066 / 1123           840 / 1870
+    6090       2256 / 2264        1815 / 2264           841 / 1880
+```
+
+**Do not implement an inversion as a pile of overrides.** `plugins/plaintext.py`
+derives from `Plugin` and states every fact positively rather than subclassing
+`Patch6090` and switching four answers off, because an override is what a
+later tidy-up deletes — after which the family silently inherits the trap.
+`patch5517` subclasses `patch6090` for the opposite reason: there it really is
+the same client with two absences.
+
+The three members then subclass one family class, because their **formats**
+differ where their tables do: 5017 ships no `ItemTexture.ini` and declares
+seven part slots where the other two declare eight, and 5165's `itemtype.dat`
+carries a 40th column. One plugin with a version switch would have had to make
+each of those a function of the root.
+
+**A missing compiled table is not evidence of this family.** Zephyr-1057 ships
+zero `.dbc` *and* four-wide action fields; CCO ships zero `.dbc` too. The
+discriminator has to be positive — the plaintext lookup chain present and the
+compiled one absent — and it then separates all seven installs on this
+machine. `version.dat` picks the member.
+
+The freeze is worth knowing on its own: nine plaintext tables are
+**byte-identical** in 5165, 5517 and 6090, so *6090's stale decoy is literally
+5165's live file*. A table stopped being maintained exactly when a compiled
+twin appeared beside it, and the three that never got one — `npc.ini`,
+`Action3DEffect.ini`, `ItemTexture.ini` — differ at all five patch levels.
+
+**Live is not the same as complete, and the two get conflated.** `3dmotion.ini`
+names four body-motion families on *every* official client; 5517 and 6090 ship
+sixteen and their compiled twin names the rest, so the shortfall never shows.
+Take the twin away and it does — and it splits this family: 5017 and 5065 ship
+four and name four, while **5165 ships 204 loose `.c3` files under
+`c3/1001`..`c3/1004` that its own table never mentions and nothing else can
+supply.** That is worse than the 6090 trap, not better: an under-reporting
+table with no shadow behind it, where the filesystem is the only authority.
+CCO is the control in the other direction — its ini names eight families and
+only four resolve — so a table's completeness has to be measured in *both*
+directions, against the disk, and declared per base.
+
+### Liveness is per table, not per family — and there is a third state
+
+The families table above answers "are the plaintext tables live?" once per
+client. **7878 is the client where one answer per install stops being enough.**
+
+It ships no `.dbc` at all, so it passes the plaintext family's positive test —
+the lookup chain present, the compiled one absent. And its plaintext tables are
+a **mix**:
+
+    ini/npc.ini          376,991 -> 900,246 bytes across 6090..7878   MAINTAINED
+    ini/EmotionIco.ini       712 -> 1,955                             MAINTAINED
+    ini/3DSimpleObj.ini  f34f56332383  byte-identical on 6090/6609/7878  FROZEN
+    ini/3dobj.ini        9202de93aa03  byte-identical                    FROZEN
+    ini/3dtexture.ini    6be2fece83fd  byte-identical                    FROZEN
+    ini/3dmotion.ini     9951727aa1ed  byte-identical                    FROZEN
+
+The four lookups are the *same 2008 files* 6090 ships as stale decoys. There
+they are shadowed and the compiled twin carries the truth. **Here there is no
+twin and no `.dat` equivalent** — checked across all 200 of 7878's `.dat`
+files. So the frozen table is the authority, and it under-reports:
+
+    base    npc.ini rows   resolved   unresolved   compiled twin
+    6090         2,277      1,828        449         present
+    6609         2,784      2,031        753         present
+    7878         4,087      2,260      1,827         ABSENT
+
+(`SimpleObjID=N` into `[ObjIDType<N>]`. The 6090 row reproduces `npcart.py`'s
+recorded 1,815/2,264 to within 13 rows of counting difference, which is what
+licenses reading the 7878 row.)
+
+**1,827 rows resolve to nothing and nothing raises**, because an npc whose
+`SimpleObjID` the frozen table never heard of is indistinguishable from an npc
+with no art. That is the 5165 trap above at nine times the scale.
+
+**Why neither existing mechanism can express it.** There are three states, and
+the contract has words for two:
+
+| state | example | what should happen |
+|---|---|---|
+| shadowed | 6090 `3DSimpleObj.ini` | read the compiled twin |
+| unshadowed and **live** | 5017 `3DSimpleObj.ini` | read the ini; it *is* the table |
+| unshadowed and **abandoned** | 7878 `3DSimpleObj.ini` | read the ini, and **say it is short** |
+
+`core/dbcshadow.py` answers from **file existence**, so on 7878 it returns
+`None` for all four — *"use the ini"* — the same answer it gives 5017.
+`prefers_compiled_tables()` returns `False`, also the same answer 5017 gives.
+Measured: **they agree.** `test_viewer.ParserPlugins.UNCONSUMED_HOOKS` proposes
+wiring them as a cross-check that fails loudly where they disagree; **on 7878
+they do not disagree, they are both wrong in the same direction**, which is
+exactly the case a disagreement-based cross-check cannot see.
+
+**What a plugin should therefore declare.** Liveness is per table and per base,
+measured, not inherited from the family. A family declaration of *"the
+plaintext tables are the LIVE ones"* — correct for 5017/5065/5165 — is on 7878
+**right about `npc.ini` and wrong about everything `npc.ini` points at**. Two
+rules, both the existing ones applied one level down:
+
+* **Declare frozen tables positively, with the bytes.** `patch7878` carries
+  `FROZEN_LOOKUPS` (four sha256 prefixes) and `NPC_COVERAGE` (rows / resolved /
+  unresolved). "Frozen" is a claim about content, so it is recorded as content
+  rather than as prose.
+* **A declared shortfall gets a reader in the same commit.** `table_quirks()`
+  reaches `/api/plugins`; `tests/test_patch7878.py` re-derives both the hashes
+  and the coverage from the install. A claim nobody checks drifts into fiction
+  while still reading as authority — `PartIni.source`, one level up.
+
+**A short answer from a base that declares its shortfall is a correct answer.**
+A short answer from one that does not is indistinguishable from a bug, and this
+project's register is mostly that distinction.
 
 ### Declare what differs in *form*, not just in content
 
@@ -121,12 +273,16 @@ with a screenshot of the real client and nobody notices for months. So:
 * `docs/attachment.md` — the spec a rewrite reads — opens with a warning not
   to port it.
 
-The only one that exists: `Patch6090` unit-scales the **female** `v_l_weapon`
-basis, because 5517 and 6090 ship it degenerate on body shapes 001 and 002 and
-clean on the male ones. Four checks say the engine does not repair it, so the
-real client very likely shows the squash. Correcting it is a judgement that the
-tool should show what the artist meant; it is labelled as such wherever it
-lands.
+The only one that exists: `Patch6090` replaces the **female** `v_l_weapon`
+basis with CCO's, because 5517 and 6090 ship it degenerate on body shapes 001
+and 002 and clean on the male ones. (Unit-scaling the rows is the *fallback*,
+for when CCO's track cannot be reached. Worth being precise about: the two
+look very different on screen, and the viewer sat on the fallback unnoticed
+because the borrow demanded an appearance id CCO does not ship —
+`docs/CORRECTIONS.md` **C34**.) Four checks say the engine does not repair it,
+so the real client very likely shows the squash. Correcting it is a judgement
+that the tool should show what the artist meant; it is labelled as such
+wherever it lands.
 
 ### Incompleteness is fine
 
@@ -135,6 +291,101 @@ collection and the app uses its own inference, labelled as such. Write down
 what you know and leave the rest open — `plugins/patch6090.py` ends with a
 "what is still open" list naming five unresolved things, which is more useful
 to the next contributor than silence.
+
+### The boundary: DatPkg clients do NOT get a plugin here
+
+**A deliberate asymmetry, decided 2026-08-09. Written down so you meet a
+documented boundary instead of an absence.**
+
+Official WDF clients are resolved through `plugins/`. **Community `.tpi`/`.tpd`
+(NetDragon DatPkg) clients — Zephyr and its kin — are resolved through
+`core/colibrary.ServerView` instead, and there is deliberately no
+`plugins/zephyr.py`.**
+
+The reason is what `coroot.REQUIRED` *means*, not the cost of changing it:
+
+```python
+REQUIRED = (("c3.wdf", "file"), ("data.wdf", "file"), ("ini", "dir"))
+```
+
+It does not answer *"is this a Conquer client"*. It answers **"is this a
+WDF-packaged install that `AssetRoot` can open"** — a narrow, true, load-bearing
+question that roughly fifty call sites depend on being narrow (`REQUIRED` 22
+refs across 4 files, `missing_parts` 17, `looks_like_root` 11). A DatPkg client
+genuinely **is not one**, so `missing_parts(Zephyr)` returns
+`['c3.wdf', 'data.wdf']` and refuses it *before any plugin is consulted*. **That
+refusal is correct.**
+
+Widening `REQUIRED` to accept WDF **or** DatPkg would not teach the system about
+DatPkg. It would make a sharp predicate vague, and every call site would quietly
+begin asking a fuzzier question than it was written for — a check that stops
+discriminating still returns a plausible answer, which is `CORRECTIONS.md` C21's
+shape exactly.
+
+**The project has been here before, and the fix went the other way.** `REQUIRED`
+once carried `bin/64/` and *"refused every client but one"*. The remedy was
+**deleting a wrong entry**, not making the predicate polymorphic.
+
+**Why `ServerView` is the right home and not a consolation prize.** A parse
+profile describes *how to read a client's tables*. Zephyr's tables are
+**synthesised** there — `colibrary rebuild-tables` derives 3,846 body
+appearances and 160 mount appearances from directory convention, because that
+client resolves parts in code rather than in tables. The profile belongs beside
+the synthesis it describes, not behind a gate that correctly refuses it.
+
+**The cost, stated rather than buried:** the plugin system is not uniform.
+Official clients get `plugins/`; community DatPkg clients get a `ServerView`
+profile. Someone will trip on that. If a **second** DatPkg client appears and
+the duplication bites, revisit — two instances are evidence, one is a guess.
+
+#### ⚠ OPEN DEFECT — a `ServerView`'s parse profile comes from the BASELINE, not from the client whose assets you are looking at
+
+**This is a live consequence of the decision above and it must be read with it.**
+A community client has no plugin of its own, so it has **no way to declare its
+own table conventions** — it inherits whichever baseline the user happens to have
+configured. `ServerView.__init__` calls `super().__init__(root)`, so it *is* an
+`AssetRoot` rooted at the baseline, and every profile probe answers about the
+baseline rather than about the imported client.
+
+Measured on one Zephyr import over two different baselines [V]:
+
+```
+ServerView(zephyr) over 5165  ->  detect_profile = plaintext   npcs = 2785
+ServerView(zephyr) over 6090  ->  detect_profile = official    npcs = 2785
+
+common npc_types compared : 397
+RESOLVED DIFFERENTLY      :  25
+  110: 5165=('','')  6090=('c3/npc/785/1.c3',      'c3/texture/9997850.dds')
+  895: 5165=('','')  6090=('c3/npc/838/1.c3',      'c3/texture/9998380.dds')
+  633: 5165=('','')  6090=('c3/mount/801/8010000.c3','c3/mount/801/8014400.dds')
+```
+
+**25 of 397 NPCs silently lose their art** when the same community server is
+viewed over a 5165 baseline instead of a 6090 one. Empty strings, no error, no
+warning — the C21 vantage-point shape at the library layer: one view serving
+another's facts, failing as a plausible answer rather than a refusal.
+
+**Scope, stated honestly.** This shows the answer *depends on an unrelated
+choice*. It does **not** establish that 6090's answers are the correct ones for
+Zephyr — which of the two is right for a DatPkg client is unmeasured, and is the
+next question rather than a conclusion. Sample was the first 400 of 2,785 npcs;
+the ratio may move on the full set.
+
+**The fix is not a fourth probe.** A probe is asked about the composed view and
+the baseline answers first. The library **already records the client's identity**
+— the zephyr entry carries `clientVersion: 1064` and its source client path — and
+**nothing consults it for parsing**: every reader of `clientVersion`
+(`coviewer`, `colibrary`, `assetdiff`) uses it for display or metadata only. So
+the open question is:
+
+> **Should a `ServerView`'s parse profile come from the library's declared client
+> version rather than from the baseline root?**
+
+Until that is answered, treat any parse-dependent answer from a `ServerView` as
+qualified by which baseline was configured, and say so when you report one.
+
+The measurement behind all three options is in
+[`handoff_zephyr_tpi.md`](handoff_zephyr_tpi.md) §1.2.
 
 ## How one gets chosen
 
@@ -195,10 +446,25 @@ writing `game_kind` directly. It records the kind against that root as well as
 globally, so pointing the tools at another install and back finds the same
 namespace instead of opening a fresh empty one.
 
-*Status: keyed and in use. `out/dll/` is the one tree still unkeyed — it holds
-artefacts from an install that no longer exists on this machine, so a migration
-would have to label data it cannot regenerate. Still open:
-`import_plan` is where a plugin will declare which builders to run on import.*
+*Status: keyed and in use, `out/dll/` included as of 2026-08-07.*
+
+`out/dll/` was the last unkeyed tree, and the reason recorded for deferring it
+— that it held artefacts from an install no longer on this machine — was
+**wrong**: the CCO install was there all along, so nothing had to be labelled
+by guesswork. It was migrated by regeneration, and the migration verified
+itself: a fresh CCO run and the archived `exports.json` agree on every shared
+entry exactly, which proves by reproduction whose artefact it was.
+
+One exception, deliberate: `out/dll/wdf_name_recovery.*` stays **global**.
+Every official client ships byte-identical `c3.wdf` and `data.wdf`, so a
+recovered name is a property of the archives rather than of the install that
+mined it — the same reason `out/wdf/` is global. It lives under `out/dll/`
+only because the wordlist came from DLL strings.
+
+`import_plan` is consumed by `tools/assetdiff.py` now, so "importing a library
+uses the plugin" is literally true for the archive list, the loose layer and
+the skip set. It remains the right place for a plugin to declare which
+*builders* to run on import; that part is still unwritten.
 
 ## Verifying a plugin
 

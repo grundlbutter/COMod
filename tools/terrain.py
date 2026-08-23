@@ -18,7 +18,13 @@ WHAT IS DRAWN
 -------------
 The cell grid. Per-cell elevation from the `.DMap` (`i16`, signed), per-cell
 passability, per-cell surface id. All of it is file data, verified by the row
-checksum that `core/dmap.py` computes -- 132/132 rows on `newbie`.
+checksum that `core/dmap.py` computes. **Not on `newbie`**: its elevation field
+is entirely zero, so its 132/132 passes identically under an unsigned read and
+validates only the stride, field order and mask/surface widths -- it is
+structurally incapable of validating the elevation read. The elevation read is
+verified on `desert` (984/984, 75 rows with a negative cell) and `d_antre01`
+(908/908, 454), where an unsigned read fails **exactly** those rows and no
+others. See `docs/dmap_elevation.md` 5.2.
 
 **And, since the placement was recovered, the map's own painted ground art.**
 `tools/puzzle.py` has the rule and the evidence; the short version is that a

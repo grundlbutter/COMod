@@ -300,9 +300,32 @@ Stated rather than papered over.
   reads them; an `EFFECT` layer is a `3DEffect.ini` key and a `SOUND` layer is a
   file path, and neither has a footprint on the painted image. They are counted
   in the map's declared layer total and nothing pretends to place them.
-* **`map/PuzzleSave/*.pux` (`TqTerrain\0`) is undecoded**, so the four maps that
+
+  > **CHECKED 2026-08-15 AND STILL TRUE — do not "correct" this line.** The same
+  > sentence in `docs/ground_art.md`, `docs/movement.md` and `tools/coplay.py`
+  > *was* stale and was struck, because **`tools/coplay.py` draws map effects**
+  > (`_map_effects` → `/api/game/mapfx`). **The MapEditor does not**: `mapfx` and
+  > `_map_effects` appear nowhere in `tools/mapedit.py`. The claim is scoped to
+  > *this consumer* and is accurate for it. **One correction does not travel to a
+  > different tool** — that is the whole reason this note exists.
+  >
+  > One thing here IS narrowed: *"neither has a footprint on the painted image"*
+  > described the state before the EFFECT coordinate space was recovered.
+  > `docs/world_effects.md` §2 now maps **2,504 of 2,504** EFFECT records into
+  > their map's cell grid, so a position **is** computable — the MapEditor simply
+  > does not draw it. "Nothing pretends to place them" remains exactly right.
+* **`map/PuzzleSave/*.pux` (`TqTerrain\0`) is undecoded**, so the maps that
   use it have no ground art at all. Their cell grid, scenery and passability
   still draw and the picker says why.
+
+  > **NOT "four maps"** (corrected 2026-08-15,
+  > `C-2026-08-15-claude-vibeco-gl-openlist`) — that was **CCO's** figure and is
+  > true only on CCO. Re-derived 2026-08-11: **160 maps** name a `.pux` as their
+  > puzzle path, across a 237-file corpus. **169 of those files are reachable on
+  > this machine today** (6609 20, 7878 136, Zephyr 13); the missing 68 are
+  > CCO's, from an install no longer present. `docs/map_scenery.md` §10 is the
+  > home of the corpus, the decoded header and the measured negative that the
+  > payload is **not** a tile index.
 * **`sky` cannot be drawn correctly.** Its art is 20 cells taller than its map
   (`docs/ground_art.md` §3.1). It is listed, labelled `mismatch`, and drawn
   anyway with the placement it does have.
@@ -348,4 +371,89 @@ out/viewer/shots/mapedit-newbie-staged-tile.png          a staged .dds on the ma
 out/viewer/shots/mapedit-gulf-whole-map.png              34,944 x 22,400 px at 3%
 out/viewer/shots/mapedit-newbie-all.png                  the CLI's own render
 out/viewer/shots/mapedit-newbie-pass.png                 the passability layer alone
+```
+
+---
+
+## Collecting and exporting a map
+
+Two cards in the right-hand column, added 2026-08-08. They exist because a
+map is a **closure**, not a file, and three properties of that closure are
+surprising enough that the UI shows them before it acts on them.
+
+### Why there is a "show me first" step
+
+`Collect this map` opens with a button rather than a summary. Resolving what
+a map shares walks every DMap on the install — about 13 seconds — and
+browsing maps should not pay that per click. Press it and the card answers
+four questions at once:
+
+| | |
+|---|---|
+| **Closure** | how many files, and how many bytes. `canyon-fairy` is 25 files / 14.5 MB |
+| **Shared with other maps** | `22 of 25 files`. Staging those changes those maps |
+| **Integrity-hashed** | only ever the `.DMap`, and only on an install that ships `integrity.json` |
+| **Unresolved keys** | layers naming art this client's index does not resolve |
+
+That last row is not an error state. The same map name resolves differently
+on different clients — `09christmas04` resolves cleanly on 5517 and leaves
+8 keys unresolved on CCO — so a short closure that *looks* complete is the
+failure worth refusing. It is reported, never dropped.
+
+### The toggles, and what each one costs
+
+* **Background (.pul)**, **Scenery index (.ani)**, **Tiles** — each shows
+  its own count, so turning one off has a visible price.
+* **Include art shared with other maps.** Off, `canyon-fairy` collects the
+  `.DMap` + 2 files instead of + 24. The map still draws: the install's own
+  tiles are still there. This is how you collect a map without taking a
+  position on every other map that uses its scenery.
+* **Resolve sharing.** Off skips the 13-second walk — and the card says
+  what that costs, because an entry collected without it cannot record what
+  it shares, so **export cannot warn**.
+
+The `.DMap` is never a toggle. It is what the map *is*; a map without it is
+not a smaller map.
+
+**Preview** is a server-side dry run: it writes nothing and lists exactly
+what would travel.
+
+### Export
+
+`Export a collected map` stages into `mods/stage/` only — `comod.py install`
+remains the one thing that touches the game. The shared-art policy is the
+one real decision:
+
+| policy | what it does |
+|---|---|
+| **write only where it differs** (default) | identical bytes are a no-op worth skipping |
+| **always write it** | for when you mean to replace the shared copy |
+| **never write it** | leave every shared file alone |
+
+Output names every outcome. A shared file that genuinely differs is written
+**and** reported with the maps it affects:
+
+```
+staged      map/map/canyon-fairy.DMap
+left alone  ani: ani/MapScene.ani is shared and already identical
+SHARED      ani/mapscene02.ani — also used by 31 other map(s): 09christmas04, Dgate, …
+INTEGRITY   map/map/x.DMap — this install hashes it in integrity.json
+```
+
+### The trap this nearly shipped with
+
+Almost all of a map's art lives **inside `c3.wdf`/`data.wdf`**, not loose:
+all 56 of `09Christmas02`'s art files are archived and none is on disk,
+while the `.DMap`, `.pul` and `.ani` all are. A collector that asks the
+filesystem gets a plausible three-file map with no scenery and reports
+success. Everything here reads through `AssetRoot`; `tools/mapparts.py`
+returns **logical** paths, never filesystem ones.
+
+### The same thing without a browser
+
+```
+py -3 tools/collect.py add-map ?              # list every map
+py -3 tools/collect.py add-map canyon-fairy   # collect it whole
+py -3 tools/collect.py stage base-canyon-fairy
+py -3 tools/mapparts.py canyon-fairy          # just the closure, with flags
 ```

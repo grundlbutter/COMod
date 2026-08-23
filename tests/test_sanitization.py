@@ -45,10 +45,48 @@ substring of the words "login" and "logic", and matching it that way flagged
     separator they were written with.
 
 Adding an identifier: run `--learn`, paste the two sets below.
+
+## Why the scan also reads DECODED views of every file
+
+Both modes above read the file as text, and **a real captured frame is not
+text.** `capture/fixtures/*.jsonl` stores payloads as
+`"head": "20000170584b5154..."` -- so an account or character name that is
+genuinely present, byte for byte, appears as `616c696365` and the token scan
+walks straight past it. The gate then reports **clean** on a file that carries
+real traffic from a real account. Measured by CCO Plugin: their opcode fixtures
+were caught twice when the name appeared as a plain token, and not at all when
+the same name sat beside it in hex.
+
+That is a guard that is safe by convention -- *nobody hex-encodes PII on
+purpose* -- rather than by construction, and it is the same family as the
+attach gate and `companion._static` (`tests/test_boundary_guards.py`).
+
+So every file is matched **as text and again through each decoded view**:
+
+| view | what it recovers |
+|---|---|
+| `hex` | contiguous hex runs, decoded at **both** byte alignments |
+| `hex-separated` | `61 6c 69 63 65`, `\x61\x6c`, `0x61,0x6c` |
+| `base64` | standard and url-safe |
+| `wide` | the above with NUL bytes dropped -- a UTF-16LE name in a memory capture decodes to `a\0l\0i\0c\0e`, which the token matcher would otherwise split into five one-letter tokens |
+
+**The identifiers never have to be known in plaintext for this to work** — the
+file is decoded and the *result* is hashed, so the hash-only design is
+preserved exactly.
+
+**The fix is in the instrument, not the data.** The captured fixtures stay real:
+a self-built one already decoded to the wrong uid once, which is why they are
+real now. A scan that cannot see a real fixture is the thing to change.
+
+Not covered, and named rather than left implied: decimal byte lists
+(`[97, 108, ...]`), compressed or encrypted payloads, and any encoding that is
+not one of the four above. `--views` prints how much each view decoded, because
+**a view that decoded nothing has not checked anything.**
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 import subprocess
@@ -254,6 +292,102 @@ def h(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Decoded views -- see "Why the scan also reads DECODED views" above.
+# ---------------------------------------------------------------------------
+
+#: A contiguous hex run. 8 is the floor because the shortest thing worth finding
+#: is a 3-character token (6 hex chars) with a byte of context either side, and
+#: shorter runs are overwhelmingly ordinary numbers.
+HEX_RUN_RE = re.compile(r"[0-9a-fA-F]{8,}")
+#: Hex byte pairs written with separators: `61 6c 69 63 65`, `\x61\x6c`,
+#: `0x61,0x6c`, `61-6c-69`.
+HEX_SEP_RE = re.compile(r"(?:[0-9a-fA-F]{2}[\s,;:_\-]{1,2}|\\x[0-9a-fA-F]{2}|"
+                        r"0x[0-9a-fA-F]{2}[\s,;]{0,2}){4,}[0-9a-fA-F]{0,2}")
+B64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+_NONHEX_RE = re.compile(r"[^0-9a-fA-F]")
+
+#: Decoded bytes per view per file. A bound is needed (a repo can contain a
+#: multi-megabyte hex blob) but a SILENT bound would make the gate quietly stop
+#: looking, so `decoded_views` reports truncation and `main` prints it.
+DECODE_BUDGET = 4_000_000
+
+
+def _hex_view(text: str, budget: int) -> tuple[str, bool]:
+    r"""Contiguous hex runs, decoded at both byte alignments.
+
+    Both alignments, because a hex run is only guaranteed byte-aligned at its
+    own start: a run that picked up one extra leading nibble from a length
+    prefix or a neighbouring field would hide every byte in it from an
+    offset-0-only decode, and the second pass costs one more `fromhex`.
+    """
+    out, spent, truncated = [], 0, False
+    for m in HEX_RUN_RE.finditer(text):
+        run = m.group(0)
+        for start in (0, 1):
+            body = run[start:]
+            body = body[:len(body) & ~1]
+            if len(body) < 6:
+                continue
+            if spent + len(body) // 2 > budget:
+                truncated = True
+                continue
+            out.append(bytes.fromhex(body).decode("latin-1"))
+            spent += len(body) // 2
+    return "\n".join(out), truncated
+
+
+def _hex_sep_view(text: str, budget: int) -> tuple[str, bool]:
+    out, spent, truncated = [], 0, False
+    for m in HEX_SEP_RE.finditer(text):
+        body = _NONHEX_RE.sub("", m.group(0).replace("0x", "").replace("\\x", ""))
+        body = body[:len(body) & ~1]
+        if len(body) < 6:
+            continue
+        if spent + len(body) // 2 > budget:
+            truncated = True
+            continue
+        out.append(bytes.fromhex(body).decode("latin-1"))
+        spent += len(body) // 2
+    return "\n".join(out), truncated
+
+
+def _b64_view(text: str, budget: int) -> tuple[str, bool]:
+    out, spent, truncated = [], 0, False
+    for m in B64_RUN_RE.finditer(text):
+        pad = m.group(0) + "=" * (-len(m.group(0)) % 4)
+        for dec in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                raw = dec(pad)
+            except Exception:                     # noqa: BLE001 -- not base64
+                continue
+            if spent + len(raw) > budget:
+                truncated = True
+                continue
+            out.append(raw.decode("latin-1"))
+            spent += len(raw)
+    return "\n".join(out), truncated
+
+
+def decoded_views(text: str, budget: int = DECODE_BUDGET) -> list[tuple[str, str, bool]]:
+    """`[(name, decoded_text, truncated)]` -- the file as the wire saw it.
+
+    Empty views are dropped: a caller that iterates these is asking *what else
+    is in this file*, and an empty string is not an answer, it is the absence
+    of one. `--views` reports the sizes so an all-empty result is visible.
+    """
+    hx, hxt = _hex_view(text, budget)
+    hs, hst = _hex_sep_view(text, budget)
+    b6, b6t = _b64_view(text, budget)
+    out = [("hex", hx, hxt), ("hex-separated", hs, hst), ("base64", b6, b6t)]
+    joined = "\n".join(v for _, v, _ in out if v)
+    if "\x00" in joined:
+        # UTF-16LE, the shape a memory capture stores a name in.
+        out.append(("wide", joined.replace("\x00", ""),
+                    hxt or hst or b6t))
+    return [(n, v, t) for n, v, t in out if v]
+
+
+# ---------------------------------------------------------------------------
 
 def publishable_files() -> list[Path]:
     """Every file `git push` would carry: tracked, plus untracked and not
@@ -282,31 +416,35 @@ def publishable_files() -> list[Path]:
     return sorted(set(keep))
 
 
-def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None) -> list[str]:
-    """Findings for one file, as human sentences.  Empty means clean.
+def identifier_findings(text: str, local: "tuple[set[str], set[str]] | None" = None,
+                        *, view: str = "") -> list[str]:
+    """Every banned identifier present in `text`, as human sentences.
 
-    `local` is `(tokens, squashed)` from `.sanitize-local`, compared as
-    plaintext. Findings from it deliberately **do not name the identifier**:
-    the whole point is that it stays private, and printing it into a build log
-    or a screenshot of a failing run would undo that.
+    Split out of `scan` so that **one matcher serves every view of a file** --
+    the plaintext and each decoded form. Two copies of this logic is how one of
+    them ends up subtly wrong and stays wrong, which is the argument
+    `core/safepath.py` is built on.
+
+    `view` names which decoding produced `text`, and it goes in the message: a
+    finding a reader cannot locate in the file is a finding they will assume is
+    a false positive.
     """
-    try:
-        raw = path.read_bytes()
-    except OSError as e:
-        return [f"unreadable: {e}"]
-    text = raw.decode("utf-8", errors="replace")
-    rel = path.relative_to(REPO).as_posix()
     bad: list[str] = []
     local_tokens, local_squashed = local or (set(), set())
-
+    where = f" [in the {view} view of the file]" if view else ""
     toks = [t.lower() for t in TOKEN_RE.findall(text)]
 
     for t in set(toks):
         if h(t) in BANNED_TOKENS:
-            bad.append(f"personal identifier present as the token {t!r}")
+            # The identifier is named only for the committed list, whose
+            # contents are already knowable to anyone holding the repo. Never
+            # for a decoded view: printing it would move a name out of an
+            # encoding and into a build log, which is the opposite of the job.
+            shown = f"the token {t!r}" if not view else f"a token ({len(t)} chars)"
+            bad.append(f"personal identifier present as {shown}{where}")
         elif t in local_tokens:
             bad.append(f"one of your .sanitize-local identifiers is present as "
-                       f"a whole token ({len(t)} chars) -- not naming it here")
+                       f"a whole token ({len(t)} chars){where} -- not naming it here")
 
     # Squashed match, done over *token windows* rather than every character
     # offset.  Every multi-part identifier we care about -- `C:\Users\<name>`,
@@ -334,11 +472,61 @@ def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None) -> list[s
             if len(joined) >= MIN_SQUASHED_LEN and h(joined) in BANNED_SQUASHED:
                 bad.append("personal identifier present at token "
                            f"{i} (squashed match over {w + 1} token(s), "
-                           f"{len(joined)} chars)")
+                           f"{len(joined)} chars){where}")
             elif joined in local_squashed:
                 bad.append(f"one of your .sanitize-local identifiers is present "
-                           f"at token {i} (squashed match over {w + 1} token(s)) "
-                           f"-- not naming it here")
+                           f"at token {i} (squashed match over {w + 1} token(s))"
+                           f"{where} -- not naming it here")
+    return bad
+
+
+def source_findings(text: str, *, view: str = "") -> list[str]:
+    """Decompiled-source identifiers in `text`. Same one-matcher rule as above."""
+    where = f" [in the {view} view of the file]" if view else ""
+    for t in {t.lower() for t in TOKEN_RE.findall(text)}:
+        if h(t) in BANNED_SOURCE:
+            return ["an identifier recovered from the client's own "
+                    "asserts is present -- that is literal text from "
+                    f"TQ's source, and belongs only in co-client-re{where} "
+                    "(not naming it here)"]
+    return []
+
+
+def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None,
+         stats: "dict[str, int] | None" = None) -> list[str]:
+    """Findings for one file, as human sentences.  Empty means clean.
+
+    `local` is `(tokens, squashed)` from `.sanitize-local`, compared as
+    plaintext. Findings from it deliberately **do not name the identifier**:
+    the whole point is that it stays private, and printing it into a build log
+    or a screenshot of a failing run would undo that.
+
+    The identifier checks run over the plaintext **and over every decoded
+    view** (`decoded_views`), so a name that is byte-for-byte present cannot
+    hide behind hex or base64. The three *regex* checks below stay plaintext-
+    only and deliberately: they are policy rules about how this repo writes
+    paths, their allowlists are keyed on a path, and "there is a string that
+    looks like an install path inside a decoded capture payload" is a different
+    claim from "this file hardcodes an install path".
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        return [f"unreadable: {e}"]
+    text = raw.decode("utf-8", errors="replace")
+    rel = path.relative_to(REPO).as_posix()
+    bad: list[str] = identifier_findings(text, local)
+
+    for name, view, truncated in decoded_views(text):
+        if stats is not None:
+            stats[name] = stats.get(name, 0) + len(view)
+        bad += identifier_findings(view, local, view=name)
+        if truncated:
+            bad.append(f"the {name} view hit the {DECODE_BUDGET:,}-byte decode "
+                       f"budget, so part of this file was NOT checked in that "
+                       f"view -- split the file or raise DECODE_BUDGET. A "
+                       f"partial scan reporting clean is the failure this "
+                       f"message exists to prevent")
 
     for m in USER_PATH_RE.finditer(text):
         bad.append(f"absolute user path {m.group(0)!r} -- "
@@ -358,13 +546,9 @@ def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None) -> list[s
                        "compiled-in asserts -- private-tree-only material. "
                        "Either drop it, or add this path to DECOMPILED_ALLOWED "
                        "and accept that the file can never be extracted")
-        for t in set(toks):
-            if h(t) in BANNED_SOURCE:
-                bad.append("an identifier recovered from the client's own "
-                           "asserts is present -- that is literal text from "
-                           "TQ's source, and belongs only in co-client-re "
-                           "(not naming it here)")
-                break
+        bad += source_findings(text)
+        for name, view, _ in decoded_views(text):
+            bad += source_findings(view, view=name)
     return bad
 
 
@@ -463,8 +647,9 @@ def main(argv: list[str]) -> int:
     # exists to prevent, so it is fatal on its own and reported first.
     tracked = local_list_is_tracked()
 
+    view_bytes: dict[str, int] = {}
     for p in files:
-        bad = scan(p, local)
+        bad = scan(p, local, view_bytes)
         rel = p.relative_to(REPO).as_posix()
         if bad:
             findings.append((rel, bad))
@@ -475,6 +660,19 @@ def main(argv: list[str]) -> int:
           f"skipping {sorted(SKIP_DIRS)}")
     print(f"banned identifiers: {len(BANNED_TOKENS)} token, "
           f"{len(BANNED_SQUASHED)} squashed")
+    # WHAT THE DECODED VIEWS ACTUALLY LOOKED AT. Printed on every run, next to
+    # the verdict, because a view that decoded nothing has checked nothing --
+    # and this whole mechanism exists because a check that could not fire was
+    # reporting clean. A reader comparing "hex 0 B" against a tree they know
+    # holds capture fixtures has been told something a bare PASS cannot say.
+    if view_bytes:
+        print("decoded views searched: "
+              + ", ".join(f"{k} {v:,} B" for k, v in sorted(view_bytes.items())))
+    else:
+        print("decoded views searched: NONE -- no file in this tree carried "
+              "hex, separated-hex or base64 runs, so the encoded-PII check "
+              "did not fire on anything. That is a fact about the tree, not a "
+              "pass.")
     if local[0] or local[1]:
         print(f"plus your .sanitize-local: {len(local[0])} token, "
               f"{len(local[1])} squashed (contents never printed)")
@@ -490,20 +688,29 @@ def main(argv: list[str]) -> int:
               "        git rm --cached .sanitize-local\n"
               "    It is listed in .gitignore, so this can only have happened\n"
               "    via `git add -f`.")
-        print("\nRESULT: FAIL")
+        print(f"\nRESULT: FAIL -- .sanitize-local is tracked; "
+              f"{len(files)} file(s) scanned")
         return 1
 
+    # Every verdict line below carries the count it was reached on. A verdict
+    # with no count is invisible to the "does the summary agree with the work"
+    # cross-check, which then passes by not applying -- CONTRIBUTING.md, "when
+    # two readouts of one run disagree". Scanning zero files and finding
+    # nothing is not a pass, and only the count can say which happened.
+    ident = len(BANNED_TOKENS) + len(BANNED_SQUASHED) + len(local[0]) + len(local[1])
     if findings:
         print(f"\n{len(findings)} FILE(S) WITH FINDINGS:\n")
         for rel, bad in findings:
             print(f"  {rel}")
             for b in bad:
                 print(f"      {b}")
-        print("\nRESULT: FAIL")
+        print(f"\nRESULT: FAIL -- scanned {len(files)} file(s) against "
+              f"{ident} identifier(s), {len(findings)} with findings")
         return 1
     print("\nno personal identifiers, no absolute user paths, "
           "no hardcoded install paths")
-    print("RESULT: PASS")
+    print(f"RESULT: PASS -- scanned {len(files)} file(s) against "
+          f"{ident} identifier(s), 0 with findings")
     return 0
 
 

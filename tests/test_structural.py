@@ -167,7 +167,11 @@ def main(argv=()):
         print(f"\n=== {len(probs)} PROBLEMS (first 25) ===")
         for x in probs[:25]:
             print(f"  {x}")
-    print("\nRESULT:", "FAIL" if probs else "PASS")
+    # The count belongs ON the verdict line: a verdict without one cannot be
+    # cross-checked against the work it claims to summarise, and a run that
+    # exercised nothing reads identically to a run that passed.
+    print(f"\nRESULT: {'FAIL' if probs else 'PASS'} -- {tested} container(s) "
+          f"exercised, {rem} remove + {add} add case(s), {len(probs)} problem(s)")
     return 1 if probs else 0
 
 

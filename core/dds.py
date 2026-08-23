@@ -35,6 +35,7 @@ pure-python path produces byte-identical output and is what the tests compare.
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from typing import Optional
@@ -44,7 +45,17 @@ try:                                    # optional -- see module docstring
 except Exception:                       # pragma: no cover - numpy is optional
     _np = None
 
-HAVE_NUMPY = _np is not None
+#: Set `CO_DDS_SCALAR=1` to force the scalar reference decoder.  It exists so
+#: the vectorised path's speedup is reproducible by anyone -- run the same
+#: benchmark twice, once with it set -- and so a suspected decode bug can be
+#: bisected against the reference without editing this file.  The two paths
+#: are byte-identical (`tests/test_dds_numpy.py`), so this changes speed only.
+SCALAR_ONLY = os.environ.get("CO_DDS_SCALAR", "") not in ("", "0")
+
+#: True when the vectorised block decoder is the one that will actually run.
+#: Read by the viewer's health panel; it is a statement about *this process*,
+#: not merely about whether numpy imports.
+HAVE_NUMPY = _np is not None and not SCALAR_ONLY
 
 # --- DDS_HEADER.dwFlags / DDS_PIXELFORMAT.dwFlags ---------------------------
 DDPF_ALPHAPIXELS = 0x1
@@ -184,8 +195,154 @@ def _color_block(c0: int, c1: int, punchthrough: bool):
             ((r0 + 2 * r1) // 3, (g0 + 2 * g1) // 3, (b0 + 2 * b1) // 3, 255))
 
 
+def _bc_blocks(data: bytes, bw: int, bh: int, bsize: int):
+    """The block payload as `(bh*bw, bsize)` uint8, for the numpy path."""
+    return _np.frombuffer(data[:bw * bh * bsize],
+                          dtype=_np.uint8).reshape(bh * bw, bsize)
+
+
+def _le(arr, first: int, count: int, dtype):
+    """`count` little-endian bytes of every block, as `dtype`.
+
+    A byte-wise assembly rather than a `view()`, because `view` needs the
+    block stride to be a multiple of the target itemsize and a DXT1 block is
+    8 bytes wide with a 4-byte field at offset 4 -- true here and not in
+    general.  Only the wide fields go through this; the 2- and 3-bit index
+    fields are unpacked byte-wise below, which is far cheaper.
+    """
+    out = _np.zeros(arr.shape[0], dtype=dtype)
+    for i in range(count):
+        out |= arr[:, first + i].astype(dtype) << dtype(8 * i)
+    return out
+
+
+def _unpack_2bit(b4):
+    """`(n,4)` bytes of 2-bit indices -> `(n,16)` uint8, pixel order.
+
+    Pixel `i` lives in byte `i//4` at bit `2*(i%4)`, so the whole field comes
+    out in four strided writes with no 32-bit shifting at all.
+    """
+    n = b4.shape[0]
+    sel = _np.empty((n, 16), dtype=_np.uint8)
+    for j in range(4):
+        sel[:, j::4] = (b4 >> (2 * j)) & 3
+    return sel
+
+
+def _expand565(c):
+    """RGB565 -> three uint8 planes, the same widening as `_rgb565_table`."""
+    r = ((c >> 11) & 0x1F).astype(_np.int32)
+    g = ((c >> 5) & 0x3F).astype(_np.int32)
+    b = (c & 0x1F).astype(_np.int32)
+    return ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2))
+
+
+def _decode_bc_numpy(data: bytes, width: int, height: int, fmt: str) -> bytearray:
+    """Vectorised BC1/BC2/BC3.  Byte-identical to `_decode_bc_py`.
+
+    Only called for block-aligned surfaces (every DDS in this install is);
+    a ragged width or height falls back to the scalar decoder rather than
+    growing a second set of edge rules that could disagree with it.
+    """
+    bw = (width + 3) // 4
+    bh = (height + 3) // 4
+    bsize = 8 if fmt == "DXT1" else 16
+    blk = _bc_blocks(data, bw, bh, bsize)
+    n = blk.shape[0]
+
+    # --- alpha, when the format carries its own ---------------------------
+    alpha = None
+    coff = 0
+    if fmt == "DXT3":
+        # 16 nibbles over 8 bytes: pixel 2k is the low nibble of byte k,
+        # pixel 2k+1 the high one.  `* 17` widens 4 bits to 8, as above.
+        a8 = blk[:, 0:8]
+        alpha = _np.empty((n, 16), dtype=_np.uint8)
+        alpha[:, 0::2] = a8 & 0xF
+        alpha[:, 1::2] = a8 >> 4
+        alpha *= 17
+        coff = 8
+    elif fmt == "DXT5":
+        a0 = blk[:, 0].astype(_np.int32)
+        a1 = blk[:, 1].astype(_np.int32)
+        abits = _le(blk, 2, 6, _np.uint64)
+        pal = _np.empty((n, 8), dtype=_np.int32)
+        pal[:, 0] = a0
+        pal[:, 1] = a1
+        wide = a0 > a1
+        # Both interpolation tables are computed for every block and selected
+        # by the c0/c1 order, which is cheaper than partitioning and cannot
+        # drift from the scalar formulas above.
+        for i, (p, q) in enumerate(((6, 1), (5, 2), (4, 3), (3, 4), (2, 5), (1, 6)), 2):
+            pal[:, i] = _np.where(wide, (p * a0 + q * a1) // 7, 0)
+        for i, (p, q) in enumerate(((4, 1), (3, 2), (2, 3), (1, 4)), 2):
+            pal[:, i] = _np.where(wide, pal[:, i], (p * a0 + q * a1) // 5)
+        pal[:, 6] = _np.where(wide, pal[:, 6], 0)
+        pal[:, 7] = _np.where(wide, pal[:, 7], 255)
+        sh = (3 * _np.arange(16, dtype=_np.uint64))
+        sel = ((abits[:, None] >> sh) & _np.uint64(0x7)).astype(_np.intp)
+        alpha = _np.take_along_axis(pal, sel, axis=1).astype(_np.uint8)
+        coff = 8
+
+    # --- the four-entry colour palette ------------------------------------
+    c0 = _le(blk, coff, 2, _np.uint32)
+    c1 = _le(blk, coff + 2, 2, _np.uint32)
+    r0, g0, b0 = _expand565(c0)
+    r1, g1, b1 = _expand565(c1)
+
+    pal4 = _np.empty((n, 4, 4), dtype=_np.uint8)
+    pal4[:, 0, 0], pal4[:, 0, 1], pal4[:, 0, 2] = r0, g0, b0
+    pal4[:, 1, 0], pal4[:, 1, 1], pal4[:, 1, 2] = r1, g1, b1
+    pal4[:, :, 3] = 255
+    if fmt == "DXT1":
+        three = c0 <= c1                       # punchthrough / 3-colour mode
+        for ch, (x0, x1) in enumerate(((r0, r1), (g0, g1), (b0, b1))):
+            pal4[:, 2, ch] = _np.where(three, (x0 + x1) // 2, (2 * x0 + x1) // 3)
+            pal4[:, 3, ch] = _np.where(three, 0, (x0 + 2 * x1) // 3)
+        pal4[:, 3, 3] = _np.where(three, 0, 255)
+    else:
+        for ch, (x0, x1) in enumerate(((r0, r1), (g0, g1), (b0, b1))):
+            pal4[:, 2, ch] = (2 * x0 + x1) // 3
+            pal4[:, 3, ch] = (x0 + 2 * x1) // 3
+
+    sel = _unpack_2bit(blk[:, coff + 4:coff + 8])
+    # One flat gather over `n*4` RGBA entries beats `take_along_axis` here:
+    # the index array is (n,16) rather than (n,16,4).
+    flat = (_np.arange(n, dtype=_np.intp)[:, None] * 4) + sel
+    px = pal4.reshape(n * 4, 4)[flat]
+    if alpha is not None:
+        px[:, :, 3] = alpha
+
+    # (blocks, 16, rgba) -> (h, w, rgba), 4x4 blocks in raster order
+    img = (px.reshape(bh, bw, 4, 4, 4)
+             .transpose(0, 2, 1, 3, 4)
+             .reshape(bh * 4, bw * 4, 4))
+    return bytearray(_np.ascontiguousarray(img[:height, :width]).tobytes())
+
+
 def _decode_bc(data: bytes, width: int, height: int, fmt: str) -> bytearray:
-    """Decode BC1/BC2/BC3 to RGBA8.  Pure python; ~40 ms for 256x256."""
+    """Decode BC1/BC2/BC3 to RGBA8.
+
+    numpy does the per-pixel assembly when it is available and the surface is
+    block-aligned -- MEASURED 35 ms -> 2.0 ms for a 256x256 DXT3 tile, and
+    that decode was the whole of the asset-viewer map load
+    (`docs/asset_decode_perf.md`).  The scalar decoder below is the reference:
+    `tests/test_dds_numpy.py` asserts the two agree byte-for-byte over the
+    shipped corpus and over synthetic blocks for the modes it does not carry.
+    """
+    bw = (width + 3) // 4
+    bh = (height + 3) // 4
+    bsize = 8 if fmt == "DXT1" else 16
+    need = bw * bh * bsize
+    if len(data) < need:
+        raise DdsError(f"{fmt}: need {need} bytes of block data, have {len(data)}")
+    if HAVE_NUMPY and width % 4 == 0 and height % 4 == 0:
+        return _decode_bc_numpy(data, width, height, fmt)
+    return _decode_bc_py(data, width, height, fmt)
+
+
+def _decode_bc_py(data: bytes, width: int, height: int, fmt: str) -> bytearray:
+    """Decode BC1/BC2/BC3 to RGBA8.  Pure python; ~35 ms for 256x256."""
     bw = (width + 3) // 4
     bh = (height + 3) // 4
     bsize = 8 if fmt == "DXT1" else 16

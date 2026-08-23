@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 from coassets import AssetRoot, C3File, DEFAULT_ROOT, parse_ini   # noqa: E402
 import c3phy                                                      # noqa: E402
 import coroot                                                     # noqa: E402
+import provenance                                                 # noqa: E402
 
 __all__ = ["Match", "MeshTextureIndex", "METHODS"]
 
@@ -237,6 +238,17 @@ class MeshTextureIndex:
     def __init__(self, root: Path | str = DEFAULT_ROOT,
                  assets: Optional[AssetRoot] = None):
         self.root = Path(root)
+        #: Where THIS index's census lives -- resolved from **this index's
+        #: own root**, not the configured one. It used to be a class
+        #: attribute evaluated at import, which meant every instance in a
+        #: process shared one path no matter which install it was built for,
+        #: and `scan_meshes` wrote through it. Two bases in one process
+        #: therefore overwrote each other's census: measured, 6090's 18,020
+        #: meshes landed in `patch5517-.../mesh_index.json`, were rejected by
+        #: `_cache_covers` on the next 5517 read, rebuilt, and thrashed back.
+        #: `_cache_covers` only caught it because the two clients differ in
+        #: size; at comparable sizes it is accepted in silence.
+        self.CACHE = coroot.derived_path("out/meshtex/mesh_index.json", self.root)
         self.ini = self.root / "ini"
         self.assets = assets or AssetRoot(self.root)
         self._owns_assets = assets is None
@@ -256,29 +268,86 @@ class MeshTextureIndex:
     def _build_universe(self) -> None:
         """Every asset path the client can open: loose files plus the archive
         entries whose name the earlier workstream recovered (24,426 of 24,757,
-        98.7% -- see docs/assets.md section 2.3)."""
+        98.7% -- see docs/assets.md section 2.3).
+
+        The recovered-name tables are **global** -- one set of names pooled
+        from every install anyone has ever unpacked -- and this is the only
+        input here that is not already per-base.  A name in that pool is not
+        a promise that *this* install ships the bytes; 774 of the 24,426 are
+        not resolvable against 5517's archives at all, 210 of them ``.c3``.
+        Folding the pool in unfiltered is what made a per-base census get
+        measured against a global universe, and it cost a permanently
+        rejected cache (``_cache_covers``, ``C-2026-08-10-quickfix-gap210``).
+
+        So the pooled names are kept, but *marked*.  ``_global_only`` is the
+        subset that no loose file backs, i.e. exactly the names whose
+        presence this install has not yet been asked to confirm.  Callers
+        that need a per-base answer resolve them through ``_in_this_install``
+        -- one TQ hash into this install's own WDF index, which is the same
+        decisive check ``exists`` already falls through to.
+
+        The marking is deliberately not a filter here.  Confirming all 24,426
+        costs 8.2 s (measured, 5517), and most constructions of this class
+        never ask a coverage question; ``_cache_covers`` only ever needs the
+        few hundred that a cache actually misses.  Pay it where it is owed.
+        """
+        loose: set[str] = set()
         for p in self.root.rglob("*"):
             if p.is_file():
-                self.universe.add(_norm(str(p.relative_to(self.root))))
+                loose.add(_norm(str(p.relative_to(self.root))))
+        self.universe.update(loose)
+        pooled: set[str] = set()
         self.names_loaded = False
         for fn in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
             f = coroot.find_derived(fn)
             if f is not None:
-                self.universe.update(_norm(v) for v in
-                                     json.loads(f.read_text("utf-8")).values())
+                pooled.update(_norm(v) for v in
+                              json.loads(f.read_text("utf-8")).values())
                 self.names_loaded = True
         f = coroot.find_derived("out/dll/wdf_name_recovery.json")
         if f is not None:
             try:
-                self.universe.update(
+                pooled.update(
                     _norm(v) for v in
                     json.loads(f.read_text("utf-8"))["resolved"].values())
                 self.names_loaded = True
             except Exception:
                 pass
+        self.universe.update(pooled)
+        #: Pooled names with no loose file behind them -- unconfirmed against
+        #: this install until `_in_this_install` says otherwise.
+        self._global_only = pooled - loose
         self.textures = {p for p in self.universe if p.endswith(".dds")}
         self.c3_files = {p for p in self.universe if p.endswith(".c3")}
         self._exists_cache: dict[str, bool] = {}
+
+    def _in_this_install(self, p: str) -> bool:
+        """Does *this* install's archive index resolve `p`?
+
+        Hashes the path with the real TQ hash and looks it up -- the same
+        stage-two check `exists` uses, and the only one that distinguishes
+        "this install ships it" from "somebody's install shipped it once".
+        Shares `_exists_cache`, so a path asked about twice costs once.
+        """
+        hit = self._exists_cache.get(p)
+        if hit is None:
+            try:
+                hit = self.assets.locate(p) is not None
+            except Exception:
+                hit = False
+            self._exists_cache[p] = hit
+        return hit
+
+    def in_scope_c3(self) -> set[str]:
+        """`c3_files` restricted to what this install can actually open.
+
+        The per-base universe, resolved.  Costs one hash per unconfirmed
+        pooled name (8.2 s on 5517) -- call it when the whole set is needed,
+        which is a full rescan; a coverage check should filter its misses
+        with `_in_this_install` instead of building this.
+        """
+        return {p for p in self.c3_files
+                if p not in self._global_only or self._in_this_install(p)}
 
     def exists(self, logical: str) -> bool:
         """Does the client have this asset?
@@ -397,7 +466,18 @@ class MeshTextureIndex:
         `EffectId<i>` (-> 3DEffectObj.ini, a .c3) and `TextureId<i>`
         (-> 3dtexture.ini, a .dds).  VERIFIED: both id spaces resolve to
         explicit paths, 2,314/2,351 and 7,785/7,929 of which exist here."""
-        for sec, kv in parse_ini(self.ini / "3DEffect.ini").items():
+        # **RETRACTED REASON:** this note used to say "there is no EFFE reader
+        # yet". There is -- `core/dbc.py::read_effe` (C44), and
+        # `tools/effects.py::EffectDB` reads the compiled table on its
+        # definitions path (C47). meshtex's own effect figures are therefore
+        # the only plaintext-lineage ones left; docs/effects.md §7a/§9a are not.
+        # STALE-INI: 3DEffect.dbc (magic EFFE) shadows this from 5517 on, and
+        # the read stays plaintext for the same reason 3DSimpleObj does below:
+        # switching moves *this tool's* coverage index on 5517/6090, and
+        # rebuilding those indexes is meshtex's owner's call rather than a
+        # passing session's (C21).
+        for sec, kv in parse_ini(self.ini / "3DEffect.ini",
+                                 allow_stale=True).items():
             try:
                 n = int(kv.get("Amount", "0") or 0)
             except ValueError:
@@ -415,7 +495,14 @@ class MeshTextureIndex:
         """ini/3DSimpleObj.ini: `[ObjIDType<n>] PartAmount=N`, then `Part<i>`
         (-> 3dobj.ini) and `Texture<i>` (-> 3dtexture.ini).  Same two id
         spaces as 3DEffect.ini.  VERIFIED by inspection; 137 sections."""
-        for sec, kv in parse_ini(self.ini / "3DSimpleObj.ini").items():
+        # STALE-INI: 3DSimpleObj.dbc (magic SIMO) shadows this from 5517 on
+        # and `dbc.read_simo` can already read it. Switching would move the
+        # meshtex coverage numbers on 5517/6090, and rebuilding those indexes
+        # is not a gate session's call (C21 -- a coverage index that changes
+        # under other sessions is exactly what caused the cross-base leak).
+        # Declared here; conversion is listed in docs/gamedata.md.
+        for sec, kv in parse_ini(self.ini / "3DSimpleObj.ini",
+                                 allow_stale=True).items():
             try:
                 n = int(kv.get("PartAmount", "0") or 0)
             except ValueError:
@@ -430,39 +517,95 @@ class MeshTextureIndex:
                           f"3DSimpleObj.ini [{sec}] Part{i}={e} Texture{i}={t}")
 
     def _build_npc_table(self) -> None:
-        """ini/npc.json rows carry `simple_object` (-> 3DSimpleObj.ini, giving
-        the texture) and three motion ids (-> 3dmotion.ini, giving the .c3
-        files that NPC animates with).  Joining them attaches the NPC's own
-        texture to every mesh file it plays.  436 of 437 rows resolve to at
-        least one real texture.  VERIFIED join; both halves are authored."""
-        p = self.ini / "npc.json"
-        if not p.is_file():
-            return
+        """An NPC's own texture, attached to every mesh it animates with.
+
+        The join is `npc table -> simple_object -> 3DSimpleObj.ini` for the
+        texture, and the row's three motion ids for the `.c3` files that NPC
+        plays.  436 of 437 CCO rows resolve to at least one real texture.
+        VERIFIED join; both halves are authored.
+
+        **Routed through `core/npcart.py` rather than parsing a table here.**
+        The community client ships `ini/npc.json`; every official client
+        ships a sectioned `ini/npc.ini` whose motion ids are **ten** digits
+        wide against the json's nine, and whose `simple_object` is a
+        zero-padded string against the json's int.  Reading only the json
+        left this rule dead on every official client.
+
+        That mattered more than a missing rule usually does. `npc_table` is
+        what discovers that a shared mesh has *several* candidate skins --
+        `c3/npc/999001100.c3` is the standby motion of thirteen NPCs -- so
+        with it dead the mesh fell through to an `inferred` 0.73 answer and
+        was reported as **definite**, `ambiguous=False`. A shared asset
+        silently acquiring one confident texture is the exact failure this
+        rule exists to prevent, so the gap did not merely lose data: it
+        inverted the finding, on the mesh the whole scoring design was built
+        around.
+
+        `npcart` normalises both forms to one row shape and resolves the id
+        widths, so this imports it rather than re-deriving it -- the same
+        call the class's own `npcart` test already makes.
+        """
         try:
-            rows = json.loads(p.read_text("utf-8", errors="replace"))
+            import npcart                                # noqa: PLC0415
+            # ASK THE PLUGIN rather than let the tables probe for themselves.
+            # This call matters more than the other three: what it builds is
+            # the mesh->texture index most of the app reads, so a profile
+            # chosen wrongly here does not fail here -- it propagates, which
+            # is the C21 shape. `plugin_for` is the rule the viewer already
+            # uses: a stored declaration outranks detection, because a
+            # private-server repack of 6090 reads as 6090 to any test of the
+            # bytes. Measured 2026-08-09: plugin and probe agree on all six
+            # declared installs, so no answer moves today.
+            #
+            # ASK `self.assets`, NOT `self.root`. `assets` may be a
+            # `colibrary.ServerView`, whose `.root` is the **baseline** it
+            # composes over rather than the client it shows, so resolving from
+            # the root asks the wrong install
+            # (`docs/CORRECTIONS.md` C-2026-08-09-plugin-c-serverview-profile).
+            # `table_profile_for` is the single definition of that rule and
+            # falls back to `plugin_for(root)` for a bare install, which is
+            # every caller today: **MEASURED 2026-08-09, no caller anywhere
+            # passes `assets=`** (`meshtex:18`, `meshtex:1242`,
+            # `thumbs:739/754/1276/1381`, `unify:228`, `test_viewer:8932` all
+            # construct from a root), so `self.assets` is unconditionally an
+            # `AssetRoot` and this changes no answer here TODAY. It is wired
+            # because the parameter exists and must be honoured the first time
+            # somebody uses it -- this index is the one that propagates.
+            #
+            # The flip counts and the STABLE-not-CORRECT scope live in
+            # `table_profile_for`'s docstring rather than being copied here:
+            # four call sites resting on one measurement is exactly how three
+            # of the copies go stale (the `_DBC_CENSUS` lesson). The two sites
+            # a `ServerView` can actually reach -- `coviewer` and `artcrawl` --
+            # state them inline because that is where the answer is shown or
+            # persisted.
+            prof = None
+            try:
+                from assetdiff import table_profile_for   # noqa: PLC0415
+                prof, _rep = table_profile_for(self.assets, self.root)
+            except Exception:                            # pragma: no cover
+                prof = None
+            tables = npcart.Tables(self.assets.read, prof)
         except Exception:
             return
-        simple = parse_ini(self.ini / "3DSimpleObj.ini")
-        motion = _flat_ini(self.ini / "3dmotion.ini")
-        for r in rows:
-            kv = simple.get(f"ObjIDType{r.get('simple_object')}")
-            if not kv:
-                continue
+        source = getattr(tables.profile, "npc_table", "npc table")
+        for row in tables.npcs:
             try:
-                n = int(kv.get("PartAmount", "0") or 0)
-            except ValueError:
+                plan = tables.plan_for_npc(row)
+            except Exception:
                 continue
-            texes = [t for t in (self._tex(self.tex_paths.get(kv.get(f"Texture{i}", "")))
-                                 for i in range(n)) if t]
+            texes = [t for t in
+                     ([self._tex(plan.texture)]
+                      + [self._tex(x) for _, x in plan.extra_parts])
+                     if t]
             if not texes:
                 continue
-            name = r.get("name", "")
-            for key in ("standby_motion", "blaze_motion", "rest_motion"):
-                f = motion.get(str(r.get(key)))
+            name = row.get("name", "")
+            for role, path in plan.motions.items():
                 for t in texes:
-                    self._add(self._npcj, f, t,
-                              f"npc.json type={r.get('type')} ({name}) "
-                              f"simple_object={r.get('simple_object')} via {key}")
+                    self._add(self._npcj, path, t,
+                              f"{source} type={row.get('type')} ({name}) "
+                              f"simple_object={row.get('simple_object')} via {role}")
 
     def _build_simplerole_table(self) -> None:
         """ini/3DsimpleRole.ini: the 24 character-creation preview roles, each
@@ -472,7 +615,8 @@ class MeshTextureIndex:
         p = self.ini / "3DsimpleRole.ini"
         if not p.is_file():
             return
-        simple = parse_ini(self.ini / "3DSimpleObj.ini")
+        # STALE-INI: same SIMO twin as _build_simpleobj_table above.
+        simple = parse_ini(self.ini / "3DSimpleObj.ini", allow_stale=True)
         motion = _flat_ini(self.ini / "3dmotion.ini")
         for sec, kv in parse_ini(p).items():
             obj = simple.get(f"ObjIDType{kv.get('3DSimpleObjID')}")
@@ -804,7 +948,10 @@ class MeshTextureIndex:
         return m[0] if m else None
 
     # -- mesh census (cached) ----------------------------------------------
-    CACHE = coroot.derived_path("out/meshtex/mesh_index.json")
+    # `CACHE` is set per instance in __init__, from that instance's own root.
+    # It is deliberately NOT a class attribute: as one it resolved at import
+    # against whatever install was configured then, and every index in the
+    # process wrote through it.
 
     def _cache_covers(self, idx: dict) -> bool:
         """Does a cached census cover the current universe?
@@ -814,27 +961,88 @@ class MeshTextureIndex:
         universe was built against a smaller one, typically before name
         recovery ran, and must not be trusted.  A healthy cache misses
         nothing (measured: 6390 of 6390); the sliver only absorbs files
-        added or renamed since the scan."""
-        missing = sum(1 for p in self.c3_files if p not in idx)
-        return missing <= max(8, len(self.c3_files) // 200)
+        added or renamed since the scan.
+
+        That premise held for the census but not for the universe it was
+        compared against, and for a while THIS FUNCTION COULD NEVER RETURN
+        TRUE.  ``_build_universe`` folded the **global**
+        ``out/wdf/{c3,data}_names.json`` into ``universe`` -- ``find_derived``
+        with no root -- so ``c3_files`` carried recovered names that a given
+        install's archives do not contain.  ``_scan_one`` returns ``None`` on
+        anything unreadable, so those never entered ``idx``, and they were
+        counted missing on every subsequent read, forever.  **The cache each
+        run wrote was rejected by the next one**, which was the whole of the
+        292 s-vs-29 s cost.  MEASURED 2026-08-10, and the missing set was
+        *identical* across installs spanning 3.6x in size:
+
+            base   universe  cached  missing  tolerance  covers
+            5017      5,021   4,811      210         25      NO
+            5517     10,473  10,263      210         52      NO
+            6090     18,230  18,020      210         91      NO
+
+            pairwise shared = 210, only-A = 0, only-B = 0   (the SAME paths)
+            readable on any base .......... 0 of 210
+            drawn from the global tables .. 210 of 210 (100.0%)
+
+        Not drift, not a stale cache, not per-tree: one fixed set of names
+        recovered from the archives' own tables that no archive resolves.
+        The fix is the one the shape of that table argues for -- **make the
+        comparand per-base** rather than widen the tolerance, which would
+        have hidden a real signal about the recovered-name set.  A miss is
+        only a miss if this install could have supplied it, so a pooled name
+        with no loose file behind it is put to ``_in_this_install``, one TQ
+        hash into this install's own archive index.  The 210 fail that and
+        leave scope; a genuinely absent local ``.c3`` still counts, because
+        it is either loose or resolvable and so never reaches the filter.
+
+        Cost is bounded by the misses, not by the universe: a healthy cache
+        pays ~210 hashes, and a cache that really is stale was going to
+        rescan for 292 s anyway.  ``docs/CORRECTIONS.md``
+        ``C-2026-08-10-quickfix-gap210``."""
+        missing = [p for p in self.c3_files if p not in idx]
+        missing = [p for p in missing if p not in self._global_only
+                   or self._in_this_install(p)]
+        return len(missing) <= max(8, len(self.c3_files) // 200)
 
     def _load_mesh_index(self) -> dict[str, dict]:
         if self._mesh_index is not None:
             return self._mesh_index
-        cached = coroot.find_derived("out/meshtex/mesh_index.json")
+        cached = coroot.find_derived("out/meshtex/mesh_index.json", self.root)
         if cached is not None and not self._cache_is_stale(cached):
             try:
-                idx = json.loads(cached.read_text("utf-8"))
+                doc = json.loads(cached.read_text("utf-8"))
             except Exception:
-                idx = None
-            if idx is not None:
+                doc = None
+            # Stamped since the provenance migration; `unwrap` returns an
+            # unstamped document unchanged, so an index built before it still
+            # loads. `strict=False` is deliberate: the only thing refused
+            # outright is an index that *says* it came from another install.
+            verdict = provenance.verdict(doc, self.root) if doc is not None else None
+            if verdict == provenance.FOREIGN:
+                print(f"[meshtex] refusing mesh index {cached}: it was built "
+                      f"from {provenance.describe(doc)}, and this is "
+                      f"{coroot.base_id(self.root)} -- rescanning",
+                      file=sys.stderr)
+                doc = None
+            idx = provenance.unwrap(doc)[1] if doc is not None else None
+            if isinstance(idx, dict):
                 if self._cache_covers(idx):
                     self._mesh_index = idx
                     return self._mesh_index
+                # Report the count the decision was actually made on. The
+                # old wording compared entries against the whole universe,
+                # which made the 210 pooled names look like a size gap and
+                # sent three readers looking for a stale cache.
+                short = [p for p in self.c3_files if p not in idx
+                         and (p not in self._global_only
+                              or self._in_this_install(p))]
                 print(f"[meshtex] ignoring stale mesh index {cached}: it has "
-                      f"{len(idx)} entries but the universe has "
-                      f"{len(self.c3_files)} .c3 files (was it built before "
-                      "name recovery?) -- rescanning",
+                      f"{len(idx)} entries and misses {len(short)} .c3 files "
+                      f"this install can open (tolerance "
+                      f"{max(8, len(self.c3_files) // 200)}; "
+                      f"{len(self.c3_files)} .c3 in the universe, of which "
+                      f"{len(self._global_only & self.c3_files)} are pooled "
+                      "names not backed by a loose file) -- rescanning",
                       file=sys.stderr)
         self._mesh_index = self.scan_meshes()
         return self._mesh_index
@@ -930,8 +1138,13 @@ class MeshTextureIndex:
                   "cached. Run `py -3 tools/health.py --bootstrap` first.",
                   file=sys.stderr)
             return out
-        self.CACHE.parent.mkdir(parents=True, exist_ok=True)
-        self.CACHE.write_text(json.dumps(out), "utf-8")
+        # Stamped with the install it was built from, so a later read can
+        # *refuse* a foreign one rather than infer from its size. This index
+        # is why the stamp exists: two bases in one process used to share one
+        # path, and `_cache_covers` only noticed because the two clients
+        # happen to differ in mesh count.
+        provenance.write_json("out/meshtex/mesh_index.json", out, self.root,
+                              tool="meshtex.py", indent=None)
         return out
 
     def all_meshes(self) -> list[str]:
@@ -1108,9 +1321,42 @@ def measure_precision(idx: MeshTextureIndex) -> dict:
     return out
 
 
+#: Every flag this CLI understands, so an unrecognised one can be REFUSED
+#: rather than swallowed.  The hand-rolled parser below dropped any unknown
+#: `--flag` into a set nobody read, so `--root <dir>` ran against the
+#: CONFIGURED install, wrote that install's index, and printed success --
+#: `docs/CORRECTIONS.md` C22.  The rule it breaks is from
+#: `handoff_5517_base_prep` §1.2: accepting an argument and discarding it is
+#: worse than refusing one.
+_FLAGS = {"--help", "--coverage", "--precision", "--scan", "--verify", "--root"}
+
+
 def _main(argv: list[str]) -> int:
+    argv = list(argv)
+
+    #: `--root DIR`, now honoured rather than ignored.  `CO_ROOT` already
+    #: worked and remains the documented fallback; this makes the flag mean
+    #: what every other tool here means by it.
+    root: Path | None = None
+    if "--root" in argv:
+        i = argv.index("--root")
+        if i + 1 >= len(argv):
+            print("--root needs a directory", file=sys.stderr)
+            return 2
+        root = Path(argv[i + 1])
+        if not root.is_dir():
+            print(f"--root: no such directory: {root}", file=sys.stderr)
+            return 2
+        del argv[i:i + 2]
+
     args = [a for a in argv if not a.startswith("--")]
     flags = {a for a in argv if a.startswith("--")}
+
+    unknown = sorted(flags - _FLAGS)
+    if unknown:
+        print(f"unrecognised flag(s): {' '.join(unknown)}\n"
+              f"known: {' '.join(sorted(_FLAGS))}", file=sys.stderr)
+        return 2
 
     if "--help" in flags or (not args and "--coverage" not in flags
                              and "--scan" not in flags
@@ -1118,10 +1364,13 @@ def _main(argv: list[str]) -> int:
         print(__doc__)
         return 0
 
-    with MeshTextureIndex() as idx:
+    # The index AND the writers below must both resolve for `root`, not
+    # for the configured install -- writing one base's coverage into
+    # another's namespace is the damage C22 actually did.
+    with MeshTextureIndex(root or DEFAULT_ROOT) as idx:
         if "--precision" in flags:
             p = measure_precision(idx)
-            out = coroot.derived_path("out/meshtex")
+            out = coroot.derived_path("out/meshtex", root)
             out.mkdir(parents=True, exist_ok=True)
             (out / "precision.json").write_text(json.dumps(p, indent=1), "utf-8")
             print(f"{'rule':<18}{'fires':>8}{'scored':>8}{'top-1':>8}{'any':>8}{'conf':>7}")
@@ -1142,9 +1391,15 @@ def _main(argv: list[str]) -> int:
                   file=sys.stderr)
             idx._load_mesh_index()
             rep = build_coverage(idx, verify="--verify" in flags)
-            out = coroot.derived_path("out/meshtex")
+            out = coroot.derived_path("out/meshtex", root)
             out.mkdir(parents=True, exist_ok=True)
             (out / "coverage.json").write_text(json.dumps(rep, indent=1), "utf-8")
+            # Sidecar, not an envelope: seven modules read this file's shape
+            # directly, so changing it to carry a stamp would mean changing
+            # all seven at once. The sidecar leaves the artefact byte-
+            # identical and still lets a reader ask what built it.
+            provenance.stamp_file(out / "coverage.json", idx.root,
+                                  tool="meshtex.py --coverage")
             s = rep["summary"]
             (out / "summary.json").write_text(json.dumps(s, indent=1), "utf-8")
             (out / "unmatched.txt").write_text("\n".join(rep["unmatched"]), "utf-8")

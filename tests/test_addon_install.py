@@ -9,7 +9,20 @@ a clean Blender, and that the File > Import/Export entries appear.
 import os
 import sys
 
-import bpy
+try:
+    import bpy
+except ModuleNotFoundError as _exc:                           # not inside Blender
+    # `unittest` discovery reports a module-level SkipTest as a SKIP; a bare
+    # ModuleNotFoundError it reports as an ERROR. This file only ever runs under
+    # Blender's bundled Python, so on a plain interpreter "absent" is the
+    # correct answer and not a failure -- without this, adding `tests/__init__.py`
+    # would have made `unittest discover -s tests` red for everyone, since
+    # nobody's system Python has `bpy`.
+    import unittest
+    raise unittest.SkipTest(
+        "needs Blender's bundled Python (no `bpy` module). Run it the way the "
+        "docstring above says: blender --background --python "
+        "tests/test_addon_install.py") from _exc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZIP = os.path.join(REPO, "build", "io_scene_c3.zip")

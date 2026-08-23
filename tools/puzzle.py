@@ -335,40 +335,12 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
 # loading
 # ---------------------------------------------------------------------------
 
-def _parse_ani(path: Path) -> dict:
-    """`ani/<name>.ani` -> {"Puzzle72": ["data/.../canyon072.dds", ...]}.
-
-    The same shape the shipped `.json` has, so callers cannot tell which
-    source answered.  Frames are kept in index order; the ground renderer
-    uses frame 0.
-    """
-    out: dict[str, list[str]] = {}
-    section = ""
-    frames: dict[int, str] = {}
-
-    def flush():
-        if section and frames:
-            out[section] = [frames[k] for k in sorted(frames)]
-
-    try:
-        text = path.read_text("latin-1", errors="replace")
-    except OSError:
-        return {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith((";", "#")):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            flush()
-            section, frames = line[1:-1].strip(), {}
-            continue
-        if "=" not in line:
-            continue
-        k, v = (x.strip() for x in line.split("=", 1))
-        if k.lower().startswith("frame") and k[5:].isdigit():
-            frames[int(k[5:])] = v.replace("\\", "/").lstrip("/").lower()
-    flush()
-    return out
+# `_parse_ani` stood here as a shim over `core/dmap.read_ani`, kept "so this
+# module's own callers are unchanged". Its last caller was `_ani_table`
+# below, and `mapparts` reached across for it -- which is how `mapparts`
+# inherited the half `read_ani` does NOT answer: which of the two spellings
+# to open. Both now call `dmap.load_ani`, so the shim has no callers and the
+# reach-across has nowhere to land (C-2026-08-09-ani-json-spelling).
 
 
 class PuzzleLibrary:
@@ -390,6 +362,12 @@ class PuzzleLibrary:
                 self.reason = f"could not resolve the game install: {e}"
         self._grid_size: dict[str, int] = {}
         self._doc_id: dict[str, int] = {}
+        #: Which registry actually answered ("ini/GameMap.dat", "" for none).
+        #: Kept so a message about a missing row can name the file that was
+        #: read rather than the one this module used to assume.
+        self._registry_rel = ""
+        #: Lazily counted by `_unregistered_count`, per install, never quoted.
+        self._unregistered: Optional[int] = None
         #: DocumentId -> file stem. See by_id.
         self._id_stem: dict[int, str] = {}
         self._assets: Optional[AssetRoot] = None
@@ -401,32 +379,45 @@ class PuzzleLibrary:
     def root(self) -> Optional[Path]:
         return self._root
 
+    def _unregistered_count(self) -> int:
+        """Shipped `.DMap` files with no row in this install's registry.
+
+        Computed once, on the install that is loaded, because the number
+        varies by client and a quoted one is a different install's fact:
+        **MEASURED 2026-08-11 -- 5517: 21 of 181, 6090: 21 of 184, 6609: 20 of
+        184.** Those are recorded here as provenance, not consulted.
+        """
+        if self._unregistered is None:
+            self._unregistered = 0
+            d = (self._root / "map" / "map") if self._root else None
+            if d and d.is_dir():
+                self._unregistered = sum(
+                    1 for p in d.iterdir()
+                    if p.suffix.lower() == ".dmap"
+                    and p.stem.lower() not in self._grid_size)
+        return self._unregistered
+
     def _load_gamemap(self) -> None:
         if self._root is None:
             self.reason = self.reason or "no game install found (core/coroot.py)"
             return
+        # Official clients ship only the binary index. Both the reader and the
+        # CHOICE between the two spellings are COre's -- this module and
+        # `mapindex` each hand-rolled the choice, `mapedit` had none at all,
+        # and a third copy is how one of them stays wrong (C-2026-08-09-ani-json-spelling). It lives in
+        # COre so that sharing it does not make this module depend on
+        # `client/`, which is not extracted into COMod.
+        from dmap import load_gamemap                    # noqa: PLC0415
         p = self._root / "ini" / "GameMap.json"
         q = self._root / "ini" / "GameMap.dat"
-        if p.is_file():
-            try:
-                rows = json.loads(p.read_text("utf-8", errors="replace"))
-            except Exception as e:                       # noqa: BLE001
-                self.reason = f"{p} did not parse: {e}"
-                return
-        elif q.is_file():
-            # Official clients ship only the binary index. Same reader the
-            # client's MapLibrary uses -- imported rather than copied, because
-            # this gap already existed in two places at once and duplicating
-            # it a third time is how it stays broken. It lives in COre so that
-            # sharing it does not make this module depend on `client/`, which
-            # is not extracted into COMod.
-            from dmap import read_gamemap_dat            # noqa: PLC0415
-            rows = read_gamemap_dat(q)
-            if rows is None:
-                self.reason = f"{q} did not parse"
-                return
-        else:
-            self.reason = f"{p} is missing, and so is {q}"
+        self._registry_rel, rows = load_gamemap(self._root)
+        if not rows:
+            # ABSENT and UNPARSEABLE are different answers and the caller acts
+            # on `reason`, so they are not collapsed into one string.
+            present = [str(x) for x in (p, q) if x.is_file()]
+            self.reason = (f"{' and '.join(present)} did not parse"
+                           if present else
+                           f"{p} is missing, and so is {q}")
             return
         for r in rows:
             stem = Path(str(r.get("FileName", "")).replace("\\", "/")).stem.lower()
@@ -455,46 +446,59 @@ class PuzzleLibrary:
         return self._assets
 
     def names(self) -> list[str]:
+        """Every map the install has, not every loose `.DMap` it happens to
+        leave lying about.
+
+        MEASURED 2026-08-11 -- a `*.DMap` glob against the union of registry,
+        archives and loose files:
+
+            5517   181 -> 192     the 11 that ship only as .7z
+            6090   184 -> 247     63 archive-only
+            6609   184 -> 306     113 archive-only, plus 9 registry rows
+                                  whose maps ship in neither form
+
+        `core/dmap.map_names` is the one place that union is computed.
+        """
         if self._root is None:
             return []
-        d = self._root / "map" / "map"
-        if not d.is_dir():
-            return []
-        return sorted(p.stem for p in d.iterdir()
-                      if p.is_file() and p.suffix.lower() == ".dmap")
+        from dmap import map_names                          # noqa: PLC0415
+        return map_names(self._root)
 
-    def _dmap_path(self, name: str) -> Optional[Path]:
+    def _dmap_bytes(self, name: str) -> tuple[Optional[bytes], str]:
+        """One map's `.DMap` content, from wherever the client reads it.
+
+        **Not the loose file.** From 5517 on the registry names
+        ``map/map/<stem>.7z`` and the loose `.DMap` beside it is a leftover
+        that drifts: 77 of 6609's 184 disagree with their own archive, and the
+        two this used to feed `PuzzlePlacement` -- `icecrypt-lev6` at 808x808
+        against its archive's 740x740, `poker` at 188x188 against 232x232 --
+        are why a corpus-wide identity measured over loose files failed on
+        exactly two maps. See `C-2026-08-10-claude-explorer-map-archive-alarm`
+        and `docs/map_twin_precedence.md`.
+
+        Returns ``(bytes, source)``; the source phrase says which rule chose
+        the file and travels into `reason` when something downstream fails.
+        """
         assert self._root is not None
-        d = self._root / "map" / "map"
-        if not d.is_dir():
-            return None
-        for p in d.iterdir():
-            if p.suffix.lower() == ".dmap" and p.stem.lower() == name.lower():
-                return p
-        return None
+        from dmap import open_map                           # noqa: PLC0415
+        return open_map(self._root, name)
 
     def _ani_table(self, ani_path: str) -> dict:
         stem = Path(ani_path.replace("\\", "/")).stem.lower()
         if stem in self._ani:
             return self._ani[stem]
-        out: dict = {}
         assert self._root is not None
-        p = self._root / "ani" / f"{stem}.json"
-        if p.is_file():
-            try:
-                out = json.loads(p.read_text("utf-8", errors="replace"))
-            except Exception:                            # noqa: BLE001
-                out = {}
-        if not out:
-            # The pre-parsed .json is something this install ships; a
-            # community client ships only the raw .ani. Parse it directly --
-            # same content, INI-shaped:
-            #     [Puzzle72]  FrameAmount=1  Frame0=data/.../canyon072.dds
-            # Without this every tile resolves to "" and the ground renders
-            # completely blank, which is exactly how it failed.
-            a = self._root / "ani" / f"{stem}.ani"
-            if a.is_file():
-                out = _parse_ani(a)
+        # The pre-parsed .json is what a community client ships; every
+        # official client ships only the raw .ani, INI-shaped:
+        #     [Puzzle72]  FrameAmount=1  Frame0=data/.../canyon072.dds
+        # Without the second spelling every tile resolves to "" and the
+        # ground renders completely blank, which is exactly how it failed.
+        # The resolution itself is COre's (`dmap.load_ani`) rather than this
+        # module's, because by the time it was written here it had been
+        # written in `mapindex` too and was still MISSING from `mapparts` --
+        # a third copy is how one of them stays wrong (C-2026-08-09-ani-json-spelling).
+        from dmap import load_ani                         # noqa: PLC0415
+        _rel, out = load_ani(self._root, f"{stem}.ani")
         self._ani[stem] = out
         return out
 
@@ -527,38 +531,77 @@ class PuzzleLibrary:
         if self._root is None:
             self.reason = self.reason or "no game install found (core/coroot.py)"
             return None
-        path = self._dmap_path(name)
-        if path is None:
-            self.reason = f"no map/map/{name}.DMap in {self._root}"
+        raw, src = self._dmap_bytes(name)
+        if raw is None:
+            self.reason = src
             return None
         try:
-            m = DMap.load(path)
+            m = DMap.parse(raw)
         except Exception as e:                           # noqa: BLE001
-            self.reason = f"{path.name} did not parse: {e}"
+            self.reason = f"{src} did not parse: {e}"
             return None
         rel = m.puzzle_path.replace("\\", "/")
         pul = self._root / rel
         if not pul.is_file():
-            self.reason = f"{path.name} names {rel}, which is not present"
+            self.reason = f"{src} names {rel}, which is not present"
             return None
         if pul.suffix.lower() != ".pul":
             # map/PuzzleSave/*.pux is "TqTerrain", a different and undecoded
-            # format. Four maps use it; say so rather than mis-reading it.
-            self.reason = (f"{path.name} uses {rel} -- the TqTerrain (.pux) "
-                           f"format, which is not decoded")
+            # format. Four maps use it on 5517; 12 do on 6609, where the
+            # map/PuzzleSave/*.pux is "TqTerrain".  Its HEADER is decoded --
+            # `dmap.read_pux` gives the puzzle's tile dimensions and
+            # `dmap.PUX_GRID` the 256-pixel tile the placement identity solves
+            # for on all 160 maps that name one -- but the tile PAYLOAD is not:
+            # 20.8 to 172.2 bytes per tile, so it is not a compiled index.
+            # Say what is known, because "not decoded" sent every reader back
+            # to the format when the geometry was already in hand.
+            from dmap import read_pux, PUX_GRID          # noqa: PLC0415
+            hdr = read_pux(pul)
+            if hdr:
+                self.reason = (
+                    f"{src} uses {rel} -- TqTerrain (.pux).  Its geometry IS "
+                    f"known: {hdr['width']}x{hdr['height']} tiles at "
+                    f"{PUX_GRID} px, implying a "
+                    f"{(hdr['width']*PUX_GRID)//64 + (hdr['height']*PUX_GRID)//32}"
+                    f"-cell map.  What is missing is the tile payload, which "
+                    f"is not a compiled index (see dmap.read_pux)")
+            else:
+                self.reason = (f"{src} uses {rel} -- the TqTerrain (.pux) "
+                               f"format, and its header did not read")
             return None
         try:
             z = Pul.load(pul)
         except Exception as e:                           # noqa: BLE001
             self.reason = f"{rel} did not parse: {e}"
             return None
-        stem = path.stem.lower()
+        stem = str(name).lower()
         g = self._grid_size.get(stem)
         if g is None:
-            self.reason = f"{path.stem} has no GameMap.json row, so no PuzzleGridSize"
+            # Two defects used to wear this one string, and it named the wrong
+            # file for both.  The registry is `GameMap.json` on the community
+            # client and the binary `GameMap.dat` on every official one, and no
+            # install ships both -- so this message sent every official-client
+            # reader to a file they do not have.  And it blamed a *container*
+            # gap for what is a genuine *absence*: reading the other spelling
+            # recovers the maps that HAVE a row and cannot recover the ones
+            # that have none, so a reader who fixes the spelling and still sees
+            # this must be told which of the two they are looking at.
+            #
+            # **The count is measured here, not quoted.**  Its first form said
+            # "21 of 5517's 181 shipped maps have none" -- a 5517 fact, printed
+            # verbatim at anyone running 6090, which is the same defect one
+            # install over as naming the wrong registry file.  It is now
+            # counted against the install that is actually loaded.
+            self.reason = (f"{name} has no row in {self._registry_rel} "
+                           f"({self._unregistered_count()} of this install's "
+                           f"shipped maps have none), so no PuzzleGridSize"
+                           if self._registry_rel else
+                           f"{name} has no PuzzleGridSize: this install "
+                           f"ships no map registry at all (neither "
+                           f"ini/GameMap.json nor ini/GameMap.dat)")
             return None
         pm = PuzzleMap(
-            name=path.stem, map_id=self._doc_id.get(stem),
+            name=str(name), map_id=self._doc_id.get(stem),
             map_width=m.width, map_height=m.height,
             grid=g, pul_w=z.width, pul_h=z.height, tiles=z.tiles,
             ani=rel_ani(z.ani_path), pul_path=rel.lower(),
@@ -602,16 +645,18 @@ class PuzzleLibrary:
         out: list[Backdrop] = []
         if self._root is None:
             return out
-        path = self._dmap_path(name)
-        if path is None:
+        raw, _src = self._dmap_bytes(name)
+        if raw is None:
             return out
         try:
-            m = DMap.load(path)
             import dmap as dmapmod                          # noqa: PLC0415
-            d = dmapmod.parse(path, want_cells=False, verify=False)
+            d, _why = dmapmod.parse_map(self._root, name,
+                                        want_cells=False, verify=False)
+            if d is None:
+                return out
         except Exception:                                   # noqa: BLE001
             return out
-        g = self._grid_size.get(path.stem.lower()) or 256
+        g = self._grid_size.get(str(name).lower()) or 256
         for e in d.extra:
             rel = str(e.get("path", "")).replace("\\", "/")
             # Three maps have a desynchronised trailer; a record whose path is
@@ -627,7 +672,7 @@ class PuzzleLibrary:
                 continue
             v = list(e.get("values", []))
             pm = PuzzleMap(name=Path(rel).stem, map_id=None,
-                           map_width=m.width, map_height=m.height,
+                           map_width=d.width, map_height=d.height,
                            grid=g, pul_w=z.width, pul_h=z.height, tiles=z.tiles,
                            ani=rel_ani(z.ani_path), pul_path=rel.lower(),
                            assets=self.assets)

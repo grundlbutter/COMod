@@ -3,7 +3,7 @@ r"""
 patch6090 -- the official Conquer Online patch 6090 client.
 
 Everything here was measured against
-``C:\Claude\ConquerAssets\Clients\6090`` and confirmed on screen. Where a
+``C:\COMod\ConquerAssets\Clients\6090`` and confirmed on screen. Where a
 claim is an inference it says so; where a value came from a person looking
 at the model and saying "that is not a ThunderApe", it says that too,
 because that is the strongest evidence this project has.
@@ -71,18 +71,58 @@ WHAT IS STILL OPEN
   screenshots -- which is what produced three wrong answers in a row.
   The degenerate frames (2 of 31 in attack swing 3) are identical in
   CCO, so any flattening there predates the 6090 work.
-* Socket bases are SKEWED on about 5% of frames -- 23 of 465 sampled
-  across five actions, determinant 0.52 to 0.9 with unit-length rows.
-  That shears a weapon slightly. Squaring it would mean moving axes off
-  where the file put them, which is the change that had weapons held at
-  impossible angles, so it is left alone until someone reads how the
-  engine handles a non-orthogonal dummy.
+* Socket bases are SKEWED on about 5% of frames. **RE-MEASURED 2026-08-09:
+  the RATE holds, the SEVERITY does not.** [V]
+
+  The old line read "23 of 465 sampled across five actions, determinant
+  **0.52 to 0.9** with unit-length rows", and had no recorded method -- the
+  figure appeared nowhere but this docstring, so the pairing that produced
+  it could not be checked.
+
+  Re-measured through ``parts.socket_anchors`` (which routes to
+  ``attach.socket_matrix``): three sockets x five actions x every frame, on
+  all four body shapes and three bases.
+
+      base  shape  socket-frames  unit-row determinants          det<0.10
+      6090   002       378        0.94 x20, 0.95, 0.98, 1.0 x252    41
+      6090   001       390        0.97, 0.98 x8, 0.99 x8, 1.0 x306  30
+      6090   003       402        1.0 x402                           0
+      6090   004       390        1.0 x390                           0
+      5517   all       identical to 6090 in every cell
+      cco    all       1.0 everywhere                                0
+
+  **Survives.** Skew is real and the rate reproduces: 22 unit-row frames
+  with determinant < 1.0 on shape 002 against the claimed 23 -- 5.8%
+  against "about 5%".
+
+  **Refuted.** The determinant range. Measured **0.94 to 0.98**, and
+  **zero frames fall in the claimed 0.52-0.90** across four shapes and
+  three bases. A 0.94 basis shears a weapon by ~6%; 0.52 would be 48%, so
+  the severity was overstated several-fold.
+
+  **What the old line hid.** It generalises one body shape to "socket
+  bases": shapes **003 and 004 are perfectly unit on every frame**. And the
+  severe cases are not skew at all but a separate near-degenerate
+  population (det < 0.10 -- 41 on shape 002, 30 on 001), which is the known
+  ``v_l_weapon`` flattening with its own expectedFailure test. **CCO is
+  clean on all four shapes.**
+
+  6090 and 5517 agree in every cell because they ship these assets
+  byte-identically -- that is **one** measurement, not two (C-2026-08-09-frozen-tables). CCO is
+  the only contrast in the lineage.
+
+  Squaring it would still mean moving axes off where the file put them --
+  the change that had weapons held at impossible angles -- so it is still
+  left alone until someone reads how the engine handles a non-orthogonal
+  dummy. ``docs/CORRECTIONS.md`` C-2026-08-09-skew-severity.
 * ``[410199-f]`` sits beside the Super aura effect and nothing reads it.
 * The builder's stats line computes its extent from the part bbox plus
   the socket translation, ignoring the socket's scale, so a scaled part
   reports a larger figure than it draws.
 """
 from __future__ import annotations
+
+from .catalog import censused
 
 import re
 import sys
@@ -93,12 +133,67 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from plugins import Plugin                            # noqa: E402
+from plugins.catalog import (  # noqa: E402
+    npc_specs,                         # noqa: E402
+    TableSpec, KIND_AT_ROWS, KIND_CSV_ROWS, KIND_SECTIONS, KIND_GAMEMAP,
+    MEASURED_SECTION_LABELS)
+
+
+#: Tables 6090 declares, censused from ITS OWN `ini/` with `core/inidat.py`.
+#: Only files that classify into a family we can read are listed; the rest are
+#: absent from this tuple rather than declared and refused, because a build's
+#: spec should say what it HAS.
+#:
+#: The two `binary-plain` entries are the exception and are deliberate. Every
+#: one of the seven builds ships `Action.dat` and `GameMap.dat` readable --
+#: they are the only files that survive the whole 5017-to-7878 range -- and
+#: their record layout is not established here. Naming them with a refusal is
+#: how a caller learns they exist and are not yet parsed, instead of wondering
+#: why a file they can see is missing from the listing.
+SPECS_6090 = (
+    TableSpec("monster", "Monster.dat", KIND_SECTIONS, "tq-stream"),
+    TableSpec("mount", "mounttype.dat", KIND_SECTIONS, "tq-stream"),
+    TableSpec("item", "itemtype.dat", KIND_AT_ROWS, "tq-stream"),
+    TableSpec("item:sub", "ItemtypeSub.dat", KIND_AT_ROWS, "tq-stream"),
+    TableSpec("item:value", "item_value_type.dat", KIND_AT_ROWS, "tq-stream"),
+    TableSpec("magic", "MagicType.dat", KIND_AT_ROWS, "tq-stream"),
+    TableSpec("magic:ex", "magictypeex.dat", KIND_AT_ROWS, "tq-stream"),
+    TableSpec("magic:op", "magictypeop.dat", KIND_CSV_ROWS, "tq-stream"),
+    TableSpec("magic:auto", "AutoUseMagic.dat", KIND_SECTIONS, "tq-stream"),
+    TableSpec("map:dest", "MapDestination.dat", KIND_SECTIONS, "tq-stream"),
+    TableSpec("action", "Action.dat", KIND_SECTIONS, "binary-plain"),
+    TableSpec("gamemap", "GameMap.dat", KIND_GAMEMAP, "binary-plain"),
+)
+
+SPECS_6090 = SPECS_6090 + npc_specs(('npc.ini', 'NpcX.ini', 'terrainnpc.ini', 'npcex.ini', 'SlotNpc.ini'))
 
 
 class Patch6090(Plugin):
     name = "patch6090"
-    label = "Official patch client (5017-6090)"
-    aliases = ("official", "6090")
+    #: **(5517-6090), not (5017-6090).** The old label claimed the whole
+    #: official lineage and was wrong at both ends of its range: 5017, 5065
+    #: and 5165 ship no compiled table at all and are a separate parse family
+    #: (`plugins/plaintext.py`), and picking this plugin for one of them
+    #: resolves nothing. The old string stays an alias so a config that stored
+    #: it keeps working.
+    label = "Official patch client, compiled tables (5517-6090)"
+    origin = "official"
+    aliases = ("official", "6090", "Official patch client (5017-6090)")
+
+    #: These tables are ASCII in practice (`Ripper`, `SpeedArrow`), and this
+    #: build ships no `codepage.ini`, which is the case `coassets.parse_ini`
+    #: documents latin1 for. 7878 is the build where that reasoning breaks.
+    TEXT_ENCODING = "latin1"
+
+    #: Measured on this build -- see `MEASURED_SECTION_LABELS`. Assigned
+    #: rather than inherited, so a build that measures otherwise says so.
+    ROW_LABEL_KEY = MEASURED_SECTION_LABELS
+
+    def table_specs(self, root):
+        # Curated specs plus every `.ini` the grammar census
+        # settled -- see `plugins/catalog/censused.py`. A curated spec
+        # always wins on subject and filename.
+        return censused.extend(SPECS_6090, self.name)
     notes = (
         "Compiled .dbc tables (RSDB/SIMO/MESH) beside stale plaintext "
         "decoys, TQ-cipher .dat item and monster tables, u32-wrapped "
@@ -320,9 +415,16 @@ class Patch6090(Plugin):
         "the per-weapon motion aliases are gone":
             "CCO's 3dmotion.ini spells out which motion folder each weapon "
             "set animates from, one key at a time -- 259 rows for set 480 "
-            "alone, e.g. 1480100 = c3/0001/410/100.c3. 6090 ships NONE of "
-            "them in either the stale ini or the compiled dbc, so an armed "
-            "key like 2480100 simply is not there. The folders themselves "
+            "alone, e.g. 1480100 = c3/0001/410/100.c3. 6090's LIVE table, "
+            "3dmotion.dbc, ships none of them, so an armed key like 2480100 "
+            "simply is not there. (CORRECTION, C27: this entry used to say "
+            "'in either the stale ini or the compiled dbc'. The stale ini "
+            "does carry them, spelled 0002480100 -- ten wide. A padding "
+            "mismatch read as absent content, in the quirk list that warns "
+            "about padding mismatches. It changes nothing for 6090, where "
+            "that ini is stale anyway, and everything for 5017/5065/5165 "
+            "where it is live: see plugins/plaintext.py. Home of the "
+            "correction: attach.WEAPON_MOTION_SET.) The folders themselves "
             "all still ship (6090 keys 18 of them), so what went missing is "
             "the mapping, not the motions -- and because the lookup's own "
             "fallback chain ends at the unarmed set 000 AND REPORTS "
@@ -396,13 +498,25 @@ class Patch6090(Plugin):
         return {k: dict(v) for k, v in self.FIELD_WIDTHS.items()}
 
     def aura_convention(self) -> str:
-        """6090 declares the Super glow by NAMING the effect after the
-        appearance id -- `3DEffect.ini [410199]` is Rainbow Blade Super's
-        aura, and no such section exists for 410195 or 410196. It ships
-        zero always-on Action3DEffect rows, where CCO ships 826 whose only
-        job is to point at an identically named effect.
+        r"""The table, exactly as CCO -- **this used to say otherwise and it
+        was wrong**. CORRECTIONS C35.
+
+        It read: *"6090 declares the Super glow by NAMING the effect after the
+        appearance id ... It ships zero always-on Action3DEffect rows, where
+        CCO ships 826."* MEASURED on the raw `ini/Action3DEffect.ini`, **6090
+        ships 2,604** and 5517 ships 972. The rows were never missing; the
+        reader spelled the always-on action `999` while this client writes the
+        action field four wide and keys them `9999` -- which is this client's
+        own declared `FIELD_WIDTHS` quirk, reaching one place the fix for it
+        did not. `effects.is_always_on` now answers width-agnostically and the
+        table resolves 621 weapon auras here, against 0 before.
+
+        Reporting a convention 6090 does not have was not cosmetic: this
+        string is served by `/api/plugins`, so a contributor writing a plugin
+        for a fourth client read it as two real conventions to choose between
+        when the only difference is a field width.
         """
-        return "effect-named-for-id"
+        return "table"
 
     # -- attachment --------------------------------------------------------
     #: MEASURED over all 3,001 body meshes in the 6090 base: every single
@@ -516,9 +630,32 @@ class Patch6090(Plugin):
         3. A constant offset would fix the resting pose and wreck the
         animation.
 
+        THE REFERENCE IS PER BODY SHAPE, NOT PER APPEARANCE
+        ---------------------------------------------------
+        An armour appearance is client-specific and CCO ships almost none of
+        this lineage's: `001139040` "Abyss Coat" has no counterpart there. The
+        basis being borrowed is **not** a property of the armour -- it comes
+        from the MOTI track of the per-shape motion file, and the mesh only
+        supplies the PHY chunk whose ordinal selects that track. MEASURED on
+        CCO, shape 001, weapon set 480, action 100 frame 0: `001131000`,
+        `001139000`, `001135000` and `001000000` all return the same
+        v_l_weapon matrix to every printed digit. So the viewer reads the
+        reference client's canonical body for the same shape, and names it in
+        the note.
+
+        Demanding an exact id match was the shipping bug -- it made the borrow
+        unreachable for most bodies, and the viewer degraded to `unit-rows`
+        without anyone reading the note.
+
         `unit-rows` remains the **fallback** for when CCO is not one of the
-        declared installs, or its track does not line up (its action 130 is 25
-        frames against this lineage's 20). It stops the collapse and leaves
+        declared installs, ships no body of this shape, or resolves a
+        different clip for the action -- specifically a clip of a different
+        length, which `Motion.matrix` would otherwise clamp into a plausible-
+        looking wrong answer (CCO's action 130 is 25 frames against this
+        lineage's 20). Refusing rather than resampling is measured, not
+        assumed: under proportional frame mapping the *control* socket
+        `v_r_weapon`, byte-identical between the clients on every action that
+        does line up, diverges by 0.97. It stops the collapse and leaves
         every direction where the file put it, so the weapon is full size and
         pointed somewhere the artist did not choose -- worse than correct,
         better than a sliver. The viewer says which of the two happened.
@@ -534,8 +671,9 @@ class Patch6090(Plugin):
                 "little as 0.012 of unit length, which flattens a held weapon "
                 "to a sliver and leaves it pointing the wrong way. The male "
                 "bodies are unaffected and CCO is clean on all four. The "
-                "orientation is taken from CCO's track for the same body, "
-                "action and frame, keeping this client's own translation -- "
+                "orientation is taken from CCO's track for the same body "
+                "shape, action and frame, keeping this client's own "
+                "translation -- "
                 "the two agree to 0.0000, so the hand does not move and only "
                 "the rewritten 3x3 is restored. A VIEWER DEVIATION, NOT A "
                 "FIX: the real client very likely shows the squash, and the "

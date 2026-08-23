@@ -81,6 +81,22 @@ class Plugin:
     #: Longer prose for the plugin's page in the UI. Say what is verified
     #: and what is inferred; a contributor's honesty here is load-bearing.
     notes = ""
+    #: Who ships this client -- ``"official"`` for TQ Digital's own patch
+    #: releases, ``"server"`` for a private server's own client.
+    #:
+    #: Declared here rather than inferred in the UI, which used to group by
+    #: *where the folder was declared* and so filed **Classic Conquer 2.0**
+    #: under "installed clients" beside the official patches. CCO is a
+    #: private server's client that happens to be installed locally; being
+    #: installed is not the same claim as being official, and only the
+    #: plugin knows which it is. A name-prefix rule (``patch*``) would have
+    #: worked today and broken on the first community plugin called
+    #: ``patch-something``.
+    #:
+    #: ``"unknown"`` is the default on purpose: a new plugin that has not
+    #: said gets grouped as unclassified rather than silently claiming to be
+    #: TQ's.
+    origin = "unknown"
 
     # -- identification ----------------------------------------------------
     def confidence(self, root: Path, exists: Callable[[str], bool]) -> float:
@@ -94,6 +110,32 @@ class Plugin:
         level it derives from.
         """
         return 0.0
+
+    # -- TWO BASES ARE NOT ENOUGH TO CLASSIFY ANYTHING ---------------------
+    #
+    # The single most expensive method error in this package's history, and
+    # it is cheap to repeat.  A session classified failing tests by running
+    # them on CCO and on 5517 and calling the ones that failed on both "not a
+    # base mismatch".  **All five of those were pinned to 6090** -- a base
+    # the comparison never ran.  A test pinned to a third client fails on
+    # both of the two you tried, by construction, so a two-base comparison
+    # cannot see it and reports the one answer that looks like a finding.
+    #
+    #   * Passing on CCO tells you a test is base-dependent.  It does not
+    #     tell you WHY.  Settle the why by running the two code paths side by
+    #     side, not by reading the assertion.
+    #   * CCO is not a neutral reference.  It ships the INTERLEAVED
+    #     `PHY MOTI PHY MOTI` chunk layout where every official client ships
+    #     the BLOCKED `PHY PHY MOTI MOTI` one, so a reader that pairs by
+    #     adjacency instead of by ordinal is green on CCO and wrong
+    #     everywhere else.  That is exactly how the render-matrix
+    #     "disagreement" survived for weeks (`docs/CORRECTIONS.md` C16).
+    #     `attach.PartMesh` is the authority on that pairing; nothing should
+    #     walk the chunk stream itself.
+    #   * Classify against EVERY declared install
+    #     (`coroot.declare_kind` records them), not against a chosen pair.
+    #
+    # `docs/CORRECTIONS.md` §3 and C16 · `docs/socket_basis_settled.md`.
 
     # -- tables ------------------------------------------------------------
     def table_profile(self):
@@ -247,6 +289,30 @@ class Plugin:
         """
         return None
 
+    def provides_reference(self) -> dict:
+        """`{topic: note}` for what *other* plugins may legitimately borrow
+        from this install, and on what evidence.
+
+        The other half of `socket_correction`'s `reference-basis:<plugin>`.
+        That mode names another plugin in a bare string and nothing on the
+        far side ever agreed to it: `Patch6090` says `reference-basis:cco`,
+        `coviewer._reference_root` looks the name up among the user's
+        declared installs, and if the `cco` plugin were renamed, retired, or
+        had never claimed to be a reference at all, the only symptom would be
+        a silent downgrade to `unit-rows` -- the failure mode this project
+        keeps paying for.
+
+        So a borrower's claim is checkable: the referenced plugin declares
+        what it is an authority *for*, and a test can assert the two agree.
+        This is a declaration, not a mechanism -- nothing dispatches on it --
+        but a claim with a named owner is one somebody can refute.
+
+        Almost every plugin returns `{}`. Claim a topic only where this
+        client is the *only* place the answer survives, and say why in the
+        note, because that is the part a reader needs.
+        """
+        return {}
+
     # -- table formats -----------------------------------------------------
     def table_quirks(self) -> dict:
         """How this client's tables differ in *form* from the obvious reading.
@@ -276,10 +342,24 @@ class Plugin:
         """How an always-on effect (the Super-weapon glow) is declared.
 
         * `"table"` -- an Action3DEffect row with the always-on action code
-          points at the effect (CCO ships 826 of them).
+          points at the effect. **Every client measured so far does this:**
+          CCO ships 826 such rows, 5517 ships 972, 6090 ships 2,604.
         * `"effect-named-for-id"` -- no row; an effect whose *name* is the
-          appearance id is itself the declaration.
-        * `"both"` -- try the table, then the name.
+          appearance id is itself the declaration. **No known client. This
+          value exists because it was once reported for 6090, on the strength
+          of a lookup that returned nothing because the reader spelled the
+          always-on action three wide while that client writes it four.** The
+          rows were there the whole time; see CORRECTIONS C35. Do not reach
+          for this because a table lookup came back empty -- measure the raw
+          `ini/Action3DEffect.ini` first, and count the all-nines rows at
+          whatever width that client writes them.
+        * `"both"` -- try the table, then the name. The default, because it is
+          the only honest answer for a client nobody has measured.
+
+        The reason this hook is narrow: it is served to humans through
+        `/api/plugins`, and a convention reported for a client that does not
+        have it is worse than no answer at all -- it reads as two real designs
+        to choose between when there is one.
         """
         return "both"
 
@@ -319,6 +399,348 @@ class Plugin:
                 "tables": ["ini/"], "skip": ["log/", "debug/", "AutoPatch"],
                 "note": f"importing as {self.label}"}
 
+    # -- catalogs: what this build can enumerate, and what it cannot -------
+    #
+    # This machinery started inside `patch7878` because 7878 needed it first.
+    # It is not 7878 machinery, and the hierarchy forks below this class
+    # (`PlaintextFamily`, `Patch6090`, and two plugins deriving straight from
+    # here), so there is no lower point that every build shares. It lands here
+    # and reads its detail from `plugins/catalog.py`.
+
+    #: Text encoding for this build's tables. **Measured per build, never
+    #: assumed** -- 7878 declares cp1256 in `ini/codepage.ini` and is actually
+    #: GBK, and every candidate decodes 8-bit bytes without raising, so "it
+    #: decoded" is not evidence. The default is the documented latin1 that
+    #: `coassets.parse_ini` reasons to for the builds that ship `codepage.ini`
+    #: as 0 or not at all.
+    TEXT_ENCODING = "latin1"
+
+    #: Column positions in an `@@` row. Only the ones a build has established.
+    ITEM_COLUMNS = {"id": 0, "name": 1}
+
+    #: Per-subject override of the label column, for tables that do not carry
+    #: the default. Empty here: a build states its own after measuring, and
+    #: assuming a `Name` key on 7878's `mounttype.dat` printed 1,937 blank
+    #: cells before it was.
+    ROW_LABEL_KEY: dict = {}
+    ROW_LABEL_DEFAULT = "Name"
+
+    def table_specs(self, root: Path) -> tuple:
+        """The `TableSpec`s this build declares, censused from its own `ini/`.
+
+        Empty by default, and that is a real answer rather than a gap: a
+        plugin that has not been measured must not inherit another build's
+        table list. `catalogs()` turns an empty spec into a named refusal.
+        """
+        return ()
+
+    def why_no_tables(self) -> str:
+        """The reason `table_specs` is empty, for the refusal text."""
+        return ("no table census has been done for this client, so nothing is "
+                "declared rather than another build's shape being assumed")
+
+    def load_table(self, spec, root: Path) -> tuple:
+        """`(text, witness, control_kind, refusal)` for one spec.
+
+        The default handles the two codecs that need no build-specific
+        knowledge. A build whose tables live somewhere else -- 7878's decrypted
+        corpus -- overrides this.
+        """
+        from . import catalog as _cat
+        try:
+            from core import tqdat
+        except ImportError:                           # pragma: no cover
+            import tqdat
+
+        path = self._find_table(spec, root)
+        if path is None:
+            return None, b"", None, f"{spec.display} is not present"
+        raw = path.read_bytes()
+
+        if spec.codec == "plaintext":
+            # **A UTF-8 BOM is stripped from the TEXT and kept in the
+            # WITNESS.** 13 files across the installs carry one.
+            #
+            # Unstripped it prefixes the first line, and every grammar
+            # mis-reads it in its own way: Zephyr's `ProfessionalName.ini`
+            # yielded a first "row" of one field (the BOM alone), which
+            # inflated the count by one AND handed `control_at_row` a row too
+            # short to probe, so a clean 77-row table was refused outright.
+            # `RacePointShop.ini` lost its `[Normal]` header the same way.
+            #
+            # It is NOT stripped from the witness: the witness is what the
+            # file actually contains, and a control that searches a doctored
+            # copy of the bytes is checking the reader against itself.
+            text = raw
+            if text.startswith(b"\xef\xbb\xbf"):
+                text = text[3:]
+            return (text.decode(self.TEXT_ENCODING, "replace"), raw,
+                    _cat.CONTROL_RAW, None)
+        if spec.codec == "tq-stream":
+            # A tq decrypt of `itemtype.dat` costs 736 ms and 6609's whole
+            # catalogue costs 2,544 ms, so this is where a cache earns its
+            # keep -- see `core/dcache.py`.
+            try:
+                from core import dcache            # noqa: PLC0415
+            except ImportError:                    # pragma: no cover
+                import dcache                      # noqa: PLC0415
+            # `root` is passed EXPLICITLY. dcache's tree is per-install, and
+            # coroot's default root is a per-process configured value -- so a
+            # tool holding two catalogues at once (the viewer serving 6090 and
+            # 5517 side by side) would otherwise read and write both builds'
+            # decodes into whichever install happens to be configured. The
+            # entry key carries the source path so it could not serve WRONG
+            # bytes, but it would miss on every read while filling one tree
+            # with another's tables: a cache that is never a hit and never
+            # says why.
+            cached = dcache.get(path, "tq-stream", root)
+            if cached is not None:
+                # **The cached decode cannot witness itself.** Handing these
+                # same bytes back as the "independent re-decode" would make
+                # the witness the parse's own output -- an identical-looking
+                # count with the evidence removed. Reported as its own kind.
+                return (cached.decode(self.TEXT_ENCODING, "replace"),
+                        cached, _cat.CONTROL_CACHED, None)
+            # Decoded twice, from disk both times. The second decode is the
+            # witness: it makes the PARSE checkable without making the CIPHER
+            # checkable, which is why the control kind differs from plaintext.
+            witness = tqdat.decrypt(path.read_bytes())
+            decoded = tqdat.decrypt(raw)
+            # Stored only AFTER the independent witness has been taken, so the
+            # first run of a table always earns a real re-decode control and a
+            # cache can never manufacture one.
+            dcache.put(path, "tq-stream", decoded, root)
+            return (decoded.decode(self.TEXT_ENCODING, "replace"),
+                    witness, _cat.CONTROL_REDECODE, None)
+        if spec.codec == "json":
+            # JSON is plaintext, so the strong control applies: the witness is
+            # the file itself and `control_json_row` searches the undecoded
+            # bytes. Always utf-8 -- these are not the 8-bit ini tables and
+            # TEXT_ENCODING does not apply to them.
+            return raw.decode("utf-8", "replace"), raw, _cat.CONTROL_RAW, None
+        if spec.codec == "binary-plain":
+            # `GameMap.dat` is the one binary table whose grammar IS
+            # established -- and on all seven builds at once, which is why it
+            # reads here rather than in a per-build override. Everything else
+            # binary is still named and refused.
+            if spec.kind == _cat.KIND_GAMEMAP:
+                return None, raw, _cat.CONTROL_RAW, None
+            return None, b"", None, (
+                "binary record layout, not sections or rows -- readable bytes "
+                "whose record shape this build has not established, so it is "
+                "named rather than parsed wrongly")
+        return None, b"", None, (
+            f"{spec.display}: codec {spec.codec!r} has no reader on "
+            f"{self.name}")
+
+    def _find_table(self, spec, root: Path) -> Optional[Path]:
+        """`ini/<filename>`, matched case-insensitively.
+
+        6609 renames `Monster.dat` and `MagicType.dat` to lowercase while the
+        builds either side of it do not, so an exact-case lookup silently
+        loses two tables on exactly one build.
+        """
+        ini = Path(root) / "ini"
+        if not ini.is_dir():
+            return None
+        exact = ini / spec.filename
+        if exact.is_file():
+            return exact
+        want = spec.filename.lower()
+        for p in ini.iterdir():
+            if p.is_file() and p.name.lower() == want:
+                return p
+        return None
+
+    def catalogs(self, root: Path) -> dict:
+        """Per subject: how many rows, and a row actually opened.
+
+        Every entry either carries a `control` -- a named row this reader
+        opened and checked back against bytes it did not produce -- or a
+        `refusal` saying what was missing.
+        """
+        from . import catalog as _cat
+        root = Path(root)
+        specs = self.table_specs(root)
+        if not specs:
+            return _cat.no_tables_declared(self.name, self.why_no_tables())
+        return _cat.build_catalogs(
+            specs, lambda s: self.load_table(s, root),
+            encoding=self.TEXT_ENCODING, columns=self.ITEM_COLUMNS)
+
+    def _label_key(self, subject: str) -> Optional[str]:
+        if subject in self.ROW_LABEL_KEY:
+            return self.ROW_LABEL_KEY[subject]
+        return self.ROW_LABEL_DEFAULT
+
+    def browse(self, subject: str, root: Path, query: str = "",
+               limit: int = 0) -> tuple:
+        """`(rows, total, refusal)` -- `(id, label)` pairs for one subject.
+
+        The listing half of `catalogs()`. Returns the refusal rather than an
+        empty list when the subject cannot be read, so a caller can tell "this
+        client has none" from "we could not look" without asking twice.
+        """
+        from . import catalog as _cat
+        root = Path(root)
+
+        # **The spec first, and `catalogs()` only when there is none.**
+        #
+        # This opened with `self.catalogs(root).get(subject)` -- building
+        # EVERY table on the install to look up one. That was ~9 subjects per
+        # build when it was written and is 130-164 now that the censused
+        # `.ini` are declared, so browsing each subject once became quadratic:
+        # ~17,000 table reads per build where 130 are needed, and the guard
+        # test that browses every subject went from seconds to over ten
+        # minutes.
+        #
+        # A subject WITH a spec needs one table read. The full-catalog path
+        # stays for subjects that have no spec -- 7878's curated `npc:*`,
+        # `monster`, `mount`, `item` and `garment` come from its bespoke
+        # `catalogs()` and are not spec-driven -- so behaviour is unchanged
+        # for them; they are a handful, not a hundred.
+        spec = next((s for s in self.table_specs(root)
+                     if s.subject == subject), None)
+        if spec is None:
+            cat = self.catalogs(root).get(subject)
+            if cat is None:
+                known = ", ".join(sorted(self.catalogs(root))) or "none"
+                return [], 0, (f"{self.name} has no subject {subject!r}; "
+                               f"it declares: {known}")
+            if not cat.ok:
+                return [], 0, cat.refusal or f"{subject}: not readable"
+            return [], 0, f"{subject}: no spec backs its catalog"
+        text, witness, _kind, refusal = self.load_table(spec, root)
+        if refusal:
+            return [], 0, refusal
+
+        # A spec's own `label_key` wins where it is set, because it is a
+        # measurement of ONE table; `ROW_LABEL_KEY` is the plugin's per-subject
+        # map and applies when the spec says nothing.
+        key = (spec.label_key if spec.label_key != ""
+               else self._label_key(subject))
+        pairs = []
+        if spec.kind == _cat.KIND_JSON_ROWS:
+            try:
+                pairs, _note, _first = _cat.json_rows(
+                    witness, spec.id_key, spec.label_key or "name")
+            except ValueError as e:
+                return [], 0, f"{subject}: {e}"
+        elif spec.kind == _cat.KIND_GAMEMAP:
+            # Binary records, so this reads the witness rather than text. The
+            # label is the map's PATH, which is the thing a caller goes on to
+            # use -- `map <id>` and `extract <path>` both take it.
+            try:
+                pairs, _note = _cat.gamemap_records(witness)
+            except ValueError as e:
+                return [], 0, f"{subject}: {e}"
+        elif text is None:
+            return [], 0, f"{subject}: unreadable on a second pass"
+        elif spec.kind == _cat.KIND_SECTIONS:
+            secs, _ = _cat.sections_from_text(text)
+            for ident, body in secs.items():
+                pairs.append((ident, body.get(key, "") if key else ""))
+        elif spec.kind == _cat.KIND_FLAT_KEYS:
+            # The VALUE is the label, and it is the useful half: these tables
+            # map an appearance id to a mesh path, and the path is what a
+            # caller goes on to use.
+            try:
+                fk, _dupes = _cat.flat_keys_from_text(text)
+            except ValueError as e:
+                return [], 0, f"{subject}: {e}"
+            pairs = list(fk.items())
+        elif spec.kind == _cat.KIND_LIST:
+            try:
+                pairs = [(v, "") for v in _cat.list_from_text(text)]
+            except ValueError as e:
+                return [], 0, f"{subject}: {e}"
+        else:
+            # **THE TABLE'S OWN DELIMITER, not `@@`.**
+            #
+            # This branch called `at_rows_from_text` for every row kind, so a
+            # `csv-rows` or `space-rows` table was split on `@@`, produced one
+            # field per line, failed the `len(r) > max(...)` test on every row
+            # and returned an EMPTY list -- with no refusal, because nothing
+            # here raised.
+            #
+            # It was live on master and not small: `browse magic:op` on 6090
+            # returned 0 rows against a catalogue claiming 647, and `browse
+            # item` on 5017/5065/5165 returned 0 against 11,255. The surface
+            # said "this client has none" in exactly the words it uses for
+            # "we could not look" -- the distinction `browse`'s own docstring
+            # promises to keep.
+            #
+            # It survived because `NoSubjectPrintsAColumnOfBlanks` skips a
+            # subject that browses zero rows (`if refusal or not rows:
+            # continue`), so the one test looking at this surface treated the
+            # symptom as "nothing to check".
+            delim = _cat.ROW_KINDS.get(spec.kind, "@@")
+            rows = _cat.rows_from_text(text, delim)
+            i_id = self.ITEM_COLUMNS.get("id", 0)
+            i_nm = self.ITEM_COLUMNS.get("name", 1)
+            for r in rows:
+                if len(r) > max(i_id, i_nm):
+                    pairs.append((r[i_id], r[i_nm]))
+
+        if query:
+            q = query.lower()
+            pairs = [p for p in pairs if q in p[0].lower() or q in p[1].lower()]
+        total = len(pairs)
+        if limit and limit > 0:
+            pairs = pairs[:limit]
+        return pairs, total, None
+
+    #: **UNCONSUMED IN PRODUCTION, and declared so rather than left to be
+    #: discovered.** Nothing in `core/` or `tools/` calls `open_row`; its only
+    #: callers are its own tests. `catalogs` and `browse` are both reached from
+    #: `tools/comod.py`, so this is the one hook of the four that no surface
+    #: exercises.
+    #:
+    #: It stays because it is the "can I open one" half of the contract the
+    #: rest of this machinery rests on -- a count is not evidence unless a
+    #: specific row can be opened -- and the tests use it for exactly that.
+    #: But a declared hook with a passing test and no consumer is the
+    #: `C46-dds-numpy` shape: it reads as supported, it is green, and nothing
+    #: exercises it in anger. `patch5017.PART_SLOTS` carries the same
+    #: declaration for the same reason.
+    #:
+    #: The consumer it is waiting for is a `comod show-row <subject> <id>`
+    #: verb, or the web UI's row detail panel. Whoever adds either should
+    #: delete this note in the same change.
+    UNCONSUMED_HOOKS = ("open_row",)
+
+    def open_row(self, subject: str, root: Path, ident: str) -> Optional[dict]:
+        """One row by id, as a dict, or None when the subject cannot be read."""
+        from . import catalog as _cat
+        root = Path(root)
+        spec = next((s for s in self.table_specs(root)
+                     if s.subject == subject), None)
+        if spec is None:
+            return None
+        text, _witness, _kind, refusal = self.load_table(spec, root)
+        if refusal or text is None:
+            return None
+        if spec.kind == _cat.KIND_JSON_ROWS:
+            import json as _json
+            try:
+                doc = _json.loads(text)
+            except ValueError:
+                return None
+            for entry in doc if isinstance(doc, list) else ():
+                if isinstance(entry, dict) and str(
+                        entry.get(spec.id_key)) == ident:
+                    return dict(entry)
+            return None
+        if spec.kind == _cat.KIND_SECTIONS:
+            secs, _ = _cat.sections_from_text(text)
+            body = secs.get(ident)
+            return dict(body) if body is not None else None
+        i_id = self.ITEM_COLUMNS.get("id", 0)
+        for r in _cat.at_rows_from_text(text):
+            if len(r) > i_id and r[i_id] == ident:
+                return {str(i): v for i, v in enumerate(r)}
+        return None
+
     # -- housekeeping ------------------------------------------------------
     def __repr__(self) -> str:                        # pragma: no cover
         return f"<Plugin {self.name}>"
@@ -335,18 +757,174 @@ def _modules():
             yield m.name
 
 
-def available() -> list:
-    """Every discovered plugin, by declaration order of nothing in
-    particular -- sort by `label` for display."""
-    out = []
+# ---------------------------------------------------------------------------
+# Discovery, and the one thing it must never do quietly
+# ---------------------------------------------------------------------------
+#
+# `available()` used to import every discovered module under a blanket
+# ``except Exception: continue``. That ``except`` was written for a good
+# reason -- **a contributor's broken plugin must not take down the picker** --
+# and it also swallowed breakage in this package's own shared machinery,
+# where the same silence is a confident wrong answer.
+#
+# MEASURED on this tree (`C:\Claude\co-discovery` @ 9cfd5ca), with a
+# `sys.meta_path` hook making one named module unimportable and nothing else
+# changed. CONTROL first, because a poisoned run that returns a short list is
+# only evidence if the unpoisoned run returns the long one:
+#
+#     poisoned module      available() returned                      count
+#     (nothing)  CONTROL   all ten plugins                             10
+#     plugins.catalog      plaintext                                    1
+#     plugins.plaintext    cco, patch5517, patch6090, patch6609         4
+#     plugins.patch6090    everything except 5517/6090/6609             7
+#     plugins.patch5017    everything except 5017/5065/5165             7
+#     struct               plaintext                                    1
+#     core.tqdat           all ten                                     10
+#     core.coroot          all ten                                     10
+#
+# **Nothing raised in any run.** And the shortfall reached the user as a
+# claim, not as a gap -- with `plugins.catalog` poisoned, the setup page's
+# own words are:
+#
+#     no parser plugin named 'patch6090'. Available: plaintext
+#
+# which is `docs/CORRECTIONS.md` C21's shape exactly: a check that has
+# stopped discriminating still returns a plausible answer. A user with ten
+# clients cannot tell that from a machine with one.
+#
+# Two things the sweep settles, and they shape the fix:
+#
+# * The blast radius is **entirely inside `plugins/`**. `core.tqdat`,
+#   `core.coroot`, `core.dcache` and `npcart` are all imported *inside
+#   functions*, so none of them can affect discovery at all. What actually
+#   breaks it is the package's own siblings -- `catalog` (9 of 10 plugins
+#   import it at module level; `plaintext` is the only one that does not,
+#   which is the whole of the asymmetry) and the three base-class modules
+#   `plaintext`, `patch5017`, `patch6090`.
+# * `struct` losing 9 plugins shows a **transitive** failure has the same
+#   shape, so a rule about "which module raised" would have to walk a chain
+#   and would still be a guess. It is not guessed here.
+#
+# WHY A MANIFEST RATHER THAN A HEURISTIC
+# --------------------------------------
+# The interesting problem is telling a contributor's breakage from ours, and
+# nothing in the traceback answers it reliably: a third-party plugin whose
+# own `import yaml` fails and a first-party plugin whose shared base class
+# fails are the same exception shape. So the two cases are separated by a
+# **declaration** instead of by inference. `FIRST_PARTY` is the list of
+# modules that ship in this repo and are therefore *ours*:
+#
+#   * one of them fails  ->  the checkout is broken, and no plausible answer
+#     may be returned. `available()` raises `DiscoveryError`.
+#   * anything else fails ->  tolerated exactly as before, and **recorded**,
+#     so `problems()` can carry the reason out to a surface.
+#
+# Same fail-closed, hand-maintained shape as `tools/gates.py` CLASSES and
+# `coroot.VOLATILE_INI`, and the same carried-out-reason shape as
+# `capture/coprofile._scan`, which already returns `(profiles, problems)`
+# because *"the layout for your build failed to parse" and "there is no
+# layout for your build" are different problems with different fixes*.
+#
+# WHAT THIS DECLARATION DOES NOT CATCH, said here rather than discovered
+# ---------------------------------------------------------------------
+# Add a first-party plugin and forget to list it, and it is treated as
+# third-party: tolerated and recorded rather than fatal. That is a weaker
+# guard, not a false alarm, and `tests/test_plugin_discovery.py` asserts
+# every listed module exists so the list cannot rot in the other direction.
+# The manifest is deliberately silent about modules it does not name, which
+# is also what keeps "drop a file in and it is discovered" true.
+
+#: The modules this repo ships, and the `PLUGIN.name` each must declare.
+#: ``None`` means shared machinery with no plugin of its own. Anything not
+#: named here is a contributor's, and its failure is survivable.
+FIRST_PARTY: dict = {
+    "catalog": None,            # shared machinery -- 9 of 10 plugins import it
+    "cco": "cco",
+    "patch5017": "patch5017",
+    "patch5065": "patch5065",
+    "patch5165": "patch5165",
+    "patch5517": "patch5517",
+    "patch6090": "patch6090",
+    "patch6609": "patch6609",
+    "patch7878": "patch7878",
+    "plaintext": "plaintext",
+    "zephyr1057": "zephyr1057",
+}
+
+
+class DiscoveryError(ImportError):
+    """A module this repo ships would not import, so the plugin list is short.
+
+    Raised rather than returned because the short list is indistinguishable
+    from a real one: every caller of `available()` presents it as *the*
+    answer, and `for_kind` turns it into "no parser plugin named X".
+    """
+
+
+def _discover() -> tuple:
+    """`(plugins, problems)` -- what loaded, and why the rest did not.
+
+    `problems` is `[(module, reason, ours)]` where `ours` is True for a
+    module named in `FIRST_PARTY`. Never raises: this is the honest scan,
+    and `available()` is the one that decides a first-party problem is fatal.
+    """
+    out, probs = [], []
     for name in _modules():
         try:
             mod = importlib.import_module(f"{__name__}.{name}")
-        except Exception:                             # pragma: no cover
+        except BaseException as e:
+            # BaseException, not Exception: a module raising SystemExit or
+            # KeyboardInterrupt at import time removed itself from the list
+            # without even reaching the old `except`, which is the same
+            # silence by a different door.
+            probs.append((name, f"{type(e).__name__}: {e}",
+                          name in FIRST_PARTY))
             continue
         p = getattr(mod, "PLUGIN", None)
         if p is not None:
             out.append(p)
+        want = FIRST_PARTY.get(name, "")
+        if want is None or want == "":
+            continue                                  # machinery, or not ours
+        got = getattr(p, "name", None)
+        if got != want:
+            # Imported fine but stopped declaring what it is. Silent today:
+            # the module vanishes from the picker with nothing raised.
+            probs.append((name, f"declares PLUGIN.name {got!r}, "
+                                f"and this repo ships it as {want!r}", True))
+    return out, probs
+
+
+def problems() -> list:
+    """`[(module, reason, ours)]` for every module that did not contribute.
+
+    The diagnostic half of discovery, and the reason `available()` can afford
+    to be strict: a surface that wants to keep going -- the setup page's
+    picker -- can show what is missing instead of a shorter list with no note.
+    """
+    return _discover()[1]
+
+
+def available() -> list:
+    """Every discovered plugin, by declaration order of nothing in
+    particular -- sort by `label` for display.
+
+    Raises `DiscoveryError` when a module named in `FIRST_PARTY` did not
+    contribute. A contributor's broken plugin is still skipped, and is
+    readable through `problems()`.
+    """
+    out, probs = _discover()
+    ours = [p for p in probs if p[2]]
+    if ours:
+        detail = "; ".join(f"plugins/{n}: {why}" for n, why, _ in ours)
+        raise DiscoveryError(
+            f"{len(ours)} module(s) this repo ships did not load, so the "
+            f"plugin list is short by an unknown amount -- {detail}. "
+            f"Only {len(out)} plugin(s) were discovered "
+            f"({', '.join(sorted(p.name for p in out)) or 'none'}); the "
+            f"checkout is broken rather than this machine having that many "
+            f"clients. `plugins.problems()` lists every module that did not "
+            f"contribute, this repo's and a contributor's alike.")
     return out
 
 
@@ -367,22 +945,147 @@ def for_kind(kind: str):
     return None
 
 
+def rank(root: Path, exists: Optional[Callable[[str], bool]] = None) -> list:
+    """`[(plugin, confidence)]`, most confident first, zero scores dropped.
+
+    **`detect` throws away everything except the winner**, and the discarded
+    part is what a person needs in order to accept or overrule it: a 0.95 from
+    a version stamp and a 0.5 from "this looks vaguely like my family" are the
+    same answer through `detect` and are not the same claim at all. Two
+    plugins tied at 0.5 are not an answer either, and `detect` returns one of
+    them with nothing to say it had a twin.
+
+    So the ranking is what the picker shows and what `comod clients add`
+    refuses on. `detect` keeps its own contract and is now written in terms of
+    this.
+
+    THE SECOND SWALLOW, and it is on the FIRST-RUN path
+    ---------------------------------------------------
+    `confidence()` raising used to be caught here by a bare
+    ``except Exception: continue``, so a plugin that threw simply scored
+    nothing and the ranking closed over the hole. That is the same defect as
+    `available()`'s one door along, and worse placed: `detect` is written in
+    terms of this, and `detect` is what runs when no `game_kind` is stored --
+    a **fresh user's very first run**. The symptom was `detect` returning
+    `GENERIC`, which the UI states as *"no parser plugin claimed this
+    install"* -- a finding about the user's client, produced by a bug in ours.
+
+    Precision worth keeping, because the line was reported one function
+    over: the swallow was at `plugins/__init__.py:749` **in `rank`**, not in
+    `detect`. `detect` has no `except` of its own; it inherits this one by
+    delegation. Both halves of the report are right about the path.
+
+    Split the same way as import failure: ours raises, a contributor's is
+    skipped. A first-party `confidence()` that throws is a bug in this repo,
+    and `comod._plugin_for` already argues the general case -- *"a guard
+    around a first-party module protects nothing and converts a bug into a
+    fact about the user's data."*
+    """
+    ranked, probs = _rank(root, exists)
+    ours = [p for p in probs if p[2]]
+    if ours:
+        detail = "; ".join(f"{n}.confidence(): {why}" for n, why, _ in ours)
+        raise DiscoveryError(
+            f"{len(ours)} plugin(s) this repo ships raised while judging "
+            f"{root} -- {detail}. The ranking is short by an unknown amount, "
+            f"so `detect` would answer GENERIC and the UI would report that "
+            f"as 'no parser plugin claimed this install' -- a statement about "
+            f"the client, caused by a defect in this repo.")
+    return ranked
+
+
+def _rank(root: Path, exists: Optional[Callable[[str], bool]] = None) -> tuple:
+    """`([(plugin, confidence)], problems)` -- the honest ranking scan.
+
+    Never raises for a plugin's own fault; `rank()` decides which faults are
+    fatal. `problems` is `[(plugin_name, reason, ours)]`, same shape as
+    `problems()`.
+    """
+    root = Path(root)
+    if exists is None:
+        def exists(p: str) -> bool:
+            return (root / p).is_file()
+    out, probs = [], []
+    for p in available():
+        try:
+            c = float(p.confidence(root, exists))
+        except BaseException as e:
+            probs.append((p.name, f"{type(e).__name__}: {e}",
+                          p.name in _FIRST_PARTY_PLUGIN_NAMES))
+            continue
+        if c > 0:
+            out.append((p, c))
+    out.sort(key=lambda pc: (-pc[1], pc[0].name))
+    return out, probs
+
+
+#: `FIRST_PARTY` keyed by the plugin name rather than the module name -- the
+#: two differ nowhere today and the manifest is what says so.
+_FIRST_PARTY_PLUGIN_NAMES = frozenset(
+    n for n in FIRST_PARTY.values() if n)
+
+
+def selfcheck(out=None) -> int:
+    """Print a verdict on this checkout's discovery, and return an exit code.
+
+    **The guard that ships.** It lives in `plugins/__init__.py` rather than
+    in `tests/` on purpose: the public COMod extraction copies a hand-listed
+    subset of this repo and ships no test for any of it, so a guard in
+    `tests/` is a guard the tree that needs it most does not have. Run it
+    anywhere::
+
+        py -3 -c "import plugins, sys; sys.exit(plugins.selfcheck())"
+
+    **The weaker form of this check is refuted, and by measurement.**
+    ``py -3 -c "import plugins; plugins.available()"`` was proposed as the
+    guard and **exited 0 on a tree where every single plugin was dead** --
+    MEASURED on a real `tools/extract_comod.py` output, where
+    `plugins/catalog/` is not shipped (`PLUGINS` lists module *names* and
+    appends `.py` to each, so a package directory cannot be named) and
+    `available()` returned `[]`. It exits 1 there now, but only because the
+    swallow was removed first; as a guard by itself it was never testing
+    anything.
+
+    What this asserts, and why each half is needed:
+
+    * every module `FIRST_PARTY` names **that is present in this tree**
+      imported, and declared the plugin name the manifest says it does. Not
+      "all ten are present": the public extraction legitimately ships three,
+      and a guard that demanded ten would be permanently red there and would
+      be turned off.
+    * **zero import failures were swallowed** -- including a contributor's,
+      which `available()` tolerates. Tolerated is not invisible.
+    * at least one plugin was discovered. A tree that ships none has nothing
+      to be short *of*, and `[]` is the answer the whole defect produced.
+    """
+    import sys as _sys
+    out = out or _sys.stdout
+    found, probs = _discover()
+    present = {n for n in FIRST_PARTY if n in set(_modules())}
+    want = {FIRST_PARTY[n] for n in present if FIRST_PARTY[n]}
+    got = {p.name for p in found}
+    bad = []
+    for name, why, ours in probs:
+        print(f"[plugins] {'REPO' if ours else 'contrib'}  plugins/{name}: "
+              f"{why}", file=out)
+        bad.append(name)
+    if want - got:
+        print(f"[plugins] MISSING  declared but not discovered: "
+              f"{', '.join(sorted(want - got))}", file=out)
+    if not got:
+        print("[plugins] EMPTY    no plugin was discovered at all", file=out)
+    ok = not bad and not (want - got) and got
+    print(f"[plugins] VERDICT: {'PASSED' if ok else 'FAILED'} -- "
+          f"{len(got)} discovered ({', '.join(sorted(got)) or 'none'}), "
+          f"{len(want)} declared and present, {len(bad)} swallowed", file=out)
+    return 0 if ok else 1
+
+
 def detect(root: Path, exists: Optional[Callable[[str], bool]] = None):
     """The most confident plugin for an install, or GENERIC.
 
     Only for installs whose kind was never declared: a stored declaration
     is the user's and outranks any heuristic.
     """
-    root = Path(root)
-    if exists is None:
-        def exists(p: str) -> bool:
-            return (root / p).is_file()
-    best, score = GENERIC, 0.0
-    for p in available():
-        try:
-            c = float(p.confidence(root, exists))
-        except Exception:                             # pragma: no cover
-            continue
-        if c > score:
-            best, score = p, c
-    return best
+    ranked = rank(root, exists)
+    return ranked[0][0] if ranked else GENERIC

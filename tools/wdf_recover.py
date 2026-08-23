@@ -145,32 +145,86 @@ SCRAPE_DIRS = ("map", "ani", "ini", "c3", "graphics", "data",
                "LauncherResources", "sound")
 
 
+#: UTF-16LE runs.  A .NET assembly stores its literals this way, and the
+#: interleaved NULs break `_RUNS` -- so an ASCII-only scan reads a .NET tool as
+#: having almost no strings at all.  MEASURED: Zephyr's own `EffectChanger.exe`
+#: spells out hundreds of asset paths (`\c3\effect\CountB\Count-1\countb3.dds`)
+#: that this tool had never once seen.
+_RUNS16 = re.compile(rb"(?:[\x20-\x7e]\x00){4,200}")
+
+
+def _tokens(s: str):
+    for tok in _TOK.findall(s):
+        if ("/" in tok or "\\" in tok) and _HASEXT.search(tok):
+            yield normalise_path(tok).lstrip("/")
+
+
 def harvest_strings(root: Path, max_file: int = 12_000_000) -> set[str]:
-    """Scrape path-looking tokens out of every loose asset that might name one.
+    """Scrape path-looking tokens out of everything that might name an asset.
 
     Covers ini/ (game database), ani/ (animation definitions -> puzzle tiles and
     cover frames), and map/ (.DMap embedded puzzle paths, plus .pul/.scene/.Part
     which enumerate the individual tile images).
+
+    **Also every .exe and .dll, wherever they sit, and in UTF-16 as well as
+    ASCII.** Two blind spots, both found by pointing this at a private server's
+    client and asking why it knew nothing about garments:
+
+      * the binaries live at the ROOT, outside `SCRAPE_DIRS`, so they were
+        never opened -- and a client's own executable names the UI art it
+        loads.
+      * literals in a .NET tool are UTF-16LE, and the NUL between every
+        character breaks an ASCII run, so an ASCII-only scan reads a .NET
+        assembly as having almost no strings at all.
+
+    **MEASURED YIELD ON 6090: ZERO new names.** 102,778 -> 103,148 path
+    strings and the dictionary pass lands on 23,963/24,757 either way. This is
+    a capability, not a win, and the docstring says so rather than implying
+    otherwise.
+
+    A correction worth keeping, because it is the reason the number above is
+    not 3: a probe of mine reported "3 names nothing else had" -- measured
+    against the MERGED committed tables while the tool measures against its
+    own fresh run. Different baselines, so the three were already reachable by
+    the existing scrape. *A background is a property of the measure, not of
+    the thing measured*, and importing another instrument's is how a null
+    becomes a finding.
+
+    What it is worth keeping for: the blind spot is real and structural, and
+    it cost the garment investigation a whole source. Zephyr's own
+    `EffectChanger.exe` spells out hundreds of asset paths that this tool
+    could not physically see -- wrong directory and wrong encoding. It still
+    did not name a garment, so the capability is unproven on the case that
+    motivated it; it is cheap, and it means the next client's tooling is
+    readable rather than invisible.
     """
     out: set[str] = set()
+    seen: set[Path] = set()
+
+    def scrape(p: Path) -> None:
+        if p in seen or not p.is_file():
+            return
+        seen.add(p)
+        try:
+            if p.stat().st_size > max_file:
+                return
+            blob = p.read_bytes()
+        except OSError:
+            return
+        for m in _RUNS.finditer(blob):
+            out.update(_tokens(m.group(0).decode("latin-1")))
+        for m in _RUNS16.finditer(blob):
+            out.update(_tokens(m.group(0).decode("utf-16-le", "replace")))
+
     for sub in SCRAPE_DIRS:
         d = root / sub
-        if not d.is_dir():
-            continue
-        for p in d.rglob("*"):
-            if not p.is_file():
-                continue
-            try:
-                if p.stat().st_size > max_file:
-                    continue
-                blob = p.read_bytes()
-            except OSError:
-                continue
-            for m in _RUNS.finditer(blob):
-                s = m.group(0).decode("latin-1")
-                for tok in _TOK.findall(s):
-                    if ("/" in tok or "\\" in tok) and _HASEXT.search(tok):
-                        out.add(normalise_path(tok).lstrip("/"))
+        if d.is_dir():
+            for p in d.rglob("*"):
+                scrape(p)
+    # The binaries, wherever they are. A client names its own UI art.
+    for p in root.rglob("*"):
+        if p.suffix.lower() in (".exe", ".dll"):
+            scrape(p)
     return out
 
 
@@ -199,6 +253,183 @@ def harvest_tpi(paths) -> set[str]:
         for e in entries:
             out.add(normalise_path(e.name).lstrip("/"))
         print(f"  tpi {f.name}: {len(entries)} names", flush=True)
+    return out
+
+
+#: Bare numeric ids live in these; the PATHS do not.
+_ID_TABLES = ("armor.ini", "armet.ini", "armet1.ini", "weapon.ini",
+              "misc.ini", "mount.ini", "head.ini", "3DSimpleObj.ini")
+
+_ID_KEYS = ("mesh", "texture", "mixtex", "thirdtex", "fourthtex", "obj",
+            "simpleobjid", "standbymotion")
+
+
+def harvest_ids(root: Path) -> set[int]:
+    r"""Bare numeric asset ids out of the appearance tables.
+
+    **This is the wordlist `harvest_strings` cannot produce.** Its filter is
+    *a token containing a slash AND an extension*, so `armor.ini`'s
+    `Mesh0=1000000` -- no slash, no extension -- is skipped, and the path the
+    client builds from that id is never tried unless some other file happens
+    to spell it out.
+
+    Usually another file does: `3dobj.ini` / `3DObj.dbc` map id -> path with
+    the path written out, and the scraper finds those. The gap is the paths
+    **no table spells out**, which the client assembles from an id by a
+    convention -- monster skins, colourway variants, npc geometry.
+    """
+    out: set[int] = set()
+    ini = root / "ini"
+    if not ini.is_dir():
+        return out
+    for name in _ID_TABLES:
+        p = ini / name
+        if not p.is_file():
+            for q in ini.iterdir():             # case-insensitive on purpose
+                if q.is_file() and q.name.lower() == name.lower():
+                    p = q
+                    break
+        if not p.is_file():
+            continue
+        for line in p.read_text("latin1", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                body = line[1:-1].strip()
+                if body.isdigit():
+                    out.add(int(body))
+            elif "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip().lower().rstrip("0123456789") in _ID_KEYS:
+                    v = v.strip()
+                    if v.isdigit() and v != "0":
+                        out.add(int(v))
+    return out
+
+
+def id_paths(ids) -> set[str]:
+    r"""Candidate paths built from real ids by this repo's OWN conventions.
+
+    The rules are imported from where they are recorded rather than retyped:
+    `core/monsterart.py` owns the monster ones and states what it measured
+    them against. A convention copied into a second file is a convention that
+    drifts.
+
+    **This is a DICTIONARY, not an enumeration**, and that is the whole point.
+    The ids are real rows out of real tables, so the candidate set is small and
+    the birthday risk is negligible -- MEASURED on 6090, 50,488 candidates
+    against 25,013 target hashes is **0.294 expected false positives**, against
+    the pattern enumerator's ~797 over 138 million candidates.
+
+    MEASURED YIELD, and it is small -- stated because the percentage will not
+    show it. Dictionary-only on 6090, no DatPkg wordlist, so the id source is
+    the only variable:
+
+        --no-ids   23,956 / 24,757   exp_fp 0.7
+        with ids   23,963 / 24,757   exp_fp 1.4      **+7 names**
+
+    16,079 ids expand to 127,849 candidate paths. Seven names for seven tenths
+    of an expected false positive is a good trade, and it is a trade the
+    enumerator cannot offer: it buys its last ~240 names with ~797.
+
+    Do not expect more on this client. 6090 is already 94.9% recovered, so
+    seven is close to what is left for ANY method there.
+
+    ZEPHYR'S GARMENT ARCHIVES ARE A MEASURED DEAD END -- recorded so nobody
+    repeats it. Five `garments*.wdf`, 14,051 entries, **0.0% named**, and they
+    stay 0.0% against every wordlist this tool has:
+
+        seeded with 24,655 official baseline names        0 / 14,051
+        Zephyr's own 130,532 plaintext DatPkg names       0
+        loose 18,036 + strings 126,177 + tpi 223,508
+          + ids 38,856   (~370k candidates)               2, exp_fp ~1.0
+        + extension permute  (4.1M candidates)            8, exp_fp ~13.5
+
+    **The expected false positives exceed the finds**, and the finds are
+    implausible on inspection -- `data/map/mapobj/.../fo-stone15.cur`, a
+    puzzle-tile `.cur`, a scene effect -- none of which belong in a garment
+    archive. That is noise, not recovery.
+
+    The namespace is disjoint from everything nameable: not the official
+    baseline, not Zephyr's own DatPkg index. The payloads are ordinary
+    (200 `.c3` and 200 `.dds` in the first 400 sampled -- mesh+texture pairs,
+    so ~7,025 garments), so the assets are unremarkable and only their NAMES
+    are unreachable.
+
+    **Enumeration cannot rescue it either, by construction.** The pattern
+    enumerator bootstraps its directory list from names already known
+    (`dirs = {n[:n.rfind('/')] for n in known}`). With zero known names in
+    this namespace it has no directories of its own to work in and would brute
+    force inside the official client's directories, which are measured not to
+    apply. Running it would cost hours and could only produce more of the
+    noise above. What this needs is a *source* for the names -- the server's
+    own tables, a patch manifest, a client string dump -- not more search.
+    """
+    try:
+        import monsterart
+    except ImportError:                                    # pragma: no cover
+        monsterart = None
+
+    out: set[str] = set()
+    for i in ids:
+        # An appearance id addresses geometry and a skin directly. `core/dbc.py`
+        # records the same shape from the compiled side: 9990010 -> c3/mesh/9990010.c3
+        out.add(f"c3/mesh/{i}.c3")
+        out.add(f"c3/texture/{i}.dds")
+        # Nine-wide zero padding: the compiled tables store ids bare and the
+        # mesh files kept their zeros, so both spellings are real.
+        out.add(f"c3/mesh/{i:09d}.c3")
+        out.add(f"c3/texture/{i:09d}.dds")
+        # Colourway variants (`core/collection.py`).
+        out.add(f"c3/texture/999{i}0.dds")
+        out.add(f"c3/texture/999{i}.dds")
+        # NPC geometry (`core/npcart.py`).
+        out.add(f"c3/npc/{i}.c3")
+        if monsterart is not None:
+            out.add(monsterart.TEXTURE.format(body=i))
+    return {normalise_path(p).lstrip("/") for p in out}
+
+
+def discover_tpi_roots() -> list[Path]:
+    r"""Declared installs that ship a DatPkg index, for the default wordlist.
+
+    **`--tpi` has existed since this tool was written and the baseline run
+    never used it**, because it defaulted to empty. The docstring above calls
+    a DatPkg client *"a third, very rich wordlist source"* and then the run
+    that produces `out/wdf/*_names.json` did not consult one, on a box holding
+    two -- so the committed tables sit at 94.06% of 6090's 25,013 hashes while
+    the material to do better was on disk the whole time.
+
+    MEASURED, hashing the plaintext names straight out of the indexes and
+    intersecting with the archive's hashes:
+
+        6090 archives                25,013 hashes
+          named by the tables        23,526   94.06%
+          still unnamed               1,487
+        7878 supplies 146,194 pairs, resolving   201
+        Zephyr        130,464 pairs, resolving   678
+        union                                    795   -> 97.23%
+
+    And the control fires, which is what makes it worth defaulting on: where a
+    DatPkg index and the recovery table both know a hash they AGREE on the
+    name -- 23,365 of 23,395 for Zephyr, 12,974 of 12,975 for 7878. The method
+    reproduces the existing recovery on the overlap before extending past it.
+
+    Sourced from `coroot`'s declared-kinds map rather than a glob of the
+    clients tree, so this uses installs the user has actually declared and
+    nothing it merely found lying about.
+    """
+    try:
+        kinds = coroot.read_settings().get(coroot.KINDS_KEY) or {}
+    except Exception:                                  # noqa: BLE001
+        return []
+    out: list[Path] = []
+    for raw in sorted(kinds):
+        p = Path(raw)
+        try:
+            if p.is_dir() and any(p.glob("*.tpi")):
+                out.append(p)
+        except OSError:
+            continue
     return out
 
 
@@ -303,7 +534,15 @@ def main() -> int:
                          "(default: the baseline c3.wdf data.wdf)")
     ap.add_argument("--tpi", nargs="+", type=Path, default=[],
                     help="DatPkg .tpi files or dirs to mine for a plaintext "
-                         "wordlist (see core/tpd.py)")
+                         "wordlist (see core/tpd.py). Omit to use every "
+                         "DECLARED install that ships one")
+    ap.add_argument("--no-ids", action="store_true",
+                    help="skip the id-referenced wordlist (bare asset ids "
+                         "from the appearance tables, expanded by the "
+                         "conventions core/monsterart.py records)")
+    ap.add_argument("--no-tpi", action="store_true",
+                    help="do not use any DatPkg wordlist, not even a "
+                         "discovered one -- for reproducing an older run")
     ap.add_argument("--max-digits", type=int, default=4,
                     help="widest numeric run to brute-force per directory "
                          "pattern; 10**N candidates each (default 4)")
@@ -327,21 +566,46 @@ def main() -> int:
 
     loose = harvest_loose(a.root)
     strings = harvest_strings(a.root)
-    tpi = harvest_tpi(a.tpi) if a.tpi else set()
+    # A DatPkg index is the richest wordlist available and it used to be
+    # opt-in, so the run that produced the committed tables never consulted
+    # one. Discovered by default now; `--tpi` still overrides and `--no-tpi`
+    # reproduces the old behaviour.
+    if a.tpi:
+        tpi_src, how = list(a.tpi), "given"
+    elif a.no_tpi:
+        tpi_src, how = [], "suppressed by --no-tpi"
+    else:
+        tpi_src, how = discover_tpi_roots(), "discovered from declared installs"
+    if tpi_src:
+        print(f"DatPkg wordlist ({how}): "
+              f"{', '.join(p.name for p in tpi_src)}", flush=True)
+    else:
+        # Said out loud. A silent empty wordlist is indistinguishable from a
+        # box with no DatPkg client, and that difference is 795 names.
+        print(f"DatPkg wordlist: NONE ({how}) -- recovery will run on loose "
+              f"files and binary strings only", flush=True)
+    tpi = harvest_tpi(tpi_src) if tpi_src else set()
+
+    # Bare ids -> paths by convention. A DICTIONARY, not an enumeration: the
+    # ids are real table rows, so the set is small and the birthday risk is
+    # ~0.3 expected false positives rather than the enumerator's ~797.
+    ids = set() if a.no_ids else harvest_ids(a.root)
+    id_words = id_paths(ids) if ids else set()
     print(f"loose paths: {len(loose)}, path-ish strings: {len(strings)}, "
-          f"tpi names: {len(tpi)}", flush=True)
+          f"tpi names: {len(tpi)}, ids: {len(ids)} -> {len(id_words)} "
+          f"convention paths", flush=True)
 
     # tpi names are real observed strings -> same "dict" (near-certain) origin.
-    r.try_paths(loose | strings | tpi)
+    r.try_paths(loose | strings | tpi | id_words)
     r.report("dictionary", t0)
-    r.try_paths(ext_permute(loose | strings | tpi))
+    r.try_paths(ext_permute(loose | strings | tpi | id_words))
     r.report("+ extension permute", t0)
 
     if not a.no_enumerate:
         # tpi names seed BOTH the directory list and the observed number
         # patterns, so a DatPkg client's numbering conventions get brute-forced
         # in the target archives even when the exact paths differ.
-        known = set(loose) | set(tpi) | set(r.found.values())
+        known = set(loose) | set(tpi) | set(id_words) | set(r.found.values())
         dirs = sorted({n[:n.rfind("/")] for n in known if "/" in n})
         pats = build_patterns(known)
         # patterns common enough to be worth trying in EVERY directory

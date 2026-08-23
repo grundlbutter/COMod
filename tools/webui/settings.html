@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Settings -- CO Asset Viewer</title>
+<link rel="stylesheet" href="/ui/style.css">
+<style>
+/* Local to this page. The shared style.css is built around the browser's
+   three-pane layout, and a settings window is one column of prose. */
+.set-wrap { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+.set-row { padding: .9rem 0; border-bottom: 1px solid rgba(128,128,128,.25); }
+.set-head { display: flex; align-items: center; gap: .6rem; }
+.set-name { font-weight: 600; min-width: 12rem; }
+.set-help { opacity: .85; margin-top: .25rem; }
+/* The effect line is the reason this page exists rather than a list of
+   names and values, so it is not the quietest thing on the row. */
+.set-effect { opacity: .75; margin-top: .35rem; font-size: .92em;
+              border-left: 2px solid rgba(128,128,128,.4); padding-left: .6rem; }
+.set-changed { font-size: .85em; opacity: .8; }
+.set-note { min-height: 1.2em; margin: .6rem 0; opacity: .8; }
+.set-bad { color: #c0392b; }
+.set-sub { margin-top: 1.8rem; }
+.set-deferred { opacity: .7; }
+.set-foot { margin-top: 1.6rem; display: flex; align-items: center;
+            justify-content: space-between; gap: 1rem; }
+</style>
+</head>
+<body>
+<div class="set-wrap">
+  <h2>Settings</h2>
+  <p class="set-help">
+    Each setting says what observably changes when you flip it. The same text
+    is what <code>comod settings &lt;name&gt;</code> prints -- one registry,
+    two surfaces, so they cannot describe a toggle two different ways.
+  </p>
+  <div id="settings-body">loading…</div>
+  <p class="set-help" style="margin-top:2rem">
+    <a href="/">back to the viewer</a>
+  </p>
+</div>
+<script src="/ui/csrf.js"></script>
+<script src="/ui/settings.js"></script>
+</body>
+</html>

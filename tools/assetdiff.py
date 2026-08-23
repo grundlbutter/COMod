@@ -45,6 +45,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
@@ -106,13 +107,25 @@ def _progress(label: str, i: int, total: int, t0: float) -> None:
         print(f"  {label}: {i}/{total}  ({dt:.0f}s)", flush=True)
 
 
-def _walk_loose(root: Path) -> list[Path]:
+def _walk_loose(root: Path, extra_skip: Iterable[str] | None = None) -> list[Path]:
+    """Loose files worth hashing, minus logs, caches and scratch.
+
+    A plugin's ``import_plan["skip"]`` is **added** to `SKIP_DIRS`, never
+    substituted for it. `SKIP_DIRS` is not a default anyone should be able
+    to override away: `.sentry-native` is in it because a transient
+    `<uuid>.run.lock` once became the canonical empty file and 28 of
+    Zephyr's tables were aliased to something that no longer existed.
+    """
+    frags = [s.strip("/\\").lower() for s in (extra_skip or ()) if s.strip("/\\")]
     out = []
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         rel = p.relative_to(root)
-        if any(part.lower() in SKIP_DIRS for part in rel.parts[:-1]):
+        parts = [part.lower() for part in rel.parts[:-1]]
+        if any(part in SKIP_DIRS for part in parts):
+            continue
+        if any(f in parts for f in frags):
             continue
         if p.suffix.lower() in SKIP_EXT:
             continue
@@ -141,36 +154,188 @@ def load_name_tables(repo: Path) -> dict[int, str]:
     return merged
 
 
-def catalog_baseline(root: Path, names: dict[int, str] | None = None) -> dict:
+def plugin_for(root: Path):
+    """The parser plugin for an install, by the rule the viewer already uses.
+
+    A stored declaration outranks detection, because the user knows things
+    the bytes do not -- a private server's repack of 6090 reads as 6090 to
+    any test of the bytes.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import plugins as plugmod
+    kind = coroot.kind_for_root(root)
+    return (plugmod.for_kind(kind) if kind else None) or plugmod.detect(Path(root))
+
+
+def table_profile_for(assets=None, root=None, resolve=True, plugin=None):
+    """``(npcart.Profile | None, report)`` for the thing whose assets are read.
+
+    **ASK THE CLIENT BEING SHOWN, NOT THE BASELINE.**  Every `npcart.Tables`
+    call site used to resolve its profile from a *root* -- `plugin_for(root)`
+    or `coroot.kind_for_root(self.root)`.  For a bare install that is right.
+    For a `colibrary.ServerView` it is wrong in a way nothing reports: a
+    `ServerView` **is** an `AssetRoot` rooted at the **baseline**
+    (`core/colibrary.py`, `super().__init__(root)`), so `.root` is the
+    baseline's path and the community client whose assets are on screen is
+    never asked.  `docs/CORRECTIONS.md`
+    **C-2026-08-09-plugin-c-serverview-profile** -- *"a DatPkg `ServerView`
+    takes its parse profile from the BASELINE, not from the client whose
+    assets it shows -- and 25 of 397 NPCs silently lose their art"*.
+
+    So: anything that can answer for itself (`ServerView.table_profile`) is
+    asked first, and the baseline plugin answers only for things that cannot.
+
+    **This function exists so there is ONE definition of that rule.**  Four
+    sites build `npcart.Tables` and each had its own three-line spelling of
+    "resolve the plugin from a root"; a fifth spelling is how the four drift.
+
+    **What this DOES and DOES NOT establish**, stated here because this is the
+    junction a later reader will arrive at.  It makes a community client's
+    parse profile **STABLE** -- the same answer whichever baseline the user has
+    configured.  It does **NOT** establish that the chosen profile's answers
+    are **CORRECT** for that client; which profile is right is **UNMEASURED**
+    and is a separate question with a separate owner.
+
+    MEASURED on `21f2501`, `zephyr` over the five official baselines --
+    supersedes the register entry's `25 of 400` file-order sample:
+
+        5165/plaintext vs 6090/official : 646 / 2785 rows      = 23.2%
+        the same, per distinct npc_type : 639 / 2747 types     = 23.3%
+        answers that CONFLICT           :   0, over all 105 pairings
+
+    Every difference is **one-sided** -- one side resolves, the other returns
+    `('', '')` -- so the register's *"RESOLVED DIFFERENTLY"* is refuted: the
+    answer never moves, it only appears or disappears.  Do not read the
+    profile that resolves more as the right one; a strict-subset nesting is
+    exactly what a larger table answering ids from a foreign id space
+    produces (`docs/handoff_zephyr_planning.md` §3.4, and
+    `docs/CORRECTIONS.md` **C-2026-08-09-reproduce-not-hold** -- *"a number
+    that REPRODUCES is not a claim that HOLDS"*).
+
+    `report` is never empty and is meant to be shown, not logged and dropped:
+    a pin that removes variance by fiat gives a **narrower** answer, and a
+    silent narrower answer is the failure shape this project has recorded most
+    often.  See `ServerView.table_profile_report`.
+    """
+    ask = getattr(assets, "table_profile", None)
+    if callable(ask):
+        try:
+            prof = ask()
+        except Exception:                                # pragma: no cover
+            prof = None
+        if prof is not None:
+            try:
+                return prof, assets.table_profile_report(resolve=resolve)
+            except Exception:                            # pragma: no cover
+                return prof, {"profile": prof.name, "how": "viewed client"}
+        # A view that ships no npc table of its own has no opinion; the
+        # baseline route below is then the honest answer rather than a
+        # fallthrough, and the report still says the view was asked.
+    r = root if root is not None else getattr(assets, "root", None)
+    if r is None:
+        return None, {"profile": None, "how": "nothing to ask"}
+    try:
+        # `plugin=` lets a caller that already resolved one hand it over, and
+        # that is not a convenience -- it preserves an answer this function
+        # cannot reach. `plugin_for` ends at `plugins.detect(root)` with no
+        # `exists`, which then probes with `(root / p).is_file()` and so
+        # CANNOT SEE INSIDE THE WDF ARCHIVES. `coviewer` resolves its plugin
+        # with `exists=self.assets.exists`, which does. For a *declared*
+        # install both take the `for_kind` branch and agree; for an
+        # **undeclared** one, re-deriving here would silently downgrade the
+        # detection to the loose layer only.
+        pl = plugin if plugin is not None else plugin_for(Path(r))
+        prof = pl.table_profile() if pl else None
+    except Exception:                                    # pragma: no cover
+        pl, prof = None, None
+    rep = {"profile": prof.name if prof else None,
+           "how": (f"baseline plugin {pl.name}" if pl
+                   else "no plugin claimed the root; npcart will probe"),
+           "pinned": False, "baseline": str(r)}
+    if callable(ask):
+        try:
+            rep = dict(assets.table_profile_report(resolve=resolve), **{
+                k: v for k, v in rep.items() if k in ("profile", "how")})
+        except Exception:                                # pragma: no cover
+            pass
+    return prof, rep
+
+
+def import_plan_for(root: Path) -> dict:
+    """What importing `root` involves, as its own plugin describes it.
+
+    The archive list is the part that mattered: this function used to be
+    the literal ``("c3.wdf", "data.wdf")``, so a baseline packaged any other
+    way -- a DatPkg client, a repack -- catalogued only its loose layer and
+    then reported every archived asset in the *other* tree as new. Not an
+    error; a quietly wrong diff, which is worse.
+
+    Errors are not swallowed. A plugin that raises here should be fixed, and
+    the old behaviour survives as `Plugin.import_plan`'s default, so an
+    install whose plugin has no opinion is catalogued exactly as before.
+    """
+    p = plugin_for(root)
+    plan = p.import_plan(Path(root), lambda rel: (Path(root) / rel).exists())
+    print(f"baseline plugin: {p.name} -- archives={list(plan.get('archives', []))} "
+          f"loose={plan.get('loose', True)}", flush=True)
+    return plan
+
+
+def _iter_archive(path: Path, names: dict[int, str]):
+    """Yield ``(name_or_None, tq_name_hash, bytes)`` for any container.
+
+    Dispatching on the suffix is what makes `import_plan`'s archive list
+    useful rather than decorative: declaring ``c3.tpi`` is pointless if the
+    reader can only open a WDF. `iter_other_assets` has always done this for
+    the *other* tree; the baseline is catching up.
+    """
+    if path.suffix.lower() in (".tpi", ".tpd"):
+        arc = TpdArchive(path)
+        for e in arc.entries:
+            yield e.name, tq_hash(e.name), arc.read(e)
+        return
+    with WdfArchive(path) as a:
+        for e in a.entries:
+            yield names.get(e.hash), e.hash, a.read(e)
+
+
+def catalog_baseline(root: Path, names: dict[int, str] | None = None,
+                     plan: dict | None = None) -> dict:
     """content: set of payload hashes; nameHashes: wdf index; loose: rel->hash;
     locator: content hash -> a filemap ref saying where the baseline holds
     those bytes (named path preferred, archive-entry-by-hash otherwise)."""
     names = names or {}
+    if plan is None:
+        plan = import_plan_for(root)
     content: set[str] = set()
     name_hashes: dict[int, str] = {}          # tq name-hash -> content hash
     loose: dict[str, str] = {}                # lowercased rel path -> hash
     locator: dict[str, list] = {}             # content hash -> ["b",...]/["w",...]
     t0 = time.time()
-    for arc_name in ("c3.wdf", "data.wdf"):
+    for arc_name in plan.get("archives", ("c3.wdf", "data.wdf")):
         p = root / arc_name
         if not p.is_file():
             continue
-        with WdfArchive(p) as a:
-            n = len(a.entries)
-            print(f"baseline {arc_name}: {n} entries", flush=True)
-            for i, e in enumerate(a.entries, 1):
-                h = HASH(a.read(e))
-                content.add(h)
-                name_hashes[e.hash] = h
-                nm = names.get(e.hash)
-                if not _alias_ok(h, nm or ""):
-                    pass                       # empty: never an alias target
-                elif nm is not None:
-                    locator.setdefault(h, ["b", nm.lower()])
-                else:
-                    locator.setdefault(h, ["w", arc_name, f"{e.hash:08x}"])
-                _progress(arc_name, i, n, t0)
-    files = _walk_loose(root)
+        rows = list(_iter_archive(p, names))
+        n = len(rows)
+        print(f"baseline {arc_name}: {n} entries", flush=True)
+        for i, (nm, name_hash, blob) in enumerate(rows, 1):
+            h = HASH(blob)
+            content.add(h)
+            name_hashes[name_hash] = h
+            if not _alias_ok(h, nm or ""):
+                pass                           # empty: never an alias target
+            elif nm is not None:
+                locator.setdefault(h, ["b", nm.lower()])
+            else:
+                locator.setdefault(h, ["w", arc_name, f"{name_hash:08x}"])
+            _progress(arc_name, i, n, t0)
+    if not plan.get("loose", True):
+        print("baseline loose layer: skipped, the plugin declares none",
+              flush=True)
+        return {"content": content, "nameHashes": name_hashes, "loose": loose,
+                "locator": locator}
+    files = _walk_loose(root, plan.get("skip"))
     print(f"baseline loose files: {len(files)}", flush=True)
     for i, p in enumerate(files, 1):
         h = HASH(p.read_bytes())

@@ -63,6 +63,14 @@ maps**. Busiest: `Dcloister` 362, `Gulf` 354, `Dgate` 319, `woods` 180,
 `zf2-e173..176`, one record each) are data bugs in two maps, not a second
 name space. VERIFIED.
 
+> **Those are CCO's numbers, and the map names do not carry across.** On
+> **patch5517** the same sweep reads **2,793 records across 53 of 181 maps**,
+> all 39 distinct names resolve, and the busiest are `Dcloister` 362 ·
+> `Gulf` 354 · `Dgate` 319 · **`woods-m`** 179 · **`newplain-m`** 151 — while
+> **`newplain` itself places none at all**. Quote the base with the count;
+> `docs/CORRECTIONS.md` C-2026-08-09-comod-particles-draw-path (a) and C41(b).
+> The *transform* below is unaffected and re-measures clean on both corpora.
+
 **The coordinate space — recovered, VERIFIED 2,504/2,504.** The x,y are
 pixels in the map's **full isometric diamond** — the bounding box of the
 whole cell grid, origin at cell (0,0)'s top corner:
@@ -192,17 +200,59 @@ VERIFIED data.)*
 
 ### 4.3 Status auras — `ini/statuseffect.ini`
 
-20 rows: `<bit index> <3D effect | NULL> <2D effect | NULL>`. The bit index
-is the same numbering the companion verified against `MsgUserAttrib` (1017)
-status bitfields on live traffic. Column 1 is a `3DEffect.ini` name — a
-persistent aura while the bit is set (`attackfast40`, `SuperSoldier`,
-`BodyShield`, `CTF_Flag`…): 15 of 19 non-NULL names resolve; `Reflect`,
-`ReflectMagic`, `Dodge`, `Bleed` are in neither the ini nor the JSON (absent
-art, stated not padded). Column 2 is a section of **`ini/effect.ini`** — the
-legacy 2D `.ani` effect system, still alive in exactly five sections:
-`TeamLeader`, `Silent`, `MapItemFlash`, `ShitsHappen`, `Freeze` — and
+`<status selector> <3D effect | NULL> <2D effect | NULL>`. Column 1 is a
+`3DEffect.ini` name — a persistent aura while the bit is set
+(`attackfast40`, `SuperSoldier`, `BodyShield`, `CTF_Flag`…). Column 2 is a
+section of **`ini/effect.ini`**, the legacy 2D `.ani` effect system, and
 `MapItemFlash` is the flash on a ground item drop, closing the item/effect
-symmetry from the other side. VERIFIED.
+symmetry from the other side.
+
+> **The counts that used to stand here were CCO's, presented as the
+> table's.** They are exactly right for the community client and describe no
+> official one. `CORRECTIONS.md`
+> `C-2026-08-09-comod-entity-effects`. **This table is per-install and there
+> is no single number for it.** Measured, `py -3 tools/worldfx.py --status`:
+>
+> | install | rows | col-1 spelling | non-NULL 3D | resolve | max bit |
+> |---|---|---|---|---|---|
+> | CCO   | 20  | bit index | 19  | **15** | 41  |
+> | 5017  | 29  | hex mask  | 13  | 10  | 31  |
+> | 5065  | 29  | hex mask  | 13  | 10  | 31  |
+> | 5165  | 44  | hex mask  | 28  | 25  | 48  |
+> | 5517  | 95  | bit index | 79  | 25  | 117 |
+> | 6090  | 120 | bit index | 102 | 25  | 171 |
+>
+> `Reflect`, `ReflectMagic`, `Dodge` and `Bleed` are the four CCO misses.
+> **`Bleed` is not a row in any official install**, so "four auras with no
+> art" does not travel either: at 5517 it is **54 of 79**, and a set bit with
+> nothing to draw is the ORDINARY outcome rather than an edge case. The
+> five-section `ini/effect.ini` is likewise CCO's; 5517 ships 76 sections and
+> 6090 ships 111, and in every install exactly one row (bit 6, `TeamLeader`)
+> uses column 2 at all.
+
+**THE FIRST COLUMN IS TWO DIFFERENT THINGS AND BOTH LOOK LIKE DECIMAL.** 5017,
+5065 and 5165 write a zero-padded **hex mask** (`00000002`); 5517, 6090 and CCO
+write a **bit index** (`1`). Reading a mask as decimal — which is what a bare
+`int(tok)` does, and `"00000010".isdigit()` is True — silently moves every row
+from `00000010` on: `0x10` is bit 4, decimal `10` is bit 10. The rows still
+parse and still resolve to real effect names; the aura simply belongs to a
+different status. `worldfx.status_bit_rows` detects the dialect from the values
+(a mask column cannot contain 3, 5, 6 or 7) and returns bit indices either way.
+The control that says the detection is right: **`poison*` is bit 1 in all six
+installs**, spelled `…0002` in the mask files and `1` in the index ones.
+
+The bit numbering is **[I], not [V]**. §4.3 previously said it was "the same
+numbering the companion verified against `MsgUserAttrib` (1017) status
+bitfields on live traffic"; `client/world.py`'s `ATTRIB_KEYS` records that the
+1017 table is the community's labelling, is **wrong above type 8**, and that
+**nothing has yet observed a real 1017** — and it carries no status type at
+all. The numbering that IS load-bearing for what we draw comes from
+`MsgPlayer` (1014)'s u64 `status` at offset 12, and `poison*` on bit 1 across
+six installs is the only cross-check we hold.
+
+Only bits **0..63** can be carried by 1014. 5517 names rows out to bit 117 and
+6090 out to 171, so 40 and 64 of their rows respectively are unreachable by
+this message; whatever raises them is a channel we do not hold.
 
 ### 4.4 The legacy stubs
 

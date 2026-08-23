@@ -62,7 +62,15 @@ async function initBasePicker() {
     if (p.kind !== group) {
       group = p.kind;
       const g = document.createElement('optgroup');
-      g.label = p.kind === 'install' ? 'Installed clients' : 'COmmunity Library';
+      // Named after what the entry IS, not where we keep it or how it got
+      // here. "Installed" was the wrong axis: Classic Conquer 2.0 is a
+      // private server's client that happens to sit in Program Files, and
+      // grouping by installed-ness filed it beside TQ's own releases. The
+      // plugin declares its `origin`; this only renders it.
+      g.label = {install: 'Official clients',
+                 server: 'Private server clients',
+                 collection: 'Curated collections',
+                 other: 'Unclassified clients'}[p.kind] || p.kind;
       sel.appendChild(g);
     }
     sel.lastChild.appendChild(o);

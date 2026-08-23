@@ -57,6 +57,17 @@ knows about paths.
 
 A NUL byte is rejected outright: it truncates the path at the OS boundary in
 some APIs, so what gets checked and what gets opened can differ.
+
+A component that ends in a **space or a dot** is rejected, and a component
+containing a **colon** is rejected.  Windows strips a trailing space/dot when
+it opens a path, so `y.DMap ` is checked under one name and written under
+another (`y.DMap`) -- the same "the path did not mean what the caller thought"
+class as the reserved names, and an integrity attack against a call site that
+processes attacker-ordered keys and keeps the first write (`colibrary`).  A
+colon opens an NTFS **alternate data stream** (`x.DMap:hidden`), a readable
+payload absent from the directory listing.  Everything here stays *under* the
+root -- these are integrity, not escape -- but "under the root" is not the same
+as "the file the caller named".  `C-2026-08-12-quickfix-confine-collapse`.
 """
 
 from __future__ import annotations
@@ -64,7 +75,7 @@ from __future__ import annotations
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-__all__ = ["UnsafePath", "confine", "is_confined", "normalize"]
+__all__ = ["UnsafePath", "confine", "confined_files", "is_confined", "normalize"]
 
 
 class UnsafePath(ValueError):
@@ -135,6 +146,32 @@ def confine(root: os.PathLike | str, logical: str) -> Path:
     for part in rel.split("/"):
         if part == "..":
             continue                      # caught by the containment test below
+        # Windows COLLAPSES a trailing space or dot when it opens a path, so a
+        # component validated as `y.DMap ` is written as `y.DMap` -- a
+        # different file than the one checked. In `colibrary`, whose keys come
+        # from a third-party filemap and whose loop is attacker-ordered, listing
+        # `foo.DMap ` before `foo.DMap` overwrites the legitimate file while the
+        # real entry is skipped and reported "kept". And `nul ` collapses to the
+        # reserved device the check below would otherwise catch. The check must
+        # see the name the OS will resolve, so reject any component that is not
+        # already in its collapsed form. (CONFIRMED integrity attack,
+        # `C-2026-08-12-quickfix-confine-collapse`; RE DX9.)
+        if part != part.rstrip(" ."):
+            raise UnsafePath(
+                logical,
+                f"component {part!r} ends in a space or dot, which Windows "
+                f"strips on open -- it would resolve to a different name than "
+                f"the one checked")
+        # A colon opens an NTFS alternate data stream: `x.DMap:hidden` stores a
+        # readable payload invisible to a directory listing, with the carrier's
+        # size unchanged, so any integrity check that enumerates or hashes files
+        # misses it. A logical asset path never contains one (the drive form
+        # `C:` is already rejected above).
+        if ":" in part:
+            raise UnsafePath(
+                logical,
+                f"component {part!r} contains ':' -- an NTFS alternate data "
+                f"stream, not a file under the root")
         stem = part.split(".", 1)[0].lower()
         if stem in _RESERVED:
             raise UnsafePath(logical,
@@ -152,6 +189,76 @@ def confine(root: os.PathLike | str, logical: str) -> Path:
     if not _is_relative_to(dest, root_res):
         raise UnsafePath(logical, f"resolves to {dest}, which is outside {root_res}")
     return dest
+
+
+def confined_files(root: os.PathLike | str) -> tuple[list[Path], list[tuple[Path, str]]]:
+    r"""`(kept, refused)` -- every regular file under `root` that is *really*
+    under `root`, and every entry that only looked like it was.
+
+    WHY THIS IS HERE AND NOT IN THE TWO CALLERS
+    -------------------------------------------
+    `confine` guards a path a caller is about to *write to*. This guards the
+    other direction: a tree a caller is about to *read from and copy out of*.
+    `tools/comod.py` and `tools/coviewer.py` each had a byte-identical
+
+        sorted(p for p in STAGE.rglob("*") if p.is_file())
+
+    and `comod.cmd_install` then `shutil.copy2`'d the result into a game
+    install. The destination of that copy is confined; the source was not, and
+    the source is the half a third-party mod controls. Two copies of the fix is
+    how one of them ends up subtly wrong -- the argument this whole module is
+    built on -- so there is one function.
+
+    MEASURED on Windows / Python 3.14.6, with an honest file as the control:
+
+        c3/texture/002135300.dds  resolves_inside=True   b'DDS legit'          <- control
+        junction/loot.txt         resolves_inside=False  b'OUTSIDE-THE-STAGE'
+        junction/secrets/id_rsa   resolves_inside=False  b'PRIVATE-KEY'
+        c3/hard.dds               resolves_inside=True   b'OUTSIDE-THE-STAGE'  <- SEE BELOW
+
+    A **directory junction** is the live vector: `mklink /J` needs no
+    privilege, `rglob` recurses straight through one, and `Path.is_symlink()`
+    reports **False** for it -- so `recurse_symlinks=False`, the 3.13+ default,
+    does not cover it. A **symlink** is the vector the old comment named and is
+    the *harder* one to produce: `os.symlink` raises `WinError 1314` without
+    the privilege, so it needs Developer Mode.
+
+    WHAT THIS DOES NOT CATCH, STATED SO NOBODY READS IT AS COMPLETE
+    ---------------------------------------------------------------
+    **Hard links.** The fourth row above is kept, deliberately and unavoidably:
+    a hard link is a second directory entry for the same file, so the path
+    genuinely *is* under `root` and `resolve()` has nothing to object to. The
+    only signal is `st_nlink > 1`, which is not one -- ordinary files carry
+    extra links for ordinary reasons, and a hard link to a file the user
+    already owns is not an escape at all. So this closes the junction and
+    symlink rows and names the third rather than implying it is covered.
+
+    Unlike `confine` this does **not** raise: listing a staged tree is exactly
+    the case `is_confined` exists for -- one bad entry is skipped and reported,
+    not fatal. **The `refused` half is the load-bearing half.** A caller that
+    drops it turns an attack into a shorter file list, which is the silent
+    outcome the whole module exists to prevent, and
+    `tests/test_boundary_guards.py` gates against exactly that.
+    """
+    base = Path(root)
+    if not base.is_dir():
+        return [], []
+    real_base = base.resolve()
+    kept: list[Path] = []
+    refused: list[tuple[Path, str]] = []
+    for p in sorted(base.rglob("*")):
+        try:
+            if not p.is_file():
+                continue
+            real = p.resolve()
+        except OSError as e:                    # a broken link, a denied entry
+            refused.append((p, f"cannot be resolved: {e}"))
+            continue
+        if _is_relative_to(real, real_base):
+            kept.append(p)
+        else:
+            refused.append((p, f"resolves to {real}, which is outside {real_base}"))
+    return kept, refused
 
 
 def is_confined(root: os.PathLike | str, logical: str) -> bool:

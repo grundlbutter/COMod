@@ -29,6 +29,8 @@ See `docs/repo_split.md` in the main tree for the full reasoning.
 | `c3phy` | C3 / PHY mesh parsing. |
 | `dmap` | `.DMap` map grids, passability and row checksums. |
 | `tqdat` | The TQ File Cipher and the encrypted `ini/*.dat` tables official clients ship (itemtype.dat, Monster.dat). |
+| `inidat` | **Which** treatment an `ini/*.dat` is under, by test rather than by filename — RSA (reads), TQ stream (reads), the 12-byte block cipher (tail only; key unknown), codepage-destroyed RAR (refuses with the reason), or never encrypted. `tqdat` knows one cipher; 7878 ships five. |
+| `dbcshadow` | Is this `ini/*.ini` shadowed by a compiled `.dbc` twin on **this** base? From 5517 on the client reads the twin, so reading the ini raises an error naming it. Resolved per path, per call — never at import time. |
 | `coassets` | The asset VFS — loose file, then overlay, then archive, in the order the game itself resolves them. |
 
 Standard library only. `numpy` is an optional speed-up, never a requirement.
@@ -36,7 +38,8 @@ Standard library only. `numpy` is an optional speed-up, never a requirement.
 ## Two properties that are enforced, not just intended
 
 **The set is closed under its own imports.** `coassets` needs `coroot`,
-`safepath`, `tqhash`, `wdf` and `tqdat`; `dmap` needs `coroot`; everything else imports
+`safepath`, `tqhash`, `wdf`, `tqdat` and `dbcshadow`;
+`dmap` needs `coroot`; everything else imports
 only the standard library. Nothing here reaches up into `tools/`, `client/` or
 `capture/`. `tools/test_viewer.py::CoreBoundary` fails if that changes — which is
 the property that makes COre extractable at all, and exactly the property that

@@ -274,6 +274,26 @@ the painted image. That is inherent to an axis-aligned texture over a rotated
 grid. Cutting and encoding it takes ~0.65 s cold, ~0.15 s warm, and it is cached
 per window; `?scale=2` quarters it.
 
+> **The two timings above predate the 2026-08-15 box-state rule and do not meet
+> it.** No install, map, machine or box state was recorded, the method is not
+> stated, and **neither "cold" nor "warm" is defined here**. The geometry beside
+> them is untouched by this note: `49×49` cells → `3136×1568` px is `(w+h)·32` by
+> `(w+h)·16`, **arithmetic, not measurement**. Only the seconds are in question.
+>
+> **What is safe to rely on is the structural claim — the crop is cached per
+> window** — not the ratio. A cold/warm pair is a shape this project has already
+> been burned by: `docs/asset_decode_perf.md` records a "cold" render reported as
+> **5 ms** because a second, already-warm process on the same port served it, and
+> that doc now states cold-vs-warm on every row, defines *cold* as a freshly
+> started process that has never rendered the map, and records who else had the
+> box. None of that was done here.
+>
+> So treat the absolute seconds as indicative of *that* machine on *that* day.
+> **Re-measure under the rule before using either as a denominator** — deliberately
+> not re-measured now, because nobody is building on them and re-running buys
+> nothing until someone needs the number. Use `docs/asset_decode_perf.md` §Method
+> as the template when you do.
+
 ---
 
 ## 5. Things worth knowing before you look at a map
@@ -290,8 +310,15 @@ per window; `?scale=2` quarters it.
   `cover` layers are placed and composited by `tools/scene.py`, and the `scene`
   layers turn out to carry **passability** as well as art — which is why the
   sky maps' walkable cells looked like they were floating in nothing. See
-  `docs/map_scenery.md`. `effect` and `sound` layers are still parsed and not
-  drawn.
+  `docs/map_scenery.md`. ~~`effect` and `sound` layers are still parsed and not
+  drawn.~~ **Only `sound`** (corrected 2026-08-15,
+  `C-2026-08-15-claude-vibeco-gl-openlist`): the `.DMap` EFFECT layer **is
+  drawn** — `tools/coplay.py` `_map_effects` → `/api/game/mapfx`, with
+  `docs/world_effects.md` §2 holding the coordinate space and the 2,504-record
+  corpus. `sound` is open for a different reason than "not placed yet": **there
+  is no audio path in this client at all** (`client/settings.py`). This was the
+  **third** copy of the same claim in this file and it outlived the first two
+  because they were corrected in the OPEN list while this one sits in §5.
 * **Animated tiles are frozen.** A handful of `Puzzle<n>` keys name several
   frames; frame 0 is used. Four `.pul` files carry a non-zero `rollSpeedX/Y`
   (`market-sky`, `skybg-move` and friends) — a scrolling backdrop, not modelled.
@@ -333,12 +360,26 @@ per window; `?scale=2` quarters it.
 
 **OPEN**
 
-* `map/PuzzleSave/*.pux` (`TqTerrain\0`), used by 4 maps.
+* `map/PuzzleSave/*.pux` (`TqTerrain\0`). ~~used by 4 maps~~ — **the 4 was
+  CCO's figure and is true only on CCO.** Re-derived 2026-08-11: **237 files
+  across four installs, and 160 maps name one as their puzzle path.**
+  `docs/map_scenery.md` §10 is the home of that re-derivation — it also carries
+  the decoded header, the solved 256 px tile, and the **measured negative that
+  the payload is not a tile index**. Read it there; do not re-measure the
+  corpus from this line. `C-2026-08-15-claude-vibeco-gl-openlist`.
 * Whether the engine draws the puzzle at one block per tile or one per map, and
   what subdivision it asks for — `CPuzzleBlockX::Create`'s arguments come from
   the packed exe. **Narrowed by `docs/map_memory.md`**: the create warns above
   80×80 subdivisions, the draw path is ordinary sprite batching, and the
   memory question (whole tile set resident per map) is answered there.
 * The `rollSpeedX/Y` scrolling backdrops.
-* ~~Scene / cover / effect layer placement~~ — **done for scene and cover**:
-  `docs/map_scenery.md`. `effect` and `sound` remain.
+* ~~Scene / cover / effect layer placement~~ — **done for scene, cover AND
+  effect**: `docs/map_scenery.md`. ~~`effect` and `sound` remain.~~ **Only
+  `sound` remains** (corrected 2026-08-15,
+  `C-2026-08-15-claude-vibeco-gl-openlist`): the `.DMap` EFFECT layer is drawn
+  — `tools/coplay.py` `_map_effects` → `/api/game/mapfx`, capped at
+  `MAPFX_DRAW_LIMIT = 48`, with `docs/world_effects.md` §2 holding the
+  coordinate space and the 2,504-record corpus. `sound` is open for a
+  **different reason** than "not placed yet": **this client has no audio
+  subsystem at all** (`client/settings.py:148-152`, *"There is no audio
+  path"*), so there is nowhere to place it.

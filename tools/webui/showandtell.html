@@ -1,0 +1,2168 @@
+<title>co-client-re — Show and Tell</title>
+<style>
+/* ------------------------------------------------------------------ tokens */
+:root{
+  --ground:#f6f7f9; --panel:#ffffff; --sunk:#eef0f4;
+  --ink:#151922; --ink-2:#4a5262; --ink-3:#798296;
+  --rule:#d9dde5; --rule-2:#e8ebf0;
+  --accent:#2c7f9b;            /* slate-cyan: structure and interaction */
+  --live:#2f7d5b; --partial:#a8761c; --blocked:#b04a3d; --held:#7a53a8;
+  --live-bg:#e6f2ec; --partial-bg:#faf0dd; --blocked-bg:#f8e8e5; --held-bg:#efe9f7;
+  --shadow:0 1px 2px rgba(20,26,38,.06),0 8px 24px -12px rgba(20,26,38,.18);
+  --mono:"Cascadia Code","Cascadia Mono",Consolas,"SF Mono",ui-monospace,monospace;
+  --sans:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --ground:#0f1218; --panel:#161b24; --sunk:#1c222d;
+    --ink:#e7eaf1; --ink-2:#a7b0c0; --ink-3:#727d90;
+    --rule:#28303d; --rule-2:#1f2733;
+    --accent:#5cb3cd;
+    --live:#5fbf92; --partial:#d6a447; --blocked:#e07a6b; --held:#ab8ad9;
+    --live-bg:#14261e; --partial-bg:#2a2113; --blocked-bg:#2b1a17; --held-bg:#211a2e;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0f1218; --panel:#161b24; --sunk:#1c222d;
+  --ink:#e7eaf1; --ink-2:#a7b0c0; --ink-3:#727d90;
+  --rule:#28303d; --rule-2:#1f2733;
+  --accent:#5cb3cd;
+  --live:#5fbf92; --partial:#d6a447; --blocked:#e07a6b; --held:#ab8ad9;
+  --live-bg:#14261e; --partial-bg:#2a2113; --blocked-bg:#2b1a17; --held-bg:#211a2e;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+}
+:root[data-theme="light"]{
+  --ground:#f6f7f9; --panel:#ffffff; --sunk:#eef0f4;
+  --ink:#151922; --ink-2:#4a5262; --ink-3:#798296;
+  --rule:#d9dde5; --rule-2:#e8ebf0;
+  --accent:#2c7f9b;
+  --live:#2f7d5b; --partial:#a8761c; --blocked:#b04a3d; --held:#7a53a8;
+  --live-bg:#e6f2ec; --partial-bg:#faf0dd; --blocked-bg:#f8e8e5; --held-bg:#efe9f7;
+  --shadow:0 1px 2px rgba(20,26,38,.06),0 8px 24px -12px rgba(20,26,38,.18);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--sans);font-size:15px;line-height:1.55;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px 96px}
+h1,h2,h3{text-wrap:balance;margin:0}
+a{color:var(--accent)}
+code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ------------------------------------------------------------------ readout */
+.readout{border-bottom:1px solid var(--rule);background:var(--panel);
+  position:sticky;top:0;z-index:50;box-shadow:var(--shadow)}
+.readout-in{max-width:1180px;margin:0 auto;padding:14px 20px;
+  display:flex;flex-wrap:wrap;gap:12px 26px;align-items:baseline}
+.brand{font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:.02em}
+.brand span{color:var(--ink-3);font-weight:400}
+.stamp{font-family:var(--mono);font-size:12px;color:var(--ink-3);
+  display:flex;gap:16px;flex-wrap:wrap;margin-left:auto}
+.stamp b{color:var(--ink-2);font-weight:600}
+
+/* drift banner — the whole point of the board */
+.drift{background:var(--blocked-bg);border-bottom:1px solid var(--blocked);
+  color:var(--ink);font-size:13px}
+.drift-in{max-width:1180px;margin:0 auto;padding:10px 20px;
+  display:flex;gap:10px;align-items:flex-start}
+.drift .tag{font-family:var(--mono);font-size:11px;font-weight:700;
+  letter-spacing:.08em;color:var(--blocked);white-space:nowrap;padding-top:2px}
+
+/* ------------------------------------------------------------------- tabs */
+.tabs{display:flex;gap:2px;flex-wrap:wrap;margin:26px 0 0;
+  border-bottom:1px solid var(--rule)}
+.tab{appearance:none;border:1px solid transparent;border-bottom:none;
+  background:none;color:var(--ink-3);font-family:var(--mono);font-size:12.5px;
+  letter-spacing:.03em;padding:9px 15px;cursor:pointer;border-radius:5px 5px 0 0;
+  margin-bottom:-1px}
+.tab:hover{color:var(--ink)}
+.tab[aria-selected="true"]{background:var(--panel);border-color:var(--rule);
+  color:var(--ink);font-weight:700}
+.tab .n{color:var(--ink-3);font-weight:400}
+.tab:focus-visible,.chip:focus-visible,.dec-opt:focus-visible,
+.cap-row:focus-visible,.slot:focus-visible{outline:2px solid var(--accent);
+  outline-offset:2px}
+.view[hidden]{display:none}
+.view{padding-top:26px}
+
+/* ------------------------------------------------------------------ pieces */
+.lede{color:var(--ink-2);max-width:66ch;margin:0 0 22px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 8px}
+.sec{margin:38px 0 0}
+.sec > h2{font-size:19px;letter-spacing:-.01em;margin-bottom:4px}
+.sec > .sub{color:var(--ink-3);font-size:13.5px;margin:0 0 16px;max-width:70ch}
+
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:9px;
+  box-shadow:var(--shadow)}
+
+/* status pills */
+.pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
+  font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  padding:2px 7px;border-radius:3px;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.s-live{color:var(--live);background:var(--live-bg)}
+.s-partial{color:var(--partial);background:var(--partial-bg)}
+.s-blocked{color:var(--blocked);background:var(--blocked-bg)}
+.s-held{color:var(--held);background:var(--held-bg)}
+/* Deliberately neither green nor red, and deliberately not invisible. "I could
+   not look" is a THIRD state; rendering it in either of the other two colours
+   is the exact defect the goals section was added to fix. Hollow dot, so it
+   cannot be mistaken at a glance for a filled status. */
+.s-unmeasured{color:var(--ink-3);background:transparent;
+  box-shadow:inset 0 0 0 1px var(--rule)}
+.s-unmeasured::before{background:transparent;box-shadow:inset 0 0 0 1.5px currentColor}
+
+/* -------------------------------------------------------- ORG §9 goals axis */
+.goal{padding:20px 22px;margin-bottom:14px}
+.goal-h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.goal-h h3{font-size:17px;margin:0;letter-spacing:-.01em}
+.goal-own{font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.claim{border-top:1px solid var(--rule-2);padding:14px 0 2px;margin-top:12px}
+.claim:first-of-type{border-top:0}
+.kind{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;padding:2px 6px;border-radius:3px;
+  color:var(--ink-2);background:var(--rule-2)}
+.fig{font-family:var(--mono);font-size:22px;font-weight:700;letter-spacing:-.02em}
+.fig-un{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--ink-3)}
+/* The limit sits WITH the figure, never below the fold: `1655/1655` alone is
+   the shape that reads as "the data is safe" to someone who has not read three
+   documents. */
+.limit{border-left:2px solid var(--partial);padding:8px 0 8px 11px;margin:10px 0 0;
+  font-size:12.5px;color:var(--ink-2)}
+.prov{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:7px}
+
+/* ------------------------------------------------- held decisions (primary) */
+.dec{border-left:3px solid var(--held);padding:22px 24px;margin-bottom:18px}
+.dec h3{font-size:17.5px;margin:8px 0 6px;letter-spacing:-.01em}
+.dec .why{color:var(--ink-2);font-size:14px;margin:0 0 16px;max-width:72ch}
+.ev{background:var(--sunk);border-radius:7px;padding:14px 16px;margin:0 0 16px}
+.ev h4{font-family:var(--mono);font-size:11px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 9px;font-weight:700}
+.ev ul{margin:0;padding-left:18px;font-size:13.5px;color:var(--ink-2)}
+.ev li{margin:5px 0}
+.ev b{color:var(--ink);font-weight:600}
+.dec-opts{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.dec-opt{text-align:left;background:var(--panel);border:1px solid var(--rule);
+  border-radius:7px;padding:13px 15px;cursor:pointer;font:inherit;color:inherit;
+  transition:border-color .12s,background .12s}
+.dec-opt:hover{border-color:var(--held)}
+.dec-opt[aria-pressed="true"]{border-color:var(--held);background:var(--held-bg);
+  box-shadow:inset 0 0 0 1px var(--held)}
+.dec-opt .k{font-family:var(--mono);font-size:11px;font-weight:700;
+  letter-spacing:.07em;color:var(--held);display:block;margin-bottom:4px}
+.dec-opt .t{font-weight:600;font-size:14px;display:block;margin-bottom:5px}
+.dec-opt .d{font-size:12.5px;color:var(--ink-3);line-height:1.45}
+.consequence{margin-top:12px;border-radius:7px;padding:13px 16px;font-size:13.5px;
+  background:var(--held-bg);border:1px solid var(--held);color:var(--ink)}
+.consequence[hidden]{display:none}
+.consequence .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--held);font-weight:700;display:block;
+  margin-bottom:5px}
+
+/* ------------------------------------------------------ capability matrix */
+.filters{display:flex;gap:7px;flex-wrap:wrap;margin:0 0 14px;align-items:center}
+.chip{appearance:none;font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;
+  padding:5px 11px;border-radius:20px;border:1px solid var(--rule);
+  background:var(--panel);color:var(--ink-2);cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.chip[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);
+  color:var(--ground);font-weight:700}
+.filters .lbl{font-family:var(--mono);font-size:11px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-3);margin-right:3px}
+
+.cap-list{display:flex;flex-direction:column;gap:0}
+.cap-row{display:grid;grid-template-columns:minmax(150px,190px) 96px 1fr auto;
+  gap:14px;align-items:baseline;padding:11px 16px;border:1px solid var(--rule);
+  border-bottom:none;background:var(--panel);cursor:pointer;text-align:left;
+  font:inherit;color:inherit;width:100%}
+.cap-row:first-child{border-radius:8px 8px 0 0}
+.cap-row:last-of-type{border-bottom:1px solid var(--rule);border-radius:0 0 8px 8px}
+.cap-row:hover{background:var(--sunk)}
+.cap-row .nm{font-family:var(--mono);font-size:13px;font-weight:600}
+.cap-row .nm i{color:var(--ink-3);font-style:normal;font-weight:400}
+.cap-row .src{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.cap-row .gist{font-size:13px;color:var(--ink-2);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.cap-row.open .gist{white-space:normal}
+.cap-detail{border:1px solid var(--rule);border-top:none;background:var(--sunk);
+  padding:14px 18px;font-size:13.5px;color:var(--ink-2);line-height:1.6}
+.cap-detail[hidden]{display:none}
+.cap-detail .meta{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
+  margin-bottom:9px;display:flex;gap:18px;flex-wrap:wrap}
+.empty{padding:26px;text-align:center;color:var(--ink-3);font-size:13.5px;
+  border:1px dashed var(--rule);border-radius:8px}
+
+/* bar */
+.bar{display:flex;height:9px;border-radius:5px;overflow:hidden;margin:0 0 8px;
+  border:1px solid var(--rule)}
+.bar i{display:block}
+.bar .b-live{background:var(--live)} .bar .b-partial{background:var(--partial)}
+.bar .b-blocked{background:var(--blocked)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;
+  color:var(--ink-3);margin-bottom:20px}
+.legend b{color:var(--ink);font-weight:700}
+
+/* ------------------------------------------------------- companion demo */
+.demo-note{border:1px solid var(--partial);background:var(--partial-bg);
+  border-radius:8px;padding:13px 16px;font-size:13.5px;margin:0 0 20px}
+.demo-note b{font-family:var(--mono);font-size:11px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--partial);display:block;margin-bottom:4px}
+.demo-grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(288px,1fr))}
+.dpanel{padding:0;overflow:hidden}
+.dpanel > header{display:flex;align-items:center;gap:9px;padding:11px 15px;
+  border-bottom:1px solid var(--rule-2);background:var(--sunk)}
+.dpanel > header h4{margin:0;font-family:var(--mono);font-size:12.5px;
+  letter-spacing:.04em;font-weight:700}
+.dpanel > header .cnt{margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--ink-3)}
+.slots{display:flex;flex-direction:column}
+.slot{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:baseline;
+  padding:9px 15px;border-bottom:1px solid var(--rule-2);text-align:left;
+  background:none;border-left:none;border-right:none;border-top:none;
+  font:inherit;color:inherit;cursor:pointer;width:100%}
+.slot:last-child{border-bottom:none}
+.slot:hover{background:var(--sunk)}
+.slot .k{font-size:13px;color:var(--ink-2)}
+.slot .v{font-family:var(--mono);font-size:13.5px;font-weight:600;text-align:right}
+.slot .v.no{color:var(--ink-3);font-weight:400;font-size:12px;font-style:italic}
+.slot .v.cav{color:var(--partial)}
+.slot .caveat{grid-column:1/-1;font-size:12.5px;color:var(--ink-2);
+  background:var(--sunk);border-left:2px solid var(--partial);padding:9px 12px;
+  margin-top:7px;border-radius:0 5px 5px 0;line-height:1.5}
+.slot .caveat[hidden]{display:none}
+.slot .caveat.blk{border-left-color:var(--blocked)}
+.feed{max-height:230px;overflow-y:auto}
+.feed .ln{padding:6px 15px;border-bottom:1px solid var(--rule-2);
+  font-family:var(--mono);font-size:12px;display:flex;gap:9px}
+.feed .ln:last-child{border-bottom:none}
+.feed .t{color:var(--ink-3);flex-shrink:0}
+.nm-w{color:var(--ink)} .nm-g{color:var(--live)} .nm-r{color:var(--blocked)}
+.nm-y{color:var(--partial)}
+
+/* ---------------------------------------------------------------- tables */
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);
+  padding:9px 14px;border-bottom:1px solid var(--rule);font-weight:700}
+.tbl td{padding:10px 14px;border-bottom:1px solid var(--rule-2);vertical-align:top}
+.tbl tr:last-child td{border-bottom:none}
+.tbl td.m{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.scroller{overflow-x:auto;border:1px solid var(--rule);border-radius:8px;
+  background:var(--panel)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
+
+/* metric tiles */
+.tiles{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.tile{padding:15px 17px}
+.tile .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:7px}
+.tile .v{font-family:var(--mono);font-size:25px;font-weight:700;
+  font-variant-numeric:tabular-nums;line-height:1.1;letter-spacing:-.02em}
+.tile .d{font-size:12px;color:var(--ink-3);margin-top:6px;line-height:1.4}
+.tile .prov{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+  margin-top:9px;padding-top:8px;border-top:1px solid var(--rule-2)}
+
+/* progress */
+.prog{height:7px;background:var(--sunk);border-radius:4px;overflow:hidden;
+  margin:9px 0 6px;border:1px solid var(--rule)}
+.prog i{display:block;height:100%;background:var(--accent)}
+
+.foot{margin-top:44px;padding-top:20px;border-top:1px solid var(--rule);
+  font-size:12.5px;color:var(--ink-3);max-width:74ch}
+.foot code{font-size:12px;background:var(--sunk);padding:1px 5px;border-radius:3px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+@media (max-width:640px){
+  .cap-row{grid-template-columns:1fr;gap:5px}
+  .stamp{margin-left:0}
+}
+</style>
+
+<div id="drift"></div>
+
+<div class="readout">
+  <div class="readout-in">
+    <div class="brand">co-client-re <span>/ show and tell</span></div>
+    <div class="stamp" id="stamp"></div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="tabs" role="tablist" id="tabs">
+    <button class="tab" role="tab" data-v="decisions" aria-selected="true">held for you <span class="n" id="t-dec"></span></button>
+    <button class="tab" role="tab" data-v="goals" aria-selected="false">the three goals <span class="n" id="t-goals"></span></button>
+    <button class="tab" role="tab" data-v="pi2" aria-selected="false">tonight <span class="n" id="t-pi2"></span></button>
+    <button class="tab" role="tab" data-v="capabilities" aria-selected="false">what works <span class="n" id="t-cap"></span></button>
+    <button class="tab" role="tab" data-v="demo" aria-selected="false">drive the companion</button>
+    <button class="tab" role="tab" data-v="found" aria-selected="false">found today <span class="n" id="t-found"></span></button>
+    <button class="tab" role="tab" data-v="teams" aria-selected="false">from the teams <span class="n" id="t-team"></span></button>
+    <button class="tab" role="tab" data-v="ground" aria-selected="false">on the ground</button>
+  </div>
+
+  <!-- ============================================================ DECISIONS -->
+  <section class="view" id="v-decisions" role="tabpanel">
+    <p class="eyebrow">two decisions, both measured, neither acted on</p>
+    <p class="lede">Nothing below is a ticket. Each one is a fork someone already
+      did the measuring for, and each is waiting on a person because the cost of
+      being wrong lands outside the code — on a live public service, or on every
+      derived file across three installs. Pick an option to see what it commits you to.</p>
+    <div id="decisions"></div>
+  </section>
+
+  <!-- ================================================================ GOALS -->
+  <section class="view" id="v-goals" role="tabpanel" hidden>
+    <p class="eyebrow">ORG §9 · the axis this board did not have</p>
+    <h2 style="font-size:19px;margin-bottom:6px">The three goals</h2>
+    <p class="lede">Every other section of this board is organised by
+      <b>subsystem</b> — rig, git, register, capabilities, clients, extraction,
+      opcodes, corrections, services, repo. Eleven of them, and not one is a
+      <b>goal</b>. So the board could not answer <i>“is goal 2 advancing”</i> at
+      all — and <b>a ledger with no row for a class of work reports the same
+      thing for <i>this class is fine</i> and <i>this class is invisible to
+      me</i>.</b> These rows are that missing axis.
+      <b>Nothing below is a status.</b> A claim renders a figure with the sha it
+      was measured at and its age, or it renders one of five words for
+      <i>I could not read a figure</i> — none of which is green, and none of
+      which is red.</p>
+    <div id="goals-note"></div>
+    <div id="goals"></div>
+  </section>
+
+  <!-- ================================================================= PI-2 -->
+  <section class="view" id="v-pi2" role="tabpanel" hidden>
+    <p class="eyebrow">five teams pushing in parallel · what has actually landed</p>
+    <h2 style="font-size:19px;margin-bottom:6px">Tonight</h2>
+    <p class="lede">The answer to <i>"what's new"</i>, without having to ask anyone.
+      <b>A row with no source renders as unsourced — never as a zero, and never as
+      a number.</b> An empty figure here means nobody has measured it yet, which is
+      a different statement from <i>measured and found to be none</i>, and the two
+      are not allowed to look alike.</p>
+    <div id="corrections"></div>
+    <div id="yours"></div>
+    <div id="pi2"></div>
+    <div class="sec">
+      <h2>The eleven undecoded opcodes</h2>
+      <p class="sub">Measured off the owner's live capture, union across both
+        clients. <b>Parsing and confirmed are shown separately</b> — a mapper that
+        parses has not been tested against traffic, and calling that "cleared"
+        is the difference this table exists to keep.</p>
+      <div id="opcodes"></div>
+    </div>
+  </section>
+
+  <!-- ========================================================= CAPABILITIES -->
+  <section class="view" id="v-capabilities" role="tabpanel" hidden>
+    <p class="eyebrow">the companion's own honesty ledger, read out of the source</p>
+    <h2 style="font-size:19px;margin-bottom:6px">What works, and what only looks like it works</h2>
+    <div id="silent"></div>
+    <div id="suite"></div>
+    <h3 style="font-size:16px;margin:34px 0 6px">The declared ledger</h3>
+    <p class="lede">Read live from <code>CAPABILITIES</code> in
+      <code>capture/companion.py</code> — not transcribed. Every one of these is a
+      thing the dashboard can be asked to show; the status is what the project is
+      willing to claim about it. <b>More than half are not fully trusted</b>, and
+      that is the interesting half. Click any row for what would move it.</p>
+    <div class="bar" id="cap-bar"></div>
+    <div class="legend" id="cap-legend"></div>
+    <div class="filters" id="cap-filters"></div>
+    <div class="cap-list" id="cap-list"></div>
+    <div id="cap-orphan"></div>
+  </section>
+
+  <!-- ================================================================= DEMO -->
+  <section class="view" id="v-demo" role="tabpanel" hidden>
+    <p class="eyebrow">the companion, with invented data, driven by real statuses</p>
+    <h2 style="font-size:19px;margin-bottom:6px">Drive the COmpanion</h2>
+    <p class="lede">This is what the dashboard puts in front of you when a
+      character is logged in. <b>Every value here is invented</b> — no client was
+      touched to draw it. What is <i>not</i> invented is the status behind each
+      field: a value the project cannot stand behind is drawn exactly as the real
+      COmpanion would draw it. Click any field to see why it reads the way it does.</p>
+    <div class="demo-note">
+      <b>The real thing is running — this is the map of it</b>
+      A working demo of the actual COmpanion is served by
+      <code>demo.py</code> on <b>http://127.0.0.1:8898</b> (the live companion is
+      8899; a demo must never answer on that port). It invents an entire wire and
+      feeds it through the <i>real</i> decoders and the <i>real</i> session fold,
+      so what you drive there is the genuine pipeline — 6 players, 8 monsters,
+      3 guilds with ally and enemy relations, chat, ground items and a kill feed,
+      with <b>no client attached and no capture read</b>. The grid below is the
+      same picture, readable without starting anything.
+      <br><br>
+      <b style="display:inline;color:var(--ink)">Expect the memory panel to be empty there.</b>
+      That is not a gap in the demo. Those values cannot be faked without faking
+      the evidence <i>grades</i> that decide whether a value may be shown at all —
+      which is the one thing this project's honesty machinery exists to prevent.
+    </div>
+    <div id="services"></div>
+    <div id="cco"></div>
+    <div class="demo-grid" id="demo"></div>
+  </section>
+
+  <!-- ================================================================ FOUND -->
+  <section class="view" id="v-found" role="tabpanel" hidden>
+    <p class="eyebrow">turned up by building this board, not by looking for them</p>
+    <h2 style="font-size:19px;margin-bottom:6px">Found today</h2>
+    <p class="lede">Each of these has a reproduction. Nothing here is fixed
+      unless it says so; they are reported so somebody can own them.</p>
+    <div id="signature"></div>
+    <div id="found"></div>
+  </section>
+
+  <!-- ================================================================ TEAMS -->
+  <section class="view" id="v-teams" role="tabpanel" hidden>
+    <p class="eyebrow">what the other teams landed, and who is standing where</p>
+    <h2 style="font-size:19px;margin-bottom:6px">From the teams</h2>
+    <p class="lede">Results reported to this board by their owners. Each is
+      rendered with the instrument that produced it, because in three of these
+      the instrument <i>is</i> the finding.</p>
+    <div id="teamfindings"></div>
+    <h3 style="font-size:16px;margin:34px 0 6px">Who is standing where</h3>
+    <p class="lede">Counted from <code>git worktree list</code>, not from branches
+      on the remote — a branch says work happened, a worktree says somebody is
+      standing in it right now.</p>
+    <div class="scroller"><table class="tbl" id="teams"></table></div>
+    <div class="sec">
+      <h2>The register</h2>
+      <p class="sub">Refuted claims, kept where the error would happen. This is the
+        project's memory of being wrong.</p>
+      <div class="tiles" id="reg"></div>
+    </div>
+  </section>
+
+  <!-- =============================================================== GROUND -->
+  <section class="view" id="v-ground" role="tabpanel" hidden>
+    <p class="eyebrow">things that are moving while you read this</p>
+    <h2 style="font-size:19px;margin-bottom:6px">On the ground</h2>
+    <p class="lede">Two client extractions are in flight. Each was sampled twice
+      with a gap, because one count cannot tell "finished at n" from "still
+      climbing through n" — and that is the only thing worth knowing.</p>
+    <div id="extraction"></div>
+    <div class="sec">
+      <h2>Clients on disk</h2>
+      <p class="sub">Discovered by listing, never hardcoded — <code>6609-x\app\*</code>
+        is moving to <code>Clients\6609</code> and <code>7878-x</code> follows it.</p>
+      <div class="scroller"><table class="tbl" id="clients"></table></div>
+    </div>
+    <div class="sec">
+      <h2>Repo shape</h2>
+      <div class="tiles" id="shape"></div>
+    </div>
+  </section>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+const SNAP = /*__SNAPSHOT__*/{};
+
+/* ------------------------------------------------------------------ decisions
+   Hand-written because they are arguments, not measurements. Every figure
+   inside them is quoted from the owning document and cites it, so a reader can
+   go and check rather than trust this page. */
+const DECISIONS = [
+  {
+    id:"prov",
+    tag:"one-way door",
+    title:"Provenance: ship the cheap warning, go straight to the correct fix, or stop and widen the net first",
+    doc:"docs/provenance_staleness.md §7",
+    why:`<code>verdict()</code> compares which install produced a file and nothing
+      else. So a file built from this install by an older version of its own tool
+      comes back <b>MATCH</b>, confidently. The measurement that was commissioned
+      to answer "how do we detect stale?" came back with a different question.`,
+    evidence:[
+      `<b>10 of 20</b> stamped artefacts are stale <b>right now</b>, and the tool says <code>match</code> on every one.`,
+      `<b>80 of 100</b> derived artefacts carry <b>no stamp at all</b> — including <code>out/wdf/</code>'s ten.`,
+      `Those ten are the shared inputs whose staleness poisons <code>meshtex</code> in the first place. <b>The files causing the problem are in the unstamped 80.</b>`,
+      `<code>generated</code> and <code>tool</code> are written into every stamp and read by nothing.`,
+      `The reordering came from a two-minute <code>rglob</code> that was nearly not run.`
+    ],
+    options:[
+      {k:"B",t:"Ship the warning now",d:"Compare tool commit. Cheap, reversible, catches the 10 stale today.",
+       c:`Catches today's 10 and nothing else. Leaves the 80 unstamped, so the
+          inputs that <i>cause</i> the staleness stay invisible — you would be
+          improving the part already best understood. Reversible, which is the
+          real argument for it.`},
+      {k:"C",t:"Go straight to the correct fix",d:"Input fingerprint in the stamp. Complete — and unshippable in reverse.",
+       c:`Correct and complete. Also a <b>one-way door</b>: a schema bump rewrites
+          the stamp on every derived artefact across three installs and there is
+          no migration back. Doing it before the 80 are stamped means doing it
+          twice.`},
+      {k:"—",t:"Neither yet — stamp the 80 first",d:"Settle the scoping question before the design one.",
+       c:`The document's own reading. A comparand built for the stamped 20 cannot
+          reach the thing whose age is the reason the 20 go stale. Costs a round
+          of work before any detection improves, and it is the only option that
+          makes the other two cheaper rather than wasted.`}
+    ]
+  },
+  {
+    id:"map",
+    tag:"touches a live public service",
+    title:"The map verb: run the read-only probe, and only then decide about restarting a live server",
+    doc:"docs/handoff_map_verb.md §5",
+    why:`The root cause is known and small: <code>ConquerDirectory = ""</code> in
+      <code>server/redux/Redux/Common.cs:25</code>, so the validator was handed no
+      client directory, loaded no <code>.DMap</code> geometry, and fell back to
+      TinyMap's own <b>empty</b> dictionary. Nothing is deployed. The fix is a
+      one-line path and a rebuild — on a box carrying live sessions.`,
+    evidence:[
+      `<b>Step A is read-only and takes about a minute.</b> It is not a warm-up; it decides whether B is even meaningful.`,
+      `If <code>map &lt;char&gt; 1002 60000 60000</code> returns <code>OK</code>, <b>stop</b> — the geometry refusal is not working and B would be applied on a false premise.`,
+      `B's success criterion is "the coordinate probe is now refused". If A already returns <code>OK</code>, you cannot tell B's effect from B's absence.`,
+      `B stops and rebuilds the Redux server. <b>Four ImConquer clients have been up since 8–9 August holding no <code>client.lock</code></b> — very likely real sessions on the public service.`,
+      `Until B passes, <code>hunt --stimulus map</code> stays forbidden: the verb cannot measure what it is being asked to measure.`
+    ],
+    options:[
+      {k:"A",t:"Run step A only",d:"Read-only probe. Confirms or kills the diagnosis for ~1 minute of risk.",
+       c:`The only option with no exposure. Returns one of two answers, and both are
+          worth having: a refusal confirms the diagnosis and unlocks the decision
+          about B, an <code>OK</code> refutes it and <b>saves you from restarting a
+          live service for nothing</b>.`},
+      {k:"B",t:"A then B, in one sitting",d:"Point ConquerDirectory at the 5065 install, rebuild, restart.",
+       c:`Fixes it properly and unblocks the <code>Map</code> discriminator and the
+          <code>map</code> stimulus. Also <b>stops a server other people are
+          connected to</b>, on a box where sessions are running outside our
+          coordination. Needs a window when the box is genuinely idle — which
+          nobody has confirmed it ever is.`},
+      {k:"—",t:"Neither — leave it standing",d:"The verb stays forbidden, the discriminator stays blocked.",
+       c:`Costs nothing today and keeps costing quietly: every question needing map
+          geometry stays unanswerable, and the standing warning has to be
+          remembered by every person every time — which the project has already
+          written down as "not a control".`}
+    ]
+  }
+];
+
+/* -------------------------------------------------------------- demo values
+   Invented. Chosen to look like a real mid-session character so the shape is
+   legible, and deliberately NOT chosen to look impressive. `k` names the
+   capability whose real status decides how each is drawn. */
+const DEMO = {
+  character:{icon:"character",fields:[
+    ["identity","character/identity","Ashcroft  ·  uid 1000942"],
+    ["level","character/hp","117"],
+    ["hp","character/hp","4,820 / 5,240"],
+    ["mana","character/mana","1,105 / 1,340"],
+    ["stamina","character/stamina","64 / 100"],
+    ["silver","character/silver","18,442,150"],
+    ["durability","character/durability","41 / 75  ·  headgear"]
+  ]},
+  inventory:{fields:[
+    ["items","inventory/items","38 in bag  ·  3 equipped"],
+    ["sockets","inventory/sockets","raw 7=3  8=255  9=255"],
+    ["containers","inventory/containers","hat · jerkin · bow"],
+    ["plus","inventory/plus","22 items at +1 or better"]
+  ]},
+  ground:{fields:[
+    ["items","ground/items","6 on the ground nearby"],
+    ["quality / plus filter","ground/quality_plus",null]
+  ]},
+  metrics:{fields:[
+    ["exp rate","metrics/exp_rate","11.3 M / hour"],
+    ["silver rate","metrics/silver_rate","+142,000 / hour"],
+    ["damage (10 s dps)","metrics/damage","8,410"],
+    ["kill rate","metrics/kill_rate","94 / hour"]
+  ]},
+  kills:{fields:[
+    ["monster tally","kills/monster_tally","234 this session"],
+    ["player kill feed","kills/feed","0 — none seen"]
+  ]},
+  players:{fields:[
+    ["in view","players/list","7"],
+    ["name colour","players/char_colour","from status bitfield"],
+    ["guild names","players/guild_name","27 guilds known"],
+    ["guild colour","players/guild_colour","6 ally · 8 enemy · own guild unknown"]
+  ]}
+};
+const CHAT = [
+  ["14:03:11","nm-w","Ashcroft","heading to the twin city gate"],
+  ["14:03:24","nm-g","Rowan","[guild] two of us on the north spawn"],
+  ["14:03:31","nm-y","Halberd","wts +5 blade, pm me"],
+  ["14:03:47","nm-r","Vex","[2010] &lt;channel 2010 — undocumented in both wikis&gt;"],
+  ["14:04:02","nm-w","Ashcroft","taking the east ramp"],
+  ["14:04:19","nm-g","Rowan","[guild] clear here"]
+];
+const PLAYERS = [
+  ["Rowan","nm-g","Rogue"],["Halberd","nm-w","—"],["Vex","nm-r","Courtesan"],
+  ["Sable","nm-w","—"],["Thistle","nm-g","Rogue"],["Marrow","nm-w","—"],
+  ["Quill","nm-w","Courtesan"]
+];
+
+/* ------------------------------------------------------------------- helpers */
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const n=v=>Number(v??0).toLocaleString("en-US");
+const cap=SNAP.capabilities||{rows:[],counts:{}};
+const byKey={};(cap.rows||[]).forEach(r=>byKey[r.panel+"/"+r.key]=r);
+
+function ago(iso){
+  if(!iso) return "";
+  const s=Math.max(0,(Date.now()-new Date(iso).getTime())/1000);
+  if(s<90) return Math.round(s)+"s ago";
+  if(s<5400) return Math.round(s/60)+" min ago";
+  if(s<172800) return Math.round(s/3600)+" h ago";
+  return Math.round(s/86400)+" d ago";
+}
+
+/* ---------------------------------------------------------------- readout */
+(function(){
+  const g=SNAP.git||{};
+  $("#stamp").innerHTML=
+    `<span>head <b>${esc(g.head)}</b></span>`+
+    `<span>origin/master <b>${esc(g.origin_master)}</b></span>`+
+    `<span>measured <b>${esc(SNAP.measured_at)}</b> <span id="age"></span></span>`;
+  const t=()=>{const e=$("#age");if(e)e.textContent="("+ago(SNAP.measured_at)+")";};
+  t();setInterval(t,15000);
+
+  // The banner is a COUNT first. Two shas is a true statement nobody reads as
+  // a warning; "200 commits behind" is one nobody reads as fine.
+  const behind = g.behind, ahead = g.ahead;
+  // STALE means BEHIND, and nothing else. The first version also fired when the
+  // board was merely AHEAD of master -- a branch carrying master plus its own
+  // unmerged commits is not stale, it is early, and calling that "stale" would
+  // have taught the reader to ignore the one banner that must never be ignored.
+  // A banner that cries wolf is the third gate failure mode: widened until inert.
+  if(behind > 0){
+    const n_ = behind===null||behind===undefined ? null : behind;
+    const headline = n_
+      ? `This board is <b>${n(n_)} commit${n_===1?"":"s"} behind <code>origin/master</code></b>.`
+      : `This board was generated from a tree that is not <code>origin/master</code>.`;
+    const detail = n_
+      ? `It was generated from <code>${esc(g.head)}</code>; the remote is
+         <code>${esc(g.origin_master)}</code>${ahead?` (and ${n(ahead)} commit${ahead===1?"":"s"} ahead)`:``}.
+         <b>Every figure below describes the older tree</b> — work that landed since
+         is not here, and absence on this page is not evidence of absence in the
+         project. Re-run <code>py -3 tools/showandtell.py</code> to refresh.`
+      : `Re-run <code>py -3 tools/showandtell.py</code> from a tree at
+         <code>origin/master</code>.`;
+    $("#drift").innerHTML=`<div class="drift"><div class="drift-in">
+      <span class="tag">STALE</span>
+      <span>${headline} ${detail}</span></div></div>`;
+  } else {
+    // Say so explicitly. "No banner" is indistinguishable from "banner broken",
+    // which is the same failure this banner exists to prevent.
+    $("#drift").innerHTML=`<div class="drift" style="background:var(--live-bg);
+      border-bottom-color:var(--live)"><div class="drift-in">
+      <span class="tag" style="color:var(--live)">CURRENT</span>
+      <span>Generated from <code>${esc(g.head)}</code>, which contains
+      everything on <code>origin/master</code> as of ${esc(SNAP.measured_at)}${
+        ahead ? ` (plus ${n(ahead)} commit${ahead===1?"":"s"} not yet merged)` : ``}.
+      <b>Nothing has landed that this board has not measured.</b></span></div></div>`;
+  }
+})();
+
+/* ---------------------------------------------------------------- decisions */
+$("#decisions").innerHTML=DECISIONS.map(d=>`
+  <article class="card dec">
+    <span class="pill s-held">held · ${esc(d.tag)}</span>
+    <h3>${d.title}</h3>
+    <p class="why">${d.why}</p>
+    <div class="ev">
+      <h4>what was measured</h4>
+      <ul>${d.evidence.map(e=>`<li>${e}</li>`).join("")}</ul>
+    </div>
+    <div class="dec-opts">
+      ${d.options.map((o,i)=>`<button class="dec-opt" aria-pressed="false"
+         data-d="${d.id}" data-i="${i}">
+         <span class="k">option ${esc(o.k)}</span>
+         <span class="t">${esc(o.t)}</span>
+         <span class="d">${esc(o.d)}</span></button>`).join("")}
+    </div>
+    <div class="consequence" id="c-${d.id}" hidden></div>
+    <p style="margin:14px 0 0;font-family:var(--mono);font-size:11.5px;color:var(--ink-3)">
+      evidence: ${esc(d.doc)}</p>
+  </article>`).join("");
+
+$$(".dec-opt").forEach(b=>b.addEventListener("click",()=>{
+  const d=DECISIONS.find(x=>x.id===b.dataset.d), o=d.options[+b.dataset.i];
+  const on=b.getAttribute("aria-pressed")==="true";
+  $$(`.dec-opt[data-d="${d.id}"]`).forEach(x=>x.setAttribute("aria-pressed","false"));
+  const box=$("#c-"+d.id);
+  if(on){box.hidden=true;return;}
+  b.setAttribute("aria-pressed","true");
+  box.hidden=false;
+  box.innerHTML=`<span class="k">if you choose ${esc(o.t)}</span>${o.c}`;
+}));
+$("#t-dec").textContent=DECISIONS.length;
+
+/* ---------------------------------------------------------------- PI-2 ----
+   The six figures the sprint will be judged on. `figure: null` is the default
+   and it renders as UNSOURCED -- not 0, not "-", not a blank cell that reads as
+   nothing-found. "Nobody has measured this" and "measured, and it is none" are
+   different claims, and this board's whole argument is that they must not look
+   alike. Grades are [I] inferred / [V] verified and are never rounded up. */
+const PI2 = [
+  {what:"7878 item icons", who:"Parser", state:"awaiting",
+   gate:"Parser wires itemart for 7878",
+   figure:null, grade:null,
+   note:`The 5017/5517 catalog exists (11,227 and 12,908 served, art-miss 0 and 5).
+     <b>7878 has no coverage figure yet</b>, and it cannot be inferred from the
+     others — a different client with a different art chain.`},
+
+  {what:"7878 maps", who:"Parser", state:"awaiting",
+   gate:"the maps verb lands",
+   figure:null, grade:null,
+   note:`VibeCO already has <code>MapLibrary(7878)</code> at <b>984×984</b> where it
+     was <code>None</code>, so the library opens. <b>Coverage across maps is a
+     separate number and is not yet taken.</b>`},
+
+  {what:"Server.dat decrypt", who:"Explorer", state:"verified", grade:"V",
+   gate:"CONFIRMED — 4/4 independent decrypts",
+   figure:"4 / 4",
+   note:`The Redux <i>server</i> layer is now hijackable — read the config, patch
+     the modulus. <b>This is NOT a Redux layer falling and the board will not
+     score it as one.</b> It is a real unblock on the route toward them, and
+     folding it into the 4-NO count would make that count say something it has
+     not earned. <b>Two adjacent true things, kept apart on purpose.</b>`},
+
+  {what:"Redux layers broken", who:"Explorer", state:"awaiting",
+   gate:"each layer Explorer breaks", figure:null, grade:null,
+   baseline:"4 NO",
+   note:`Tracked as a <b>delta from 4-NO</b>, not as an absolute. Each layer that
+     falls moves it 4 → 3 → 2. <b>Rendering "4" as a current figure would be
+     wrong the moment one falls and right-looking until someone checked.</b>`},
+
+  {what:"Phase C — oracle tables", who:"RE NewFunc", state:"verified", grade:"V",
+   gate:"CONFIRMED — oracle enumerated",
+   figure:"1,655 tables",
+   note:`A measured count of what the oracle reaches. <b>Separate row from the
+     tracer below</b>, because they are different claims and one being green does
+     not advance the other.`},
+
+  {what:"Phase C — ndac.dll tracer", who:"RE NewFunc", state:"awaiting",
+   gate:"the Unicorn + DebugActiveProcess trace concludes",
+   figure:null, grade:null,
+   note:`<b>GREEN-LIT by the owner</b> — it was blocked by the harness classifier,
+     not by a technical wall, and that block is lifted. <b>Green-lit is not
+     concluded:</b> a trace that is permitted to run, and a trace that ran, and a
+     trace that concluded are three states. This row moves on the third.`},
+
+  {what:"Launcher autologin fix", who:"Quick Fix", state:"verified", grade:"V",
+   gate:"CONFIRMED — A/B against a running client, in one process",
+   figure:"graduated [I] → [V]",
+   note:`It was <b>[I]</b> here an hour ago on "built and green with no client",
+     which is evidence about the <i>harness</i>. It is <b>[V]</b> now because it
+     was run <b>against a live client, A/B in one process</b> — the same
+     condition twice with only the fix varying. <b>That is what the grade was
+     waiting for, and the row moved because the evidence moved.</b>`},
+
+  {what:"2032 MsgTaskDialog — no mapper at all", who:"unowned", state:"awaiting",
+   gate:"anyone writes a mapper for it",
+   figure:null, grade:null,
+   note:`<b>The busiest opcode in the capture and the only one of the eleven with
+     NO mapper</b> — 106 messages against MsgMagicInfo's 48. Six of the eleven are
+     now graded; this one cannot be graded because there is nothing to grade.
+     <br><br>
+     <b>And it sits outside the 1000-range entirely</b>, which the rest do not.
+     That is not a numbering quirk — it says the opcode space has structure
+     nothing in this project has accounted for, and <code>2032</code> is the only
+     evidence of it we hold. <b>NPC and quest dialog is also the surface most
+     likely to carry text worth reading.</b>`},
+
+  {what:"Opcode mappers", who:"CCO Plugin", state:"awaiting",
+   gate:"each mapper tested against captured traffic",
+   figure:null, grade:null,
+   note:`<b>0 of 11 confirmed.</b> See the table below — and note that a mapper
+     which parses is not a mapper which is confirmed. The nine assumed ones are
+     assumed <i>in the same way</i> the damage panel was, right up until it turned
+     out to be summing a kill counter.`},
+];
+
+/* ------------------------------------------------- the owner's own verdicts
+   The only figure on this board that moves while the owner plays. Read from
+   the LOG, not from the running app, so a session can be read after it ends --
+   a number that exists only while a server is up vanishes exactly when someone
+   comes to look at it.
+
+   `wrong` and `confirmed` are never totalled together: one says the guess was
+   bad, the other says the guess was GOOD, and a sum of the two says only that
+   somebody clicked. And "no log yet" is rendered as its own state, because the
+   loop never having been used and the loop finding nothing are different facts
+   that a zero would merge. */
+(function(){
+  const c = SNAP.corrections || {};
+  if(!c.exists){
+    $("#corrections").innerHTML=`
+      <article class="card dec" style="border-left-color:var(--held);margin-bottom:22px">
+        <span class="pill s-held">no verdicts recorded yet</span>
+        <h3>Your adjudications will appear here</h3>
+        <p class="why" style="margin-bottom:0"><b>The log does not exist yet</b> —
+          which is not the same as it being empty. Nothing has been judged because
+          the loop has not been used, and this row will fill in as you play.
+          <b>It reads the log rather than the running COmpanion</b>, so the session
+          can still be read after you close it.</p>
+      </article>`;
+    return;
+  }
+  const f = c.fields || [];
+  $("#corrections").innerHTML=`
+    <article class="card dec" style="border-left-color:var(--${c.loud?"blocked":"live"});margin-bottom:22px">
+      <span class="pill s-${c.loud?"blocked":"live"}">${
+        c.loud ? n(c.loud)+" loud" : "your verdicts"}</span>
+      <h3>What you judged while playing</h3>
+      <div class="tiles" style="margin:12px 0">
+        <div class="card tile"><div class="k">confirmed</div>
+          <div class="v" style="color:var(--live)">${n(c.confirmed)}</div>
+          <div class="d">you looked and the guess was right — this is what
+            promotes a grade</div></div>
+        <div class="card tile"><div class="k">wrong</div>
+          <div class="v" style="color:var(--partial)">${n(c.wrong)}</div>
+          <div class="d">the guess was bad; some carry a replacement, some only
+            say it is off</div></div>
+        <div class="card tile"><div class="k">loud</div>
+          <div class="v" style="color:var(--${c.loud?"blocked":"ink-3"})">${n(c.loud)}</div>
+          <div class="d">a <b>confirmed</b> field corrected — somebody measured
+            it and got it wrong</div></div>
+      </div>
+      <p style="margin:0 0 10px;font-size:13px;color:var(--ink-2)">
+        <b>Never totalled.</b> <code>confirmed</code> says a guess was good and
+        <code>wrong</code> says it was bad; a sum of the two says only that
+        somebody clicked.${c.unparsable?` <b>${n(c.unparsable)} line(s) could not
+        be parsed</b> and are counted rather than dropped.`:""}</p>
+      ${f.length?`<div class="scroller"><table class="tbl">
+        <thead><tr><th>field</th><th>confirmed</th><th>wrong</th>
+          <th>grade as shown</th></tr></thead><tbody>
+        ${f.map(x=>`<tr><td class="m">${esc(x.field)}</td>
+          <td class="m" style="color:var(--live)">${n(x.confirmed)}</td>
+          <td class="m" style="color:var(--partial)">${n(x.wrong)}</td>
+          <td class="m">${(x.grades||[]).map(esc).join(", ")}</td></tr>`).join("")}
+        </tbody></table></div>`:""}
+      <p style="margin:10px 0 0;font-size:12.5px;color:var(--ink-3)">
+        <b>Grades are the ones recorded at the time of the judgement</b>, not the
+        ones the mappers carry now. If a field is upgraded tomorrow, yesterday's
+        verdict keeps saying what was on screen when you answered it.</p>
+    </article>`;
+})();
+
+/* --------------------------------------------------- things YOU can touch
+   The owner asked for two controls: toggle the UI recommendations, and correct
+   COmpanion's guesses while playing. A board that reports on those without
+   saying how to REACH them fails the "learns by looking, not asking" standard
+   in the one place it was written for. Each row states where it is and what it
+   does — and a control that has not shipped says so plainly rather than being
+   omitted, because an absent row is indistinguishable from a control nobody
+   built. */
+const YOURS = [
+  {name:"Toggle the UI recommendations", where:"COMod → settings window",
+   state:"building", who:"COMod",
+   what:`Turn the recommendation surface off and on. Shipping alongside
+     performance, caching and thumbnail controls in the same window.`},
+  {name:"Adjudicate COmpanion's guesses while you play",
+   where:"COmpanion — hover any cell it could not stand behind",
+   state:"ready", who:"COmpanion",
+   what:`<b>Live now.</b> Two controls appear on hover, beside the value:
+     <br><br>
+     <span class="mono" style="font-size:12.5px">
+     <b>✓</b> &nbsp;"This value is correct" &nbsp;→ records it as <b>confirmed</b><br>
+     <b>✎</b> &nbsp;"This value is wrong" &nbsp;&nbsp;&nbsp;→ one prompt, records it as <b>wrong</b></span>
+     <br><br>
+     On cells marked <code>inferred</code>, <code>unproven</code>,
+     <code>capped</code> or <code>partial-gauge</code> — <b>not</b> on values the
+     server can stand behind, where a prompt on every cell is a prompt nobody
+     reads. Those can still be corrected from the pencil, and that is the path
+     that fires <b>loud</b>: somebody measured it and got it wrong.
+     <br><br>
+     <b>The ✓ is the half that matters and it nearly did not exist.</b> The loop
+     first recorded only wrongness — and a <code>?</code> field you look at and
+     confirm is exactly what promotes a grade, by the only person who can see the
+     right answer on their own screen. A lone "wrong?" asks you to notice an
+     error; the tick beside it asks you to <b>adjudicate</b>.
+     <br><br>
+     <b>The ✎ records even if you cancel out of naming a replacement.</b>
+     <i>"This is wrong and I do not know the right answer"</i> is a real
+     observation, and demanding the answer would lose the cases where you only
+     know something is off. Once answered the opposite half hides, and what you
+     have already judged stays visible.`},
+];
+$("#yours").innerHTML=`
+  <article class="card dec" style="border-left-color:var(--accent);margin-bottom:22px">
+    <span class="pill s-partial">for you to drive — in build</span>
+    <h3>Two controls you asked for, and where they will be</h3>
+    <div class="scroller" style="margin:12px 0 0"><table class="tbl">
+      <thead><tr><th>control</th><th>where</th><th>state</th><th>what it does</th></tr></thead>
+      <tbody>${YOURS.map(y=>`<tr>
+        <td class="m"><b>${esc(y.name)}</b></td>
+        <td class="m">${esc(y.where)}</td>
+        <td><span class="pill s-${y.state==="ready"?"live":"partial"}">${
+          esc(y.state)}</span></td>
+        <td style="font-size:12.5px;color:var(--ink-2)">${y.what}</td></tr>`).join("")}
+      </tbody></table></div>
+    <p style="margin:12px 0 0;font-size:12.5px;color:var(--ink-3)">
+      <b>Listed while still in build on purpose.</b> An absent row and a control
+      nobody built look identical, and this board's whole argument is that those
+      must not. When they ship these rows say <i>where to click</i>, not that they
+      exist.</p>
+    <p style="margin:10px 0 0;font-size:12.5px;color:var(--ink-2);
+      border-top:1px solid var(--rule-2);padding-top:10px">
+      <b>A rule this board will obey when it renders your corrections.</b> Each
+      correction records the grade <i>as it was rendered at the time</i>, and this
+      page reads grades <b>live</b> from the source — so those are two copies of
+      one fact that will diverge the moment a mapper is upgraded. <b>Yesterday's
+      correction must keep saying what it was answering.</b> The summary will
+      never be backfilled from the live table, because a record re-labelled with
+      a grade it never saw is no longer evidence of anything.</p>
+  </article>`;
+
+$("#pi2").innerHTML = PI2.map(d=>{
+  const st = d.state==="verified" ? ["live","VERIFIED"]
+           : d.state==="inferred" ? ["partial","INFERRED [I]"]
+           : ["held","NOT YET SOURCED"];
+  // The whole point: no figure -> say so in words, never render a digit.
+  const fig = d.figure!=null
+    ? `<span class="num" style="font-size:23px">${esc(d.figure)}</span>`
+    : `<span style="font-family:var(--mono);font-size:13px;color:var(--held)">
+         no measurement exists yet</span>`;
+  return `<article class="card dec" style="border-left-color:var(--${st[0]});margin-bottom:14px">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <span class="pill s-${st[0]}">${st[1]}</span>
+      <span class="mono" style="font-size:11.5px;color:var(--ink-3)">${esc(d.who)}</span>
+      ${d.grade?`<span class="pill s-partial">grade ${esc(d.grade)}</span>`:""}
+    </div>
+    <h3 style="font-size:16px">${esc(d.what)}</h3>
+    <div style="margin:6px 0 10px">${fig}${d.baseline?`
+      <span class="mono" style="font-size:12px;color:var(--ink-3)">
+        &nbsp;baseline ${esc(d.baseline)}</span>`:""}</div>
+    <p class="why" style="margin:0 0 10px">${d.note}</p>
+    <p style="margin:0;font-family:var(--mono);font-size:11.5px;color:var(--ink-3)">
+      becomes measurable when: ${esc(d.gate)}</p>
+  </article>`;}).join("");
+$("#t-pi2").textContent = PI2.filter(d=>d.state==="awaiting").length;
+
+/* The eleven undecoded opcodes. COUNTS are from the owner's live capture and
+   are a recorded observation -- that capture is gone and they cannot be
+   re-taken. GRADES are read LIVE from `pktfeed.py` every build, because a
+   hand-written "0 of 11 confirmed" is exactly the transcription this page
+   exists to stop trusting. The two halves have different provenance and the
+   table says so. */
+const SEEN = {2032:106, 1103:48, 1102:44, 1019:22, 1110:17, 1056:14,
+              1025:12, 1107:11, 1026:3, 1023:2, 1106:1};
+const NAMES = {2032:"MsgTaskDialog", 1103:"MsgMagicInfo", 1102:"MsgAccountSoftKb",
+               1019:"MsgFriend", 1110:"MsgMapInfo", 1056:"MsgTrade",
+               1025:"MsgWeaponSkill", 1107:"MsgSyndicate", 1026:"MsgTeamMember",
+               1023:"MsgTeam", 1106:"MsgSyndicateAttributeInfo"};
+(function(){
+  const og = SNAP.opcode_grades || {rows:[]};
+  const byOp = {}; (og.rows||[]).forEach(r=>byOp[r.op]=r);
+  const ops = Object.keys(SEEN).map(Number).sort((a,b)=>SEEN[b]-SEEN[a]);
+  const graded = ops.filter(o=>byOp[o] && byOp[o].graded);
+  const anyV = graded.filter(o=>byOp[o].V > 0);
+
+  $("#opcodes").innerHTML=`
+  <p style="margin:0 0 6px;font-size:14px">
+    <b>${graded.length} of ${ops.length} now have a graded mapper</b>, and
+    <b>${anyV.length}</b> carry at least one field at <code>V</code>.
+    <b>Grades are read from <code>capture/pktfeed.py</code> on every build</b> —
+    this table was a hand-written "0 of 11" an hour ago, which is the
+    transcription this page exists to stop trusting.</p>
+  <p style="margin:0 0 12px;font-size:12.5px;color:var(--ink-3)">
+    The <b>seen</b> column has different provenance: it is a recorded observation
+    from the owner's live capture, which has since ended. <b>It cannot be
+    re-measured and is not presented as current.</b></p>
+  <div class="scroller"><table class="tbl">
+    <thead><tr><th>opcode</th><th>name</th><th>seen</th><th>mapper</th>
+      <th>V</th><th>I</th><th>?</th><th>fields</th></tr></thead><tbody>
+    ${ops.map(o=>{
+      const r = byOp[o];
+      const has = r && r.graded;
+      const fields = has ? Object.entries(r.fields)
+        .map(([k,g])=>`<code>${esc(k)}</code>&thinsp;<b style="color:var(--${
+          g==="V"?"live":g==="I"?"partial":"held"})">${esc(g)}</b>`).join(" &nbsp;") : "";
+      return `<tr>
+        <td class="m">${o}</td><td class="m">${esc(NAMES[o]||"")}</td>
+        <td class="m">${n(SEEN[o])}</td>
+        <td><span class="pill s-${has?"partial":"blocked"}">${
+          has?"graded":"no mapper"}</span></td>
+        <td class="m" style="color:var(--live)">${has?r.V:""}</td>
+        <td class="m" style="color:var(--partial)">${has?r.I:""}</td>
+        <td class="m" style="color:var(--held)">${has?r.unknown:""}</td>
+        <td style="font-size:12px">${fields}</td></tr>`;}).join("")}
+    </tbody></table></div>
+  <p style="margin:12px 0 0;font-size:13px;color:var(--ink-2);max-width:76ch">
+    <b>A mapper that parses is not a mapper that is confirmed</b>, which is why
+    the fields are broken out rather than totalled. <b><code>1110
+    MsgMapInfo</code> is the row to read</b>: all four fields sit at
+    <code>?</code>, including <code>map_id</code> and <code>doc_id</code> — and
+    those two <b>cannot be separated by more capture</b>, because every sample so
+    far comes from one of the 59 maps where they are equal. Tomorrow's Step 0
+    walk into MysticCave or CageMatch is the state that separates them.
+    <b><code>2032</code> still has no mapper at all</b>, and it is the busiest of
+    the eleven.</p>`;
+})();
+
+/* --------------------------------------------------------- the silent one */
+/* Explorer's result, verified by the Director. It leads the tab because it is
+   "what works and what doesn't" in its most literal available form: a healthy
+   tool, a clean run, and a wrong answer, with every audible channel silent. */
+$("#silent").innerHTML=`
+  <article class="card dec" style="border-left-color:var(--blocked);margin-bottom:22px">
+    <span class="pill s-blocked">a green result that is wrong</span>
+    <h3>Every tool reports 6609's maps unchanged. 113 of them it has never seen.</h3>
+    <p class="why">6609's <b>184 loose <code>.DMap</code> files are byte-identical
+      to 6090's — 0 differing.</b> That is a true statement and every tool we have
+      returns it cleanly. The maps that actually changed are inside
+      <b>297 <code>.7z</code> archives no tool opens</b>, and <b>113 maps ship
+      archive-only</b>, so they are invisible to the entire toolchain rather than
+      merely unread.</p>
+    <div class="ev">
+      <h4>why nothing fired</h4>
+      <ul>
+        <li><b>A stale map is a valid map.</b> There is no malformed byte to
+          detect, no parse to fail, no checksum to mismatch — so every audible
+          channel stays correctly silent.</li>
+        <li>The failure needs a comparison nobody was making: <b>content present
+          in an archive against content present loose</b>.</li>
+        <li>It went unseen because the active install hid it. <b>5517 is 98.3%
+          honest</b>, so the loose files there really are the content. <b>6090 was
+          already 40% wrong</b> and nothing was asking.</li>
+      </ul>
+    </div>
+    <div class="ev">
+      <h4>what this costs the board — and the scope, measured rather than assumed</h4>
+      <ul>
+        <li><b>A status of <span class="pill s-live">live</span> means the code
+          path works. It does not mean the inputs are complete.</b> Those are
+          different claims, and only the first one is measured anywhere. Explorer's
+          result is that distinction biting: the code path worked perfectly, on the
+          wrong file.</li>
+        <li><b>The ledger below does not inherit it, and I checked rather than
+          assumed.</b> <code>capture/companion.py</code> and
+          <code>capture/pktfeed.py</code> contain <b>zero</b> references to
+          <code>.DMap</code> — the COmpanion is fed by packets and process memory,
+          so none of its 24 capabilities is a map-geometry consumer.</li>
+        <li><b>Twelve modules are</b>, and the gap lands there instead:
+          <code>core/dmap.py</code>, <code>core/colibrary.py</code>,
+          <code>client/gamemap.py</code>, and <code>tools/</code>'s
+          <code>coplay</code>, <code>mapedit</code>, <code>mapindex</code>,
+          <code>mapparts</code>, <code>puzzle</code>, <code>scene</code>,
+          <code>terrain</code>, <code>worldfx</code> and <code>test_viewer</code>.
+          <b>The viewer suite is in that list</b>, which is worth knowing about
+          any figure it produces.</li>
+      </ul>
+    </div>
+    <p style="margin:14px 0 0;font-family:var(--mono);font-size:11.5px;color:var(--ink-3)">
+      found by Explorer · verified by the Director · 2026-08-11</p>
+  </article>`;
+
+/* ------------------------------------------------------- ORG §9 goals axis */
+(function(){
+  const G=SNAP.goals; if(!G||!G.goals) return;
+  const box=$("#goals"); if(!box) return;
+  const c=G.counts||{};
+  const t=$("#t-goals"); if(t) t.textContent=`${G.measured}/${G.total}`;
+
+  /* Stated ONCE, as a property of the section. Two goals hit the same
+     circularity in different subsystems; making a reader diff two caveats to
+     notice that is the section failing at the one job only it can do. */
+  $("#goals-note").innerHTML=`
+    <article class="card" style="padding:16px 20px;margin-bottom:16px;
+      border-left:3px solid var(--partial)">
+      <div style="font-family:var(--mono);font-size:10.5px;font-weight:700;
+        letter-spacing:.07em;text-transform:uppercase;color:var(--partial)">
+        one limit, shared by two goals</div>
+      <p style="margin:8px 0 0;font-size:13px;color:var(--ink)">
+        ${esc(G.shared_circularity||"")}</p>
+    </article>
+    <p style="font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
+      margin:0 0 14px">
+      ${Object.entries(c).filter(([,v])=>v).map(([k,v])=>
+        `<b>${v}</b> ${esc(k.replace(/_/g," "))}`).join(" · ")}
+      · axis from <code>${esc(G.source||"")}</code></p>`;
+
+  const age=a=>{
+    if(!a) return "age UNKNOWN";
+    if(a.valid===null||a.valid===undefined)
+      return `age <b>UNKNOWN</b> — no sha this tree can resolve, which is <b>not</b> the same as up to date`;
+    if(a.valid)
+      return `<b>valid</b> — ${a.distance} commit${a.distance===1?"":"s"} back, <b>0</b> of its surface moved`;
+    return `<b>EXPIRED</b> — ${a.surface_changed} surface file${a.surface_changed===1?"":"s"} moved in ${a.distance} commit${a.distance===1?"":"s"}`;
+  };
+
+  box.innerHTML=G.goals.map(g=>{
+    const claims = g.claims.length ? g.claims.map(cl=>{
+      const f=cl.figure, p=cl.provenance||{}, a=p.age||{};
+      const head = f
+        ? `<div class="fig">${n(f.numerator)} / ${n(f.denominator)}</div>
+           <div style="font-size:12.5px;color:var(--ink-2);margin-top:2px">${esc(f.unit)}</div>`
+        : `<div class="fig-un">${esc((cl.state||"").toUpperCase().replace(/_/g," "))}</div>
+           <div style="font-size:12.5px;color:var(--ink-2);margin-top:2px">${esc(cl.detail||cl.state_means||"")}</div>`;
+      const beside = f && f.beside && f.beside.length
+        ? `<div class="scroller" style="margin:10px 0 0"><table class="tbl"><tbody>
+             ${f.beside.map(b=>`<tr><td class="m" style="width:90px">${
+               b.present?n(b.value):"—"}</td><td style="font-size:12.5px;color:var(--ink-2)">${
+               esc(b.label)}${b.present?"":" <i>(key absent from the artefact)</i>"}</td></tr>`).join("")}
+           </tbody></table></div>` : "";
+      const exits = (cl.exits||[]).length
+        ? `<div class="prov">exit codes mapped explicitly: ${cl.exits.map(e=>
+             `<b>${e.code}</b> ${esc(e.word)}`).join(" · ")} — <i>2 and 3 are
+             neither failures nor passes</i></div>` : "";
+      return `<div class="claim">
+        <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:9px">
+          <span class="kind">${esc(cl.kind)}</span>
+          <b style="font-family:var(--mono);font-size:13px">${esc(cl.name)}</b>
+          <span class="pill ${cl.passing?"s-live":"s-unmeasured"}">${
+            esc((cl.state||"").replace(/_/g," "))}</span>
+          <span style="font-size:12px;color:var(--ink-3)">${esc(cl.answers||"")}</span>
+        </div>
+        ${head}${beside}
+        <div class="prov">
+          measured at <code>${esc(p.commit||"—")}</code>${
+            p.exists&&!p.committed?" <b>(present but uncommitted — cannot be attributed to a sha)</b>":""} ·
+          ${age(a)}<br>
+          surface: <code>${esc((cl.surface||[]).join(", ")||"—")}</code><br>
+          source: <code>${esc(cl.command||"—")}</code>${
+            cl.artefact?` → <code>${esc(cl.artefact)}</code>`:""}${
+            cl.reads?` · reads ${esc(cl.reads)}`:""}${
+            cl.doc?` · <code>${esc(cl.doc)}</code> ${esc(cl.doc_sections||"")}`:""}<br>
+          ${esc(cl.runnable||"")}${cl.never_invoke?" · <b>never invoked by this board — read the stamp, never re-derive it</b>":""}
+        </div>
+        ${cl.limit?`<div class="limit"><b>Limit.</b> ${esc(cl.limit)}</div>`:""}
+      </div>`;
+    }).join("")
+    /* A goal whose owner has supplied nothing must APPEAR. Omitting it is the
+       precise defect this axis exists to fix. */
+    : `<div class="claim">
+         <div style="display:flex;gap:9px;align-items:center;margin-bottom:8px">
+           <span class="pill s-unmeasured">unmeasured</span></div>
+         <div class="fig-un">NO CLAIM SUPPLIED</div>
+         <p style="margin:6px 0 0;font-size:12.5px;color:var(--ink-2)">
+           This goal's owner has supplied no measurement, so this board has
+           none to render. <b>That is this row working, not a gap in it</b> —
+           an absent row and a row saying “nobody has measured this” are
+           different statements, and only one of them can be acted on.
+           <b>Writing another team's row is how a goal owner ends up with a row
+           they did not measure</b>, so nothing is invented here.</p>
+       </div>`;
+    return `<article class="card goal">
+      <div class="goal-h">
+        <span class="kind">goal ${g.id}</span>
+        <h3>${esc(g.title)}</h3>
+        <span class="goal-own">${esc(g.owner)}</span>
+        <span class="goal-own">· ${g.measured_claims}/${g.total_claims||0} claim${
+          g.total_claims===1?"":"s"} carrying a figure</span>
+      </div>
+      <p style="margin:7px 0 0;font-size:13px;color:var(--ink-2)">${esc(g.preserves)}</p>
+      ${claims}
+    </article>`;
+  }).join("");
+})();
+
+/* ---------------------------------------------- the inherited suite figure */
+(function(){
+  const i=SNAP.inherited; if(!i) return;
+  const dist=i.distance, py=i.python_changed, valid=i.valid;
+  const verdict = dist===0
+    ? `Taken on the current head.`
+    : valid
+      ? `<b>${dist} commit${dist===1?"":"s"} behind head</b>, and <b>0 Python files
+         changed</b> in them. A Python suite's verdict can only be moved by Python,
+         so this is old by sha and <b>still valid for ${esc(i.scope)}</b>.
+         Verification is scoped to a surface, not to a sha.`
+      : `<b>EXPIRED.</b> ${py} Python file${py===1?"":"s"} changed in the
+         ${dist} commit${dist===1?"":"s"} since —
+         ${(i.python_files||[]).slice(0,4).map(f=>`<code>${esc(f)}</code>`).join(", ")}${
+           (i.python_files||[]).length>4?" and more":""}.`;
+  const d=i.delta||{}, g=i.gates||{};
+  $("#suite").innerHTML=`
+    <article class="card" style="padding:18px 20px;margin-bottom:8px">
+      <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+        <span class="pill s-${i.valid?"live":"partial"}">${i.valid?"valid for the Python surface":"EXPIRED"}</span>
+        <span class="mono" style="font-size:12px;color:var(--ink-3)">
+          <code>${esc(i.command)}</code> · measured at <code>${esc(i.commit)}</code>
+          · head <code>${esc(i.head)}</code></span>
+      </div>
+      <div class="scroller" style="margin:14px 0 0">
+        <table class="tbl"><thead><tr>
+          <th>install</th><th>ran</th><th>fail</th><th>err</th><th>skip</th>
+          <th>xfail</th><th>collected</th><th>what those numbers are</th></tr></thead><tbody>
+        ${(i.installs||[]).map(x=>`<tr>
+          <td class="m"><b>${esc(x.name)}</b><br>
+            <span style="color:var(--ink-3);font-size:11px">${esc(x.base_id)}</span></td>
+          <td class="m">${n(x.ran)}</td>
+          <td class="m" style="color:${x.failures?"var(--partial)":"var(--live)"}">
+            <b>${n(x.failures)}</b></td>
+          <td class="m">${n(x.errors)}</td><td class="m">${n(x.skipped)}</td>
+          <td class="m" style="color:${x.expected_failures?"var(--held)":"var(--ink-3)"}">
+            <b>${n(x.expected_failures)}</b></td>
+          <td class="m">${n(x.collected)}</td>
+          <td style="font-size:12.5px">
+            <code>${esc(x.detail)}</code><br>
+            <span style="color:var(--ink-2)">${esc(x.why)}</span>
+            <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--rule-2)">
+              <span class="pill s-held">xfail</span>
+              <code>${esc(x.xfail_detail||"")}</code><br>
+              <span style="color:var(--ink-2)">${esc(x.xfail_why||"")}</span>
+            </div></td></tr>`).join("")}
+        </tbody></table>
+      </div>
+      <p style="margin:14px 0 0;font-size:13.5px;color:var(--ink)">
+        <b>Delta against the previous master: ${n(d.new)} new, ${n(d.fixed)} fixed,
+        on ${esc(d.scope||"")}.</b> That is the number that is an acceptance bar,
+        and it is the only one. <b>Nine failures with a zero delta is a pass</b>;
+        the same nine with no delta beside them would be alarming and unreadable.
+        An absolute inherits the lifetime of the tree it was taken on — a
+        before/after on one commit inherits nothing. <b>Expected failures are a
+        third category and are counted separately: a tracked open bug is neither
+        a pass nor a failure.</b> Both rows were verified against the runs' own
+        <code>viewer_verdict</code> records and reproduce to the digit. Gates
+        <b>${n(g.passed)}/${n(g.total)}</b>, ${n(g.not_run)} not run and named.</p>
+      <p style="margin:10px 0 0;font-size:12.5px;color:var(--ink-3)">
+        ${verdict} <b>Not re-run by this board</b> — 550 s quiet against 1945 s
+        loaded, and starting one while another session verifies makes both
+        unattributable. This figure arrived <b>with its sha attached</b>, which is
+        the only reason it is here: it sat as EXPIRED for hours while two runs
+        happened, because a run nobody reports the verdict of is a rumour.</p>
+      <p style="margin:10px 0 0;font-size:12.5px;color:var(--ink-2);
+        border-top:1px solid var(--rule-2);padding-top:10px">
+        <b>And this figure is produced by something that reads map geometry.</b>
+        <code>tools/test_viewer.py</code> is one of the twelve modules that consume
+        <code>.DMap</code>, so Explorer's result above applies to it: <b>a pass
+        means the code path worked on the files it was given.</b></p>
+    </article>`;
+})();
+
+/* ------------------------------------------------------------- capabilities */
+(function(){
+  const c=cap.counts||{}, tot=cap.total||1;
+  const order=[["live",c.live||0],["partial",c.partial||0],["blocked",c.blocked||0]];
+  $("#cap-bar").innerHTML=order.map(([k,v])=>
+    `<i class="b-${k}" style="width:${(100*v/tot).toFixed(2)}%"></i>`).join("");
+  $("#cap-legend").innerHTML=order.map(([k,v])=>
+    `<span><b>${v}</b> ${k}</span>`).join("")+
+    `<span>of <b>${tot}</b> declared capabilities</span>`;
+  // A capability moving live -> partial reads as a regression and is usually the
+  // opposite. `metrics/damage` dropped this sprint because the panel was found to
+  // be summing a KILL COUNTER: damage_total 100,727,891 was a running kill count
+  // and dps 13,646.9 was ~24x under the real figure. Blank-where-unknown is the
+  // repair. Without this note the honest number looks like the broken one.
+  $("#cap-legend").insertAdjacentHTML("afterend", `
+    <p style="margin:-8px 0 20px;font-size:13px;color:var(--ink-2);max-width:74ch">
+      <b>Fewer <span class="pill s-live">live</span> than last time is not a
+      regression here.</b> <code>metrics/damage</code> moved to
+      <span class="pill s-partial">partial</span> because the panel was found to be
+      summing a <b>kill counter</b> — <code>damage_total</code> of 100,727,891 was a
+      running kill count and <code>dps</code> of 13,646.9 was <b>~24× under</b> the
+      real figure. <b>It was wrong before and is honest now</b>, and it went partial
+      rather than live because an unknown owner now counts nothing at all rather
+      than folding damage <i>taken</i> into damage <i>dealt</i>. Open the row for
+      the full retraction — it is quoted from the source, not summarised here.</p>`);
+  $("#t-cap").textContent=(c.partial||0)+(c.blocked||0);
+
+  const FILTERS=[["all","everything"],["partial","partial"],["blocked","blocked"],
+                 ["live","live"],["memory","memory-backed"]];
+  let active="all";
+  $("#cap-filters").innerHTML=`<span class="lbl">show</span>`+FILTERS.map(([k,l])=>
+    `<button class="chip" data-f="${k}" aria-pressed="${k==="all"}">${esc(l)}</button>`).join("");
+
+  function draw(){
+    const rows=(cap.rows||[]).filter(r=>
+      active==="all"?true:active==="memory"?r.primary==="memory":r.status===active);
+    if(!rows.length){$("#cap-list").innerHTML=`<div class="empty">nothing matches that filter</div>`;return;}
+    $("#cap-list").innerHTML=rows.map((r,i)=>{
+      const gist=r.needs?r.needs.replace(/\s+/g," "):"(no note recorded)";
+      const src=r.primary==="memory"?"memory":r.primary==="derived"?"derived":
+                r.primary==="none"?"—":"packet";
+      return `<button class="cap-row" data-i="${i}" aria-expanded="false">
+        <span class="nm">${esc(r.panel)}<i>/${esc(r.key)}</i></span>
+        <span><span class="pill s-${r.status}">${r.status}</span></span>
+        <span class="gist">${esc(gist)}</span>
+        <span class="src">${esc(src)}</span>
+      </button>
+      <div class="cap-detail" hidden>
+        <div class="meta">
+          <span>primary: <b>${esc(r.primary)}</b></span>
+          ${r.memory?`<span>memory: ${esc(r.memory)}</span>`:""}
+          ${r.packet?`<span>packet: ${esc(r.packet)}</span>`:""}
+        </div>
+        ${r.needs?esc(r.needs):"<i>No note is recorded for this capability.</i>"}
+      </div>`;
+    }).join("");
+    $$(".cap-row",$("#cap-list")).forEach(b=>b.addEventListener("click",()=>{
+      const open=b.getAttribute("aria-expanded")==="true";
+      b.setAttribute("aria-expanded",String(!open));
+      b.classList.toggle("open",!open);
+      b.nextElementSibling.hidden=open;
+    }));
+  }
+  $$("#cap-filters .chip").forEach(b=>b.addEventListener("click",()=>{
+    active=b.dataset.f;
+    $$("#cap-filters .chip").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));
+    draw();
+  }));
+  draw();
+
+  const orph=cap.sources_without_capability||[];
+  if(orph.length){
+    $("#cap-orphan").innerHTML=`<div class="card" style="margin-top:20px;padding:16px 18px">
+      <span class="pill s-blocked">found while measuring</span>
+      <p style="margin:10px 0 0;font-size:13.5px;color:var(--ink-2)">
+      ${orph.length===1?"One entry has":orph.length+" entries have"} a declared data
+      source in <code>SOURCES</code> and <b>no row in <code>CAPABILITIES</code></b>:
+      ${orph.map(o=>`<code>${esc(o.panel)}/${esc(o.key)}</code>`).join(", ")}.
+      The UI derives its honest placeholder from the declared status, so a source
+      with no status has nothing to render from — it is neither claimed nor
+      disclaimed. Small, and worth an owner.</p></div>`;
+  }
+})();
+
+/* --------------------------------------------------- are they actually up?
+   The board names URLs; the board checks them. All three were down at once
+   while the page still invited a reader to open them -- an address quoted
+   without being tested is the same defect as a count quoted without its scope,
+   and this one fails in front of whoever is watching. */
+(function(){
+  const svc = SNAP.services || [];
+  if(!svc.length) return;
+  const up = svc.filter(s=>s.up).length;
+  $("#services").innerHTML=`
+    <article class="card dec" style="border-left-color:var(--${up?"live":"blocked"});margin-bottom:22px">
+      <span class="pill s-${up?"live":"blocked"}">${up} of ${svc.length} answering</span>
+      <h3>What you can open right now</h3>
+      <p class="why" style="margin-bottom:12px"><b>Checked when this page was
+        built</b>, not assumed — a loopback connect per port, no request issued,
+        so it cannot disturb a capture that is running.</p>
+      <div class="scroller"><table class="tbl">
+        <thead><tr><th>service</th><th>address</th><th>state</th>
+          <th>what it needs</th></tr></thead><tbody>
+        ${svc.map(s=>`<tr>
+          <td class="m"><b>${esc(s.name)}</b></td>
+          <td class="m">${s.up
+            ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url)}</a>`
+            : `<span style="color:var(--ink-3)">${esc(s.url)}</span>`}</td>
+          <td><span class="pill s-${s.up?"live":"blocked"}">${s.up?"answering":"not running"}</span></td>
+          <td style="font-size:12.5px;color:var(--ink-2)">${esc(s.needs)}${
+            s.up?"":`<br><code style="font-size:11.5px">${esc(s.start)}</code>`}</td>
+        </tr>`).join("")}
+        </tbody></table></div>
+      <p style="margin:12px 0 0;font-size:12.5px;color:var(--ink-3)">
+        <b>The demo on 8898 is the one to drive.</b> It runs the real decoders
+        and the real session fold over invented traffic — so it shows the actual
+        pipeline, needs no game client, and <b>cannot touch the rig</b>.</p>
+    </article>`;
+})();
+
+/* ------------------------------------------------- CCO: what is possible */
+(function(){
+  const rig=SNAP.rig||{};
+  const running=rig.known?rig.total:null;
+  const state = running===null
+    ? `<span class="pill s-partial">rig state unknown</span> The process list could
+       not be read, which is <b>not</b> the same as nothing running.`
+    : running===0
+      ? `<span class="pill s-live">rig is quiet</span> <b>0 game clients running</b>
+         at the moment this page was measured. The four <code>ImConquer</code>
+         processes this board reported for most of its life are <b>gone</b> — which
+         is why that figure is now measured on every run instead of written in prose.`
+      : `<span class="pill s-partial">${running} client${running===1?"":"s"} running</span>
+         ${rig.lock&&rig.lock.held?`<code>client.lock</code> is held, so this is
+         coordinated.`:`<b>No <code>client.lock</code> is held</b>, so these are
+         outside our coordination and may be real sessions on the public service.`}`;
+
+  $("#cco").innerHTML=`
+  <article class="card dec" style="border-left-color:var(--accent);margin-bottom:22px">
+    <span class="pill s-live">ready</span>
+    <h3>Running the real COmpanion against CCO — what is actually possible today</h3>
+    <p class="why">${state}</p>
+    <div class="ev">
+      <h4>ready, verified now</h4>
+      <ul>
+        <li>The CCO install resolves through <code>coroot</code> as kind
+          <code>cco</code>, <b>nothing missing</b> — item names and icons will
+          render. <b>Resolve it through <code>coroot</code>, never by listing a
+          clients tree</b>: <code>Clients/CCO-local</code> is an <b>empty
+          directory</b>, and measuring one silently measures nothing. It caught me
+          before <code>cco.py</code>'s own warning did.</li>
+        <li>Its client is <code>bin/64/ImConquer.exe</code>, and the profile
+          <code>imconquer-x64</code> is <b>for this build</b>. The companion's
+          default discovery already looks for that image, so it attaches the
+          moment a client appears.</li>
+        <li><b>Pass <code>--root</code>.</b> Without it the companion resolves
+          the default root — <b>5517, a different client</b> — and item names and
+          icons come from the wrong install while everything still looks fine.</li>
+      </ul>
+    </div>
+    <div class="ev">
+      <h4>what would light up, by evidence grade — 17 memory fields</h4>
+      <ul>
+        <li><b><code>x</code> and <code>y</code> at grade V.</b> The only two
+          watched to CHANGE correctly — walked out and <b>back</b>, which is the
+          repeat-of-the-same-condition control. <i>A coincidence does not follow
+          you around the map and then come back.</i></li>
+        <li><b>The other 15 at grade I</b> — <code>read-once</code>: a plausible
+          value sat there when it was read. <code>uid</code>, <code>action</code>,
+          <code>max_hp</code>, <code>stamina</code> and <code>guild_id</code> also
+          carry <code>corroborated-external</code>. They render <b>with that
+          qualifier attached</b>, never as bare confident numbers.</li>
+        <li>All 24 packet capabilities apply as normal — <b>with one caveat worth
+          watching</b>: CCO speaks a <b>diverged protobuf dialect</b>, and the
+          opcode mappings were derived against a different server. Undecoded
+          opcodes surface in the Developer panel, which is exactly how the next
+          field gets found.</li>
+      </ul>
+    </div>
+    <div class="ev" style="background:none;border:1px solid var(--blocked)">
+      <h4>MEASURED against a live client — the client is Themida-packed</h4>
+      <ul>
+        <li><b>The build cannot be identified from disk, and the refusal is
+          correct.</b> <code>tools/headerdiff.py</code> named the 5 differing PE
+          header bytes: the resource directory RVA and size, and
+          <b><code>SECTION .themida</code></b>. The file confirms it — 16 sections,
+          <b>nine with empty names</b> at entropy 7.92–7.99, a <code>.themida</code>
+          section with <b>20,480,000 virtual bytes and zero raw bytes</b>, and
+          <code>.boot</code> carrying <b>14,571,520 bytes at entropy 7.94</b>. The
+          program is encrypted on disk and unpacked at runtime, so the mapped image
+          genuinely is not the file. <b>No mask should be widened.</b></li>
+        <li><b>The offsets nevertheless SURVIVE across launches.</b> A provisional
+          load returned coherent values for every field — name, level 130, guild,
+          uid, x/y, max HP 4278, stamina 150, silver ~2.06M. <b>Strong evidence the
+          layout applies; not verification</b>, because with no computable build key
+          every grade reads <i>"earned on OTHER bytes — unverified here"</i>.</li>
+        <li><b>Three defects that run surfaced, unowned.</b>
+          <code>guild_id: 0</code> alongside a real guild NAME — a contradiction
+          inside one read, so one of those offsets is wrong here.
+          <code>inventory: 0</code> and <code>equipment: 0</code> — null pointers on
+          a level-130 character, which is <b>why the inventory panel stays empty and
+          it is not a UI fault</b>. And struct acquisition agreed on
+          <b>2 of 32 candidates across 19 distinct results</b>.</li>
+      </ul>
+    </div>
+    <div class="ev" style="background:none;border:1px solid var(--blocked)">
+      <h4>the ceiling, and it is a hard one</h4>
+      <ul>
+        <li><b>PROVOCATION is not available. Observation under stimulus is the
+          ceiling.</b> CCO cannot be put on a server we own — Redux is 5065-era
+          and cannot serve this dialect — and there is a standing prohibition on
+          contacting the retail server: no HTTP, no TCP, no DNS.
+          <b>No value this client displays is ours to choose.</b></li>
+        <li><b>I cannot launch it, and did not.</b>
+          <code>docs/CONTEXT.md</code> constraint 3 forbids launching
+          <code>ImConquer.exe</code>, <code>ImLauncher.exe</code> or
+          <code>ImBootstrapper.exe</code> outright. <b>Launching is yours;
+          attaching read-only is the tool's.</b></li>
+      </ul>
+    </div>
+  </article>`;
+})();
+
+/* -------------------------------------------------------------------- demo */
+(function(){
+  const order=["character","inventory","players","metrics","kills","ground"];
+  let html=order.map(p=>{
+    const d=DEMO[p]; if(!d) return "";
+    const rows=d.fields.map(([label,key,val])=>{
+      const r=byKey[key]||{status:"blocked",needs:"No declared capability."};
+      const st=r.status;
+      const shown=st==="blocked"
+        ? `<span class="v no">cannot be shown</span>`
+        : `<span class="v${st==="partial"?" cav":""}">${esc(val??"—")}</span>`;
+      return `<button class="slot" aria-expanded="false">
+          <span class="k">${esc(label)}</span>${shown}
+          <span class="caveat${st==="blocked"?" blk":""}" hidden>
+            <b class="pill s-${st}">${st}</b><br>${esc(r.needs||"")}</span>
+        </button>`;
+    }).join("");
+    const bad=d.fields.filter(([,k])=>(byKey[k]||{}).status!=="live").length;
+    return `<article class="card dpanel">
+      <header><h4>${esc(p)}</h4>
+        <span class="cnt">${bad?bad+" not fully trusted":"all live"}</span></header>
+      <div class="slots">${rows}</div></article>`;
+  }).join("");
+
+  html+=`<article class="card dpanel"><header><h4>chat</h4>
+      <span class="cnt">${esc((byKey["chat/feed"]||{}).status||"")}</span></header>
+    <div class="feed">${CHAT.map(([t,c,who,msg])=>
+      `<div class="ln"><span class="t">${esc(t)}</span>
+       <span class="${c}">${esc(who)}</span><span>${msg}</span></div>`).join("")}</div>
+    </article>`;
+  html+=`<article class="card dpanel"><header><h4>players in view</h4>
+      <span class="cnt">${PLAYERS.length}</span></header>
+    <div class="feed">${PLAYERS.map(([nm,c,g])=>
+      `<div class="ln"><span class="${c}">${esc(nm)}</span>
+       <span class="t">${esc(g)}</span></div>`).join("")}</div>
+    </article>`;
+  $("#demo").innerHTML=html;
+  $$(".slot").forEach(b=>b.addEventListener("click",()=>{
+    const open=b.getAttribute("aria-expanded")==="true";
+    b.setAttribute("aria-expanded",String(!open));
+    $(".caveat",b).hidden=open;
+  }));
+})();
+
+/* --------------------------------------------------------------- signature */
+/* Six people, one week, one shape. This is above the list rather than in it,
+   because the list is instances and the shape is the finding. */
+$("#signature").innerHTML=`
+  <article class="card dec" style="border-left-color:var(--accent);margin-bottom:26px">
+    <span class="pill s-blocked">the day's signature</span>
+    <h3>Almost everything below is one defect: a measurement whose scope came off it</h3>
+    <p class="why">Not a theme chosen to tidy the list — the same shape turned up
+      independently, in different subsystems, found by different people, several
+      times in a week. <b>In every case the measurement was correct and the scope
+      that made it true went missing</b>, so a number true of something narrow got
+      read as true of something wide.</p>
+    <div class="ev">
+      <h4>the instances, each measured by someone different</h4>
+      <ul>
+        <li><b>855/0/0/72</b> — one install's result, quoted as the suite's. It is
+          two rows and nine failures.</li>
+        <li><b>A targeted 3-test class run wrote a full verdict record</b> into the
+          only 5517 slot. It parses, it is well-formed, and it is not a suite.</li>
+        <li><b>Five clients agreeing</b> on <code>v_l_weapon</code> — <b>one</b>
+          measurement, because all five ship the input byte-identically and
+          <i>cannot</i> disagree.</li>
+        <li><b>Explorer's <code>.DMap</code> walk</b> — a clean run of a healthy
+          tool, reporting truthfully on the 184 loose files and silent about the
+          113 that ship archive-only.</li>
+        <li><b>My <code>skipped=2</code></b> — a real measurement of a real thing,
+          and not the thing that was reported.</li>
+        <li><b>A green sanitization run</b> — 527 files scanned, and silent about
+          <code>sessions/</code>, where captures land.</li>
+        <li><b>An icon endpoint returning HTTP 200</b> for ids that do not exist,
+          with the same bytes it returns for real ones. Every miss is a hit.</li>
+        <li><b>A three-install verification that would have gone green</b> over a
+          regression inside the icon fix — because nothing in the viewer suite
+          touches <code>capture/companion.py</code>. <b>The suite's scope did not
+          cover the change, and a pass would have said it did.</b></li>
+      </ul>
+    </div>
+    <div class="ev">
+      <h4>the two rules that fall out, and they are not the same rule</h4>
+      <ul>
+        <li><b>State the scope beside the number, always.</b> Not as caution — as
+          form. <i>An absolute inherits the lifetime and the boundary of whatever
+          it was taken on; a delta with its scope named inherits nothing.</i> Every
+          instance above is a number that would have been harmless with its scope
+          still attached.</li>
+        <li><b>A wrong answer that flatters gets no scrutiny.</b> Most traps here
+          have an <i>alarming</i> wrong reading — a branch that looks reverted, a
+          suite that looks stale — and alarm is what buys the second look.
+          <b>UNEXPECTED SUCCESS reads as "the bug is fixed".</b> Nothing prompts a
+          second look at a result that says you have won, <b>and scrutiny was the
+          only thing protecting us.</b></li>
+      </ul>
+    </div>
+  </article>`;
+
+/* ------------------------------------------------------------------- found */
+const FOUND = [
+  {sev:"blocked", where:"the icon resolver · measured on the owner's live client",
+   title:"MagicBow does not show the wrong icon — it shows the NOT-FOUND icon, with HTTP 200",
+   body:`The owner reported two items drawing the wrong icon. Measured against the
+     running capture, both are equipped on the live character —
+     <code>160229 MagicBoots</code> and <code>500329 MagicBow</code> — and
+     <b>their NAMES resolve correctly</b>. Only the icon path fails.`,
+   sting:`<b>The control is what turns a bug report into a mechanism.</b> Two
+     invented ids return byte-identical icons to the real ones:
+     <br><br>
+     <span class="mono" style="font-size:12px">
+     160229 MagicBoots &nbsp;2843 B &nbsp;md5 49c932fc6071<br>
+     500329 MagicBow &nbsp;&nbsp;&nbsp;2843 B &nbsp;md5 49c932fc6071<br>
+     <b>999999 DOES NOT EXIST &nbsp;2843 B &nbsp;md5 49c932fc6071</b><br>
+     <b>888888 DOES NOT EXIST &nbsp;2843 B &nbsp;md5 49c932fc6071</b><br>
+     112539 PhoenixHat &nbsp;3216 B &nbsp;md5 96d3e2a74bdc &nbsp;(resolver works)</span>
+     <br><br>
+     <b>And it returns HTTP 200.</b> No status, no flag, no log line — so every
+     miss is a hit to everything downstream. <b>A silent fallback icon is an
+     instrument that cannot fire</b>, which is exactly why these are being found
+     one at a time by a person looking at their own character.`,
+   repro:`<code>/icon/999999</code> and <code>/icon/500329</code> return identical
+     bytes. <code>/api/item/500329</code> returns <code>"MagicBow"</code>, so the
+     name path is sound and only the icon path falls through.`,
+   fix:`<b>FIXED, and the catalog now exists.</b> COmpanion CCO Plugin made the
+     resolver refuse and then counted the refusals — which is the only order that
+     works, because until refusing is possible every miss is a hit and the count
+     cannot be taken at all.
+     <br><br>
+     <span class="mono" style="font-size:12px">
+     5017 &nbsp;&nbsp;378 → <b>11,227</b> icons served<br>
+     5517 &nbsp;2,342 → <b>12,908</b> icons served<br>
+     lost &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>0</b></span>
+     <br><br>
+     <b>Still not claimed:</b> which image the fallback was. It was never decoded
+     here, and an unverified identity would have sent someone to the wrong file.`,
+   done:true},
+
+  {sev:"blocked", where:"the icon fix's own verification · caught before it landed",
+   title:"A green three-install verification would not have caught the regression inside the fix",
+   body:`The icon fix worked — and a <b>client-exact</b> variant of it silently
+     <b>lost 1,223 working icons</b>. The pre-rebase sha had already been merged.
+     It would have passed a <b>full three-install verification green</b>, because
+     <b>nothing in the viewer suite touches
+     <code>capture/companion.py</code></b>.`,
+   sting:`<b>This is the signature applied to a verification rather than to a
+     number, and it is the strongest form of it on this board.</b> A pass is a
+     statement about the surface the suite covers. Read as a statement about the
+     change, it is a scope error wearing three installs and a green tick — and
+     three installs makes it <i>more</i> convincing, not less.
+     <br><br>
+     <b>What caught it was the team's own still-permits control</b>, not the
+     suite: a check that the fix did not stop anything that previously worked.
+     <b>A fix verified only by what it repairs cannot see what it breaks.</b>`,
+   repro:`The client-exact variant serves 1,223 fewer icons than its predecessor
+     while every gate the change was routed through reports green.`,
+   fix:`<b>Caught and corrected before landing</b> — final numbers 5017
+     378 → 11,227 and 5517 2,342 → 12,908, <b>lost 0</b>. The transferable part
+     is the control: <b>pair every fix with a check that it still permits what
+     already worked</b>, and do not let install count stand in for surface
+     coverage. <code>verdictcheck</code>'s INSUFFICIENT is the mechanical form of
+     this — it exists to say "your change is not on the surface this number
+     measured".`,
+   done:true},
+
+  {sev:"partial", where:"tools/test_viewer.py · the verdict record it writes",
+   title:"A targeted 3-test run writes a record indistinguishable from a suite verdict",
+   body:`Running one test class — <code>python tools/test_viewer.py
+     ParseRefusesANameAndStillTakesAPath</code>, three tests — <b>wrote a full
+     verdict record into the only 5517 slot.</b> Anyone asking <i>"is 5517
+     covered?"</i> gets that record instead of <code>NO-RECORD</code>.`,
+   sting:`<b>The refusal works, and it works for the wrong reason.</b> This record
+     carries <code>rev=unknown</code> and <code>dirty=True</code>, so
+     <code>verdictcheck</code> answers <code>UNVERIFIABLE</code> — it refuses
+     because the tree was dirty, <b>not because three tests is not a suite</b>.
+     Run the same class on a clean tree and it would write
+     <code>rev=&lt;sha&gt;</code>, <code>dirty=False</code>, <code>ran=3</code>
+     — <b>and that record would APPLY.</b>
+     <br><br>
+     Quick Fix hit the same shape and caught it because <b>six</b> was a
+     recognisable number. This one says three. <b>Neither is recognisable to a
+     tool that only reads counts.</b>`,
+   repro:`<code>out/ci/viewer_verdict_patch5517-76c7f4499934.json</code> —
+     <code>rev=unknown, ran=3, failures=0, errors=1, dirty=True</code>.`,
+   fix:`<b>Not fixed, deliberately.</b> It wants a decision — should a filtered
+     run write a record at all, or write one marked partial? — and that changes a
+     tool three sessions depend on. A real 5517 suite run is queued and will
+     overwrite the slot, so the immediate hazard clears itself. <b>The design
+     question does not.</b>`},
+
+  {sev:"blocked", where:"tests/test_viewer.py · test_socket_bases_cannot_flatten_a_weapon",
+   title:"On the wrong client this open bug reports itself FIXED — the wrong reading is the encouraging one",
+   body:`The test is marked <code>@unittest.expectedFailure</code> so an open bug
+     <i>cannot be forgotten</i>. <b>On CCO the assertion passes</b>, and an
+     ungated run would print <b>UNEXPECTED SUCCESS</b> — which reads as
+     <i>"the bug is fixed"</i> and means <i>"you are on the wrong client."</i>`,
+   sting:`<b>Every other trap on this board has an alarming wrong reading, which
+     is what makes people look twice. This one's wrong reading is good news</b>,
+     so nothing prompts the second look. It is the four-state rule at its
+     meanest: <i>"I could not check"</i> must not read as <i>"I checked and it
+     is fine"</i> — and here it reads as <i>better</i> than fine.
+     <br><br>
+     So the test is <b>gated as well as expected-failing</b>, which is why CCO
+     skips 84 against 6090's 71 and reports <code>xfail 0</code>. <b>The zero is
+     the gate working</b>, not the bug being absent.`,
+   repro:`Measured on all six declared bases: five patch clients read
+     <code>v_l_weapon</code> as <code>(0.9987, 0.0506, 0.0562)</code>; CCO reads
+     <code>(1.0, 1.0, 1.0)</code>. <b>And the five are ONE measurement, not
+     five</b> — all five ship both inputs byte-identically
+     (<code>c3/mesh/002131090.c3</code>, md5 <code>be6093c8c7fd</code>), and
+     clients sharing a file always agree. Five agreeing bases look like five
+     confirmations and are one.`,
+   fix:`Nothing to fix in the test — the gate is the fix. <b>If any board or
+     report ever shows UNEXPECTED SUCCESS for this, that is an install error and
+     not a result.</b> Rendered here so the encouraging reading has a warning
+     attached to it in advance.`},
+
+  {sev:"blocked", where:"the harness around a gate, not the gate · fixed at bfeef80",
+   title:"A gate can run, print FAIL, and be pushed through — because nothing consumed its exit code",
+   body:`<code>test_sanitization</code> printed <code>RESULT: FAIL — 1 with
+     findings</code>. The finding was real: an absolute
+     <code>C:\\Program Files\\…</code> install path in a doc. <b>The commit was
+     pushed anyway</b>, because the gates were the first step of a compound
+     command whose last step was the push, and <b>nothing between them read an
+     exit code</b>. The gate was perfect. The harness around it had no teeth.`,
+   sting:`This is a <b>third</b> failure mode, and it is a different kind from
+     the two already on the register. Those are properties of a gate. <b>This is
+     a property of how a gate is invoked</b> —
+     <br><br>
+     <span class="mono" style="font-size:12px">passes by NOT APPLYING &nbsp;&nbsp;a verdict line with no count<br>
+     fires on CORRECT behaviour&nbsp;&nbsp;widened until inert<br>
+     <b>RUNS, FAILS, and is IGNORED&nbsp;&nbsp;nothing consumes the exit code</b></span>
+     <br><br>
+     <b>A gate whose result a human must notice fails open under load</b> — and
+     it failed open on the person who had spent that day telling six teams to
+     read their verdicts.`,
+   repro:`Put any gate and a push in one compound command. The gate runs, prints
+     its verdict, and the push executes regardless.`,
+   fix:`Mechanical, not attentional: <b>never put a gate and a push in one
+     command.</b> Run gates, read each verdict on its own, push as a separate
+     act. Both commits on this board's branch were pushed that way.`},
+
+  {sev:"blocked", where:"capture/companion.py:1682 · ReplaySession",
+   title:"<code>--replay</code> starts cleanly and then fails on every snapshot",
+   body:`<code>ClientSession.__init__</code> never sets <code>self.hero</code>;
+     <code>_attach_hero()</code> does, and only the live <code>start()</code> path
+     calls it. <code>ReplaySession</code> overrides <code>start()</code>, so it
+     reaches <code>snapshot()</code> without the attribute and
+     <code>hero_snapshot()</code> raises <code>AttributeError</code>. The server
+     reports the session started, the page loads, and <code>/api/snapshot</code>
+     then dies on every request.`,
+   sting:`The mode exists so the UI can be checked without the game running.
+     That is the one thing it cannot currently do. <code>--selftest</code> stays
+     green because it never calls <code>snapshot()</code> on a replay session.`,
+   repro:`add_replay(report) -> True, then session.snapshot() -> AttributeError:
+     'ReplaySession' object has no attribute 'hero'`,
+   fix:`<b>FIXED</b> — the four <code>hero*</code> fields are declared in
+     <code>ClientSession.__init__</code>, so "no memory source" is a state the
+     class can be in and report rather than a hole each subclass must know to
+     fill. <b>The gate now exercises the path it certifies</b>: the selftest
+     builds a detached session and serves a snapshot from it. Negative control
+     run before believing it — re-removing the initialisers turns that check red
+     with the original <code>AttributeError</code> and the suite to FAIL.
+     Register <code>C-2026-08-10-showandtell-replay-hero</code>.`,
+   done:true},
+
+  {sev:"partial", where:"capture/scrub.py",
+   title:"“Scrub the capture and demo it” does not reach the exposure",
+   body:`<code>scrub.py</code> redacts <b>credentials</b>. Its docstring says in
+     terms that character names, positions and chat are “a different problem with
+     a different shape”, and <code>find_personal_data()</code> only <i>reports</i>
+     such files — it never edits them. The run even prints
+     <i>“N file(s) of personal data remain”</i>.`,
+   sting:`So running it and reporting the frames as scrubbed would be an
+     assurance the tool does not give. Names and chat are exactly what a
+     Show and Tell would put on a screen.`,
+   repro:`capture/scrub.py lines 48–51 and 403–412, read directly.`,
+   fix:`Nothing to fix in <code>scrub.py</code> — it is correct and says so
+     plainly. The correction is to the plan: this board invents its demo traffic
+     outright, so no capture is read and there is nothing to scrub.`},
+
+  {sev:"partial", where:"tools/webui · replay/demo banner",
+   title:"The no-live-process banner asserts the packet panels are real",
+   body:`A session with no process behind it renders: <i>“a replay carries
+     packets only … <b>The packet-fed panels below are real.</b>”</i> True for a
+     replay of your own capture. <b>False for invented traffic</b>, where those
+     same panels are fiction.`,
+   sting:`Small, and it lands on the one sentence whose job is to tell you how
+     much to trust the screen.`,
+   repro:`Open the demo on 8898 — the banner appears above panels filled with
+     invented players, guilds and chat.`,
+   fix:`<b>FIXED</b> in the same slice — sessions declare <code>feed_is_real</code>
+     and the banner reads it, instead of inferring <i>real</i> from <i>not
+     live</i>. An invented feed now says so.`,
+   done:true},
+
+  {sev:"partial", where:"tools/companiondemo.py · this board's own demo",
+   title:"Two of my own bugs decoded perfectly and were still wrong",
+   body:`Building the demo produced the same failure shape twice.
+     <code>MsgName</code> encoded with its fields transposed decoded cleanly,
+     counted as events, and yielded <code>action_None</code> — <b>an empty guilds
+     panel</b>. Mob uids numbered from 9000 fell under <code>entity_kind</code>'s
+     300k boundary, so <b>all 8 monsters filed as NPCs</b> and the monsters panel
+     stayed empty while players showed fourteen.`,
+   sting:`<b>No exception, no dead frame, healthy event counts — just empty
+     panels.</b> Decode-success was the wrong bar. This is the same shape as
+     <code>--replay</code> being green because the gate never called the path it
+     certified: in both, the instrument reported on itself rather than on the
+     thing.`,
+   repro:`400 frames in, 367 events out, and nothing per-opcode was being
+     checked — the totals looked healthy while 33 attribute frames were vanishing
+     entirely.`,
+   fix:`<b>Applied.</b> The selftest now asserts the OUTCOME, not the decode:
+     every frame must yield at least one event, and every panel it feeds must
+     come out non-empty after folding through the real session.`},
+
+  {sev:"live", where:"capture/rendercontract.py · a property, not a defect",
+   title:"The honesty machinery refused to be faked, and that is worth showing",
+   body:`The plan included a demo mode that also invented the memory-backed
+     values so the dashboard lit up end to end. <b>It could not be built
+     honestly.</b> <code>hero_snapshot()</code> does not print values — it asks
+     <code>rendercontract</code> for a <i>cell</i>, and a cell's digits only reach
+     the payload when the field's <b>evidence grade</b> supports them.`,
+   sting:`So faking the memory panel needs faked <b>grades</b>: not invented
+     numbers, but invented <i>proof that the numbers were verified</i> —
+     indistinguishable downstream from a real verification. <b>A viewer can
+     discount a number. They cannot discount a grade that lies.</b> The design
+     made the dishonest version structurally unavailable rather than merely
+     discouraged.`,
+   repro:`Attempt it and the contract correctly renders nothing, because grade U
+     digits never enter the payload — asserted by companion.py's own selftest.`,
+   fix:`Nothing to fix. The mode was <b>refused</b>, and the memory panel reports
+     itself unavailable with its reason — which is the honest edge of what this
+     project can see today.`},
+
+  {sev:"blocked", where:"tests/test_client.py:3583, 3594 · EntityArtTest · UNEXPLAINED",
+   title:"Five readings say these two tests pass. One says they fail. Nobody has explained the difference.",
+   body:`<code>EntityArtTest.test_the_dye_selects_the_texture_the_capture_proved</code>
+     and <code>test_the_lookup_survives_a_key_of_any_width</code> were reported
+     failing. <b>They are not reproducing.</b> Run by name on current master:
+     <code>Ran 2 tests, OK</code>. The whole file is 287 tests OK exit 0.`,
+   sting:`<b>This is rendered OPEN, not resolved.</b> Four other readings agree
+     they pass and one says they fail, and an environment-dependent test that
+     fails for exactly one person is worth more attention than a settled one —
+     but nobody has found the mechanism, so the board says so rather than
+     picking the comfortable answer.
+     <br><br>
+     <b>The attribution is the finding.</b> RE New Functionality only ever
+     claimed <i>“not caused by my change”</i>, and proved it with a detached
+     baseline at <code>bd43671</code>, delta zero. <b>That control was sound.</b>
+     It was then generalised into <i>“two pre-existing failures on master”</i>
+     and sent to six teams — <b>a different claim, with no evidence behind
+     it</b>. “Not mine” and “a property of the tree” are not the same statement.`,
+   repro:`<code>py -3 -m unittest tests.test_client.EntityArtTest.test_the_dye_selects_the_texture_the_capture_proved tests.test_client.EntityArtTest.test_the_lookup_survives_a_key_of_any_width -v</code>
+     → <b>Ran 2 tests, OK</b> at <code>dff36cf</code>.`,
+   fix:`Do not tell teams to expect these failures — five readings say they will
+     not see them. <b>Find what is different about the one environment that
+     does</b>, because that difference is the actual finding and it is still
+     unowned. <b>My own earlier reading of this was wrong too</b> and is the
+     entry below: I measured a real thing that was not this thing.`},
+
+  {sev:"partial", where:"tests/test_addon_install.py, tests/test_blender_roundtrip.py",
+   title:"The <code>skipped=2</code> I found is real, and is NOT the pair above",
+   body:`Measuring the report, I found a clean <code>skipped=2</code> and took the
+     count as the explanation. <b>Different tests entirely.</b>
+     <code>test_addon_install</code> and <code>test_blender_roundtrip</code> are
+     separate FILES needing Blender's bundled Python; the reported pair are
+     methods inside <code>tests/test_client.py</code>. <b>Two twos, no
+     relation.</b>`,
+   sting:`<b>Left up as its own correction, because the near-miss is the
+     instructive part.</b> A matching count, a clean mechanism and two
+     invocations to show — it read as settled, and it would have replaced one
+     wrong claim with a better-dressed one. <b>A coincidence that arrives with a
+     mechanism attached is the hardest kind to doubt.</b>`,
+   repro:`<code>py -3 -m unittest discover -s tests -t .</code> → OK, skipped=2.
+     <code>py -3 tests/test_addon_install.py</code> → exit 1,
+     <code>ModuleNotFoundError: No module named 'bpy'</code>.`,
+   fix:`Nothing to fix: both skip cleanly with a reason through the harness and
+     hard-error only when invoked directly, and each docstring says how to run
+     them under Blender. <b>Worth knowing that a pre-push run can report these
+     as failures depending purely on how it was invoked.</b>`},
+
+  {sev:"partial", where:"tests/test_sanitization.py:63 · SKIP_DIRS",
+   title:"A green sanitization run is silent about <code>sessions/</code> — which is where captures land",
+   body:`<code>SKIP_DIRS = {"refs", ".git", "__pycache__", "out", "mods",
+     "build", "sessions"}</code>. Every exclusion is deliberate and documented in
+     the source, so this is a <b>scope statement, not a defect</b> — but the
+     <b>load-bearing name on that list is <code>sessions/</code></b>, and
+     <code>sessions/</code> is where capture files are written.`,
+   sting:`The run prints <i>“scanned 527 file(s) … 0 with findings”</i> and a
+     reader takes that as the repository. <b>It is one line away from the privacy
+     question that is still the owner's</b> — the 17 capture files carrying names
+     and chat. A clean sanitization run says nothing about them, and nothing in
+     the output says so. (<code>refs/</code> is the biggest by count at
+     <b>604 files</b>, and the least interesting: vendored third-party material.)`,
+   repro:`Read <code>tests/test_sanitization.py:60–63</code>; count
+     <code>refs/</code> with <code>find refs -type f</code>.`,
+   fix:`No code change proposed. Quote the scanned count <b>with its scope</b>,
+     the way every other number on this board is quoted.`},
+
+  {sev:"partial", where:"capture/companion.py · SOURCES",
+   title:"<code>character/position</code> has a data source and no declared status",
+   body:`It is in <code>SOURCES</code> as <code>primary: memory</code> reading
+     <code>x, y</code>, with no row in <code>CAPABILITIES</code>.`,
+   sting:`The UI derives its honest placeholder <i>from the declared status</i>,
+     so a source without one is neither claimed nor disclaimed — the single case
+     the honesty machinery cannot render either way.`,
+   repro:`Cross-check both tables: SOURCES has 25 keys, CAPABILITIES has 24 rows,
+     and the difference is exactly this one.`,
+   fix:`Declare it, at whatever status the evidence supports.`}
+];
+$("#found").innerHTML=FOUND.map(f=>`
+  <article class="card dec" style="border-left-color:var(--${f.sev})">
+    <span class="pill s-${f.sev}">${f.sev==="blocked"?"broken":"needs an owner"}</span>
+    <h3>${f.title}</h3>
+    <p class="why">${f.body}</p>
+    <div class="ev"><h4>why it matters</h4>
+      <ul><li>${f.sting}</li></ul></div>
+    <div class="ev"><h4>reproduction</h4>
+      <ul><li>${f.repro}</li></ul></div>
+    <div class="ev" style="background:none;border:1px solid var(--rule);padding:12px 14px">
+      <h4>${f.done?"fix — landed":(f.sev==="live"?"resolution":"suggested fix — not applied")}</h4><ul><li>${f.fix}</li></ul></div>
+    <p style="margin:12px 0 0;font-family:var(--mono);font-size:11.5px;color:var(--ink-3)">
+      ${esc(f.where)}</p>
+  </article>`).join("");
+$("#t-found").textContent=FOUND.length;
+
+/* -------------------------------------------------- what the teams landed */
+const TEAMS = [
+  {who:"VibeCO Content + Boundary", sev:"partial", at:"new teams, live tonight",
+   title:"Two teams stood up mid-PI — and neither has a figure on this board yet",
+   body:`<b>VibeCO Content</b>: 7878 into the world, item icons, and the
+     <code>c3.wdb</code> <b>72,826-mesh</b> join. <b>Boundary</b>: untrusted-artifact
+     enumeration, and making <b>three implicit guards explicit</b>.`,
+   note:`<b>Recorded here rather than on the tonight tab, because neither has
+     produced a measurement.</b> Nine teams running in parallel is the thing most
+     likely to put a number on this board that nobody took — so a team exists
+     here the moment it is stood up, and its figures appear only when they are
+     measured. <b>Boundary's brief is the board's own shape:</b> a guard that is
+     implicit cannot be checked, and three of them were.`},
+
+  {who:"COMod / Parser", sev:"live", at:"landed",
+   title:"7878's content is readable — it was encrypted and unknown",
+   body:`<span class="mono" style="font-size:12.5px">
+     NPC <b>4,084</b> &nbsp; Monster <b>5,234</b> &nbsp; Mount <b>1,937</b> &nbsp;
+     Garment <b>691</b><br>
+     itemtype <b>55,420</b> rows &nbsp;·&nbsp; <b>153 of 155</b> tables readable</span>
+     <br><br>Decrypted content lands in
+     <code>ConquerAssets\\derived\\7878-dat-decrypted</code>.`,
+   note:`<b>Read that directory's README before using it: two of the files are
+     NOT content.</b> A directory of 155 things where 153 are one kind and 2 are
+     another is exactly the shape that gets averaged over — and the two are the
+     ones a naive consumer would trip on.`},
+
+  {who:"COmpanion CCO Plugin", sev:"live", at:"landed",
+   title:"The icon catalog, with a failure rate that can exist for the first time",
+   body:`<span class="mono" style="font-size:12.5px">
+     5017 &nbsp;&nbsp;&nbsp;378 → <b>11,227</b> served &nbsp; art-miss <b>0</b><br>
+     5517 &nbsp;2,342 → <b>12,908</b> served &nbsp; art-miss <b>5</b><br>
+     lost &nbsp;<b>0</b></span>`,
+   note:`<b>The art-miss column is the deliverable, not the served count.</b>
+     Before this there was no failure rate at all — every miss was served as a
+     200 with the not-found image, so the denominator existed and the numerator
+     could not. <b>5 is a number that can be chased; "unknown" was not.</b>`},
+
+  {who:"Parser", sev:"blocked", at:"landed",
+   title:"<code>pb_decode</code> was discarding ~95% of two opcodes' records, silently",
+   body:`Repeated protobuf fields were being collapsed to their last value.
+     <b>95.4% of op-1105 records and 94.4% of op-1017 records were discarded</b>
+     — and <b>78 attribute records for 64 entities decoded as one</b>.`,
+   note:`<b>Nothing failed while this was happening.</b> No exception, no
+     malformed frame, no dropped count — the decoder returned a well-formed dict
+     every time and threw away the rest of the field. It is the same shape as the
+     icon 200 and the silent map fallback: <b>a component reporting success on
+     the fraction it kept.</b>`},
+
+  {who:"VibeCO", sev:"live", at:"landed",
+   title:"7878 opens, and 74 maps stopped serving a previous client's content",
+   body:`<code>MapLibrary(7878)</code> is <b>984×984</b> where it was
+     <code>None</code>; <code>Catalog(7878)</code> opens where it raised
+     <code>AttributeError</code>.`,
+   note:`<b>The 74 is the interesting half.</b> Those maps on 6090 were serving
+     a <i>previous client's</i> content — not failing, not blank, just quietly
+     answering with the wrong install's data. An <code>AttributeError</code> is a
+     bug that announces itself; <b>74 maps returning plausible wrong content is
+     the kind that does not.</b>`},
+
+  {who:"Quick Fix", sev:"live", at:"landed",
+   title:"Two safety gaps on the path this capture runs on",
+   body:`<code>running_clients()</code> now sees <b>both</b>
+     <code>ImConquer</code> pids — it was seeing one, on a box whose whole
+     coordination rests on a two-client ceiling. And
+     <code>watchfield</code>/<code>watchread</code> now <b>refuse to attach
+     without an explicit assertion</b>.`,
+   note:`A ceiling enforced by a counter that under-counts is not a ceiling.
+     <b>This one was under-counting by exactly the margin that matters</b> —
+     one of two.`},
+
+  {who:"Explorer", sev:"live", at:"de8b39f, fd4afcb",
+   title:"<code>core/dmap.py stale</code> — the alarm for the failure nothing could hear",
+   body:`Turns the silent case into a non-zero exit. <b>Four states, not three</b> —
+     <code>current</code>, <code>stale</code>, <code>none</code>,
+     <code>unreadable</code> — because <i>“I could not check”</i> has to be
+     spelled differently from <i>“I checked and it is fine.”</i> Collapsing those
+     two is exactly what let the loose-file walk survive: <b>it was never wrong,
+     it was never asked.</b>`,
+   table:[["install","loose","current","stale","archive-only","exit"],
+          ["5517","181","178","3","11","1"],
+          ["6090","184","110","74","63","1"],
+          ["6609","184","107","77","113","1"],
+          ["5017","142","142 (none)","—","ships no archives","0"]],
+   note:`<b>5017 is a negative control on real data</b>, and it is the row that
+     makes the other three mean something: an install that ships no archives
+     exits 0. A checker that fired everywhere would be no better than one that
+     fired nowhere.`},
+
+  {who:"Parser", sev:"live", at:"merged at 975a09c · C-2026-08-10-parser-tpd-grammar",
+   title:"The <code>.tpi</code> record grammar, and the empty file that desynchronises everything after it",
+   body:`<code>core/tpd.py</code> documented the two “duplicate” size fields as
+     exact duplicates. <b>True for the Zephyr archives it was verified against,
+     false for 7878</b>, where flag 2 means chunked storage and those fields are
+     the FIRST chunk rather than a copy. Recovered from the bytes: c3.tpi
+     <b>59,964/59,964</b> entries and data.tpi <b>86,149/86,149</b>, landing
+     exactly on EOF, zero chunk-sum mismatches, 818/818 sample decompressions
+     exact.`,
+   note:`<b>The load-bearing case is the rare one.</b> A <code>flag 0</code>
+     entry is an EMPTY file with a 10-byte tail instead of 22 — four in c3.tpi,
+     one in data.tpi. A parser assuming the long tail over-reads by 12 bytes and
+     <b>desynchronises every entry after it</b>, which surfaces as thousands of
+     corrupt entries far from the cause rather than as a failure at the empty
+     file. <b>And the validation criterion is the other half</b>: consume exactly
+     <code>count</code> entries AND land exactly on EOF. Gating on the header's
+     declared index length would have been easier and would have <b>failed
+     Zephyr</b>, where that field is 9 bytes short.`},
+
+  {who:"Parser", sev:"partial", at:"research, may not land",
+   title:"The 7878 <code>.dat</code> cipher: five things it is NOT, measured so nobody re-runs them",
+   body:`7878 ships <b>zero <code>.dbc</code> files</b> (6090 ships 15, 6609
+     ships 12) and 200 encrypted <code>ini/*.dat</code> tables at 7.96–7.98
+     bits/byte. <b>The contrast is what makes it sharp:</b> 6609's equivalent new
+     tables open at <b>100% under the existing TQ cipher at seed 9527</b>. Only
+     7878 changed.`,
+   note:`<b>Ruled out by measurement, and recorded so the cost is not paid
+     twice:</b> the entire 2<sup>32</sup> TQ LCG seed space (zero survivors);
+     an 8-byte block cipher (sizes uniform mod 8, no padding); a period-128
+     keystream; 6090's <code>levexp.dat</code> as known plaintext (5.9% agreement
+     at identical 4030 bytes); ASCII digit/space/CRLF plaintext (18.1%, chance).
+     <b>The open signal is deliberately not called a hypothesis</b> — 8-grams
+     repeat at a dominant 48-byte gap, and a 48-byte record structure with
+     constant fields explains that exactly as well as a keystream period.
+     <b>The two are not yet separated, so neither is claimed.</b>`},
+
+  {who:"RE DX9", sev:"partial", at:"reported",
+   title:"“Screen capture was lost in DX9” — refuted, and by the trap its own discoverer documented",
+   body:`<code>ReadFramePixels</code> is genuinely gone. <b>Capture was never
+     lost:</b> <code>CMyBitmap::ScreenShot</code>, <code>CapScreen</code> and
+     <code>TargetBmpCreate</code> are present in <b>all four builds across nine
+     years</b>, and DX9 <i>gained</i> <code>.png</code>/<code>.bmp</code> output
+     plus three more capable routes.`,
+   note:`<b>The mechanism is the lesson.</b> <code>CapScreen</code> was
+     re-signatured <code>void</code> → <code>bool</code>, so a raw name diff
+     lists it as <b>both removed and added</b> — and reading that as a
+     disappearance is the aggregate trap this project already documents, biting
+     the person who documented it. <b>A diff over names answers a question about
+     names, not about capability.</b>`},
+
+  {who:"Quick Fix", sev:"live", at:"merged at 7a76bf0",
+   title:"6609 extraction integrity — PASS, 110,524 / 110,524 MD5-exact",
+   body:`All four discrepancy classes zero. This is the answer to the shortfall
+     the “on the ground” tab could not resolve from file counts alone.`,
+   note:`Two independent instruments now agree on 6609, and neither is a count of
+     files in a directory — <b>which is the instrument that could not settle
+     it.</b>`},
+
+  {who:"RE New Functionality", sev:"live", at:"reported",
+   title:"7878 and 6609 are complete — proved from the PE, not from a file count",
+   body:`A PE declares where its own last byte must be. Comparing file size
+     against declared section end plus certificate table gives
+     <b>all 16 targets at slack +0, every Authenticode block intact</b> — and
+     <b>truncation takes the signature first</b>.`,
+   note:`This settled a question two samples of a directory walk could not, and a
+     third sample never could have. <b>Change instrument, do not repeat the
+     measurement.</b>`},
+];
+$("#teamfindings").innerHTML=TEAMS.map(t=>`
+  <article class="card dec" style="border-left-color:var(--${t.sev});margin-bottom:16px">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <span class="pill s-${t.sev}">${esc(t.who)}</span>
+      <span class="mono" style="font-size:11.5px;color:var(--ink-3)">${esc(t.at)}</span>
+    </div>
+    <h3>${t.title}</h3>
+    <p class="why">${t.body}</p>
+    ${t.table?`<div class="scroller" style="margin:0 0 16px"><table class="tbl">
+      <thead><tr>${t.table[0].map(h=>`<th>${esc(h)}</th>`).join("")}</tr></thead>
+      <tbody>${t.table.slice(1).map(r=>`<tr>${r.map(c=>
+        `<td class="m">${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`:""}
+    <div class="ev"><h4>why the instrument is the finding</h4>
+      <ul><li>${t.note}</li></ul></div>
+  </article>`).join("");
+
+/* ------------------------------------------------------------------- teams */
+(function(){
+  const w=(SNAP.git||{}).worktrees||[];
+  $("#t-team").textContent=w.length;
+  $("#teams").innerHTML=`<thead><tr><th>worktree</th><th>branch</th><th>head</th>
+      <th>ahead</th><th>behind</th></tr></thead><tbody>`+
+    w.map(t=>`<tr><td class="m">${esc(t.name)}</td><td class="m">${esc(t.branch)}</td>
+      <td class="m">${esc(t.sha)}</td>
+      <td class="m">${t.ahead??"—"}</td><td class="m">${t.behind??"—"}</td></tr>`).join("")+
+    `</tbody>`;
+
+  const r=SNAP.register||{};
+  $("#reg").innerHTML=[
+    ["entries",n(r.entries),"counted by id form, not by heading"],
+    ["numeric space",`C1–C${r.highest_numeric}`,"frozen; new ids are dated"],
+    ["dated ids",n(r.dated),`C-&lt;date&gt;-&lt;slug&gt;`],
+    ["headings",n(r.headings),`${(r.non_entry_headings||[]).length} are policy sections, not entries — counting headings over-reports`]
+  ].map(([k,v,d])=>`<div class="card tile"><div class="k">${k}</div>
+      <div class="v">${v}</div><div class="d">${d}</div></div>`).join("");
+})();
+
+/* ------------------------------------------------------------------ ground */
+(function(){
+  const ex=SNAP.extraction||[];
+  $("#extraction").innerHTML=ex.map(e=>{
+    if(e.missing) return `<div class="card tile"><div class="k">${esc(e.client)}</div>
+      <div class="v">missing</div><div class="d">no tree found for this client</div></div>`;
+    const pct=Math.min(100,e.percent||0);
+    const over=(e.percent||0)>100;
+    const state=e.growing?`still extracting — <b>+${n(e.delta)}</b> files in ${e.span_seconds}s`
+      :`<b>not growing</b> across a ${e.span_seconds}s window`;
+    const short=e.expected-e.second;
+    let read;
+    if(e.growing) read=`Live. It will land somewhere near the target.`;
+    else if(over) read=`Sitting <b>${n(-short)} above</b> the expected
+      ${n(e.expected)}. Finished — and the two counts are measuring slightly
+      different things, so treat the target as approximate rather than the walk
+      as wrong.`;
+    else if(short>0) read=`Stopped <b>${n(short)} files short</b> of the expected
+      ${n(e.expected)} and not moving. Two samples cannot separate a finished
+      extraction from a stalled one — <b>and a third sample never could either</b>.
+      <b>RESOLVED by changing instrument:</b> a PE declares where its own last
+      byte must be, so RE New Functionality compared file size against declared
+      section end plus certificate table. <b>All 16 targets at slack +0, every
+      Authenticode block intact</b> — and truncation takes the signature first.
+      So it is <b>finished</b>, and the shortfall is a counting difference rather
+      than missing data. <code>innoextract</code> is gone from the process table,
+      which agrees.`;
+    else read=`Complete.`;
+    return `<article class="card tile" style="margin-bottom:12px">
+      <div class="k">${esc(e.tree||e.client)}</div>
+      <div class="v">${n(e.second)} <span style="font-size:14px;color:var(--ink-3)">
+        / ${n(e.expected)} · ${e.percent}%</span></div>
+      <div class="prog"><i style="width:${pct}%"></i></div>
+      <div class="d">${state}. ${read}</div>
+      <div class="prov">two samples ${e.span_seconds}s apart · walk took ${e.walk_seconds}s
+        · files only, directories excluded</div>
+    </article>`;
+  }).join("")||`<div class="empty">no extraction measured</div>`;
+
+  const cl=(SNAP.clients||{}).dirs||[];
+  $("#clients").innerHTML=`<thead><tr><th>tree</th><th>path</th></tr></thead><tbody>`+
+    cl.map(d=>`<tr><td class="m">${esc(d.name)}</td>
+      <td class="m" style="color:var(--ink-3)">${esc(d.path)}</td></tr>`).join("")+`</tbody>`;
+
+  const s=SNAP.shape||{};
+  $("#shape").innerHTML=[
+    ["tools",s.tools,"py"],["core",s.core,"py"],["capture",s.capture,"py"],
+    ["client",s.client,"py"],["plugins",s.plugins,"py"],["docs",s.docs,"md"],
+    ["web ui",s.webui,"files"],["fixtures",s.fixtures,"synthetic captures"]
+  ].map(([k,v,d])=>`<div class="card tile"><div class="k">${k}</div>
+      <div class="v">${n(v)}</div><div class="d">${d}</div></div>`).join("");
+})();
+
+/* -------------------------------------------------------------------- foot */
+$("#foot").innerHTML=`
+  <p><b>Nothing here needed the rig, and that is a design property rather than a
+  convenience.</b> This board attaches to no client, and the demo on 8898 needs
+  <b>zero</b> game clients to show a full dashboard. A Show and Tell that required
+  one would be competing with a worker's verification for a rig that is at best
+  two clients wide. This one cannot — which is why it kept working through the
+  days when four <code>ImConquer</code> processes were up holding no
+  <code>client.lock</code>. <b>That count is now measured on every run</b> rather
+  than asserted in prose: it read four for most of this board's life and is
+  ${(SNAP.rig&&SNAP.rig.known)?"<b>"+n(SNAP.rig.total)+"</b> right now":"unknown right now"}.</p>
+  <p><b>No capture was read and no name is real.</b> Every character, guild and
+  line of chat in the demo was invented for it. That is stronger than scrubbing:
+  <code>capture/scrub.py</code> redacts credentials and states plainly that
+  names, positions and chat are a different problem it only <i>reports</i>. There
+  was nothing to scrub because nothing real was ever loaded.</p>
+  <p><b>Verified, on this tree.</b> <code>companion.py --selftest</code> re-run at
+  <code>422a7a7</code>: PASS. <code>demo.py --selftest</code>: PASS — 500 invented
+  frames decoded by the real mappers into 500 events, no frame decoding to
+  nothing, and every panel it feeds non-empty after folding.</p>
+  <p><b>Two instruments this board deliberately prefers.</b> Teams are counted
+  from worktrees, not branches: <i>a branch on origin says work happened; a
+  worktree says somebody is standing in it.</i> Register entries are counted by
+  id form, not by <code>###</code> heading — three of those headings are policy
+  sections, so <i>counting headings over-reports.</i></p>
+  <p><b>What this page did not measure.</b> The viewer suite is not run here; the
+  figure under “what works” is inherited, labelled, and carries its distance from
+  head <i>computed</i> rather than asserted. It is not re-run to freshen it: 550 s
+  on a quiet box against 1945 s under load, and starting one while another session
+  is verifying makes both results unattributable. No game client was touched
+  either: four
+  <code>ImConquer</code> processes have been up since 8–9 August holding no
+  <code>client.lock</code>, which very likely makes them real sessions on the
+  public service.</p>
+  <p>Everything else here comes from <code>measure.py</code>, re-runnable, at
+  <code>${esc((SNAP.git||{}).head||"")}</code>. The two decisions are quoted from
+  their owning documents and cite them, because a summary of a measurement is
+  the thing this project keeps having to retract.</p>`;
+
+/* -------------------------------------------------------------------- tabs */
+$$("#tabs .tab").forEach(b=>b.addEventListener("click",()=>{
+  $$("#tabs .tab").forEach(x=>x.setAttribute("aria-selected",String(x===b)));
+  $$(".view").forEach(v=>v.hidden=(v.id!=="v-"+b.dataset.v));
+}));
+</script>

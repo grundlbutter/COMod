@@ -54,13 +54,29 @@ defaults, not as measurements, until someone looks.
 """
 from __future__ import annotations
 
+from .catalog import censused
+
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
-from plugins.patch6090 import Patch6090            # noqa: E402
+from plugins.patch6090 import Patch6090, SPECS_6090   # noqa: E402
+
+#: 5517 ships FEWER tables than the 6090 it inherits code from, and this is the
+#: direction that goes wrong quietly: inheriting 6090's spec would have made
+#: this build claim four tables it does not have, and each would have surfaced
+#: as "0 rows" -- a statement about the client that is really a statement about
+#: us. MEASURED with `core/inidat.py` on 5517's own `ini/`: no `ItemtypeSub`,
+#: no `item_value_type`, no `magictypeex`, no `AutoUseMagic`.
+#: `SlotNpc.ini` joins the list because it arrives at 6090: 5517 does not
+#: ship it at all. The npc-family tables it DOES have come through
+#: `SPECS_6090` unchanged.
+_ABSENT_ON_5517 = ("ItemtypeSub.dat", "item_value_type.dat",
+                   "magictypeex.dat", "AutoUseMagic.dat", "SlotNpc.ini")
+SPECS_5517 = tuple(s for s in SPECS_6090
+                   if s.filename not in _ABSENT_ON_5517)
 
 
 def _version(root: Path, exists) -> str:
@@ -74,10 +90,18 @@ def _version(root: Path, exists) -> str:
         return ""
 
 
+
 class Patch5517(Patch6090):
     name = "patch5517"
     label = "Official patch client 5517"
+    origin = "official"
     aliases = ("5517",)
+
+    def table_specs(self, root):
+        # Curated specs plus every `.ini` the grammar census
+        # settled -- see `plugins/catalog/censused.py`. A curated spec
+        # always wins on subject and filename.
+        return censused.extend(SPECS_5517, self.name)
     notes = ("Same parse family as 6090 -- compiled .dbc twins, TQ-cipher "
              "itemtype/Monster .dat, four-wide action fields -- with 26,098 "
              "of its 26,766 files byte-identical to 6090 at the same path "
@@ -151,22 +175,50 @@ class Patch5517(Patch6090):
         return q
 
     def colour_provenance(self):
-        """**Not** 6090's "verified / authored". The colour sets are
-        inherited and every one of them is unconfirmed here.
+        """Inherited from 6090, and now **measured to resolve identically**
+        here -- which is a weaker claim than "verified", deliberately.
 
-        6090's claim rests on the author looking at 36 monster directories in
-        *that* client. This client's loose layer differs by 27,363 files, so
-        a set may name a texture 5517 does not ship, or ship a skin the
-        creature does not wear. `Catalog.monster_colourways` filters by
-        existence, so the first failure mode shows up as a short strip -- but
-        the second does not show up at all, and calling it "authored" is what
-        would stop anyone checking.
+        MEASURED 2026-08-09 via `Catalog.monster_colourways`, run per base in
+        **separate processes**: in-process root switching silently keeps the
+        first catalogue's plugin, and a run that does it compares a base with
+        itself and reports a confident zero difference.
 
-        Say inherited until someone does the same pass here; then this
-        override comes off and the sets move into a `Patch5517.MONSTERS` of
-        their own.
+            38 of 39 directories resolve the IDENTICAL strip on 5517 and 6090
+             1 differs -- `104n`, 4 stems here against 5, missing 906000000
+
+        **What that buys, and what it does not.** It retires the first failure
+        mode this docstring used to warn about -- a set naming a texture 5517
+        does not ship now has exactly one instance, and it is named. It does
+        **not** retire the second. If the 6090 scan put the wrong skins on a
+        creature, 5517 resolves the *same wrong strip*: identical output proves
+        the two clients agree, not that either is right. So this inherits
+        6090's confidence exactly -- no more, and no longer any less.
+
+        **The textures are the same bytes, and that is NOT evidence.** 114 of
+        the 115 declared stems are byte-identical across the two installs --
+        necessarily, because both read one `c3.wdf` (md5 `1c16683437bc`) and
+        one `data.wdf` of identical size. That comparison could not have come
+        out any other way, and it is recorded here only so the next reader does
+        not mistake it for confirmation. What genuinely discriminates is
+        *existence*: 906000000 is absent from 5517's loose layer, which is the
+        only reason the one real difference surfaced at all.
+
+        **Left inherited rather than copied into a `Patch5517.MONSTERS`.** The
+        earlier plan was to copy the sets down once checked. Copying 39
+        identical sets creates a second place to drift; the measurement says
+        they are the same, so the honest encoding is to keep inheriting and
+        assert the identity in a test. Only a set that genuinely diverges earns
+        its own entry here.
         """
-        return "inherited colourway (6090 scan, unverified here)", "inferred"
+        # The word "unverified" is load-bearing and
+        # `ParserPlugins::test_a_subclass_does_not_inherit_its_parents_evidence`
+        # asserts it. It caught this label the first time it was rewritten:
+        # the measurement below is real, and it tempted a shorter string that
+        # dropped the hedge. Strips resolving identically is agreement, not a
+        # check -- nobody has confirmed the 6090 scan's CHOICES against this
+        # client. Keep both halves: the hedge, then what was measured.
+        return ("inherited colourway (6090 scan, unverified here; strips "
+                "measured identical, 38/39)", "inferred")
 
     def import_plan(self, root, exists) -> dict:
         plan = super().import_plan(root, exists)

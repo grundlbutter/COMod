@@ -546,10 +546,33 @@ first:
 
 `c3/0001`–`c3/0004` are not four mystery folders: they are the per-body-type
 motion sets, so they fold into Characters (see `docs/appearance_ids.md`).
+**There are sixteen of them, not four** — `c3/1001`…`3004` are the same shape,
+`ini/3dmotion.dbc` names all sixteen, and 5517 and 6090 both ship them (CCO
+ships only the first four). They used to land in `character/misc`. The rule and
+its evidence live in `tools/catalog.py` — the `^c3/[0-3]00[1-4]/` entry in
+`RULES` — and are cited rather than restated here.
 
 Inside a category you get **kind of file** chips (mesh / texture / …) and a
 **group** axis — for map art that group is the region folder, so you can go
 straight to `newplain` (13,730 tiles) or `island` (474).
+
+**Hide animation assets.** A checkbox at the top of the Categories pane drops
+everything the taxonomy files under `motion` — 2,475 entries on 5517. Nothing
+in this pane can preview an animation: `/api/mesh` on `c3/0001/000/001.c3`
+returns `meshes: []`, because the file is four `MOTI` chunks and no geometry.
+The character builder and the model view are where a motion is bound over a
+mesh and played, and they are unchanged.
+
+It is **off by default** — a browser whose job is "every asset the client can
+see" does not start by hiding a bucket. While it is on it shows an amber banner
+naming the count, and the server recomputes every number — category totals, sub
+chips, role chips, the grand total, the per-category line — so the readout can
+never disagree with the list. It persists in `localStorage` under
+`coviewer.hideMotion`, the same convention as `coviewer.collapsed` (panels) and
+`coviewer.dirsClosed` (folder tree). `tools/catalog.py`'s `animation_buckets()`
+derives the set from the taxonomy and records what it deliberately does *not*
+cover — monster, mount and NPC motion-only action files, which the taxonomy
+files under `mesh`.
 
 ### Maps
 
@@ -642,6 +665,7 @@ viewport and deciding it seems right.
 | **`SHAP` ribbons** | The two-point blade line, transformed by `SMOT[frame] × world`, smeared into 5 interpolated pairs per tick, capped at `min(segments × 5, 800) + 1` pairs and emitted as a triangle strip. `Flash4102`: 7 segments → **36 pairs → 72 strip vertices**. VERIFIED against `Shape_Draw` / `Shape_SetSegment`. |
 | **Blend state** | Straight from the layer's `ASB`/`ADB`, which are `D3DBLEND`, mapped to the GL factor. `5,2` (SRCALPHA/ONE) is the additive glow, `5,6` ordinary alpha. Per layer, not a global setting. |
 | **Depth** | Effects are depth-*tested* but do not write depth, so they never occlude each other. |
+| **`PTCL` / `PTCX` / `PTC3` particles** | The simulation is **baked** — `frames[i]` is the solved set for frame i — so there is no integrator and writing one would invent motion the file already states. Each live particle becomes one **camera-facing** quad of half-extent `size × scale_of(world)` (the transformed `(1,1,1)` over √3, RVA 0x1EC968), taking the flipbook cell `int(cellPhase × N²)` of an `N × N` atlas, `N = texGrid`. The billboard plane comes from the **view matrix**, not from `_basis()` — the two differ in sign on X, which would mirror every atlas cell. Six vertices per particle (a triangle list; the engine's own buffer is a 4-vertex strip, so `vertsPerParticle` 4 and `QUAD_VERTS_PER_PARTICLE` 6 describe different buffers). VERIFIED against `Ptcl_Draw`; what is *not* applied is listed below. |
 | **Anchoring** | Aura and trail ride the weapon socket's world matrix **as it is on the frame being drawn** — `setEffectTime`'s parent matrix reaches the static quads, not only the ribbon history (§5.2; it used to reach only the ribbons, and the glow hung where the hand had been). The impact spark is anchored to a **separate dummy target** in front of the figure, because that is where the engine draws it. INFERRED (`docs/effects.md` §8). |
 
 ### The swing preview, and why it exists
@@ -660,10 +684,22 @@ and look like nothing happened.)
 
 ### What effect playback does *not* do
 
-* **`PTCL` / `PTC3` particle systems are not decoded** (`docs/effects.md` §6.6).
-  Layers that are pure particles draw **nothing** and the panel says so, rather
-  than substituting something plausible. 464 of 2,255 effects need particles for
-  at least one layer; for effects reachable from a weapon it is 29 of 1,134.
+* **The `PTC3` per-particle alpha envelope.** `particleAlpha` / `particleLife`
+  run on a particle's **normalised life**, and a baked frame carries no life
+  and no birth frame — the input does not exist in the descriptor. So the
+  envelope is not applied and particles draw at full alpha. On patch5517 that
+  is inert for the 1,057 parts whose peak level is 1.0 and too bright for the
+  1,154 whose peak is lower. `PTCX`/`PTC3` do ship a per-particle `u16` id
+  which *looks* like a stable identity (a dropped particle leaves a gap in the
+  sequence), so life may be recoverable from first/last appearance — not done,
+  and not asserted, because the decoded meaning of that field is "a key into
+  the owner's attachment-matrix map", which is a different claim.
+* **`worldSpace`, `billboard` and `roll`.** Three `PTC3` header fields the draw
+  path carries and does not act on: `worldSpace` (+0x34, "non-zero skips the
+  position transform", 165 of patch5517's 2,211 `PTC3` parts), `billboard`
+  (+0x30, 337 non-zero) and `roll` (+0x3C, 333 non-zero). One clause of prose
+  each is not enough to branch a transform on, and a wrong branch puts a whole
+  effect somewhere else in the world.
 * **A blend mode whose source factor is `SRCCOLOR` ignores the alpha envelope.**
   The `410009` aura is authored `ASB=3 (SRCCOLOR), ADB=7 (DESTALPHA)`, so the
   per-frame alpha never reaches the blend equation. That is faithful to the
@@ -767,8 +803,11 @@ Keyboard: <kbd>↑</kbd><kbd>↓</kbd> item, <kbd>←</kbd><kbd>→</kbd> colour
 <kbd>PgUp</kbd>/<kbd>PgDn</kbd>/<kbd>Home</kbd>/<kbd>End</kbd>,
 <kbd>Enter</kbd> keep it, <kbd>Esc</kbd> close. <kbd>B</kbd> <kbd>H</kbd>
 <kbd>R</kbd> or <kbd>1</kbd>–<kbd>4</kbd> open a picker directly.
-<kbd>Q</kbd> steps the equipped weapon up a quality (shift-<kbd>Q</kbd> down)
-and <kbd>A</kbd> toggles its Super aura — see §5.2.
+<kbd>Q</kbd> steps the weapon the **Colour & variants** panel is showing up a
+quality (shift-<kbd>Q</kbd> down) — <kbd>3</kbd>/<kbd>4</kbd> point that panel
+at a hand, see *Which weapon `Q` steps* below. <kbd>A</kbd> toggles the
+**right** hand's Super aura, shift-<kbd>A</kbd> the **left** hand's — they are
+independent, see §5.2.
 
 **Arrowing previews on the character**, using the same 130 ms debounce and
 monotonic load token as the browser (§2): the highlight moves on every press,
@@ -984,7 +1023,8 @@ sharing a look: Normal · Refined + Unique · Elite + Super
 ```
 
 <kbd>Q</kbd> / shift-<kbd>Q</kbd> steps up and down the ladder without opening
-anything.
+anything — the ladder **this panel is showing**, which with a weapon in each
+hand is the whole question: see *Which weapon <kbd>Q</kbd> steps* below.
 
 **Outliers are reported, not forced into five.** A quality that is not offered
 says which of *three different things* is true, because they are not the same
@@ -1009,6 +1049,65 @@ and for `410009` that is nine cells — the eight family ids **plus `800000`**, 
 different weapon type that reuses the blade mesh. The quality selector is keyed
 on the family, so it cannot wander like that.
 
+### Which weapon <kbd>Q</kbd> steps — FIXED
+
+The same collapsed one-weapon assumption that *One aura per hand* (below) found
+in the aura was still in `stepQuality`, which read
+
+```js
+const slot = B.loadout.r_weapon ? 'r_weapon'
+           : (B.loadout.l_weapon ? 'l_weapon' : null);
+```
+
+— the right hand *or, failing that,* the left. With Bronze Club `480138` in
+both hands, the reported loadout, <kbd>Q</kbd> could only ever step the right
+one; the left hand needed the picker or that hand's **Switch to Super** button.
+
+The aura fixed its version of this by growing a second key (<kbd>A</kbd> and
+shift-<kbd>A</kbd>). **<kbd>Q</kbd> cannot**: <kbd>Q</kbd> and shift-<kbd>Q</kbd>
+are already *up* and *down*, and that is the axis the ladder actually has.
+
+So it takes its slot from the **Colour & variants** panel — the slot you last
+touched, and the only one whose ladder is on screen. Opening a picker
+(<kbd>3</kbd> right hand, <kbd>4</kbd> left hand, or clicking the slot),
+arrowing inside one, and picking a quality all move that panel, so the target
+follows the thing you are already looking at. **No new mode and no new
+setting**: the panel *is* the selector, its heading names the hand
+(*Quality — Left hand*) and the line under the buttons says what the key does.
+
+<kbd>Q</kbd> works **with a picker open**, and has to: opening one is the only
+way to point that panel at a slot, so a <kbd>Q</kbd> that died there could not
+reach the second hand without closing it again first. Not in the search box,
+which takes focus when a picker opens — there <kbd>q</kbd> types a `q`, which
+is the only thing it can sensibly do. It goes live as soon as you leave that
+box, which <kbd>↓</kbd> does on its way into the list.
+
+When the panel is on something with no ladder — the body, a helmet, an empty
+slot — the answer has to come from the loadout, and there it either is or is
+not ambiguous:
+
+| equipped | <kbd>Q</kbd> |
+|---|---|
+| nothing | *no weapon equipped* |
+| exactly one weapon | steps it — there is nothing to get wrong |
+| more than one | names them and says which key opens which, rather than quietly preferring a hand |
+
+That last row is the point. Silently preferring the right hand is the behaviour
+being removed, so it is not the fallback either. Every outcome names the slot it
+acted on (*Left hand: Super — 480139 · carries the aura*), including the end of
+the ladder (*Left hand: already the Super*), because with two weapons in play a
+silent keypress is indistinguishable from a dropped one.
+
+Guarded by `tools/test_viewer.py::PerHandSuperAura` — the same class, because it
+is the same assumption in the same file, and that class's own *Switch to Super*
+button was the workaround this report was reduced to.
+
+**Why this survived three weeks inside a section headed *FIXED*:
+`C-2026-08-09-q-key-per-hand`.** The claim below said *"the keyboard"* where the commit
+that earned it said *"the keyboard (A / shift-A)"*. The register owns that
+correction and the rule it produced; this section does not restate it.
+Session brief: `docs/handoff_2026-08-09_q_key_per_hand.md`.
+
 ### The aura toggle — the actual ask
 
 *"Super items get an aura applied to them, visible on the character. Can you make
@@ -1019,10 +1118,12 @@ not by reading it — it did work. It was just not findable: a small ghost butto
 in the fourth panel down, ~1,230 px into a 670 px scroller, and it only ever
 appeared if you had already hunted `410009` out of a list of 5,384. So:
 
-* a **Super aura** checkbox sits in the viewport control bar, next to grid and
-  wireframe, visible whenever a weapon is equipped, with <kbd>A</kbd> as its key;
-* the panel switch is a real labelled toggle reading *showing on the weapon* /
-  *this weapon has one* / *not on this quality*;
+* an **aura R** / **aura L** checkbox sits in the viewport control bar, next to
+  grid and wireframe — **one per weapon hand**, each shown whenever that hand is
+  holding something, with <kbd>A</kbd> and shift-<kbd>A</kbd> as their keys
+  (see *One aura per hand* below);
+* the panel switch is a real labelled toggle per hand reading *showing on this
+  weapon* / *this weapon has one* / *not on this quality*;
 * the intent is **sticky** — persisted in `localStorage`, and kept across weapon
   changes, so stepping Elite → Super lights the glow back up by itself;
 * when there is no aura the panel says **why, in this weapon's own terms**
@@ -1045,6 +1146,58 @@ families with an aura on some non-Super id 213
 So "only Super glows" is true 575 times out of 646 and the UI must not hardcode
 it. 796 weapon appearances carry an aura across 29 families — `blade`,
 `bigblade`, `lance`, `halberd`, `bow`, shields — not just `blade/`.
+
+### One aura per hand — FIXED
+
+*"I can only make one weapon super at a time. This needs to be an independent
+control for each weapon hand."* A character can hold a weapon in each hand and
+both can glow.
+
+**The limitation was entirely in `tools/webui/builder.js`**, and it is worth
+saying which layer it was *not* in, because two of the three looked like
+suspects:
+
+* **not `tools/superfx.py`.** `SLOT_SOCKET` has mapped `l_weapon` →
+  `v_l_weapon` and `r_weapon` → `v_r_weapon` since it was written, and
+  `SuperFxDB.anchor()` is a `@staticmethod` taking the slot — there is no state
+  in it to share.
+* **not the payload.** `/api/superfx?slot=` resolves and anchors either hand.
+  MEASURED on body `003131090` holding `480139` (Super Bronze Club) in both
+  hands, one request per hand: right translation `(-24.635, 3.271, 78.656)`,
+  left `(23.423, 3.068, 77.751)` — mirrored, and each **equal to 0.0** against
+  the matching socket in `/api/figure`'s `anchors`, which returns both dummies
+  in a single response.
+* **the UI.** `B.superfx` was one `{on, rec}`, one `localStorage` flag and one
+  checkbox, and `equippedWeapon()` returned the right hand *or, failing that,*
+  the left. So the left-hand aura was reachable only with the right hand empty,
+  and both together were not expressible.
+
+What changed: state, persistence, the viewport checkboxes, the panel block, the
+switch and the keyboard are all per hand, and each `EffectInstance` now carries
+its `slot`. That last part is the half that a split toggle alone does not fix —
+`placeSuperFx()` used to write **one** socket matrix into **every** live
+instance, and `fxLoop()`'s parent callback ignored its argument, either of which
+drags the left glow onto the right hand. The two sockets are ~144 units apart
+mid-swing on action `401`, so that would not have been subtle. The code carries
+the reasoning inline (`tools/webui/builder.js`, the *weapon fx* section) and
+`tools/test_viewer.py::PerHandSuperAura` holds the guard, including a control
+asserting the two hands are far enough apart for the bug to be visible at all.
+
+The old scalar `cobuilder.aura` value is migrated on read: `'1'` becomes both
+hands on, which is what that setting did in either case it could reach.
+
+**The same assumption had a second home.** `stepQuality` — the <kbd>Q</kbd> key
+— carried its own copy of *the right hand, or failing that the left*, so with
+both hands full the left weapon's quality could not be stepped from the
+keyboard and the *Switch to Super* button above was what you were left with.
+That is fixed too, and differently, because <kbd>Q</kbd> had no spare key: see
+*Which weapon <kbd>Q</kbd> steps* earlier in this section.
+
+**Orthogonal to the female-shape socket work.** This path goes through
+`attach.socket_matrix`; the viewer-only `socket_correction` for the degenerate
+`v_l_weapon` track on shapes 001/002 is untouched, and both
+`SocketCorrectionIsViewerOnly` and a per-hand instance of the same assertion are
+green. The measurements above are on a male body (003) on purpose.
 
 ### The glow did not follow the swing — FIXED
 
@@ -1531,8 +1684,11 @@ The effect library is a model kind. Picking one loads it through the same
 `/api/effect` the asset browser uses and plays it with the same `fx.js`,
 anchored at the origin because a standalone effect has no parent to ride, and
 framed on its own quads' bounds so a 12-unit spark is not an invisible dot.
-Effects whose every layer is `PTCL`/`PTC3` draw nothing and say so — particles
-are still not decoded (§4.5).
+Effects whose every layer is `PTCL`/`PTC3` **draw** — the particle draw path
+landed with the format work (§4.5). They are framed on the bounds
+`effectplay.particle_bounds` computes from the baked frames, half-extent
+included, because a pure-particle effect has no `PHY` geometry to measure and
+without it the camera keeps whatever the last model left it at.
 
 ### One family is listed and withheld
 
@@ -1551,7 +1707,7 @@ is worse than no row.
 | **`ini/3DSimpleObj.ini` — 137 sections** | 34 resolve to a mesh that ships, and every one of those meshes is already reachable as a role, an NPC or the mount, so a separate "simple objects" kind would have been the same 34 models under a second name. The table is still used, for the roles and as a texture source. |
 | **262 of the 263 monster shapes `3dmotion.ini` names** | Only 65 directories under `c3/monster/` ship any art at all; the other shapes name files that are simply not in this install. They are not listed as empty models — there is nothing to show — but the per-action "not in this install" reporting inside a family that *is* here covers the same ground honestly. |
 | **`npc_simple:217`** | Listed and withheld — see above. |
-| **`PTCL` / `PTC3` effects** | Unchanged from §4.5: 464 of 2,255 effects need particles for at least one layer and particles are still not decoded. Those layers draw nothing and the panel says so. |
+| ~~**`PTCL` / `PTC3` effects**~~ | **Previewable, as of the particle draw path — see §4.5.** This row used to say the layers draw nothing because particles were not decoded. They are decoded and they are drawn; what remains unapplied is named in §4.5's "does *not* do" list, and it is three header fields and one envelope, not the form. |
 
 ### Two lists, because one convention cannot reach everything
 
@@ -1828,8 +1984,12 @@ preview.
   Verified: zero non-zero `uv1` values across the whole corpus.
 * **`MNEW` and `CCFL` chunks** (31 and 26 in the 2022 patches) are undecoded —
   they are listed in the Mesh panel as "other chunks" and not drawn.
-* **`PTCL` / `PTC3` particle systems.** 431 effect objects are pure particles.
-  Their layers draw nothing and say so. See §4.5.
+* ~~**`PTCL` / `PTC3` particle systems.**~~ **Drawn — see §4.5.** The old note
+  here said their layers draw nothing, and quoted **431** pure-particle effect
+  objects as if that were a property of the format. It is CCO's number
+  (`docs/CORRECTIONS.md` C41(b)); on patch5517 the same measurement is **127
+  effects whose every part is a particle system**, out of 1,200 that need one
+  somewhere. Quote the base with the count.
 * ~~**Map viewing/editing.**~~ **Built, as of task #30 — see §10 and
   `docs/mapeditor.md`.** The old note here said maps were out of scope because
   `integrity.json` covers them. Measuring the manifest showed that it covers the

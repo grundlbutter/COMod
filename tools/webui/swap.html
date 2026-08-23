@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Swap an asset -- CO Asset Viewer</title>
+<link rel="stylesheet" href="/ui/style.css">
+<style>
+/* Local to this page. The shared style.css is built around the browser's
+   three-pane layout; this page is two panes of equal weight with the swap
+   itself between them, because seeing both halves is the whole point. */
+.sw-wrap { display: flex; flex-direction: column; height: 100vh; }
+.sw-top { padding: .6rem 1rem; border-bottom: 1px solid rgba(128,128,128,.25);
+          display: flex; align-items: baseline; gap: 1rem; }
+.sw-top h2 { margin: 0; font-size: 1.1rem; }
+.sw-top .sw-sub { opacity: .8; font-size: .9em; }
+.sw-body { flex: 1; display: grid; grid-template-columns: 1fr 15rem 1fr;
+           min-height: 0; }
+.sw-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.sw-pane + .sw-pane { border-left: 1px solid rgba(128,128,128,.25); }
+.sw-mid { border-left: 1px solid rgba(128,128,128,.25);
+          border-right: 1px solid rgba(128,128,128,.25);
+          padding: .8rem; overflow-y: auto; }
+.sw-head { padding: .5rem .8rem; border-bottom: 1px solid rgba(128,128,128,.25); }
+.sw-role { font-weight: 600; }
+.sw-role small { font-weight: 400; opacity: .75; display: block; }
+.sw-stage { position: relative; height: 46%; min-height: 12rem;
+            background: rgba(128,128,128,.08); }
+.sw-stage canvas { width: 100%; height: 100%; display: block; }
+.sw-msg { position: absolute; inset: 0; display: flex; align-items: center;
+          justify-content: center; text-align: center; padding: 1rem;
+          pointer-events: none; opacity: .85; }
+.sw-pick { flex: 1; overflow-y: auto; min-height: 0; padding: .4rem .8rem; }
+.sw-kinds { display: flex; flex-wrap: wrap; gap: .3rem; padding: .5rem .8rem;
+            border-bottom: 1px solid rgba(128,128,128,.25); }
+.sw-kind { padding: .25rem .6rem; border: 1px solid rgba(128,128,128,.4);
+           border-radius: 999px; cursor: pointer; font-size: .9em; }
+.sw-kind.on { background: rgba(90,140,220,.25); border-color: rgba(90,140,220,.8); }
+.sw-kind[disabled] { opacity: .45; cursor: not-allowed; }
+.sw-item { padding: .25rem .4rem; cursor: pointer; border-radius: 3px;
+           display: flex; gap: .5rem; align-items: baseline; }
+.sw-item:hover { background: rgba(128,128,128,.15); }
+.sw-item.on { background: rgba(90,140,220,.28); }
+.sw-item .sw-id { opacity: .65; font-size: .85em; }
+.sw-item.sw-dim { opacity: .55; }
+.sw-note { font-size: .85em; opacity: .8; padding: .3rem .4rem;
+           border-left: 2px solid rgba(128,128,128,.5); margin-bottom: .3rem; }
+.sw-search { width: 100%; box-sizing: border-box; margin: .4rem 0; }
+
+/* An empty parts list is a fault until proven otherwise, so the states are
+   not styled alike: `fault` and `unknown` are loud, `none` is a statement,
+   and only `ok` is quiet. */
+.sw-parts { padding: .5rem .8rem; border-top: 1px solid rgba(128,128,128,.25);
+            max-height: 32%; overflow-y: auto; }
+.sw-state { padding: .5rem .6rem; border-radius: 4px; margin-bottom: .5rem; }
+.sw-state b { display: block; }
+.sw-state .sw-detail { font-size: .9em; opacity: .9; margin-top: .3rem; }
+.sw-state .sw-files { font-size: .85em; opacity: .8; margin-top: .35rem;
+                      font-family: ui-monospace, monospace;
+                      white-space: pre-wrap; word-break: break-all; }
+.sw-fault { background: rgba(200,60,50,.16);
+            border-left: 3px solid rgba(200,60,50,.9); }
+.sw-unknown { background: rgba(220,150,40,.16);
+              border-left: 3px solid rgba(220,150,40,.9); }
+.sw-none { background: rgba(128,128,128,.14);
+           border-left: 3px solid rgba(128,128,128,.7); }
+.sw-ok { background: rgba(70,160,90,.12);
+         border-left: 3px solid rgba(70,160,90,.7); }
+.sw-cb { display: block; padding: .12rem 0; }
+
+/* The cohort question is asked at the moment of the swap, never in a settings
+   panel: which rows change is a property of this swap, not a preference. */
+.sw-mode { margin: .5rem 0; }
+.sw-mode label { display: block; padding: .35rem .5rem; border-radius: 4px;
+                 border: 1px solid rgba(128,128,128,.35); margin-bottom: .35rem;
+                 cursor: pointer; }
+.sw-mode label.on { border-color: rgba(90,140,220,.9);
+                    background: rgba(90,140,220,.14); }
+.sw-mode .sw-eff { display: block; font-size: .85em; opacity: .8;
+                   margin-left: 1.4rem; }
+.sw-warn { background: rgba(220,150,40,.16);
+           border-left: 3px solid rgba(220,150,40,.9);
+           padding: .45rem .6rem; border-radius: 4px; margin: .5rem 0;
+           font-size: .9em; }
+.sw-stub { background: rgba(160,90,200,.16);
+           border-left: 3px solid rgba(160,90,200,.9);
+           padding: .45rem .6rem; border-radius: 4px; margin: .5rem 0;
+           font-size: .9em; }
+.sw-stub code { font-size: .95em; }
+.sw-writes { font-family: ui-monospace, monospace; font-size: .82em;
+             opacity: .9; white-space: pre-wrap; word-break: break-all; }
+.sw-arrow { text-align: center; font-size: 1.4rem; opacity: .6; margin: .3rem 0; }
+.sw-row { display: flex; align-items: center; gap: .5rem; margin: .35rem 0;
+          flex-wrap: wrap; }
+.sw-lab { font-size: .7em; opacity: .7; text-transform: uppercase;
+          letter-spacing: .05em; }
+.sw-sel { flex: 1; min-width: 12rem; font: inherit; font-size: .82em;
+          padding: .25rem .4rem; border-radius: 4px;
+          background: rgba(128,128,128,.12); color: inherit;
+          border: 1px solid rgba(128,128,128,.35); }
+.sw-sel option:disabled { opacity: .45; }
+.sw-warn { margin: .4rem 0; padding: .5rem .6rem; border-radius: 4px;
+           background: rgba(200,120,0,.15);
+           border: 1px solid rgba(200,120,0,.5); font-size: .82em; }
+.sw-warn strong { display: block; margin-bottom: .15rem; }
+.sw-drawer { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+             display: flex; justify-content: flex-end; z-index: 50; }
+.sw-drawer.hidden { display: none; }
+.sw-drawer-in { width: min(46rem, 94vw); height: 100%; overflow: auto;
+                padding: 1rem 1.2rem; background: #14171c; color: #dfe6ef;
+                box-shadow: -8px 0 24px rgba(0,0,0,.5); }
+.sw-drawer-in h3 { margin: .2rem 0 .4rem; }
+.sw-file { display: flex; gap: .5rem; padding: .2rem 0; font-size: .82em;
+           border-bottom: 1px solid rgba(128,128,128,.18); }
+.sw-file b { min-width: 5.5rem; }
+.sw-members { max-height: 12rem; overflow: auto; margin: .3rem 0;
+              padding: .35rem .5rem; border-radius: 4px;
+              background: rgba(128,128,128,.10); font-size: .8em; }
+.sw-members div { padding: .08rem 0; }
+.sw-plan { white-space: pre-wrap; font-size: .78em; line-height: 1.35;
+           max-height: 30rem; overflow: auto; background: rgba(128,128,128,.10);
+           padding: .5rem; border-radius: 4px; }
+.sw-cmd { white-space: pre-wrap; font-size: .8em; cursor: pointer;
+          background: rgba(128,128,128,.14); padding: .35rem; border-radius: 3px; }
+.sw-go { margin-top: .6rem; padding: .35rem .8rem; cursor: pointer; }
+.sw-step { margin: .5rem 0; }
+</style>
+</head>
+<body>
+<div class="sw-wrap">
+  <div class="sw-top">
+    <h2>Swap an asset</h2>
+    <span class="sw-sub">Pick what you want on the left, what it replaces on
+      the right. The file paths are worked out for you.</span>
+    <span style="margin-left:auto">
+      <button id="btn-mods" class="sw-go" type="button">Mod staging</button>
+      <a href="/">back to the viewer</a></span>
+  </div>
+  <div id="sw-writable"></div>
+  <div class="sw-body">
+
+    <div class="sw-pane" id="pane-donor">
+      <div class="sw-head">
+        <span class="sw-role">Your library
+          <small>collect something first &mdash; this pane is never an install</small></span>
+      </div>
+      <div class="sw-kinds" id="donor-kinds"></div>
+      <div class="sw-stage"><canvas id="gl-donor"></canvas>
+        <div class="sw-msg" id="msg-donor">pick a kind</div></div>
+      <div class="sw-pick">
+        <input class="sw-search" id="donor-q" type="search"
+               placeholder="filter" autocomplete="off">
+        <div id="donor-list"></div>
+      </div>
+      <div class="sw-parts" id="donor-parts"></div>
+    </div>
+
+    <div class="sw-mid" id="sw-mid">
+      <div class="sw-arrow">&rarr;</div>
+      <div id="mid-body">Pick a donor and a target.</div>
+    </div>
+
+    <div class="sw-pane" id="pane-target">
+      <div class="sw-head">
+        <span class="sw-role">The private server
+          <small>CCO &mdash; the NPC set from its own npc.json</small></span>
+      </div>
+      <div class="sw-kinds" id="target-kinds"></div>
+      <div class="sw-stage"><canvas id="gl-target"></canvas>
+        <div class="sw-msg" id="msg-target">pick a kind</div></div>
+      <div class="sw-pick">
+        <input class="sw-search" id="target-q" type="search"
+               placeholder="filter" autocomplete="off">
+        <div id="target-list"></div>
+      </div>
+      <div class="sw-parts" id="target-parts"></div>
+    </div>
+
+  </div>
+</div>
+
+  <!-- Mod staging. The same tree, and the same comod.py commands, the rest
+       of the suite uses -- this page does not get a private install path. -->
+  <div id="drawer" class="sw-drawer hidden">
+    <div class="sw-drawer-in">
+      <h3>Mod staging</h3>
+      <p class="sw-note">
+        Staged files live in <code id="stage-dir">mods/stage</code>. Nothing
+        touches the game install until you press <b>Install</b>, which runs
+        <code>comod.py install --yes</code> &mdash; the same path as the CLI,
+        with its backups and its <code>uninstall</code> revert.
+      </p>
+      <div id="stage-list"></div>
+      <div class="sw-row">
+        <button id="btn-dry" class="sw-go" type="button">Install (dry run)</button>
+        <button id="btn-install" class="sw-go" type="button">Install for real</button>
+        <button id="btn-amend" class="sw-go" type="button">Add to install (amend)</button>
+        <button id="btn-uninstall" class="sw-go" type="button">Uninstall / revert</button>
+        <button id="btn-clear" class="sw-go" type="button">Clear staging</button>
+        <button id="drawer-close" class="sw-go" type="button">close</button>
+      </div>
+      <div id="drawer-warn"></div>
+      <h3 style="margin-top:1rem">Installed, by date</h3>
+      <p class="sw-note">Each install or amendment is its own dated entry with
+        its own backups. A revert peels them back newest first, because a
+        later entry's backup holds what the one before it left behind.</p>
+      <div id="record-list"></div>
+      <pre id="mod-output" class="sw-plan"></pre>
+    </div>
+  </div>
+
+<script src="/ui/csrf.js"></script>
+<script src="/ui/fx.js"></script>
+<script src="/ui/gl.js"></script>
+<script src="/ui/swappage.js"></script>
+</body>
+</html>
