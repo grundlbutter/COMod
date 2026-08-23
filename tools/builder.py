@@ -339,6 +339,10 @@ class BuilderIndex:
                 self.weapon_type_names = {}
 
         self.manifest = partsmod.PartManifest(self.root, tables=tables)
+        #: slot -> why the rows this slot does not offer were not offered.
+        #: Filled by `_build_slot`; read by `slot_info` so the reason string
+        #: names the half that is actually missing.
+        self.dropped: dict[str, dict] = {}
         self.options: dict[str, list[Option]] = {}
         for slot in self.manifest.slots:
             self.options[slot] = self._build_slot(slot)
@@ -377,16 +381,30 @@ class BuilderIndex:
         if ini is None:
             return []
         out: list[Option] = []
+        # WHY THE SPLIT IS RECORDED: the test below is mesh AND texture, and
+        # `slot_info` used to report every rejection as "no mesh on disk".
+        # MEASURED on CCO's weapon.ini: 5,381 of 5,384 entries resolve a mesh
+        # and 5,214 resolve a texture, so of the 170 entries not offered, 167
+        # are missing a TEXTURE and the readout blamed the mesh for all of
+        # them. A reason string that names the wrong half sends the reader to
+        # the wrong file.
+        dropped = {"noMesh": 0, "noTexture": 0, "noParts": 0}
         for app in ini:
             if not app.parts:
+                dropped["noParts"] += 1
                 continue
             pr = app.parts[0]
             mesh = self._resolve(pr.mesh, "mesh")
             tex = self._resolve(pr.texture, "texture")
             # The whole point: an option is a SHIPPED pair or it is not offered.
             if not mesh or not tex:
+                if not mesh:
+                    dropped["noMesh"] += 1
+                else:
+                    dropped["noTexture"] += 1
                 continue
             out.append(self._make(slot, app.ident, pr, mesh, tex))
+        self.dropped[slot] = dropped
         return out
 
     def _make(self, slot: str, ident: str, pr, mesh: str, tex: str) -> Option:
@@ -455,17 +473,30 @@ class BuilderIndex:
             rows = len(ini) if ini else 0
             garments = len({o.mesh for o in opts})
             usable = bool(opts)
+            # Both numbers in every sentence below are ENTRIES of `s.mesh_ini`
+            # -- appearance rows -- tested one row at a time against that
+            # row's own first part. They are never a per-mesh count: many rows
+            # share one mesh and differ only in texture (`garments` below is
+            # the distinct-mesh number, and on CCO's weapon.ini it is 437
+            # against 5,384 rows). Saying "entries" and meaning meshes is how
+            # a 12x discrepancy reads as a bug in the resolver.
+            drop = self.dropped.get(s.name, {})
+            no_mesh = drop.get("noMesh", 0)
+            no_tex = drop.get("noTexture", 0)
             if not s.shipped:
                 reason = (f"{s.mesh_ini} is declared by ini/RolePart.ini but does "
                           f"not ship in this build, so there is nothing to offer.")
             elif not usable:
-                reason = (f"{s.mesh_ini} ships {rows} entries but not one of their "
-                          f"meshes resolves to a file the client can open, so "
-                          f"equipping any of them would draw nothing.")
+                reason = (f"{s.mesh_ini} ships {rows} entries but none of them "
+                          f"resolves to a mesh AND a texture the client can open "
+                          f"({no_mesh} have no mesh, {no_tex} have a mesh but no "
+                          f"texture), so equipping any of them would draw nothing.")
             elif len(opts) < rows * 0.2:
                 reason = (f"only {len(opts)} of {rows} entries in {s.mesh_ini} "
-                          f"have art that ships; the rest are listed by the ini "
-                          f"but have no mesh on disk.")
+                          f"resolve both a mesh and a texture that ship "
+                          f"({no_mesh} of the rest have no mesh, {no_tex} have a "
+                          f"mesh but no texture). Entries, not meshes: these "
+                          f"{len(opts)} use {garments} distinct meshes.")
             else:
                 reason = ""
             body_specific = self._body_specific(s.name)
@@ -480,9 +511,14 @@ class BuilderIndex:
                 "shipped": s.shipped,
                 "usable": usable,
                 "reason": reason,
+                # `rows` and `count` are both ENTRIES of mesh_ini; `garments`
+                # is the distinct-mesh count behind `count`, and the two must
+                # never be swapped in a sentence -- see the reasons above.
                 "rows": rows,
                 "count": len(opts),
                 "garments": garments,
+                "noMesh": no_mesh,
+                "noTexture": no_tex,
                 "bodySpecific": body_specific,
                 "primary": s.name in PRIMARY_SLOTS,
                 "aliases": s.aliases,

@@ -71,7 +71,29 @@ input[type=search] { text-transform: none; }
 .facet-axis > .axis-name {
   flex: 0 0 100%; color: var(--mut); font-size: 10px; text-transform: uppercase;
   letter-spacing: .5px; margin-bottom: -1px;
+  display: flex; align-items: center; gap: 8px;
 }
+/* The chips of one axis, held in their own wrapping row so the axis header can
+   carry a control beside its name without joining the chip flow. */
+.facet-axis > .axis-chips {
+  flex: 0 0 100%; display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+}
+.facet-axis > .axis-chips:empty { display: none; }
+.axis-chips > .axis-note { flex: 0 0 100%; margin-top: 1px; }
+/* Disclosure control in an axis header: right-aligned, and never uppercased
+   with the label -- it is a sentence about a count, not a heading. */
+button.disclose {
+  margin-left: auto; text-transform: none; letter-spacing: 0;
+  white-space: nowrap; font-size: 10.5px; padding: 1px 7px;
+}
+/* "3 of 14 · 1 selected kept" beside the Your-tags label: a reading, not a
+   heading, so it does not inherit the header's uppercasing. */
+.axis-name > .tagcount {
+  margin-left: auto; text-transform: none; letter-spacing: 0;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* A search box inside a wrapping facet axis is a row of its own. */
+.facet-axis > input[type=search] { flex: 0 0 100%; margin-top: 1px; }
 .chip {
   display: inline-flex; align-items: baseline; gap: 5px;
   padding: 3px 8px; border-radius: 999px; cursor: pointer; font-size: 11.5px;
@@ -282,6 +304,8 @@ div.filter-note.hidden { display: none; }
 .relgroup { margin-bottom: 11px; }
 .relgroup h3 { font-size: 11.5px; margin: 0 0 2px; font-weight: 600; }
 .relgroup .note { color: var(--mut); font-size: 10.5px; margin-bottom: 5px; }
+.relgroup .showall { color: var(--accent); text-decoration: underline dotted; }
+.relgroup .showall:hover { text-decoration: underline; }
 .relstrip { display: flex; flex-wrap: wrap; gap: 5px; }
 .relstrip .cell { width: 46px; text-align: center; cursor: pointer; }
 .relstrip .cell img {
@@ -296,6 +320,46 @@ div.filter-note.hidden { display: none; }
 .pending {
   border: 1px dashed var(--line); border-radius: 6px; padding: 7px 9px;
   color: var(--mut); font-size: 11px;
+}
+
+/* ---- a map's art set, and what it names that is not here ---- */
+.artset {
+  margin: 9px 0 2px; padding: 6px 9px; border-radius: 6px;
+  background: #6aa9ff14; border: 1px solid #6aa9ff44; font-size: 11.5px;
+}
+.artset b { color: var(--fg); }
+.artset span { color: var(--mut); }
+/* Unresolved references are not an error -- the install is allowed to be
+   incomplete -- so this is the warn colour and not the bad one. What it must
+   never be is invisible. */
+.artset.bad { background: #e6b4551f; border-color: #e6b45566; }
+.artset.bad span { color: var(--warn); }
+
+.relgroup.unres {
+  margin-top: 8px; padding: 8px 9px; border-radius: 6px;
+  border: 1px solid #e6b45544; background: #e6b45510;
+}
+.unres-sec { margin: 7px 0 0; }
+.unres-sec h4 {
+  font-size: 11px; margin: 0 0 1px; font-weight: 600; color: var(--warn);
+}
+/* Two lines, not two columns. A logical path is long and a `via` beside it
+   squeezes the path into a 60px gutter that hyphenates mid-word -- the one
+   piece of information the row exists to carry, made unreadable to make room
+   for the footnote. */
+.unres-row {
+  font-size: 10.5px; padding: 2px 0; border-bottom: 1px dotted #ffffff12;
+}
+.unres-row .g {
+  display: inline-block; min-width: 44px; color: var(--mut); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: .4px; vertical-align: baseline;
+}
+.unres-row .r {
+  font-family: var(--mono); color: var(--fg); overflow-wrap: anywhere;
+}
+.unres-row .v {
+  display: block; margin-left: 44px; color: var(--mut); font-size: 9.5px;
+  overflow-wrap: anywhere;
 }
 
 /* ---- loadout ---- */

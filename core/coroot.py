@@ -74,6 +74,7 @@ __all__ = [
     "missing_parts", "looks_like_root", "describe_root",
     "user_config_path", "repo_config_path", "config_root", "save_root",
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
+    "installs_root", "set_installs_root",
     "derived_overrides", "derived_override", "set_derived_override",
     "broken_derived_overrides",
     "PER_BASE", "GLOBAL", "GLOBAL_EXCEPTIONS", "UndeclaredDerived",
@@ -1149,6 +1150,41 @@ def derived_path(rel: str, root=None) -> Path:
     repo = _repo_dir()
     base = repo if repo is not None else Path.cwd()
     return base / derived_rel(rel, root)
+
+
+def installs_root() -> Optional[Path]:
+    """Where comod keeps install records, when it is not the local tree.
+
+    An install record describes a GAME INSTALL. There is one game install per
+    machine, so there should be one record for it -- but `comod` derives the
+    location from its own `PROJECT`, which is per-CHECKOUT. On a box with
+    linked worktrees that means one record per worktree, and two consequences:
+
+      * a worktree can install over a game another checkout already modified,
+        and neither record knows, so `uninstall` restores a file to a state
+        the other install has since replaced;
+      * the guard that stops the CCO tests asserting STOCK facts reads this
+        location to decide whether anything is installed. In a worktree with
+        no records it answered "nothing is installed" and the tests pinned
+        stock values against a modded game.
+
+    A *setting* rather than a search, because the search has no honest answer:
+    the records here live in a LINKED worktree, not the primary, so
+    `primary_checkout()` finds nothing and any "look around for one" rule is
+    guessing which checkout speaks for the machine. Unset -- which is the
+    shipped case, where there is exactly one tree -- means the local one.
+    """
+    raw = _read_user_config().get("installs_root")
+    if not raw:
+        return None
+    p = Path(str(raw))
+    return p if p.is_dir() else None
+
+
+def set_installs_root(path) -> Path:
+    """Name the shared install-record directory, or clear it with ``None``."""
+    return write_settings(installs_root=("" if path is None
+                                         else str(Path(path).resolve())))
 
 
 def derived_overrides() -> dict:

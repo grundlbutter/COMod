@@ -1160,6 +1160,182 @@ class Resolution(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
+class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
+    r"""`Catalog.resolve_id` / `Catalog.exists` must answer about the INSTALL,
+    not about `out/wdf/*_names.json`.
+
+    A WDF entry stores `tq_hash(name)` and nothing else, so every name in
+    `Catalog._path_set` for an archived asset is one a *recovery pass* put
+    back. Those tables are a derived artefact: a linked worktree that has not
+    built them, `CO_DERIVED_FALLBACK=0`, or a fresh clone all see none. When
+    that happens a resolver keyed on the name set says "does not resolve to a
+    shipped file" for assets the same process hands out over `/api/mesh` a
+    moment later -- MEASURED on CCO, `/api/appearance?table=body&id=002000000`
+    returned `mesh: null` while `/api/mesh?path=c3/mesh/002000000.c3` on the
+    same server returned HTTP 200 and 46,688 bytes.
+
+    THE FIXTURE. Rather than mock the artefact search, the archive half of the
+    name set is simply removed: that IS the state an un-recovered install is
+    in, and it is exactly reproducible. Two controls then refuse to let the
+    fixture pass vacuously -- `test_the_fixture_actually_removes_names`, and
+    the `bite` counter each assertion loop carries. Without the latter, a
+    resolver that answered None for everything would agree perfectly with an
+    oracle that also answered None.
+
+    The oracle is `coassets.AssetRoot`, which resolves by asking the container
+    the same way `read()` does and therefore never had the defect. Agreement is
+    asserted cell for cell over every row of every part table, not over a
+    four-id sample: `test_id_resolution_matches_coassets` above is a four-id
+    sample and it stayed GREEN through the whole outage.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coviewer
+        from coassets import AssetRoot
+        cls.coviewer = coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+        cls.cat.wait_tables()
+        cls.R = AssetRoot(ROOT)
+        # Hash-only entries are the whole subject. A DatPkg root states every
+        # entry's path, so there is no recovery table and nothing to lose.
+        if not cls.cat._unnamed:
+            cls.cat.close()
+            cls.R.close()
+            raise unittest.SkipTest(
+                f"{ROOT} has no hash-addressed archive entries -- its container "
+                f"states every path, so no name needs recovering")
+        cls.named = len(cls.cat._path_set)
+        cls.cat.all_paths = sorted(cls.cat.loose)
+        cls.cat._path_set = set(cls.cat.all_paths)
+        cls.cat._ships_cache = {}
+        cls.stripped = len(cls.cat._path_set)
+        #: The oracle probes the filesystem up to 21 times per miss, and the
+        #: part tables reference the same ids over and over -- `l_weapon` and
+        #: `r_weapon` are one file read twice, and hundreds of colourways share
+        #: a mesh. Memoised, or this class alone costs 95 s on 5517.
+        cls._oracle_cache: dict = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cat.close()
+        cls.R.close()
+
+    def _rows(self):
+        for table, ini in sorted(self.cat.tables.items()):
+            for app in ini:
+                if app.parts:
+                    yield table, app.ident, app.parts[0]
+
+    def _oracle(self, ref, kind):
+        """`AssetRoot.resolve_asset(ref, kind).logical` or None, memoised."""
+        key = (ref, kind)
+        if key not in self._oracle_cache:
+            loc = self.R.resolve_asset(ref, kind)
+            self._oracle_cache[key] = loc.logical if loc else None
+        return self._oracle_cache[key]
+
+    def test_the_fixture_actually_removes_names(self):
+        """The control. Everything below is meaningless if the strip was a
+        no-op, so the strip is measured before it is relied on."""
+        self.assertLess(self.stripped, self.named,
+                        "stripping the archive names removed nothing -- this "
+                        "install's paths must all be loose, so the fixture "
+                        "cannot reproduce an un-recovered install")
+        self.assertTrue(self.cat.tables, "no part tables loaded")
+
+    def test_resolve_id_agrees_with_the_container_over_every_row(self):
+        """Every appearance row of every part table, mesh and texture.
+
+        `bite` is the second control: at least one resolution must come back
+        from the hash path -- a path the stripped name set does not contain.
+        """
+        bite = 0
+        checked = 0
+        for table, ident, pr in self._rows():
+            for ref, kind in ((pr.mesh, "mesh"), (pr.texture, "texture")):
+                mine = self.cat.resolve_id(ref, kind)
+                theirs = self._oracle(ref, kind)
+                self.assertEqual(
+                    mine, theirs,
+                    f"{table}[{ident}] {kind} {ref!r}: the catalogue says "
+                    f"{mine!r}, the container says {theirs!r}")
+                checked += 1
+                if mine and mine not in self.cat._path_set:
+                    bite += 1
+        self.assertGreater(checked, 100, "no appearance rows were checked")
+        self.assertGreater(
+            bite, 0,
+            f"{checked} references checked and not one resolved through the "
+            f"hash lookup -- the fixture is not exercising the path this test "
+            f"exists to guard")
+
+    def test_exists_agrees_with_the_container(self):
+        """`Catalog.exists` is injected into assetcat, mapindex, unify,
+        swapplan and BuilderIndex. It has to mean "this install can produce
+        these bytes", which is `AssetRoot.exists`."""
+        bite = 0
+        for table, ident, pr in self._rows():
+            for ref, kind in ((pr.mesh, "mesh"), (pr.texture, "texture")):
+                p = self._oracle(ref, kind)
+                if p is None:
+                    continue
+                self.assertTrue(self.cat.exists(p),
+                                f"{table}[{ident}] {kind}: exists() denies "
+                                f"{p}, which read() would return")
+                if p not in self.cat._path_set:
+                    bite += 1
+        self.assertGreater(bite, 0, "no hash-only asset was exercised")
+        # and it must still refuse what is not there
+        self.assertFalse(self.cat.exists("c3/mesh/no_such_mesh_zz.c3"))
+
+    def test_the_builder_offers_what_the_container_can_read(self):
+        """The Character builder's pickers, which take `resolve_id` and
+        `exists` by injection from `Catalog.builder`.
+
+        MEASURED on CCO before the fix, with the recovery tables not visible:
+        "only 236 of 5384 entries in ini/weapon.ini have art that ships" --
+        against 5,214 that the container can in fact read.
+        """
+        idx = self.cat.builder
+        oracle = {}
+        for slot, ini in self.cat.tables.items():
+            n = 0
+            for app in ini:
+                if not app.parts:
+                    continue
+                pr = app.parts[0]
+                if (self._oracle(pr.mesh, "mesh")
+                        and self._oracle(pr.texture, "texture")):
+                    n += 1
+            oracle[slot] = n
+        seen = 0
+        for s in idx.slot_info():
+            if s["name"] not in oracle:
+                continue
+            seen += 1
+            self.assertEqual(
+                s["count"], oracle[s["name"]],
+                f"{s['name']}: the picker offers {s['count']} of {s['rows']} "
+                f"{s['ini']} entries, the container can read "
+                f"{oracle[s['name']]}")
+            # The readout's own arithmetic: every row is offered, dropped for
+            # a mesh, dropped for a texture, or has no parts at all. A reason
+            # string that blames the mesh for a missing texture sends the
+            # reader to the wrong file.
+            self.assertEqual(
+                s["count"] + s["noMesh"] + s["noTexture"]
+                + idx.dropped.get(s["name"], {}).get("noParts", 0),
+                s["rows"],
+                f"{s['name']}: counts do not add up to {s['rows']} rows")
+            if s["reason"] and s["rows"]:
+                self.assertIn("entries", s["reason"],
+                              f"{s['name']}: the reason must say which unit it "
+                              f"is counting")
+        self.assertGreater(seen, 0, "no slot was compared")
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
 @unittest.skipUnless(HAVE_PIL, "Pillow not installed")
 class Swap(unittest.TestCase):
     """The texture-swap staging path, with STAGE redirected somewhere safe."""
@@ -1778,7 +1954,7 @@ class ClientsAreGroupedByWhatTheyAre(unittest.TestCase):
                 self.assertNotIn(k, seen, f"{k} appears in two blocks")
                 seen.add(k)
         self.assertEqual(runs, len(set(kinds)))
-        self.assertEqual(kinds[0], "install", "official clients come first")
+        self.assertEqual(kinds[0], "install", "offline clients come first")
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
@@ -1849,10 +2025,28 @@ class Maps(unittest.TestCase):
         cls.mapindex = mapindex
         cls.cat = coviewer.Catalog(ROOT)
         cls.ix = cls.cat.maps
+        # A real socket on an ephemeral port, so the route assertions below go
+        # through the real routing and the real JSON encoder rather than
+        # calling the handler method directly. Same shape as
+        # `HideAnimationAssetsToggle._serve`.
+        cls.httpd = coviewer.ViewerServer(("127.0.0.1", 0), coviewer.Handler,
+                                          cls.cat, ROOT)
+        cls.httpd.views[""] = cls.cat
+        cls.httpd.root_found = None
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
         cls.cat.close()
+
+    def _get(self, path: str):
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}{path}", timeout=180) as r:
+            return json.load(r)
 
     def test_all_maps_listed_largest_first(self):
         rows = self.ix.summary()
@@ -1943,6 +2137,251 @@ class Maps(unittest.TestCase):
         rec = self.ix.get("definitely_not_a_map")
         self.assertTrue(rec.error)
         self.assertEqual(rec.tile_count, 0)
+
+    # -- the art set: what the map names, INCLUDING what is not here --------
+    #
+    # The panel's whole claim is "here is everything that goes with this map".
+    # Three walks used to filter their own misses out where they found them,
+    # so the claim was true only of the art that happened to be present. The
+    # tests below are about the half that used to disappear.
+
+    def _index_denying(self, *deny: str):
+        """A `MapIndex` over the same root whose `exists` denies these paths.
+
+        A fixture rather than a real broken install, because the property
+        under test is "what does this code do when a named file is not
+        here", and no install on this machine is missing the file we want it
+        to be missing. The denial is the only difference from `self.ix`.
+        """
+        gone = {d.lower() for d in deny}
+        cat = self.cat
+        return self.mapindex.MapIndex(
+            self.ix.root, exists=lambda p: p.lower() not in gone and cat.exists(p))
+
+    def _a_map_with_tiles(self):
+        for name in ("island", "canyon-fairy", "desert", "newplain", "gulf"):
+            rec = self.ix.get(name)
+            if rec.tiles:
+                return rec
+        self.skipTest("no map on this base resolves any ground tile")
+
+    def test_a_named_file_that_is_not_here_is_listed_not_dropped(self):
+        """The failure this whole feature exists to prevent.
+
+        Measured on 5517's `hq` before the fix: the map names 1,364 pieces of
+        art, 56 of them ship, and the panel reported **56** with no error and
+        no count. Dropping the other 1,308 where they were found made a map
+        that is mostly missing indistinguishable from a small map.
+        """
+        rec = self._a_map_with_tiles()
+        victim = rec.tiles[0]
+        blind = self._index_denying(victim)
+        after = blind.get(rec.name)
+        self.assertNotIn(victim, after.tiles,
+                         "the fixture did not actually deny the file")
+        refs = [u for u in after.unresolved if u.ref == victim]
+        self.assertEqual(len(refs), 1,
+                         f"{victim} vanished instead of being listed as "
+                         f"unresolved; unresolved={[u.ref for u in after.unresolved]}")
+        self.assertEqual(refs[0].reason, "absent")
+        self.assertEqual(refs[0].group, "ground")
+        # ...and nothing else moved. A denial that quietly shrinks the rest of
+        # the walk would make the count above true and the panel still wrong.
+        self.assertEqual(after.tile_count, rec.tile_count - 1)
+
+    def test_unknown_and_not_there_do_not_collapse_into_one_label(self):
+        """Two different answers, two different labels, both actionable.
+
+        `absent` names a file that could be gone and found. `unknown` means
+        the index does not define the key at all, so there is no file to look
+        for -- the index is what is short. A reader who cannot tell them apart
+        cannot act on either.
+        """
+        rec = self._a_map_with_tiles()
+        blind = self._index_denying(rec.tiles[0])
+        after = blind.get(rec.name)
+        reasons = {u.reason for u in after.unresolved}
+        self.assertIn("absent", reasons)
+        for u in after.unresolved:
+            self.assertIn(u.reason, self.mapindex.UNRESOLVED_REASONS)
+            # Every reason must carry prose. A label whose meaning lives only
+            # in the source is a label the panel cannot explain.
+            self.assertTrue(self.mapindex.REASON_TEXT.get(u.reason, "").strip(),
+                            f"reason {u.reason!r} has no explanation")
+        self.assertNotEqual(
+            self.mapindex.REASON_TEXT["absent"],
+            self.mapindex.REASON_TEXT["unknown"],
+            "the two states must not be described identically")
+
+    def test_denying_everything_reports_everything(self):
+        """The whole-population version, so the accounting cannot be right for
+        one file and wrong for the rest.
+
+        This is the control the single-file test cannot be: a walk that
+        reported the first miss and then gave up would pass that one and fail
+        this one.
+        """
+        rec = self._a_map_with_tiles()
+        if rec.tile_count < 5:
+            self.skipTest("need a map with a few tiles to make this bite")
+        blind = self.mapindex.MapIndex(self.ix.root, exists=lambda p: False)
+        after = blind.get(rec.name)
+        self.assertEqual(after.tiles, [], "nothing should resolve")
+        listed = {u.ref for u in after.unresolved if u.reason == "absent"}
+        missing = set(rec.tiles) - listed
+        self.assertEqual(missing, set(),
+                         f"{len(missing)} tiles were dropped rather than listed")
+
+    def test_the_empty_pul_slot_is_not_reported_as_missing_art(self):
+        """The converse duty. A false entry costs what a dropped one does.
+
+        `0xFFFF` in a `.pul` is "nothing painted here" (`coassets.PUL_EMPTY`),
+        not tile 65535. MEASURED across three installs: 27 of CCO's 136 maps,
+        36 of 5517's 192 and 72 of 7878's 470 place it, and **no `.ani` on any
+        of them defines `Puzzle65535`** -- which is what a sentinel looks like.
+        Before the constant was shared, every one of those maps grew a phantom
+        unresolved reference, and a list that cries wolf stops being read.
+        """
+        import coassets
+        self.assertEqual(coassets.PUL_EMPTY, 0xFFFF)
+        sentinel = f"Puzzle{coassets.PUL_EMPTY}"
+        seen = []
+        for name in self.ix.names():
+            rec = self.ix.get(name)
+            if any(u.ref == sentinel for u in rec.unresolved):
+                seen.append(name)
+        self.assertEqual(seen, [],
+                         f"{len(seen)} maps report the empty-slot sentinel as "
+                         f"unresolved art: {seen[:6]}")
+
+    def test_the_layer_walk_agrees_with_core_dmap(self):
+        """Two walks over the same bytes must read the same number of layers.
+
+        They did not. `tools/mapindex` carried the pre-1005 payload table
+        while `core/dmap` had learnt 1005's wider cover and 1006's renumbered
+        tag; the short walk met an unmodelled tag and returned cleanly, so a
+        map with 2,923 layers of scenery presented as a map with none.
+        MEASURED on CCO 2.0 at the time: ninja01_new 0/2923, 2020love01_new
+        0/1170, bp-flandlords-y_new 0/79, magictower01_new 1/34.
+
+        Not pinned to those four names -- it is every map this base has, so
+        the next version bump fails here rather than in the panel.
+        """
+        import dmap as core_dmap
+        from coassets import DMap as CoDMap
+        disagree, checked = [], 0
+        for name in self.ix.names():
+            raw, _why = core_dmap.open_map(self.ix.root, name)
+            if raw is None:
+                continue
+            try:
+                m = CoDMap.parse(raw)
+            except Exception:
+                continue
+            mine = len(list(self.mapindex.iter_layers(m)))
+            d, _ = core_dmap.parse_map(self.ix.root, name,
+                                       want_cells=False, verify=False)
+            if d is None:
+                continue
+            checked += 1
+            if len(d.layers) != mine:
+                disagree.append((name, m.version, m.layer_count,
+                                 mine, len(d.layers)))
+        self.assertGreater(checked, 50, "the sweep read almost nothing")
+        self.assertEqual(disagree, [],
+                         "(map, version, declared, mapindex, core/dmap)")
+
+    def test_a_scene_says_which_kind_of_empty_it_is(self):
+        """`scene_parts` had three exits that all returned `[]`: not on disk,
+        did not parse, and resolved nothing. The caller could not tell them
+        apart, so the panel drew all three as a scene with no pieces -- and
+        the first of the three is the trap `tools/mapparts` documents, where
+        the art lives in an archive and a `.is_file()` test on a logical path
+        answers a different question.
+        """
+        rep = self.ix.scene_parts("map/scene/definitely-not-a-scene.scene")
+        self.assertIsInstance(rep, dict)
+        self.assertEqual(rep["parts"], [])
+        self.assertTrue(rep["error"], "an empty result must say why")
+        self.assertEqual([u["reason"] for u in rep["unresolved"]], ["absent"])
+        # and a real one, when this base has one, must NOT claim an error
+        for name in self.ix.names():
+            rec = self.ix.get(name)
+            if not rec.scenes:
+                continue
+            good = self.ix.scene_parts(rec.scenes[0])
+            self.assertFalse(good["error"], f"{rec.scenes[0]}: {good['error']}")
+            self.assertTrue(good["parts"])
+            return
+        self.skipTest("no map on this base has a scene layer")
+
+    # -- the route the panel actually reads ---------------------------------
+
+    def test_the_map_route_carries_the_unresolved_half(self):
+        """`/api/map` must ship the counts and the list, not just the art.
+
+        The panel cannot report what the payload does not carry, and a field
+        that is present only when non-empty is a field the page cannot lead
+        with -- "no unresolved references" and "this server is too old to
+        say" would render identically.
+        """
+        rec = self._a_map_with_tiles()
+        d = self._get("/api/map?name=" + rec.name)
+        for k in ("resolvedCount", "unresolvedCount", "unresolved",
+                  "sceneDetailShown", "sceneDetailLimit", "sceneFrameCount"):
+            self.assertIn(k, d, f"/api/map dropped {k}")
+        self.assertIsInstance(d["unresolved"], list)
+        self.assertEqual(d["unresolvedCount"], len(d["unresolved"]))
+        self.assertEqual(d["resolvedCount"], rec.resolved_count)
+        self.assertGreater(d["resolvedCount"], 0)
+        for u in d["unresolved"]:
+            self.assertEqual(sorted(u), ["group", "reason", "ref", "via", "why"])
+            self.assertIn(u["reason"], self.mapindex.UNRESOLVED_REASONS)
+            self.assertTrue(u["why"].strip())
+
+    def test_the_scene_detail_cap_admits_to_being_a_cap(self):
+        """A truncated list that does not say it is truncated is the same
+        failure as a dropped reference: the panel is short for a reason the
+        reader cannot see."""
+        import coviewer
+        rec = self._a_map_with_tiles()
+        d = self._get("/api/map?name=" + rec.name)
+        self.assertEqual(d["sceneDetailLimit"],
+                         coviewer.Handler.SCENE_DETAIL_LIMIT)
+        self.assertEqual(d["sceneDetailShown"], len(d["scenePartDetail"]))
+        self.assertEqual(d["sceneDetailShown"],
+                         min(d["sceneCount"], d["sceneDetailLimit"]))
+
+    def test_the_panel_prints_both_halves_of_the_count(self):
+        """The page's side of the same contract, checked in the source.
+
+        No gate covers `tools/webui/*`, so the one thing that can be asserted
+        here is that the strings the panel leads with exist and that the
+        reason table the server defines is fully spelled out in the page. A
+        reason the server can emit and the page has no heading for would
+        render as a section with a raw identifier -- which the page also
+        handles, and which this pins so the handling is not deleted.
+        """
+        code = _strip_js_comments(
+            (Path(__file__).resolve().parent / "webui" / "app.js")
+            .read_text("utf-8"))
+        self.assertIn("assets go with this map", code)
+        self.assertIn("every reference it makes resolves", code,
+                      "the zero case must be stated, not left blank")
+        self.assertIn("it names are unresolved", code)
+        for reason in self.mapindex.UNRESOLVED_REASONS:
+            self.assertIn(f"'{reason}'", code,
+                          f"the page has no heading for reason {reason!r}")
+        # The fall-through that prints a reason the page was never taught.
+        self.assertIn("const rest = new Set(unres.map(u => u.reason));", code)
+        # A capped strip must say it is capped AND offer the rest. "Everything
+        # that goes with this map" is the ask; 96 of 230 with no way past it
+        # is a smaller answer wearing the same words.
+        self.assertIn("showing ${limit} of ${uniq.length.toLocaleString()}", code)
+        self.assertIn("draw the other ${(uniq.length - limit).toLocaleString()}",
+                      code)
+        # ...and the count must be taken on the deduped set, not the raw list.
+        self.assertIn("const uniq = [...new Set(paths)];", code)
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
@@ -16533,9 +16972,22 @@ class NpcModelArtPins(unittest.TestCase):
     def test_a_colourway_probe_asks_the_archive_not_the_name_table(self):
         """c3/texture/109000000.dds is a real 16KB skin whose WDF name was
         never recovered, so the path set has never heard of it while the
-        renderer loads it by hash. Probing names emptied 109's strip."""
-        self.assertFalse(self.cat.exists("c3/texture/109000000.dds"))
+        renderer loads it by hash. Probing names emptied 109's strip.
+
+        The name-set fact is the *subject*, so it is asserted directly on
+        `_path_set`. It used to be asserted as `assertFalse(cat.exists(...))`,
+        which pinned the DEFECT rather than the datum: `Catalog.exists` was
+        itself a name-set probe then, and a name-set probe is exactly what
+        this test says must not be used. Both existence tests now answer the
+        archive, so both are True here while the name is still missing --
+        MEASURED on 5517 and 6090, `_path_set` False, 16,512 bytes readable.
+        """
+        self.assertNotIn("c3/texture/109000000.dds", self.cat._path_set,
+                         "the premise of this test is that this name was "
+                         "never recovered; if it has been, pick another")
+        self.assertTrue(self.cat.exists("c3/texture/109000000.dds"))
         self.assertTrue(self.cat.assets.exists("c3/texture/109000000.dds"))
+        self.assertEqual(len(self.cat.read("c3/texture/109000000.dds")), 16512)
         # 197's blue is the same case: real skin, unrecovered name, and the
         # scan says it belongs. A name-based probe would drop it.
         self.assertIn("c3/texture/797000000.dds",
@@ -20322,6 +20774,502 @@ class CoverAnchorConvention(unittest.TestCase):
         self.assertEqual(old["version"], 1)
         self.assertEqual(old["layerTag"], ex.LAYER_TAGS["terrain"])
 
+#: The pages, for the source-level assertions below. No gate covers
+#: `tools/webui/*`, so anything claimed about the UI is either driven in a
+#: browser or asserted against the file that is served.
+WEBUI_PAGES = PROJECT / "tools" / "webui"
+
+
+class SettingsDirectoryManagement(unittest.TestCase):
+    r"""The Settings page's Directory Management, over the real routing.
+
+    Three things this suite is here to hold, all of them the owner's rulings
+    rather than style:
+
+    1. **Nothing is ever declared silently.** Listing and scanning are reads.
+       `test_the_scan_declares_nothing` asserts the config file is
+       byte-identical after a scan, and `test_declaring_without_a_kind_is_refused`
+       asserts the write path cannot be reached without an explicit answer.
+
+    2. **A guess is never presented as an identification.** `detect_report`
+       returns a verdict, and only `confident` -- >= 0.9 with the runner-up
+       more than 0.05 below -- is one. Weak and tied reads carry `ask: true`.
+
+    3. **The scan folder is resolved through `coroot`, not hardcoded.**
+       `tests/test_sanitization.py`'s check 3 only matches the Program Files
+       path, so a hardcoded asset-tree path would sail past it; that is not
+       permission, and `test_no_module_hardcodes_the_clients_folder` is the
+       guard the gate does not provide.
+
+    Runs against a **temporary config**: `coroot.user_config_path` reads
+    `APPDATA` at call time, so pointing it at a scratch directory keeps every
+    declaration these tests make out of the real per-user config. Without that
+    a test run would adopt directories on the developer's machine -- which is
+    the exact defect the feature exists to prevent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import coviewer                                # noqa: PLC0415
+        cls.coviewer = coviewer
+
+    def setUp(self):
+        import coviewer
+        self.tmp = Path(tempfile.mkdtemp(prefix="co-settings-"))
+        self.env = {}
+        for k in ("APPDATA", "XDG_CONFIG_HOME"):
+            self.env[k] = os.environ.get(k)
+        os.environ["APPDATA"] = str(self.tmp / "appdata")
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        coroot.invalidate_cache()
+        # A tree of fake clients: three under one parent, one somewhere else.
+        # `coroot.missing_parts` is a CONTENT check, so the fakes have to
+        # carry the real markers or nothing will accept them.
+        self.clients = self.tmp / "Assets" / "Clients"
+        for name in ("aaa", "bbb", "ccc"):
+            self._fake_client(self.clients / name)
+        self.elsewhere = self.tmp / "Program Files" / "Something"
+        self._fake_client(self.elsewhere)
+        coroot.write_settings(**{coroot.KINDS_KEY: {
+            str(self.clients / "aaa"): "patch5017",
+            str(self.clients / "bbb"): "cco",
+            str(self.elsewhere): "patch5065",
+        }, "game_kind": "patch5017",
+            "game_root": str(self.clients / "aaa")})
+
+    def tearDown(self):
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        coroot.invalidate_cache()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _fake_client(p: Path):
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "c3.wdf").write_bytes(b"\0" * 16)
+        (p / "data.wdf").write_bytes(b"\0" * 16)
+        (p / "ini").mkdir(exist_ok=True)
+
+    # -- where the scan looks ----------------------------------------------
+    def test_the_clients_folder_is_derived_from_the_declarations(self):
+        """No literal. The scan folder is where MOST declared clients live."""
+        root, why = self.coviewer.clients_root()
+        self.assertEqual(Path(root), self.clients)
+        self.assertIn("2 of your declared clients", why)
+        # ...and not the common ancestor, which for this layout is the temp
+        # directory itself and holds a `Program Files` tree that is not a
+        # place to scan.
+        self.assertNotEqual(Path(root), self.tmp)
+
+    def test_an_explicit_scan_folder_outranks_the_derivation(self):
+        other = self.tmp / "Elsewhere"
+        other.mkdir()
+        coroot.write_settings(**{self.coviewer.CLIENTS_ROOT_KEY: str(other)})
+        root, why = self.coviewer.clients_root()
+        self.assertEqual(Path(root), other)
+        self.assertIn(self.coviewer.CLIENTS_ROOT_KEY, why)
+
+    def test_no_module_hardcodes_the_clients_folder(self):
+        r"""The guard `tests/test_sanitization.py` does not provide.
+
+        Its check 3 matches `Program Files...Classic Conquer` only, so a
+        hardcoded `C:\COMod\ConquerAssets\Clients` in shipping code passes it
+        while being the same defect: a tool that only runs on the machine it
+        was written on. Scoped to the modules this feature touches.
+        """
+        pat = re.compile(r"[A-Za-z]:[\\/]+COMod[\\/]+ConquerAssets",
+                         re.IGNORECASE)
+        for rel in ("tools/coviewer.py", "tools/webui/setdirs.js",
+                    "tools/webui/sethealth.js", "tools/webui/dirscan.js"):
+            text = (PROJECT / rel).read_text("utf-8", errors="replace")
+            self.assertIsNone(pat.search(text),
+                              f"{rel} hardcodes the asset tree")
+
+    # -- detection: a guess is not an identification -----------------------
+    def test_the_verdict_thresholds_are_the_codebase_rule(self):
+        self.assertEqual(self.coviewer.DETECT_CONFIDENT, 0.9)
+        self.assertEqual(self.coviewer.DETECT_TIE, 0.05)
+
+    def test_a_weak_read_asks_and_a_confident_one_does_not(self):
+        """Synthetic rankings, so the verdicts are tested rather than the
+        clients. The real ones are exercised by
+        `test_the_real_installs_are_identified` below when they are present."""
+        import plugins as plugmod
+
+        class Fake:
+            def __init__(self, name):
+                self.name = name
+                self.label = name
+                self.origin = "official"
+
+        cases = [
+            ([("a", 0.95)], "confident", False),
+            ([("a", 0.95), ("b", 0.45)], "confident", False),
+            ([("a", 0.85)], "weak", True),          # below the 0.9 bar
+            ([("a", 0.95), ("b", 0.92)], "tie", True),   # within 0.05
+            ([("a", 0.95), ("b", 0.90)], "tie", True),   # exactly 0.05 is a tie
+            ([], "none", True),
+        ]
+        for ranking, verdict, ask in cases:
+            with unittest.mock.patch.object(
+                    plugmod, "rank",
+                    return_value=[(Fake(n), c) for n, c in ranking]):
+                rep = self.coviewer.detect_report(self.clients / "ccc")
+            self.assertEqual(rep["verdict"], verdict, ranking)
+            self.assertEqual(rep["ask"], ask, ranking)
+            if ranking:
+                # The whole ranking is served, not just the winner: it is the
+                # part `plugins.detect` throws away and the part a person
+                # needs in order to overrule the top row.
+                self.assertEqual(len(rep["ranking"]), len(ranking))
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_real_installs_are_identified(self):
+        """Against the actual clients on this machine, not a fixture."""
+        rep = self.coviewer.detect_report(ROOT)
+        self.assertFalse(rep["missing"], rep["error"])
+        self.assertTrue(rep["ranking"], "no plugin claimed the real install")
+        self.assertEqual(rep["ranking"][0]["confidence"], rep["confidence"])
+        self.assertIn(rep["verdict"], ("confident", "weak", "tie"))
+
+    def test_a_folder_that_is_not_a_client_is_reported_as_such(self):
+        empty = self.tmp / "not-a-client"
+        empty.mkdir()
+        rep = self.coviewer.detect_report(empty)
+        self.assertTrue(rep["missing"])
+        self.assertEqual(rep["verdict"], "none")
+        self.assertTrue(rep["ask"])
+
+    # -- the routes ---------------------------------------------------------
+    def _handler(self):
+        """A Handler bound to a stub server, so the routes are exercised
+        without building a catalogue for four fake installs."""
+        import coviewer
+
+        class Stub:
+            game_root = None
+            server_name = ""
+            library = None
+            csrf_token = ""
+
+        h = coviewer.Handler.__new__(coviewer.Handler)
+        h.server = Stub()
+        h.server.game_root = Path(self.clients / "aaa")
+        sent = []
+        h._json = lambda obj, code=200: sent.append((code, obj))
+        h._error = lambda code, msg: sent.append((code, {"error": msg}))
+        h._sent = sent
+        return h
+
+    def test_the_list_splits_offline_clients_from_private_servers(self):
+        h = self._handler()
+        h.api_installs_dirs(lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200)
+        cats = {r["root"]: r["category"] for r in doc["installs"]}
+        self.assertEqual(cats[str(self.clients / "aaa")], "offline-client")
+        self.assertEqual(cats[str(self.clients / "bbb")], "private-server")
+        self.assertEqual([r["root"] for r in doc["privateServers"]],
+                         [str(self.clients / "bbb")])
+        self.assertEqual(
+            sorted(r["root"] for r in doc["offlineClients"]),
+            sorted([str(self.clients / "aaa"), str(self.elsewhere)]))
+
+    def test_a_declaration_whose_folder_vanished_is_still_listed(self):
+        """`_declared_bases` drops it because a picker must not offer a click
+        that fails. This list is the place you go to FIX it, so it must not."""
+        shutil.rmtree(self.clients / "aaa")
+        h = self._handler()
+        h.api_installs_dirs(lambda k, d="": d)
+        _code, doc = h._sent[-1]
+        row = next(r for r in doc["installs"]
+                   if r["root"] == str(self.clients / "aaa"))
+        self.assertFalse(row["exists"])
+        self.assertFalse(row["usable"])
+
+    def test_the_scan_offers_and_declares_nothing(self):
+        r"""The owner's ruling, and the assertion has to be able to FAIL.
+
+        The candidate is forced to read as **confident**, which is the only
+        state an auto-adopting scan would plausibly act on. Without that the
+        fake client scores nothing against every real plugin, "the config did
+        not change" is true because there was nothing to adopt, and the test
+        passes over a scan that adopts every confident hit -- measured: with
+        `declare_kind` wired into the scan loop, the unforced version of this
+        test still said OK.
+        """
+        import plugins as plugmod
+
+        class Fake:
+            name = "patch5017"
+            label = "Official patch client 5017"
+            origin = "official"
+
+        cfg = coroot.user_config_path()
+        before = cfg.read_bytes()
+        h = self._handler()
+        with unittest.mock.patch.object(plugmod, "rank",
+                                        return_value=[(Fake(), 0.95)]):
+            h.api_installs_scan(lambda k, d="": d)
+        _code, doc = h._sent[-1]
+        self.assertTrue(doc["scanned"], doc.get("error"))
+        found = {c["name"] for c in doc["candidates"]}
+        self.assertEqual(found, {"ccc"},
+                         "only the UNDECLARED folder under the scan root")
+        self.assertEqual(doc["newCount"], 1)
+        self.assertEqual(doc["candidates"][0]["verdict"], "confident",
+                         "the forced ranking must actually reach the scan, "
+                         "or this test cannot fail")
+        # The whole point: a read that writes nothing, even about a folder it
+        # is sure of.
+        self.assertEqual(cfg.read_bytes(), before,
+                         "the scan wrote to the config")
+        self.assertNotIn(str(self.clients / "ccc"),
+                         coroot.read_settings()[coroot.KINDS_KEY])
+
+    def test_declaring_without_a_kind_is_refused(self):
+        cfg = coroot.user_config_path()
+        before = cfg.read_bytes()
+        h = self._handler()
+        h.post_installs_declare(
+            json.dumps({"path": str(self.clients / "ccc")}).encode(),
+            lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("Nothing is declared without one", doc["error"])
+        self.assertEqual(cfg.read_bytes(), before)
+
+    def test_declaring_a_folder_that_is_not_a_client_is_refused(self):
+        empty = self.tmp / "nope"
+        empty.mkdir()
+        h = self._handler()
+        h.post_installs_declare(
+            json.dumps({"path": str(empty), "kind": "patch5017"}).encode(),
+            lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 400)
+        self.assertTrue(doc["missing"])
+
+    def test_declaring_records_the_kind_and_leaves_game_kind_alone(self):
+        r"""`coroot.declare_kind` also writes the single `game_kind`, which is
+        the fallback answer for the CONFIGURED root. Declaring a fourth client
+        must not silently re-label the one that is open."""
+        h = self._handler()
+        # The fake clients cannot pass a real plugin's `confidence`, so the
+        # plugin's own check is stubbed -- what is under test here is the
+        # bookkeeping around the declaration, not the detection, which
+        # `test_a_weak_read_asks...` covers.
+        import plugins as plugmod
+        plug = plugmod.for_kind("patch5165")
+        with unittest.mock.patch.object(type(plug), "confidence",
+                                        lambda *a, **k: 0.95):
+            h.post_installs_declare(
+                json.dumps({"path": str(self.clients / "ccc"),
+                            "kind": "patch5165"}).encode(),
+                lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200, doc)
+        self.assertTrue(doc["ok"])
+        kinds = coroot.read_settings()[coroot.KINDS_KEY]
+        self.assertEqual(kinds[str((self.clients / "ccc").resolve())],
+                         "patch5165")
+        self.assertEqual(coroot.read_settings()["game_kind"], "patch5017",
+                         "declaring another client re-labelled the open one")
+
+    def test_a_private_server_name_is_stored_and_shown(self):
+        """No plugin can know what the shard is CALLED -- the plugin label
+        names the parser. So the name is asked for and kept."""
+        import plugins as plugmod
+        plug = plugmod.for_kind("cco")
+        h = self._handler()
+        with unittest.mock.patch.object(type(plug), "confidence",
+                                        lambda *a, **k: 0.95):
+            h.post_installs_declare(
+                json.dumps({"path": str(self.clients / "ccc"), "kind": "cco",
+                            "serverName": "Someone's Shard"}).encode(),
+                lambda k, d="": d)
+        code, _doc = h._sent[-1]
+        self.assertEqual(code, 200)
+        h2 = self._handler()
+        h2.api_installs_dirs(lambda k, d="": d)
+        _c, doc = h2._sent[-1]
+        row = next(r for r in doc["installs"]
+                   if r["root"] == str(self.clients / "ccc"))
+        self.assertEqual(row["serverName"], "Someone's Shard")
+        self.assertEqual(row["category"], "private-server")
+
+    def test_forget_drops_the_declaration_and_not_the_folder(self):
+        h = self._handler()
+        h.post_installs_forget(
+            json.dumps({"path": str(self.clients / "bbb")}).encode(),
+            lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200)
+        self.assertTrue(doc["forgot"])
+        self.assertNotIn(str(self.clients / "bbb"),
+                         coroot.read_settings()[coroot.KINDS_KEY])
+        self.assertTrue((self.clients / "bbb").is_dir())
+
+    # -- the browser half ---------------------------------------------------
+    def test_the_page_never_declares_without_a_gesture(self):
+        """Source-level, against the STRIPPED js so a comment cannot pass it.
+
+        Every `/api/installs/declare` POST in the UI must sit inside a click
+        handler. The launch scan in particular must not have one at all.
+        """
+        dirs = _strip_js_comments(
+            (WEBUI_PAGES / "setdirs.js").read_text("utf-8"))
+        scan = _strip_js_comments(
+            (WEBUI_PAGES / "dirscan.js").read_text("utf-8"))
+        self.assertNotIn("installs/declare", scan,
+                         "the launch scan can declare a directory")
+        self.assertEqual(dirs.count("'/api/installs/declare'"), 1,
+                         "more than one declare call site to keep honest")
+        # The single call site is inside an addEventListener('click', ...).
+        at = dirs.index("'/api/installs/declare'")
+        head = dirs[:at]
+        self.assertIn("addEventListener('click'",
+                      head[head.rindex("addEventListener") - 20:]
+                      if "addEventListener" in head else "",
+                      "the declare POST is not inside a click handler")
+
+
+class SettingsHealthManagement(unittest.TestCase):
+    """The Settings page's Health Management, and the cost it states."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import coviewer                                # noqa: PLC0415
+        cls.coviewer = coviewer
+
+    def test_the_cost_caveats_carry_the_measurements_that_refute_the_table(self):
+        r"""The estimates in `health.DERIVED` and `health.THUMB_FACTS` came
+        from ONE install and the tool repeats them for every install. Both
+        counter-examples are served with them, in the server's own strings, so
+        the page cannot say something milder than the tool believes."""
+        boot = self.coviewer.BOOTSTRAP_COST_CAVEAT
+        self.assertIn("2,164 s", boot)
+        self.assertIn("36 minutes", boot)
+        self.assertIn("5-9 min", boot)
+        self.assertIn("PER INSTALL", boot)
+        thumb = self.coviewer.THUMB_COST_CAVEAT
+        self.assertIn("Per client, not once", thumb)
+        self.assertIn("47,973", thumb)
+        self.assertIn("1,352", thumb)
+        self.assertIn("313 MB", thumb)
+        self.assertIn("637 MB", thumb)
+        self.assertIn("15-30 minutes", thumb)
+
+    def test_the_page_prints_the_cost_before_the_button(self):
+        """Document order, from the source: the `.set-cost` block is appended
+        before the control that starts the job. A warning under a button is a
+        warning read after the click."""
+        js = _strip_js_comments((WEBUI_PAGES / "sethealth.js").read_text("utf-8"))
+        for cost_marker, button in (("box.appendChild(cost);", "#boot-start"),
+                                    ("box.appendChild(cost);", "#thumb-start")):
+            self.assertIn(cost_marker, js)
+        # Every block that has a start button appends its cost first.
+        for btn in ("'boot-start'", "'thumb-start'", "'index-start'"):
+            at = js.index(btn)
+            self.assertIn("box.appendChild(cost);", js[:at],
+                          f"{btn} is offered before its cost is stated")
+
+    def test_the_runner_reports_itself_running_before_the_child_exists(self):
+        r"""The race that made the live relay useless.
+
+        `BootstrapRunner` spawns on a worker thread because it may have to run
+        `--use` and then `--bootstrap`, so for a few milliseconds after
+        `start()` returns `self.proc` is still None. A `running()` that reads
+        only `self.proc` answers **false** there -- and the page, which polls
+        immediately after POSTing start, concludes the job is over and cancels
+        its own poll. MEASURED in the browser: the run completed, the server
+        held the whole transcript, and the page sat on "(no output yet)".
+
+        Asserted with the spawn blocked, so the window is the whole test
+        rather than a few milliseconds.
+        """
+        import coviewer
+        run = coviewer.BootstrapRunner(PROJECT)
+        gate = threading.Event()
+        real = subprocess.Popen
+        # Released on the way out whatever happens below. Without this, an
+        # assertion that fails before `gate.set()` leaves the worker parked
+        # for the full timeout and the report is a 20-second hang on top of
+        # the real failure -- twice as long to read and half as clear.
+        self.addCleanup(gate.set)
+
+        def slow(*a, **k):
+            gate.wait(20)
+            return real(*a, **k)
+
+        with unittest.mock.patch.object(subprocess, "Popen", slow):
+            res = run.start(False, [])
+            self.assertTrue(res["started"])
+            # No child yet, by construction.
+            self.assertIsNone(run.proc)
+            self.assertTrue(run.running(),
+                            "a runner that has accepted a job must not "
+                            "report itself idle before it spawns")
+            self.assertTrue(run.status()["running"])
+            # ...and a second start is refused while it is in that state.
+            self.assertFalse(run.start(False, [])["started"])
+            gate.set()
+        for _ in range(200):
+            if not run.running():
+                break
+            time.sleep(0.1)
+        self.assertFalse(run.running())
+        self.assertFalse(run.active)
+        self.assertIsNotNone(run.status()["returncode"])
+
+    def test_a_use_that_does_not_exist_stops_before_the_build(self):
+        r"""`health.main` handles `--use` and RETURNS before it looks at
+        `--bootstrap`, so supplying and building is two invocations. The
+        second must not run when the first refused -- a build against an
+        override that was rejected is a build nobody asked for."""
+        import coviewer
+        run = coviewer.BootstrapRunner(PROJECT)
+        run.start(False, ["out/opcodes.json=" +
+                          str(PROJECT / "no-such-file-here.json")])
+        for _ in range(600):
+            if not run.running():
+                break
+            time.sleep(0.1)
+        st = run.status()
+        self.assertEqual(st["returncode"], 2, st["tail"])
+        self.assertEqual(len(st["steps"]), 2,
+                         "the sequence must contain both invocations")
+        text = "\n".join(st["tail"])
+        self.assertIn("no such file", text.lower())
+        # health.py's own verdict line only appears if the bootstrap step ran.
+        self.assertNotIn("RESULT:", text,
+                         "the build ran after its --use was refused")
+
+    def test_the_progress_line_parsed_is_the_builders_own(self):
+        """`bootstrap()` numbers each artefact as it starts it. The page shows
+        that count rather than a second one kept in step by hand."""
+        import coviewer
+        m = coviewer._BOOTSTRAP_PROGRESS_RE.match(
+            "[2/5] out/meshtex/coverage.json  (~15 s)")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "2")
+        self.assertEqual(m.group(2), "5")
+        self.assertEqual(m.group(3), "out/meshtex/coverage.json")
+        self.assertEqual(m.group(4), "15 s")
+
+    def test_thumbnail_status_says_the_cost_is_per_client(self):
+        """The caveat rides on the same response as the plan, so a page cannot
+        render one without the other."""
+        js = _strip_js_comments((WEBUI_PAGES / "sethealth.js").read_text("utf-8"))
+        self.assertIn("doc.costCaveat", js)
+        self.assertIn("'costCaveat'",
+                      (HERE / "coviewer.py").read_text("utf-8")
+                      .replace('"costCaveat"', "'costCaveat'"))
 
 if __name__ == "__main__":
     raise SystemExit(_main())

@@ -67,7 +67,20 @@ async function initBasePicker() {
       // private server's client that happens to sit in Program Files, and
       // grouping by installed-ness filed it beside TQ's own releases. The
       // plugin declares its `origin`; this only renders it.
-      g.label = {install: 'Official clients',
+      //
+      // "OFFLINE CLIENTS", NOT "OFFICIAL CLIENTS" -- and not a path test.
+      // These are the standalone TQ patch clients kept locally to compare
+      // against: nothing to log into, no server behind them. The owner
+      // describes the set by where it sits ("anything in
+      // ConquerAssets/Clients"), and today that folder holds exactly this
+      // group -- but membership is still decided by the plugin's declared
+      // `origin`, for two reasons. It keeps the one axis this picker already
+      // chose (what a client IS, not where it lives), and `ConquerAssets/` is
+      // a GENERATED tree -- `tools/extract_comod.py` writes it, its location
+      // is not a fact about the repo, and `tests/test_sanitization.py` exists
+      // precisely so shipped code does not learn one machine's directories.
+      // A patch client declared from a USB stick is still an offline client.
+      g.label = {install: 'Offline Clients',
                  server: 'Private server clients',
                  collection: 'Curated collections',
                  other: 'Unclassified clients'}[p.kind] || p.kind;

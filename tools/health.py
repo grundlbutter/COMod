@@ -23,7 +23,9 @@ has:
   * **derived data** -- `out/` is generated and gitignored, so a fresh clone
     starts empty, and until the WDF filename recovery has run the catalogue
     can only see loose files.  `--bootstrap` runs the generators in the order
-    they depend on each other;
+    they depend on each other, and relays each one's own progress as it runs
+    (`_run_relaying`) -- it used to discard it, and a builder that takes
+    minutes in silence is indistinguishable from one that has hung;
   * **thumbnails** -- whether `out/thumbs/` has been generated, how complete
     it is, and what generating it would cost in time and disk on *this*
     machine.  Generating them is **opt-in**: nothing here starts a render.
@@ -410,13 +412,147 @@ def check_provenance(explicit=None) -> dict:
     return rep
 
 
+#: How often a *terminal* redraws the in-place status line, and how often a
+#: non-interactive run (a pipe, a log file, CI) prints a fresh liveness line.
+#: A pipe gets a much slower cadence because every line it prints is kept.
+_REFRESH_SECONDS = 0.5
+_HEARTBEAT_SECONDS = 5.0
+#: After this long with no new line from the child, the status says so rather
+#: than leaving a stale label sitting under a moving clock.
+_QUIET_SECONDS = 15.0
+
+
+def _mmss(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
+    r"""Run `cmd` and show that it is alive, without inventing a number.
+
+    `bootstrap` used to run each builder with `stdout=subprocess.DEVNULL`,
+    which threw away progress the builders were *already writing*.  Between
+    the "[1/4] ..." line and the "done in 368 s" line there was nothing at
+    all, and a five-to-nine minute silence is indistinguishable from a hang.
+    The owner watched one and believed it had stalled.  It had not.
+
+    So this relays instead of reimplementing -- the same move `ThumbRunner`
+    in `tools/coviewer.py` makes on `tools/thumbs.py`: read the child's own
+    output, split on `\r` *or* `\n` (some tools in this tree write
+    carriage-return progress), and show its most recent line.
+
+    **Two signals, both substantiated, neither a percentage.**
+
+    * The child's latest line, verbatim.  `wdf_recover.py` reports
+      ``enumerate dir 800/9045   24233/25013 ( 96.9%) tested=... 461s``;
+      `meshtex.py` reports ``scan 3500/6390`` on stderr.  Those counts are
+      the builders' own and are relayed unaltered.
+    * Elapsed time since *this* builder started, plus (on a terminal) a
+      spinner.  That is the honest floor: it is true of a silent builder and
+      of a chatty one, and it says "alive", not "77% done".
+
+    Nothing here derives an overall percentage or an ETA.  A builder's phases
+    do not cost proportionally, and not even repeatably: MEASURED on
+    Clients/5517, `wdf_recover`'s wordlist harvest is 312 s cold and 57 s
+    warm, in the same tool on the same install.  A bar drawn over that would
+    be confidently wrong, and this project has paid for those before.
+
+    **This is a progress display, not a transcript, and the difference is
+    lossy on purpose.**  At most one update is painted per period, so when
+    several lines arrive inside one window only the newest is shown.  That is
+    right for progress lines, which supersede each other, and it does drop
+    record lines a full log would keep -- run the builder directly (the
+    report prints the command) if you want all of it.
+
+    Returns `(returncode, tail)`; the tail is the last 40 lines, so a failure
+    can print evidence instead of only telling you to re-run it.
+    """
+    import queue                                    # noqa: PLC0415
+    import subprocess                               # noqa: PLC0415
+    import threading                                # noqa: PLC0415
+
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, errors="replace")
+    lines: "queue.Queue[str]" = queue.Queue()
+
+    def pump() -> None:
+        buf = ""
+        try:
+            while True:
+                ch = proc.stdout.read(1)            # type: ignore[union-attr]
+                if not ch:
+                    break
+                if ch in ("\r", "\n"):
+                    if buf.strip():
+                        lines.put(buf.strip())
+                    buf = ""
+                else:
+                    buf += ch
+        except Exception as e:                       # pragma: no cover
+            lines.put(f"(reader stopped: {e})")
+        if buf.strip():
+            lines.put(buf.strip())
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+
+    tty = sys.stdout.isatty()
+    period = _REFRESH_SECONDS if tty else _HEARTBEAT_SECONDS
+    t0 = time.time()
+    last, tail, width, tick, shown = "", [], 0, 0, 0.0
+    last_at = t0
+    while True:
+        # Read liveness BEFORE draining: if the pump has finished, everything
+        # it ever queued is already visible to this drain.
+        alive = proc.poll() is None or reader.is_alive()
+        while True:
+            try:
+                last = lines.get_nowait()
+            except queue.Empty:
+                break
+            last_at = time.time()
+            tail.append(last)
+            del tail[:-40]
+        now = time.time()
+        if now - shown >= period:
+            tick += 1
+            spin = "|/-\\"[tick % 4] + "  " if tty else ""
+            # A phase the builder has not spoken from in a while is exactly
+            # the moment someone reaches for Ctrl-C, and a frozen line beside
+            # a moving clock reads as "stuck at dictionary". Say which it is:
+            # the clock is the run, this is the silence inside it.
+            quiet = now - last_at
+            mark = (f"   [+{_mmss(quiet)} with no new output]"
+                    if last and quiet >= _QUIET_SECONDS else "")
+            status = (f"{indent}{_mmss(now - t0):>6}  {spin}"
+                      + (last or "(working; no output from it yet)") + mark)
+            if tty:
+                width = max(20, shutil.get_terminal_size((100, 24)).columns - 1)
+                sys.stdout.write("\r" + status[:width].ljust(width))
+            else:
+                sys.stdout.write(status + "\n")
+            sys.stdout.flush()
+            shown = now
+        if not alive:
+            break
+        time.sleep(0.1)
+    if tty and width:                                # erase the status line
+        sys.stdout.write("\r" + " " * width + "\r")
+        sys.stdout.flush()
+    rc = proc.wait()
+    if proc.stdout is not None:
+        proc.stdout.close()
+    return rc, tail
+
+
 def bootstrap(only_missing: bool = True) -> int:
     """Run the derived-data builders, in dependency order.
 
     Deliberately a thin sequencer over the existing tools -- it adds the
-    ordering constraint and nothing else.
+    ordering constraint, relays their progress (`_run_relaying`), and nothing
+    else.
     """
-    import subprocess                                # noqa: PLC0415
     todo = [(rel, argv, cost) for rel, argv, cost, _ in DERIVED
             if not only_missing or coroot.find_derived(rel) is None]
     # An artefact whose BUILDER is not in this tree is not a failure.
@@ -473,11 +609,14 @@ def bootstrap(only_missing: bool = True) -> int:
         print(f"[{i}/{len(todo)}] {rel}  (~{cost})")
         print(f"        {' '.join(argv)}")
         t0 = time.time()
-        r = subprocess.run(cmd, cwd=str(REPO), stdout=subprocess.DEVNULL)
-        if r.returncode != 0:
-            print(f"        FAILED (exit {r.returncode}). Re-run it directly "
-                  f"to see why:\n        py -3 {' '.join(argv)}")
-            return r.returncode
+        rc, tail = _run_relaying(cmd, str(REPO))
+        if rc != 0:
+            print(f"        FAILED (exit {rc}). Its last words:")
+            for line in tail[-15:]:
+                print(f"        | {line}")
+            print(f"        Re-run it directly to see the rest:\n"
+                  f"        py -3 {' '.join(argv)}")
+            return rc
         got = REPO / rel
         print(f"        done in {time.time() - t0:.0f} s"
               + (f", {got.stat().st_size / 1e6:.1f} MB" if got.is_file() else ""))

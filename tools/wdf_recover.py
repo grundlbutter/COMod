@@ -123,14 +123,50 @@ def hash_from(state: tuple[int, int, int], rest: bytes) -> int:
 # wordlist harvesting
 # ---------------------------------------------------------------------------
 
+def _progress(msg: str) -> None:
+    r"""One carriage-return progress line.
+
+    The same shape `tools/thumbs.py` writes, for the same reason and read by
+    the same consumers: `ThumbRunner` in `tools/coviewer.py` and
+    `health._run_relaying` both split a child's output on `\r` as well as
+    `\n`, so a tool that writes progress this way is legible whether it is
+    run in a terminal or driven from another process.
+
+    WHY THE HARVEST NEEDED ONE AT ALL, measured on Clients/5517 with the
+    tool's stdout on a pipe and every line timestamped: it printed
+    `targets: 25013 hashes` at +0.5 s and then said **nothing at all until
+    +312.7 s** -- one unbroken silence -- because `harvest_loose` and
+    `harvest_strings` walk and read the whole install without a word.
+    Everything after that point already reported itself, at worst 81 s apart.
+    So the fix belongs here and not everywhere.
+
+    That 312 s was a COLD run. The same harvest with the file cache warm
+    takes 57 s, and both numbers are of the harvest, not of this function --
+    the counters cost nothing measurable either way. Quoting the cold figure
+    as though it were the warm one, or the reverse, is the mistake this
+    paragraph exists to stop.
+
+    Counts of FILES, never a share of the run. The phases do not cost
+    proportionally and a bar drawn over them would be confidently wrong.
+    """
+    sys.stdout.write("\r  " + msg[:100].ljust(100))
+    sys.stdout.flush()
+
+
 def harvest_loose(root: Path) -> set[str]:
     out = set()
+    seen = 0
     for p in root.rglob("*"):
+        seen += 1
+        if seen % 2000 == 0:
+            _progress(f"loose files: {seen:,} walked, {len(out):,} paths")
         if p.is_file():
             try:
                 out.add(p.relative_to(root).as_posix().lower())
             except ValueError:
                 pass
+    print(f"\r  loose files: {seen:,} walked, {len(out):,} paths".ljust(100),
+          flush=True)
     return out
 
 
@@ -216,15 +252,27 @@ def harvest_strings(root: Path, max_file: int = 12_000_000) -> set[str]:
         for m in _RUNS16.finditer(blob):
             out.update(_tokens(m.group(0).decode("utf-16-le", "replace")))
 
+    # Listed rather than streamed, so the progress line can say how many
+    # files are left in THIS directory. It is the same walk either way.
     for sub in SCRAPE_DIRS:
         d = root / sub
-        if d.is_dir():
-            for p in d.rglob("*"):
-                scrape(p)
-    # The binaries, wherever they are. A client names its own UI art.
-    for p in root.rglob("*"):
-        if p.suffix.lower() in (".exe", ".dll"):
+        if not d.is_dir():
+            continue
+        files = [p for p in d.rglob("*") if p.is_file()]
+        for i, p in enumerate(files, 1):
             scrape(p)
+            if i % 200 == 0 or i == len(files):
+                _progress(f"strings {sub}/: {i:,}/{len(files):,} files, "
+                          f"{len(out):,} paths")
+    # The binaries, wherever they are. A client names its own UI art.
+    bins = [p for p in root.rglob("*") if p.suffix.lower() in (".exe", ".dll")]
+    for i, p in enumerate(bins, 1):
+        scrape(p)
+        if i % 10 == 0 or i == len(bins):
+            _progress(f"strings binaries: {i:,}/{len(bins):,} files, "
+                      f"{len(out):,} paths")
+    print(f"\r  strings: {len(seen):,} files read, {len(out):,} paths"
+          .ljust(100), flush=True)
     return out
 
 

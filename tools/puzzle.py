@@ -84,7 +84,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import coroot                                            # noqa: E402
-from coassets import AssetRoot, DMap, Pul                 # noqa: E402
+from coassets import AssetRoot, DMap, Pul, PUL_EMPTY      # noqa: E402
 import dds                                               # noqa: E402
 
 try:                                    # speed only -- see dds.py's docstring
@@ -96,8 +96,12 @@ except Exception:                                        # pragma: no cover
 CELL_PX_W = 64
 #: Pixels per cell along the image's y axis. Half of CELL_PX_W: 2:1 isometric.
 CELL_PX_H = 32
-#: An empty slot in a .pul -- no tile painted there.
-EMPTY = 0xFFFF
+#: An empty slot in a .pul -- no tile painted there.  Re-exported, not
+#: redeclared: the constant is a property of the `.pul` format and now lives
+#: with the reader (`coassets.PUL_EMPTY`), because a second consumer that did
+#: not know it treated 0xFFFF as a reference to tile 65535.  The name stays
+#: here so `puzzle.EMPTY` keeps meaning what it always did.
+EMPTY = PUL_EMPTY
 #: What an unpainted pixel becomes when the art is flattened to RGB. Deliberately
 #: near-black rather than a grass green: off-art is *void*, not ground.
 VOID = (12, 12, 14)

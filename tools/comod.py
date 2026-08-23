@@ -81,7 +81,21 @@ WORK = PROJECT / "Installed" / "work"
 #: root, none of that can happen: an install's originals and the record of
 #: what displaced them live together, and neither can be reached by any
 #: other root.
-INSTALLS = PROJECT / "Installed" / "installs"
+def _installs_root() -> Path:
+    """Where install records live. The local tree unless one is configured.
+
+    See `coroot.installs_root` for why this is a setting and not a search:
+    on a box with linked worktrees the records sit in a linked one, so there
+    is no checkout the code can infer speaks for the machine. A shipped tree
+    has exactly one checkout and never sets it.
+    """
+    shared = coroot.installs_root()
+    if shared is not None:
+        return shared
+    return PROJECT / "Installed" / "installs"
+
+
+INSTALLS = _installs_root()
 
 #: Where the single-install layout kept them. Read once, to migrate.
 LEGACY_BACKUP = PROJECT / "mods" / "backup"

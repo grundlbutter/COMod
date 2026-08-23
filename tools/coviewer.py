@@ -95,7 +95,36 @@ except Exception:                                        # pragma: no cover
     c3tex = None
 
 WEBUI = HERE / "webui"
-STAGE = PROJECT / "mods" / "stage"
+#: The stage tree, and it MUST agree with `comod.STAGE`. It did not: the
+#: mods/ -> Installed/ move changed comod and left this behind, so the
+#: viewer wrote and counted staged files in a directory the installer
+#: never looked at. Mod staging showed "0 installed" over a live install
+#: record. Imported rather than re-derived, so the two cannot drift again.
+def _comod_paths():
+    """comod's own STAGE/WORK/INSTALLS, so the viewer cannot disagree with the
+    tool that installs and reverts.
+
+    A local copy of these constants is how the viewer came to stage files into
+    a directory `comod install` did not read.
+    """
+    import comod                                          # noqa: PLC0415
+    return comod
+
+
+def _install_recorded(root=None) -> bool:
+    """Whether comod has an install on record for the install being browsed."""
+    try:
+        import comod                                      # noqa: PLC0415
+        target = root if root is not None else coroot.game_root()
+        return comod.load_manifest(target) is not None
+    except Exception:
+        # An unreadable record is not "nothing installed" -- but this is a
+        # status flag with nowhere to put a third state, so it stays False and
+        # the Mod staging panel reports the record itself.
+        return False
+
+
+STAGE = _comod_paths().STAGE
 OUTDIR = PROJECT / "out" / "viewer"
 PREVIEW_DIR = OUTDIR / "preview"
 TAGS_FILE = OUTDIR / "tags.json"
@@ -745,6 +774,390 @@ class IndexRunner:
         }
 
 
+#: `tools/health.py --bootstrap` numbers each artefact as it starts it:
+#: "[2/5] out/meshtex/coverage.json  (~15 s)". Parsed rather than
+#: re-implemented, for the same reason as the two runners above -- what the
+#: browser shows is the builder's own count, not a second one kept in step by
+#: hand.
+_BOOTSTRAP_PROGRESS_RE = re.compile(
+    r"^\[(\d+)/(\d+)\]\s+(\S+)\s*(?:\(~([^)]*)\))?\s*$")
+
+
+class BootstrapRunner:
+    r"""Runs `tools/health.py --bootstrap` in a child process, on request only.
+
+    The same three rules as `ThumbRunner` and `IndexRunner`, because this is
+    the same kind of job. What is different, and is the reason this exists at
+    all rather than a `subprocess.run` inside a request handler:
+
+    * **`bootstrap()` prints its progress and throws it away.** The function
+      writes `[i/n] <artefact> (~cost)` and `done in N s` to stdout and runs
+      each builder with `stdout=DEVNULL`, so a caller that shells out and
+      waits sees nothing for the length of the whole run. Six artefacts and a
+      documented "6-10 minutes" is long enough that a silent HTTP request is
+      indistinguishable from a hung one. The lines are relayed.
+
+    * **`--use` cannot ride along with `--bootstrap`.** `health.main` handles
+      `--use` and *returns* before it looks at `--bootstrap` -- so supplying
+      an artefact and then building is two invocations, in that order, and the
+      second must not run if the first refused. That sequencing is here rather
+      than in the page: a browser that fires two POSTs and hopes is the
+      version that builds against a rejected override.
+
+    **The estimates are per-install and are relayed as the tool's own, never
+    as a promise.** `DERIVED` carries "5-9 min" for `wdf_recover`; a measured
+    run on `Clients/5517` took 2,164 s -- 36 minutes, four times the top of
+    the range. So the cost column is served with the measurement that
+    contradicts it attached (`BOOTSTRAP_COST_CAVEAT`), and the page prints
+    both before the button. A user who clicks expecting 9 minutes and waits 36
+    is the complaint this section was built to answer.
+    """
+
+    def __init__(self, project: Path):
+        self.project = project
+        self.lock = threading.Lock()
+        self.proc: Optional[subprocess.Popen] = None
+        self.started: float = 0.0
+        self.finished: float = 0.0
+        self.returncode: Optional[int] = None
+        self.cancelled = False
+        self.all: bool = False
+        self.uses: list = []
+        self.progress: dict = {"label": "", "done": 0, "total": 0, "cost": ""}
+        self.tail: list[str] = []
+        self.steps: list[str] = []
+        #: True from the moment `start` accepts until `_run` is done.
+        #:
+        #: `ThumbRunner` and `IndexRunner` can answer "am I running?" from
+        #: `self.proc` alone because they spawn the child INSIDE `start()`.
+        #: This one is a sequencer -- it may run `--use` and then
+        #: `--bootstrap` -- so the spawning happens on the worker thread, and
+        #: for the first few milliseconds after `start()` returns `self.proc`
+        #: is still None.
+        #:
+        #: MEASURED, because it is not a hypothetical race. The page POSTs
+        #: start, immediately polls status, reads `running: false`, concludes
+        #: the job is over and CANCELS ITS OWN POLL -- so the run completes,
+        #: the server has the whole transcript, and the browser sits on "(no
+        #: output yet)" forever. A status that is briefly wrong is a status
+        #: that is permanently believed.
+        self.active = False
+
+    def running(self) -> bool:
+        if self.active:
+            return True
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, rebuild_all: bool = False, uses: Optional[list] = None) -> dict:
+        """`uses` is a list of `"REL=PATH"` strings, applied before building."""
+        uses = [str(u) for u in (uses or []) if str(u).strip()]
+        with self.lock:
+            if self.running():
+                return {"started": False, "reason": "already running",
+                        **self.status()}
+            health_py = str(HERE / "health.py")
+            steps = []
+            if uses:
+                argv = [sys.executable, health_py]
+                for u in uses:
+                    argv += ["--use", u]
+                steps.append(argv)
+            steps.append([sys.executable, health_py,
+                          "--bootstrap-all" if rebuild_all else "--bootstrap",
+                          "--no-write"])
+            self.all = bool(rebuild_all)
+            self.uses = uses
+            self.started = time.time()
+            self.finished = 0.0
+            self.returncode = None
+            self.cancelled = False
+            self.progress = {"label": "", "done": 0, "total": 0, "cost": ""}
+            self.tail = []
+            self.steps = [" ".join(a[1:]) for a in steps]
+            # Set BEFORE the thread exists, or the first poll wins the race.
+            self.active = True
+            threading.Thread(target=self._run, args=(steps,),
+                             daemon=True).start()
+            _log("bootstrap: started " + " ; ".join(self.steps))
+            return {"started": True, "steps": list(self.steps), **self.status()}
+
+    def cancel(self) -> dict:
+        with self.lock:
+            if not self.running():
+                return {"cancelled": False, "reason": "not running",
+                        **self.status()}
+            self.cancelled = True
+            # May be None inside the start race described on `active`. The
+            # flag is still set, so `_run` sees `cancelled` after its first
+            # step and stops; there is simply nothing to kill yet.
+            proc = self.proc
+        if proc is None:
+            _log("bootstrap: cancelled before the child was spawned")
+            return {"cancelled": True, **self.status()}
+        if os.name == "nt":
+            # Same reason as the other two: the builders are children of the
+            # child, and terminate() would leave them running.
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True)
+        else:                                       # pragma: no cover
+            proc.terminate()
+        _log("bootstrap: cancelled")
+        return {"cancelled": True, **self.status()}
+
+    def _run(self, steps: list) -> None:
+        rc = 0
+        try:
+            for argv in steps:
+                creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
+                    if os.name == "nt" else 0
+                try:
+                    self.proc = subprocess.Popen(
+                        argv, cwd=str(self.project), stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1,
+                        errors="replace", creationflags=creation)
+                except OSError as e:                 # pragma: no cover
+                    self.tail.append(f"(could not start: {e})")
+                    rc = 1
+                    break
+                self._pump(self.proc)
+                rc = self.proc.wait()
+                if rc != 0 or self.cancelled:
+                    # A refused `--use` must not be followed by a build
+                    # against the override it refused.
+                    break
+        finally:
+            # In a `finally` so a crash in here cannot leave the runner
+            # claiming to be running forever -- that state has no exit and no
+            # button, and the only cure would be restarting the viewer.
+            self.returncode = rc
+            self.finished = time.time()
+            self.active = False
+        _log(f"bootstrap: finished, exit {rc}")
+
+    def _pump(self, proc) -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                m = _BOOTSTRAP_PROGRESS_RE.match(line)
+                if m:
+                    self.progress = {"label": m.group(3),
+                                     "done": int(m.group(1)),
+                                     "total": int(m.group(2)),
+                                     "cost": (m.group(4) or "").strip()}
+                self.tail.append(line)
+                del self.tail[:-60]
+        except Exception as e:                       # pragma: no cover
+            self.tail.append(f"(reader stopped: {e})")
+
+    def status(self) -> dict:
+        elapsed = ((self.finished or time.time()) - self.started
+                   if self.started else 0.0)
+        return {
+            "running": self.running(),
+            # Served because the page keys "is there anything to show" on it.
+            # Without it a finished run with `returncode == 0` is the only
+            # evidence a run ever happened, and `0` is a value a renderer is
+            # one `!` away from reading as "no".
+            #
+            # `startedAt`, NOT `started`. `start()` returns
+            # `{"started": <bool>, **self.status()}`, so a key called
+            # `started` here OVERWRITES the boolean that says whether the
+            # request was accepted -- and a REJECTED start would come back
+            # carrying a truthy timestamp under the name the caller checks.
+            # Caught by a test asserting the rejection, which is the only
+            # place the two spellings meet.
+            "startedAt": self.started or 0.0,
+            "all": self.all,
+            "uses": list(self.uses),
+            "steps": list(self.steps),
+            "elapsedSeconds": round(elapsed, 1),
+            "returncode": self.returncode,
+            "cancelled": self.cancelled,
+            "progress": dict(self.progress),
+            "tail": self.tail[-14:],
+            # The builders' own last line. `bootstrap` prints a phase line per
+            # artefact and nothing in between, so between two of them there is
+            # no percentage to show and none is invented.
+            "phase": self.tail[-1] if self.tail else "",
+        }
+
+
+# ---------------------------------------------------------------------------
+# directories: which clients this machine has, and which it has been TOLD about
+# ---------------------------------------------------------------------------
+
+#: Below this a detection is a GUESS, not an identification. The threshold is
+#: the codebase's, not this module's: `plugins.rank` exists precisely because
+#: "a 0.95 from a version stamp and a 0.5 from 'this looks vaguely like my
+#: family' are the same answer through `detect` and are not the same claim".
+DETECT_CONFIDENT = 0.9
+
+#: Two candidates within this of each other are a TIE. A tie is not an answer,
+#: and presenting the arbitrary winner of a sort as an identification is the
+#: failure `plugins.rank`'s docstring names outright.
+DETECT_TIE = 0.05
+
+#: What a declared plugin's `origin` means to somebody choosing a folder.
+#: "official" is an offline copy of a retail patch client; "server" is a
+#: private server's own client. The words the user picked are the words shown.
+ORIGIN_CATEGORY = {"official": "offline-client", "server": "private-server"}
+
+#: Settings key holding the folder that `Scan` looks in. Stored in the same
+#: per-user document as everything else (`core/coroot.py`) -- there is one
+#: config store and this is not a second one.
+CLIENTS_ROOT_KEY = "clients_root"
+
+#: Settings key holding `{root: "what private server this is"}`. A private
+#: server client is declared exactly like any other -- `coroot.declare_kind`
+#: -- and this is the human name asked for on top, which no plugin can know.
+SERVER_NAMES_KEY = "server_names"
+
+#: Said next to every estimate this page prints, and it is not decoration.
+#: `health.DERIVED` documents `tools/wdf_recover.py` at "5-9 min"; a measured
+#: run on `Clients/5517` took **2,164 s -- 36 minutes**, four times the top of
+#: the range. The table's numbers came from one install, and the cost of each
+#: artefact is a function of the archives in the install being built from.
+BOOTSTRAP_COST_CAVEAT = (
+    "These estimates are the ones tools/health.py carries in its own DERIVED "
+    "table, and they are PER INSTALL rather than universal. Measured "
+    "counter-example: wdf_recover is documented at \u201c5-9 min\u201d and "
+    "took 2,164 s \u2014 36 minutes \u2014 on Clients/5517, four times the "
+    "top of the range. Read the column as \u201cwhat it cost on the machine "
+    "that wrote the table\u201d, not as what it will cost here.")
+
+#: The same warning for thumbnails, and the same reason. `health.THUMB_FACTS`
+#: is one client's census (4,950 meshes / 66,834 textures); CCO is a different
+#: client and was measured at 47,973 textures + 1,352 meshes, 313 MB of PNG
+#: and ~637 MB on disk, with the tool's own estimate at 15-30 minutes. The
+#: cost is PER CLIENT and every client has its own.
+THUMB_COST_CAVEAT = (
+    "Per client, not once. The counts and megabytes below are this run's "
+    "figures for the client currently selected; each client you declare has "
+    "its own cache and its own bill. Measured on Classic Conquer 2.0: 47,973 "
+    "textures + 1,352 meshes, 313 MB of PNG, ~637 MB on disk, and the tool's "
+    "own estimate for that run was 15-30 minutes.")
+
+
+def clients_root() -> tuple:
+    """``(Path|None, why)`` -- the folder `Scan` looks in for new clients.
+
+    Resolved **through `coroot`** and never written here as a literal. Three
+    sources, most specific first:
+
+    1. ``clients_root`` in the per-user config, if the user has set one. An
+       explicit answer outranks any derivation.
+    2. The folder that most of the *declared* installs already live in. The
+       declarations are the user's own (`coroot.declare_kind`), so this is
+       still their answer -- read back rather than asked again. Modal, not
+       common-ancestor: a machine with seven clients under one folder and one
+       in Program Files has a common ancestor of ``C:\\``, which is not a
+       place to scan.
+    3. The parent of the configured install root, as a last resort.
+
+    Why not the literal. `tests/test_sanitization.py` bans hardcoding the
+    conventional install path, and its check-3 regex only matches the Program
+    Files one -- so writing the asset-tree path here would sail past the gate
+    and still be the same defect: a tool that only works on the machine it was
+    written on. The gate not catching it is not permission.
+    """
+    doc = coroot.read_settings()
+    explicit = str(doc.get(CLIENTS_ROOT_KEY) or "").strip()
+    if explicit:
+        p = Path(explicit)
+        return (p, f"set in {coroot.user_config_path()} ({CLIENTS_ROOT_KEY})")
+
+    counts: dict = {}
+    for path in (doc.get(coroot.KINDS_KEY) or {}):
+        try:
+            parent = Path(str(path)).resolve().parent
+        except OSError:                              # pragma: no cover
+            continue
+        counts[parent] = counts.get(parent, 0) + 1
+    if counts:
+        # Ties broken by path text so the answer does not depend on dict order.
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0]
+        if best[1] >= 2 and best[0].is_dir():
+            return (best[0], f"where {best[1]} of your declared clients live")
+
+    try:
+        cfg = coroot.config_root()
+    except Exception:                                # pragma: no cover
+        cfg = None
+    if cfg:
+        p = Path(cfg[0]).parent
+        if p.is_dir():
+            return (p, f"the folder holding the configured install ({cfg[1]})")
+    return (None, "no clients declared yet, and no folder set -- set one below")
+
+
+def detect_report(root) -> dict:
+    """What the plugins say `root` is, **with the ranking kept**.
+
+    `plugins.detect` throws away everything but the winner, and the discarded
+    part is the whole question here: whether the answer is an identification
+    or a guess. So this returns the ranking and a `verdict`, and `ask` is true
+    for anything that is not a clean win.
+
+    Four verdicts, and only one of them is an answer:
+
+    * ``confident`` -- top score >= 0.9 and the runner-up more than 0.05 below.
+    * ``tie`` -- two plugins within 0.05 of each other. Not an answer: the
+      winner of that sort is arbitrary.
+    * ``weak`` -- one plugin on top, scoring below 0.9. A guess.
+    * ``none`` -- nothing claimed it.
+
+    The owner's ruling on a weak or tied read is **(a) ask**, not (c) take the
+    best guess -- so nothing here declares anything, and the caller that acts
+    on it (`post_installs_declare`) takes a `kind` from the user rather than
+    this function's opinion.
+    """
+    p = Path(root)
+    out = {"root": str(p), "exists": p.is_dir(),
+           "missing": [], "ranking": [], "verdict": "none",
+           "suggested": "", "confidence": 0.0, "gap": None,
+           "ask": True, "error": ""}
+    if not p.is_dir():
+        out["error"] = f"{p} is not a directory"
+        return out
+    out["missing"] = coroot.missing_parts(p)
+    if out["missing"]:
+        out["error"] = ("not a Conquer Online client folder: missing "
+                        + ", ".join(out["missing"]))
+        return out
+    sys.path.insert(0, str(PROJECT))
+    import plugins as plugmod
+    try:
+        ranked = plugmod.rank(p)
+    except plugmod.DiscoveryError as e:
+        # A short ranking that reads as complete is the failure mode here too:
+        # served EMPTY with the reason, exactly as `api_plugins` does.
+        out["error"] = str(e)
+        return out
+    out["ranking"] = [{"name": pl.name, "label": pl.label,
+                       "origin": getattr(pl, "origin", "unknown"),
+                       "confidence": round(float(c), 4)}
+                      for pl, c in ranked]
+    if not ranked:
+        out["verdict"] = "none"
+        return out
+    top = float(ranked[0][1])
+    second = float(ranked[1][1]) if len(ranked) > 1 else None
+    out["confidence"] = round(top, 4)
+    out["gap"] = None if second is None else round(top - second, 4)
+    out["suggested"] = ranked[0][0].name
+    if second is not None and (top - second) <= DETECT_TIE:
+        out["verdict"] = "tie"
+    elif top < DETECT_CONFIDENT:
+        out["verdict"] = "weak"
+    else:
+        out["verdict"] = "confident"
+        out["ask"] = False
+    return out
+
+
 # ---------------------------------------------------------------------------
 # catalogue
 # ---------------------------------------------------------------------------
@@ -755,8 +1168,15 @@ class IndexRunner:
 #: under the same heading. That is not hypothetical: declared installs sort by
 #: plugin name and `cco` -- a `server` since it is a private server's client --
 #: sorts before every `patch*`, which put "Private server clients" both above
-#: and below the official block. Ordering belongs here, with the payload; the
+#: and below the offline block. Ordering belongs here, with the payload; the
 #: renderer stays a renderer.
+#:
+#: The keys are WIRE TOKENS, not headings -- `basepicker.js` maps them to the
+#: text on screen, so `install` renders as "Offline Clients" (the standalone
+#: TQ patch clients, nothing to log into) and `server` as "Private server
+#: clients". The token is kept stable for the same reason `post_base` keeps
+#: the `library:` prefix: it never reaches a user, and renaming it would
+#: rewrite an API to change a caption.
 BASE_GROUP_ORDER = {"install": 0, "server": 1, "collection": 2, "other": 3}
 
 
@@ -877,6 +1297,16 @@ class Catalog:
         #: `tests/test_gamemap_registry.py` reads it to prove entries were
         #: indexed, and that assertion should keep meaning what it means.
         self._arc_by_hash: Optional[dict] = None
+        #: `ships()` memo for paths the NAME set does not carry. `tq_hash` is
+        #: pure python and a miss probes up to 21 candidate paths, and the
+        #: same ids are walked three times over (the `references` build,
+        #: `_appearance_rows`, then `BuilderIndex`) plus once more per
+        #: duplicated table -- `mix_body` is `body`, `l_weapon` is `r_weapon`.
+        #: MEASURED on CCO, "loaded 11 appearance tables" -- 0.3 s before this
+        #: whole change, 2.3 s with the hash fallback and no memo, 0.7 s with.
+        #: With the name tables suppressed (every row takes the miss path) it
+        #: is 0.9 s.
+        self._ships_cache: dict[str, bool] = {}
 
         self.archived: dict[str, str] = {}       # logical -> archive name
         if self.server_view is not None:
@@ -1790,8 +2220,8 @@ class Catalog:
 
     # -- resolution ---------------------------------------------------------
     #: Same rule as coassets.AssetRoot.resolve_asset (INFERRED: reproduces 94%
-    #: of armor.ini, 98% of weapon.ini, 79% of armet.ini) but resolved against
-    #: the in-memory path set instead of hitting the filesystem 21 times.
+    #: of armor.ini, 98% of weapon.ini, 79% of armet.ini) but answered from
+    #: memory -- `ships()` below -- instead of hitting the filesystem 21 times.
     MESH_DIRS = ("mesh", "weapon", "body", "hair", "mount", "npc", "monster")
     TEX_DIRS = ("texture", "weapon", "body", "hair", "mount", "npc", "monster")
 
@@ -1819,13 +2249,54 @@ class Catalog:
             self._arc_by_hash = index
         return self._arc_by_hash
 
+    def ships(self, logical: str) -> bool:
+        """Can this install produce the bytes of `logical`? -- the SAME
+        question `read()` answers, asked without reading.
+
+        `_path_set` is a set of **names**, and on a hash-addressed archive a
+        name is a thing that has to be *recovered*: a WDF entry stores
+        `tq_hash(name)` and nothing else. So membership of `_path_set` answers
+        "did the recovery table happen to name this entry", which is a fact
+        about `out/wdf/*_names.json`, not about the install. When those tables
+        are not visible to the process -- a linked worktree that has not built
+        them, `CO_DERIVED_FALLBACK=0`, a fresh clone -- `_path_set` shrinks to
+        the loose files alone and this returns False for ~24,000 entries the
+        very same server hands out over `/api/mesh` a moment later.
+
+        MEASURED on the CCO install (24,757 WDF entries) with the name tables
+        suppressed, over all 26,933 appearance rows of all 11 part tables:
+
+            first part's mesh resolves        name set 4,372   hash 20,806
+            first part's texture resolves     name set 5,932   hash 22,660
+            mesh AND texture (what the
+            builder will offer as an option)  name set 3,438   hash 20,218
+
+        The hash column is unchanged whether the tables are present or not,
+        because it is not asking them anything.
+
+        The archive half is gated on `_unnamed` for cost, not caution: a
+        container that states its entries' paths (DatPkg) has already put every
+        one of them in `_path_set`, so the hash index could not add a single
+        answer -- and building it costs 3,414 ms on 7878's 146,196 entries.
+        """
+        if logical in self._path_set:
+            return True
+        # Hash-addressed entries the recovery table never named. `arc_by_hash`
+        # is keyed exactly as `AssetRoot.locate()` keys its archive lookup, so
+        # a True here is a promise `read()` keeps.
+        hit = self._ships_cache.get(logical)
+        if hit is None:
+            hit = bool(self._unnamed) and tq_hash(logical) in self.arc_by_hash
+            self._ships_cache[logical] = hit
+        return hit
+
     def resolve_id(self, asset_id: str, kind: str = "texture") -> Optional[str]:
         if not asset_id or asset_id == "0":
             return None
         # full-path references from synthesised old-client tables
         if "/" in asset_id or "\\" in asset_id:
             key = asset_id.replace("\\", "/").lstrip("/").lower()
-            return key if key in self._path_set else None
+            return key if self.ships(key) else None
         dirs = self.TEX_DIRS if kind == "texture" else self.MESH_DIRS
         ext = ".dds" if kind == "texture" else ".c3"
         ids = []
@@ -1835,12 +2306,12 @@ class Catalog:
         for sub in dirs:
             for i in ids:
                 p = f"c3/{sub}/{i}{ext}"
-                if p in self._path_set:
+                if self.ships(p):
                     return p
         return None
 
     def exists(self, logical: str) -> bool:
-        return logical.lower().replace("\\", "/").lstrip("/") in self._path_set
+        return self.ships(logical.lower().replace("\\", "/").lstrip("/"))
 
     def list_under(self, prefix: str) -> list[str]:
         p = prefix.lower().replace("\\", "/").lstrip("/")
@@ -2464,6 +2935,11 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/index/cancel": self.post_index_cancel,
                 "/api/thumbs/cancel": self.post_thumbs_cancel,
                 "/api/thumbs/decision": self.post_thumbs_decision,
+                "/api/installs/declare": self.post_installs_declare,
+                "/api/installs/forget": self.post_installs_forget,
+                "/api/installs/clientsroot": self.post_installs_clientsroot,
+                "/api/bootstrap/start": self.post_bootstrap_start,
+                "/api/bootstrap/cancel": self.post_bootstrap_cancel,
                 "/api/mapedit/passability": self.post_mapedit_passability,
             }.get(path)
             if not handler:
@@ -2521,7 +2997,15 @@ class Handler(BaseHTTPRequestHandler):
             "/api/tables": self.api_tables,
             "/api/appearances": self.api_appearances,
             "/api/appearance": self.api_appearance,
+            # `/api/dirs` was already taken by the file-tree browser. The
+            # settings page's directory management lives under
+            # `/api/installs/*` for that reason -- renaming the existing one
+            # would break the catalogue pane for a naming preference.
             "/api/dirs": self.api_dirs,
+            "/api/installs/dirs": self.api_installs_dirs,
+            "/api/installs/scan": self.api_installs_scan,
+            "/api/installs/detect": self.api_installs_detect,
+            "/api/bootstrap/status": self.api_bootstrap_status,
             "/api/files": self.api_files,
             "/api/provenance": self.api_provenance,
             "/api/mesh": self.api_mesh,
@@ -2678,7 +3162,11 @@ class Handler(BaseHTTPRequestHandler):
             "numpy": dds.HAVE_NUMPY,
             "stageDir": str(STAGE),
             "stagedCount": len(_staged_files()),
-            "installed": (PROJECT / "mods" / "manifest.json").is_file(),
+            # comod's own record for the install being browsed, not a
+            # pre-split file at a fixed path. `mods/manifest.json` was
+            # the layout before installs were keyed per root, so this
+            # answered False for every install made since.
+            "installed": _install_recorded(),
             # WHICH PARSE PROFILE ANSWERED, and what it could not resolve.
             # Pinning a community client's profile removes the baseline
             # variance BY FIAT, which trades a wrong-and-unstable answer for a
@@ -2834,8 +3322,8 @@ class Handler(BaseHTTPRequestHandler):
         # heading. That is not hypothetical: declared installs are sorted by
         # plugin name, and `cco` -- now a `server` -- sorts before every
         # `patch*`, which would have put "Private server clients" above the
-        # official block AND again below it. Order the payload so each kind is
-        # contiguous; the renderer stays a renderer.
+        # "Offline Clients" block AND again below it. Order the payload so each
+        # kind is contiguous; the renderer stays a renderer.
         entries.sort(key=base_group_key)
         return self._json({"paths": entries, "current": cur})
 
@@ -4091,6 +4579,342 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "current": name,
                            "knownPaths": len(cat.all_paths)})
 
+    # -- API: directory management ------------------------------------------
+    #
+    # NOTHING HERE DECLARES ANYTHING BY ITSELF.
+    # -----------------------------------------
+    # `api_installs_dirs` and `api_installs_scan` are both READS. They list
+    # what the user has already declared and what folders exist beside it, and
+    # neither writes the config. Adopting one is `post_installs_declare`, which
+    # takes an explicit path AND an explicit kind from the page.
+    #
+    # This is the owner's ruling and it is not a style preference: a tool that
+    # adopts directories on startup is one bad guess away from indexing the
+    # wrong tree, and every downstream artefact -- the index namespace, the
+    # parse profile, the thumbnail cache -- is then filed under a name nobody
+    # chose. The scan offers; the person answers.
+
+    def _install_rows(self) -> list:
+        """Every declared install, as the settings page needs to show it.
+
+        Not `_declared_bases`: that one *drops* a root that has gone away,
+        because it feeds a picker and offering a dead entry means a click that
+        fails. This list is the place you go to FIX that, so a declaration
+        whose folder is missing has to be visible and removable. The two
+        differ deliberately.
+        """
+        sys.path.insert(0, str(PROJECT))
+        import plugins as plugmod
+        doc = coroot.read_settings()
+        names = dict(doc.get(SERVER_NAMES_KEY) or {})
+        try:
+            configured = str(Path(coroot.game_root()).resolve())
+        except Exception:
+            configured = ""
+        rows = []
+        for path, kind in (doc.get(coroot.KINDS_KEY) or {}).items():
+            p = Path(str(path))
+            plug = plugmod.for_kind(str(kind))
+            origin = getattr(plug, "origin", "unknown") if plug else "unknown"
+            exists = p.is_dir()
+            missing = coroot.missing_parts(p) if exists else []
+            try:
+                resolved = str(p.resolve())
+            except OSError:                          # pragma: no cover
+                resolved = str(p)
+            rows.append({
+                "root": str(p),
+                "kind": str(kind),
+                "label": plug.label if plug else str(kind),
+                "origin": origin,
+                # The two words the page prints. A plugin with no `origin` is
+                # "unknown" and stays unknown -- inheriting one would be this
+                # module asserting something the plugin declined to.
+                "category": ORIGIN_CATEGORY.get(origin, "unknown"),
+                "serverName": str(names.get(str(path))
+                                  or names.get(resolved) or ""),
+                "exists": exists,
+                "missing": missing,
+                "usable": exists and not missing,
+                "current": bool(configured) and resolved == configured,
+                "pluginKnown": plug is not None,
+                "indexed": (exists and not missing and coroot.find_derived(
+                    "out/meshtex/coverage.json", p) is not None),
+            })
+        rows.sort(key=lambda r: (r["category"], r["kind"]))
+        return rows
+
+    def api_installs_dirs(self, arg):
+        """The declared installs, split into offline clients and private
+        servers, plus where `Scan` will look."""
+        root, why = clients_root()
+        rows = self._install_rows()
+        return self._json({
+            "installs": rows,
+            "offlineClients": [r for r in rows
+                               if r["category"] == "offline-client"],
+            "privateServers": [r for r in rows
+                               if r["category"] == "private-server"],
+            "unclassified": [r for r in rows if r["category"] == "unknown"],
+            "clientsRoot": str(root) if root else "",
+            "clientsRootExists": bool(root and root.is_dir()),
+            "clientsRootWhy": why,
+            "clientsRootKey": CLIENTS_ROOT_KEY,
+            "storePath": str(coroot.user_config_path()),
+            "confidentAt": DETECT_CONFIDENT,
+            "tieWindow": DETECT_TIE,
+        })
+
+    def api_installs_scan(self, arg):
+        """Folders under the clients root that have NOT been declared.
+
+        A read. The response is an OFFER -- `candidates` with a detection
+        report each -- and the config is not touched. `newCount` is what the
+        launch prompt keys on.
+        """
+        root, why = clients_root()
+        out = {"clientsRoot": str(root) if root else "", "clientsRootWhy": why,
+               "candidates": [], "newCount": 0, "scanned": False, "error": ""}
+        if root is None:
+            out["error"] = ("no folder to scan: " + why)
+            return self._json(out)
+        if not root.is_dir():
+            out["error"] = f"{root} is not a directory"
+            return self._json(out)
+        declared = set()
+        for path in (coroot.read_settings().get(coroot.KINDS_KEY) or {}):
+            try:
+                declared.add(str(Path(str(path)).resolve()).lower())
+            except OSError:                          # pragma: no cover
+                declared.add(str(path).lower())
+        try:
+            children = sorted(p for p in root.iterdir() if p.is_dir())
+        except OSError as e:
+            out["error"] = f"could not read {root}: {e}"
+            return self._json(out)
+        out["scanned"] = True
+        for p in children:
+            try:
+                key = str(p.resolve()).lower()
+            except OSError:                          # pragma: no cover
+                key = str(p).lower()
+            if key in declared:
+                continue
+            # A folder that is not a client is not a candidate. Reported all
+            # the same when it is close -- `_variants` and half-copied trees
+            # sit right beside the real ones, and "why is 5065_old not
+            # offered" is a question the page should be able to answer.
+            rep = detect_report(p)
+            rep["name"] = p.name
+            rep["client"] = not rep["missing"] and not rep["error"]
+            out["candidates"].append(rep)
+        out["newCount"] = sum(1 for c in out["candidates"] if c["client"])
+        return self._json(out)
+
+    def api_installs_detect(self, arg):
+        """The detection report for one arbitrary path, for the Add fields."""
+        raw = arg("root", "").strip().strip('"')
+        if not raw:
+            return self._error(400, "root= required")
+        return self._json(detect_report(raw))
+
+    def post_installs_declare(self, body: bytes, arg):
+        r"""Declare one folder as a client of a named kind.
+
+        `kind` is REQUIRED and comes from the page. There is no "work it out
+        from the folder" branch, and that absence is the feature: detection
+        produces a confidence, the page shows it, and a weak or tied read is
+        put to the user as a question. Defaulting here would put the guess
+        back one layer down where nobody can see it.
+
+        Validated the way `post_setroot` validates: by contents, and by the
+        plugin's own claim about the folder. A declaration is baked into an
+        index directory name, so a wrong one is expensive to notice.
+
+        **Does not change which client is being browsed.** `coroot.declare_kind`
+        also writes the single `game_kind`, which is the fallback answer for
+        the *configured* `game_root`; declaring a seventh client must not
+        silently re-label the one that is open. It is written back.
+        """
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        raw = str(doc.get("path") or "").strip().strip('"')
+        kind = str(doc.get("kind") or "").strip()
+        if not raw:
+            return self._error(400, "no path given")
+        if not kind:
+            return self._json({
+                "ok": False, "path": raw,
+                "error": "no kind given. Nothing is declared without one -- "
+                         "run detection and answer, or pick a plugin."}, 400)
+        p = Path(raw)
+        if not p.is_dir():
+            return self._json({"ok": False, "path": raw,
+                               "error": f"{raw} is not a directory"}, 400)
+        missing = coroot.missing_parts(p)
+        if missing:
+            return self._json({
+                "ok": False, "path": raw, "missing": missing,
+                "error": f"{raw} is not a Conquer Online client: missing "
+                         + ", ".join(missing)}, 400)
+        sys.path.insert(0, str(PROJECT))
+        import plugins as plugmod
+        try:
+            plug = plugmod.for_kind(kind)
+        except plugmod.DiscoveryError as e:
+            return self._json({"ok": False, "path": raw, "error": str(e)}, 500)
+        if plug is None:
+            names = ", ".join(sorted(x.name for x in plugmod.available()))
+            return self._json({
+                "ok": False, "path": raw,
+                "error": f"no parser plugin named {kind!r}. Available: "
+                         f"{names}."}, 400)
+        conf = plug.confidence(p, lambda q: (p / q).is_file())
+        if conf <= 0.0 and not doc.get("force"):
+            best = detect_report(p)
+            return self._json({
+                "ok": False, "path": raw, "confidence": 0.0,
+                "detect": best,
+                "error": f"{raw} does not look like {plug.label} to that "
+                         f"plugin's own check. Nothing was declared."}, 400)
+        before = coroot.read_settings().get("game_kind", "")
+        saved = coroot.declare_kind(p, plug.name)
+        after = coroot.read_settings()
+        try:
+            same = (Path(str(after.get("game_root") or "")).resolve()
+                    == p.resolve())
+        except OSError:                              # pragma: no cover
+            same = False
+        if not same and after.get("game_kind") != before:
+            coroot.write_settings(game_kind=before)
+        name = str(doc.get("serverName") or "").strip()
+        if name:
+            names_map = dict(coroot.read_settings().get(SERVER_NAMES_KEY) or {})
+            try:
+                names_map[str(p.resolve())] = name
+            except OSError:                          # pragma: no cover
+                names_map[str(p)] = name
+            coroot.write_settings(**{SERVER_NAMES_KEY: names_map})
+        coroot.invalidate_cache()
+        origin = getattr(plug, "origin", "unknown")
+        _log(f"declared {p} as {plug.name} (confidence {conf:.2f})")
+        return self._json({
+            "ok": True, "path": str(p), "kind": plug.name,
+            "plugin": plug.label, "confidence": round(float(conf), 4),
+            "origin": origin,
+            "category": ORIGIN_CATEGORY.get(origin, "unknown"),
+            "serverName": name, "savedTo": str(saved),
+            "restartRequired": True,
+        })
+
+    def post_installs_forget(self, body: bytes, arg):
+        """Drop one declaration. The folder is not touched."""
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        raw = str(doc.get("path") or "").strip().strip('"')
+        if not raw:
+            return self._error(400, "no path given")
+        gone = coroot.forget_kind(raw)
+        names_map = dict(coroot.read_settings().get(SERVER_NAMES_KEY) or {})
+        for k in [k for k in names_map
+                  if str(k).lower().replace("\\", "/")
+                  == raw.lower().replace("\\", "/")]:
+            names_map.pop(k)
+            coroot.write_settings(**{SERVER_NAMES_KEY: names_map})
+        coroot.invalidate_cache()
+        _log(f"forgot declaration for {raw}" if gone
+             else f"no declaration to forget for {raw}")
+        return self._json({"ok": True, "forgot": gone, "path": raw})
+
+    def post_installs_clientsroot(self, body: bytes, arg):
+        """Set (or clear) the folder `Scan` looks in.
+
+        Stored in the per-user config through `coroot.write_settings`, beside
+        every other setting. There is no second store, and there is no literal
+        default compiled in -- see `clients_root`.
+        """
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        raw = str(doc.get("path") or "").strip().strip('"')
+        if not raw:
+            coroot.write_settings(**{CLIENTS_ROOT_KEY: ""})
+            root, why = clients_root()
+            return self._json({"ok": True, "cleared": True,
+                               "clientsRoot": str(root) if root else "",
+                               "clientsRootWhy": why})
+        p = Path(raw)
+        if not p.is_dir():
+            return self._json({"ok": False, "path": raw,
+                               "error": f"{raw} is not a directory"}, 400)
+        coroot.write_settings(**{CLIENTS_ROOT_KEY: str(p)})
+        root, why = clients_root()
+        return self._json({"ok": True, "clientsRoot": str(root) if root else "",
+                           "clientsRootWhy": why})
+
+    # -- API: bootstrap ------------------------------------------------------
+    def _bootstrapper(self) -> "BootstrapRunner":
+        run = getattr(self.server, "bootstrapper", None)
+        if run is None:
+            run = BootstrapRunner(PROJECT)
+            self.server.bootstrapper = run           # type: ignore[attr-defined]
+        return run
+
+    def api_bootstrap_status(self, arg):
+        """What bootstrap is doing, and what it would cost -- with the
+        measurement that contradicts the cost table attached."""
+        run = self._bootstrapper()
+        try:
+            derived = health.check_derived(
+                self.server.game_root)               # type: ignore[attr-defined]
+        except Exception as e:                       # pragma: no cover
+            derived = {"artefacts": [], "error": f"{type(e).__name__}: {e}"}
+        return self._json({
+            "run": run.status(),
+            "derived": derived,
+            "costCaveat": BOOTSTRAP_COST_CAVEAT,
+            # `bootstrap()` builds for the CONFIGURED root, not for whichever
+            # base the browser is looking at -- its argv carries no --root.
+            # Named so the page can say which install it is about.
+            "buildsFor": str(coroot.read_settings().get("game_root") or ""),
+            "browsing": str(self.server.game_root or ""),  # type: ignore[attr-defined]
+            "known": [rel for rel, _a, _c, _w in health.DERIVED],
+            "allExplains":
+                "“Bootstrap” builds only what is MISSING and skips "
+                "everything already on disk. “Rebuild everything” "
+                "(--bootstrap-all) re-runs every builder whether the artefact "
+                "is there or not, overwriting it — so it pays the full "
+                "cost of the table above every time, including the "
+                "36-minute one. Use it when an artefact is present but "
+                "suspect; use plain bootstrap otherwise.",
+        })
+
+    def post_bootstrap_start(self, body: bytes, arg):
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            doc = {}
+        uses = []
+        for item in (doc.get("uses") or []):
+            if isinstance(item, str):
+                spec = item.strip()
+            else:
+                rel = str((item or {}).get("rel") or "").strip()
+                path = str((item or {}).get("path") or "").strip().strip('"')
+                spec = f"{rel}={path}" if rel else ""
+            if spec:
+                uses.append(spec)
+        run = self._bootstrapper()
+        return self._json(run.start(bool(doc.get("all")), uses))
+
+    def post_bootstrap_cancel(self, body: bytes, arg):
+        return self._json(self._bootstrapper().cancel())
+
     # -- API: health / setup / thumbnails -----------------------------------
     def api_health(self, arg):
         r"""The first-run check, and the same report `--health` prints.
@@ -4433,7 +5257,20 @@ class Handler(BaseHTTPRequestHandler):
         out = {"state": state, "run": runner.status() if runner else None,
                "prompt": (self._thumbs_off_reason() is None
                           and health.should_prompt(state)),
-               "enabled": cosettings.get("thumbnails")}
+               "enabled": cosettings.get("thumbnails"),
+               # Served, not written into the page: the cost of a thumbnail
+               # run is PER CLIENT and the figures in `state.plan` are one
+               # client's census. A page that prints the plan without this
+               # sentence tells a user with three clients the bill for one.
+               "costCaveat": THUMB_COST_CAVEAT,
+               "forClient": str(self.server.game_root or ""),  # type: ignore[attr-defined]
+               "activeServer": getattr(self.server, "server_name", ""),
+               # Whether a run would be a first fill or a top-up. The button
+               # says "Generate" or "Re-run" from this, and "Re-run" is not a
+               # second, different job -- `thumbs.py --resume` skips anything
+               # whose content hash is unchanged.
+               "rerun": state.get("status") not in ("none", None),
+               }
         # Generation is incremental: re-read the manifests so a page left open
         # during a run picks up what has landed.
         if self.cat is not None and runner and runner.running():
@@ -5009,6 +5846,12 @@ class Handler(BaseHTTPRequestHandler):
             "category": cat_id, "sub": sub, "total": len(rows), "offset": offset,
             "roles": role_counts,
             "groups": [{"id": k, "count": v} for k, v in top_groups],
+            # `groups` is the top 400; `groupTotal` is how many there ARE. The
+            # page needs the second to say "N groups hidden" truthfully -- with
+            # only the first it would report the size of its own truncation and
+            # call it the total. effect/mesh is the case that proves it: 400
+            # groups sent, and that is exactly the cap.
+            "groupTotal": len(group_counts),
             "rows": rows[offset:offset + limit],
             "allSubjects": [r["subject"] for r in rows],
             # `bool(u)` was enough while `u` was either the real index or
@@ -5033,8 +5876,24 @@ class Handler(BaseHTTPRequestHandler):
                     or q in (r.get("puzzle") or "")]
         return self._json({"total": len(rows), "rows": rows})
 
+    #: How many of a map's `.scene` layers get their parts walked.  The cap is
+    #: real work -- each scene is a file read plus an index lookup per part --
+    #: so it stays, but the payload now says it was applied.  A truncated list
+    #: that does not admit to being truncated is the same failure as a dropped
+    #: reference: the panel shows fewer pieces than the map has and nothing
+    #: distinguishes that from a map with fewer pieces.
+    SCENE_DETAIL_LIMIT = 60
+
     def api_map(self, arg):
-        """One map and every piece of art that draws it."""
+        """One map and every piece of art that draws it -- **including the art
+        it names that this install does not ship.**
+
+        `unresolved` is part of the contract, not a diagnostic.  The three
+        walks behind it (`.pul` -> tile index, cover layers, scene parts) each
+        used to filter their misses out where they found them, so a map that
+        named 1,364 pieces and shipped 56 of them reported 56 with no error.
+        Measured on 5517's `hq`, which is exactly that map.
+        """
         name = arg("name", "")
         if not name:
             return self._error(400, "name required")
@@ -5042,9 +5901,25 @@ class Handler(BaseHTTPRequestHandler):
         out = rec.to_json()
         # scene parts resolve to sprite frames one level further down
         parts = []
-        for s in rec.scenes[:60]:
-            parts.append({"scene": s, "parts": self.cat.maps.scene_parts(s)})
+        shown = rec.scenes[:self.SCENE_DETAIL_LIMIT]
+        scene_unresolved = []
+        for s in shown:
+            rep = self.cat.maps.scene_parts(s)
+            parts.append({"scene": s, "parts": rep["parts"],
+                          "error": rep["error"],
+                          "unresolved": rep["unresolved"]})
+            scene_unresolved.extend(rep["unresolved"])
         out["scenePartDetail"] = parts
+        out["sceneDetailShown"] = len(shown)
+        out["sceneDetailLimit"] = self.SCENE_DETAIL_LIMIT
+        # Merged into the one list the panel reads, so a scene's misses are
+        # counted with everything else's rather than living in a second place
+        # a reader has to know to look at.
+        out["unresolved"] = out["unresolved"] + scene_unresolved
+        out["unresolvedCount"] = len(out["unresolved"])
+        out["sceneFrameCount"] = len({f for p in parts
+                                      for pt in p["parts"]
+                                      for f in pt["frames"]})
         return self._json(out)
 
     # -- API: the MapEditor ------------------------------------------------

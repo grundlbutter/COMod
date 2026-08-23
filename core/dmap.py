@@ -267,6 +267,68 @@ def layer_payload(version: int) -> dict:
         return LAYER_PAYLOAD_1006
     return LAYER_PAYLOAD
 
+
+def layer_payload_for(version: str | int) -> dict:
+    """`layer_payload` for a version that may still be the string a header
+    carried.
+
+    `coassets.DMap` keeps `version` as the text it read -- ``"1004"`` for the
+    numeric form, ``"101"`` for the ``DMAP101`` tagged form -- while this
+    module keeps the int.  Two callers now share one table and they hold the
+    version in two types; converting at each call site is how one of them
+    ends up doing ``layer_payload("1006")``, which matches no branch and
+    silently returns the base table.  That is not hypothetical: it is exactly
+    the bug this pair of functions was extracted to close (`tools/mapindex`
+    read **0** of `ninja01_new`'s 2,923 declared layers).
+    """
+    try:
+        return layer_payload(int(version))
+    except (TypeError, ValueError):
+        return LAYER_PAYLOAD
+
+
+def decode_layer(t: int, pay: bytes, index: int = 0) -> dict:
+    """One layer record: its tag and payload -> the fields it carries.
+
+    THE ONE HOME for the record's field layout.  `parse()` below walks the
+    layer table and `tools/mapindex.iter_layers` walks it again over the same
+    bytes for the Asset Viewer; while each held its own copy of the shapes
+    they drifted, and the drift was invisible because both walks *succeeded*
+    -- one of them just stopped early and reported a smaller map.  MEASURED on
+    the CCO 2.0 install before the copies were merged:
+
+        map                 version  declared  mapindex read  this read
+        ninja01_new            1006     2,923              0      2,923
+        2020love01_new         1006     1,170              0      1,170
+        bp-flandlords-y_new    1006        79              0         79
+        magictower01_new       1005        34              1         34
+
+    Four maps whose entire art set was absent from the panel, with no error:
+    `mapindex` carried the pre-1005 table, met tag 24 (or 1005's tag 0) and
+    returned cleanly.  A short read looks exactly like a small map.
+    """
+    shape = LAYER_SHAPE.get(t, "unknown")
+    rec: dict = {"index": index, "type": t, "shape": shape,
+                 "type_name": LAYER_TYPES.get(t, f"UNKNOWN_{t}")}
+    if shape == "cover":
+        rec["path"] = _cstr(pay[:260])
+        rec["key"] = _cstr(pay[260:388])
+        (ox, oy, w, h, dx, dy, iv) = struct.unpack_from("<IIIIiiI", pay, 388)
+        rec.update(origin=[ox, oy], size=[w, h],
+                   offset=[dx, dy], frame_interval=iv)
+    elif shape == "scene":
+        rec["path"] = _cstr(pay[:260])
+        rec["origin"] = list(struct.unpack_from("<II", pay, 260))
+    elif shape == "sound":
+        rec["path"] = _cstr(pay[:260])
+        ox, oy, rng, vol = struct.unpack_from("<IIII", pay, 260)
+        rec.update(origin=[ox, oy], range=rng, volume=vol)
+    elif shape == "effect":
+        rec["name"] = _cstr(pay[:64])
+        rec["origin"] = list(struct.unpack_from("<II", pay, 64))
+    return rec
+
+
 # MSVC debug fill.  Some maps declare more layers than they actually wrote and
 # leave the tail as uninitialised heap; treat it as end-of-data rather than
 # pretending to decode it.
@@ -544,27 +606,7 @@ def parse(path: str | Path, want_cells: bool = True, verify: bool = True) -> DMa
             if o + size > len(b):
                 d.layer_error = f"layer {i}: payload overruns file"
                 break
-            pay = b[o:o + size]
-            shape = LAYER_SHAPE[t]
-            rec: dict = {"index": i, "type": t, "shape": shape,
-                         "type_name": LAYER_TYPES.get(t, f"UNKNOWN_{t}")}
-            if shape == "cover":
-                rec["path"] = _cstr(pay[:260])
-                rec["key"] = _cstr(pay[260:388])
-                (ox, oy, w, h, dx, dy, iv) = struct.unpack_from("<IIIIiiI", pay, 388)
-                rec.update(origin=[ox, oy], size=[w, h],
-                           offset=[dx, dy], frame_interval=iv)
-            elif shape == "scene":
-                rec["path"] = _cstr(pay[:260])
-                rec["origin"] = list(struct.unpack_from("<II", pay, 260))
-            elif shape == "sound":
-                rec["path"] = _cstr(pay[:260])
-                ox, oy, rng, vol = struct.unpack_from("<IIII", pay, 260)
-                rec.update(origin=[ox, oy], range=rng, volume=vol)
-            elif shape == "effect":
-                rec["name"] = _cstr(pay[:64])
-                rec["origin"] = list(struct.unpack_from("<II", pay, 64))
-            d.layers.append(rec)
+            d.layers.append(decode_layer(t, b[o:o + size], i))
             o += size
         else:
             d.layers_complete = True

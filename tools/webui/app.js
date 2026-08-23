@@ -33,6 +33,13 @@ const state = {
   /** Category browsing: the taxonomy tree and where we are in it. */
   categories: [],
   cat: { id: null, sub: null, role: null, group: null },
+  /** The last /api/catfiles payload, kept so the Group disclosure can redraw
+   *  its own chips without a round trip. */
+  catFacets: null,
+  /** Group disclosure: `null` means "decide from the size of the list"
+   *  (see GROUP_COLLAPSE_OVER); `true`/`false` is an explicit choice by the
+   *  user and outranks the default until they leave the category. */
+  catGroupsOpen: null,
   /** "hide animation assets": the motion buckets cannot be previewed in this
    *  mode. Restored from localStorage below, alongside the panel-collapse and
    *  folder-tree state, so it survives a trip to the builder and back. */
@@ -54,6 +61,11 @@ const state = {
    *  is OR; across axes it is AND. */
   sel: { class: new Set(), gender: new Set(), size: new Set(), kind: new Set() },
   selTags: new Set(),
+  /** The Your-tags search box: what is typed in it, and whether the caret was
+   *  in it when the facet host was last rebuilt. Neither is a filter on the
+   *  results -- both are a view over the tag vocabulary. */
+  tagQuery: '',
+  tagQueryFocus: false,
   group: false,
   lastQuery: null,       // the last /api/appearances payload
   /** Keyboard navigation over whatever the list is currently showing.
@@ -1264,6 +1276,10 @@ async function loadCategories() {
 
 function openCategory(id, sub) {
   state.cat = { id, sub, role: null, group: null };
+  // Back to "decide from the size of the list". Carrying the choice across
+  // categories would collapse Weapons' three groups because Effects' four
+  // hundred were collapsed a moment ago.
+  state.catGroupsOpen = null;
   $('#cat-tree').classList.add('hidden');
   $('#cat-controls').classList.remove('hidden');
   $('#cat-search').value = '';
@@ -1272,6 +1288,8 @@ function openCategory(id, sub) {
 
 function closeCategory() {
   state.cat = { id: null, sub: null, role: null, group: null };
+  state.catFacets = null;
+  state.catGroupsOpen = null;
   $('#cat-tree').classList.remove('hidden');
   $('#cat-controls').classList.add('hidden');
   navSet('category', []);
@@ -1301,33 +1319,10 @@ async function loadCategoryFiles() {
             el('b', null, meta ? meta.label : state.cat.id));
   if (state.cat.sub) cb.append(document.createTextNode(' / ' + state.cat.sub));
 
-  // role + group chips
-  const fh = $('#cat-facets');
-  fh.innerHTML = '';
-  const roles = Object.entries(data.roles || {}).sort((a, b) => b[1] - a[1]);
-  if (roles.length > 1) {
-    const box = el('div', 'facet-axis');
-    box.appendChild(el('div', 'axis-name', 'Kind of file'));
-    for (const [r, n] of roles) {
-      box.appendChild(chip(r, n, state.cat.role === r, () => {
-        state.cat.role = state.cat.role === r ? null : r;
-        loadCategoryFiles();
-      }));
-    }
-    fh.appendChild(box);
-  }
-  if ((data.groups || []).length > 1) {
-    const box = el('div', 'facet-axis');
-    box.appendChild(el('div', 'axis-name',
-      state.cat.id === 'map' ? 'Region / map folder' : 'Group'));
-    for (const g of data.groups.slice(0, 60)) {
-      box.appendChild(chip(g.id, g.count, state.cat.group === g.id, () => {
-        state.cat.group = state.cat.group === g.id ? null : g.id;
-        loadCategoryFiles();
-      }));
-    }
-    fh.appendChild(box);
-  }
+  // role + group chips. Kept out of this function so the group disclosure can
+  // redraw itself from the payload it already has instead of re-querying.
+  state.catFacets = data;
+  renderCatFacets();
 
   list.innerHTML = '';
   const items = [];
@@ -1351,6 +1346,124 @@ async function loadCategoryFiles() {
     (data.motionFilter
       ? ` · ${(data.motionHidden || 0).toLocaleString()} animation entries in this category hidden by the filter`
       : '');
+}
+
+/** Above this many groups the chip list starts collapsed.
+ *
+ *  Measured on 5517 at a 1500px window (the left pane is ~330px, which fits
+ *  about four chips a row): weapon/mesh has 2 groups, Weapons 3,
+ *  Characters 19, Maps 42, monster/mesh 85, npc/mesh 156 -- 130 of them a
+ *  single file -- and effect/mesh 412. Twelve is three rows of chips, and the
+ *  distribution is bimodal with nothing between 19 and 42: the small axes that
+ *  read as a legend stay open, every axis that reads as a wall starts shut. */
+const GROUP_COLLAPSE_OVER = 12;
+
+/** How many group chips this page is willing to draw at once. Unchanged from
+ *  the original `slice(0, 60)`; what IS new is that the count line says so
+ *  instead of truncating in silence. */
+const GROUP_RENDER_CAP = 60;
+
+/** Draw the "Kind of file" and "Group" axes from `state.catFacets`.
+ *
+ *  Separate from `loadCategoryFiles` because opening and closing the group
+ *  disclosure changes nothing the server knows: it redraws from the payload
+ *  already in hand rather than asking /api/catfiles the same question again.
+ */
+function renderCatFacets() {
+  const fh = $('#cat-facets');
+  if (!fh) return;
+  fh.innerHTML = '';
+  const data = state.catFacets;
+  if (!data) return;
+
+  const roles = Object.entries(data.roles || {}).sort((a, b) => b[1] - a[1]);
+  if (roles.length > 1) {
+    const box = el('div', 'facet-axis');
+    box.appendChild(el('div', 'axis-name', 'Kind of file'));
+    for (const [r, n] of roles) {
+      box.appendChild(chip(r, n, state.cat.role === r, () => {
+        state.cat.role = state.cat.role === r ? null : r;
+        loadCategoryFiles();
+      }));
+    }
+    fh.appendChild(box);
+  }
+
+  const groups = data.groups || [];
+  if (groups.length <= 1) return;
+
+  // `groups` is the server's top 400; `groupTotal` is how many exist. Fall
+  // back to the list length only for a server too old to send the figure --
+  // never quietly report the size of a truncation as a total.
+  const total = (typeof data.groupTotal === 'number' && data.groupTotal)
+    ? data.groupTotal : groups.length;
+  const sel = state.cat.group;
+  const selRec = sel
+    ? (groups.find(g => g.id === sel) || { id: sel, count: 0 })
+    : null;
+  const open = state.catGroupsOpen === null
+    ? total <= GROUP_COLLAPSE_OVER
+    : state.catGroupsOpen;
+
+  const mkChip = g => chip(g.id, g.count, state.cat.group === g.id, () => {
+    state.cat.group = state.cat.group === g.id ? null : g.id;
+    loadCategoryFiles();
+  });
+
+  const box = el('div', 'facet-axis');
+  const head = el('div', 'axis-name');
+  head.appendChild(el('span', null,
+    state.cat.id === 'map' ? 'Region / map folder' : 'Group'));
+
+  // What the disclosure hides. Collapsed, the selected group is still drawn --
+  // a filter you cannot see is a filter you forget is on -- so it does not
+  // count as hidden.
+  const drawn = open ? Math.min(groups.length, GROUP_RENDER_CAP)
+                     : (selRec ? 1 : 0);
+  const hidden = Math.max(0, total - drawn);
+
+  const btn = el('button', 'ghost tiny disclose');
+  btn.type = 'button';
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  btn.setAttribute('aria-controls', 'cat-groups');
+  // Expanded, the count is only on the button when it is the count actually on
+  // screen: "hide 412 groups" over a note reading "60 of 412 shown" would be
+  // two numbers for one thing. Truncated, the note owns the arithmetic.
+  btn.textContent = open
+    ? (drawn < total ? '▾ hide groups'
+                     : `▾ hide ${total.toLocaleString()} groups`)
+    : (hidden === 1 ? '▸ show 1 group'
+                    : `▸ show ${hidden.toLocaleString()} groups`);
+  btn.title = open
+    ? 'Collapse the group filter. Any group you have selected stays visible.'
+    : `${total.toLocaleString()} groups in this category` +
+      (selRec ? ` — ${hidden.toLocaleString()} hidden, the one you selected is shown`
+              : ` — all ${hidden.toLocaleString()} hidden`);
+  btn.addEventListener('click', () => {
+    state.catGroupsOpen = !open;
+    renderCatFacets();
+  });
+  head.appendChild(btn);
+  box.appendChild(head);
+
+  const chips = el('div', 'axis-chips');
+  chips.id = 'cat-groups';
+  if (open) {
+    const shown = groups.slice(0, GROUP_RENDER_CAP);
+    // A selection outside the drawn slice would otherwise be invisible even
+    // with the list open, which is the same fault as hiding it when closed.
+    if (selRec && !shown.some(g => g.id === sel)) shown.unshift(selRec);
+    for (const g of shown.slice(0, GROUP_RENDER_CAP)) chips.appendChild(mkChip(g));
+    if (hidden > 0) {
+      chips.appendChild(el('span', 'mut small axis-note',
+        `${drawn.toLocaleString()} of ${total.toLocaleString()} shown` +
+        (total >= 400 ? ' (the server sends the 400 largest)' : '')));
+    }
+  } else if (selRec) {
+    chips.appendChild(mkChip(selRec));
+  }
+  box.appendChild(chips);
+  fh.appendChild(box);
 }
 
 // ------------------------------------------------------------------ maps
@@ -1412,6 +1525,26 @@ async function selectMap(name) {
   await showProvenance(rec.file);
 }
 
+/** How many unresolved rows to print per reason before summarising. */
+const UNRES_SHOWN = 40;
+
+/** The order the reasons are printed in, and what each one MEANS.
+ *
+ * Five reasons rather than one bucket, because a reader has to be able to act
+ * on the difference and the actions are not the same. "The index does not
+ * define this key" means the art cannot even be named and there is nothing to
+ * go looking for; "this install ships no such file" names the exact file that
+ * is missing. Collapsing them into "missing" throws away the half that says
+ * what to do next. The server (`mapindex.UNRESOLVED_REASONS`) is where the
+ * labels are decided; this is the order and the heading text. */
+const UNRES_ORDER = [
+  ['absent', 'Named, not shipped'],
+  ['unknown', 'Named a key the index does not define'],
+  ['unreadable', 'A container on the way did not parse'],
+  ['loose-only', 'Ships only inside an archive'],
+  ['unsupported', 'A format this reader does not read'],
+];
+
 function renderMapPieces(rec) {
   const b = $('#mappieces-body');
   b.innerHTML = '';
@@ -1425,6 +1558,33 @@ function renderMapPieces(rec) {
     ['tile set', rec.ani],
     ['layers', `${rec.layersDecoded} of ${rec.layerCount} decoded`],
   ]));
+
+  // ---- the headline: how big this map's art set actually is.
+  //
+  // Both halves, always, and the unresolved half is stated even when it is
+  // zero. A panel that prints the count only when it is non-zero cannot be
+  // read as "this map is complete" -- an absent line and a line saying none
+  // look identical, and the reader has to know the feature exists to tell
+  // them apart.
+  const unres = rec.unresolved || [];
+  const sceneFrames = rec.sceneFrameCount || 0;
+  const total = (rec.resolvedCount || 0) + sceneFrames;
+  const sum = el('div', 'artset' + (unres.length ? ' bad' : ''));
+  sum.appendChild(el('b', null, `${total.toLocaleString()} assets go with this map`));
+  sum.appendChild(el('span', null,
+    unres.length
+      ? ` · ${unres.length.toLocaleString()} more it names are unresolved`
+      : ' · every reference it makes resolves'));
+  b.appendChild(sum);
+
+  // ABOVE the art, not below it. The strips run to hundreds of thumbnails --
+  // 316 on icecrypt-lev2 -- and a section underneath them is 1,500px past
+  // where anyone stops reading. The count in the summary would be the only
+  // thing seen, and a count without the list is back to "something is
+  // missing and you cannot tell what". The exceptional half goes first; the
+  // bulk of the art set is what the reader scrolls FOR.
+  renderUnresolved(b, unres);
+
   const note = el('div', 'small mut');
   note.style.margin = '6px 0 10px';
   note.textContent =
@@ -1432,14 +1592,28 @@ function renderMapPieces(rec) {
     'placed on it. Click any tile to open it.';
   b.appendChild(note);
 
-  strip(b, `Ground tiles (${rec.tileCount})`, rec.tiles,
-        'the .pul names tile indices, the .ani turns them into these files');
-  strip(b, `Animated sprites (${rec.coverCount})`,
-        rec.covers.flatMap(c => c.frames), 'cover layers — props and animations');
+  const nUn = g => unres.filter(u => u.group === g).length;
+
+  artGroup(b, 'Ground tiles', rec.tileCount, nUn('ground'), rec.tiles,
+           'the .pul names tile indices, the .ani turns them into these files');
+  const coverFrames = rec.covers.flatMap(c => c.frames);
+  artGroup(b, 'Animated sprites', rec.coverCount, nUn('cover'),
+           coverFrames, 'cover layers — props and animations',
+           'sprite', 'sprites');
   if (rec.scenes.length) {
     const g = el('div', 'relgroup');
-    g.appendChild(el('h3', null, `Scenery objects (${rec.scenes.length})`));
-    g.appendChild(el('div', 'note', 'map/Scene/*.scene, each made of sprite parts'));
+    g.appendChild(el('h3', null,
+      groupTitle('Scenery objects', rec.scenes.length, nUn('scene'),
+                 'object', 'objects')));
+    let n = 'map/Scene/*.scene, each made of sprite parts';
+    // The server walks only the first N scenes. Saying so is the same duty as
+    // listing an unresolved reference: the alternative is a strip that is
+    // short for a reason the reader cannot see.
+    if (rec.sceneDetailShown < rec.scenes.length) {
+      n += ` — parts walked for the first ${rec.sceneDetailShown} of ` +
+           `${rec.scenes.length}`;
+    }
+    g.appendChild(el('div', 'note', n));
     const frames = (rec.scenePartDetail || [])
       .flatMap(s => s.parts.flatMap(p => p.frames));
     b.appendChild(g);
@@ -1447,6 +1621,10 @@ function renderMapPieces(rec) {
     const names = el('div', 'small mut');
     names.textContent = rec.scenes.slice(0, 12).join(', ');
     b.appendChild(names);
+    for (const s of (rec.scenePartDetail || [])) {
+      if (!s.error) continue;
+      b.appendChild(el('div', 'small warn', `⚠ ${s.scene} — ${s.error}`));
+    }
   }
   if (rec.effects.length) {
     const g = el('div', 'relgroup');
@@ -1458,11 +1636,89 @@ function renderMapPieces(rec) {
   }
   if (rec.sounds.length) {
     const g = el('div', 'relgroup');
-    g.appendChild(el('h3', null, `Sounds (${rec.sounds.length})`));
+    g.appendChild(el('h3', null,
+      groupTitle('Sounds', rec.sounds.length, nUn('sound'))));
     g.appendChild(el('div', 'small mut', rec.sounds.slice(0, 8).join(', ')));
     b.appendChild(g);
   }
   if (rec.error) b.appendChild(el('div', 'warn', '⚠ ' + rec.error));
+}
+
+/** One group of a map's art: its thumbnails, or — when none of it resolved —
+ *  the heading anyway.
+ *
+ *  `strip` returns silently on an empty list, which is right for a group the
+ *  map never used and WRONG for a group the map filled and the install cannot
+ *  answer. On 5517's `hq` the .ani defines none of the 1,196 tile keys the
+ *  .pul places, so "Ground tiles" disappeared from the panel entirely: a map
+ *  with no ground and a map whose ground is all missing rendered identically,
+ *  which is the same collapse this whole panel exists to prevent, one level up
+ *  from the individual reference. */
+function artGroup(host, name, n, missing, paths, note, one, many) {
+  const title = groupTitle(name, n, missing, one, many);
+  if (paths && paths.length) { strip(host, title, paths, note); return; }
+  if (!missing) return;         // the map genuinely does not use this group
+  const g = el('div', 'relgroup');
+  g.appendChild(el('h3', null, title));
+  g.appendChild(el('div', 'note', note));
+  g.appendChild(el('div', 'small mut',
+    `nothing here resolved — all ${missing.toLocaleString()} are listed under ` +
+    'Unresolved above'));
+  host.appendChild(g);
+}
+
+/** "Ground tiles (230)" — or "Ground tiles (230 · 2 unresolved)". */
+function groupTitle(name, n, missing, one = '', many = '') {
+  const unit = many ? ` ${n === 1 ? one : many}` : '';
+  return `${name} (${n.toLocaleString()}${unit}` +
+         (missing ? ` · ${missing.toLocaleString()} unresolved` : '') + ')';
+}
+
+/** Every reference the map makes that did not end at a shipped file.
+ *
+ * Nothing here is a thumbnail, because there is no file to draw — that is the
+ * point. Each row names what the map asked for, which group asked for it and
+ * what it asked through, so the entry is actionable rather than a tally. */
+function renderUnresolved(host, unres) {
+  if (!unres.length) return;
+  const g = el('div', 'relgroup unres');
+  g.appendChild(el('h3', null, `Unresolved (${unres.length.toLocaleString()})`));
+  g.appendChild(el('div', 'note',
+    'the map names these and this install does not answer them. They are ' +
+    'listed rather than dropped: a map that quietly omits them looks smaller ' +
+    'than it is.'));
+  const rest = new Set(unres.map(u => u.reason));
+  for (const [reason, heading] of UNRES_ORDER) {
+    const rows = unres.filter(u => u.reason === reason);
+    rest.delete(reason);
+    if (!rows.length) continue;
+    g.appendChild(unresSection(heading, rows));
+  }
+  // A reason the server grew and this page has not been taught about must
+  // still appear. Falling through to nothing is how a new state becomes an
+  // invisible one.
+  for (const reason of rest) {
+    g.appendChild(unresSection(reason, unres.filter(u => u.reason === reason)));
+  }
+  host.appendChild(g);
+}
+
+function unresSection(heading, rows) {
+  const sec = el('div', 'unres-sec');
+  sec.appendChild(el('h4', null, `${heading} — ${rows.length.toLocaleString()}`));
+  if (rows[0] && rows[0].why) sec.appendChild(el('div', 'note', rows[0].why));
+  for (const u of rows.slice(0, UNRES_SHOWN)) {
+    const r = el('div', 'unres-row');
+    r.appendChild(el('span', 'g', u.group));
+    r.appendChild(el('span', 'r', u.ref));
+    if (u.via) r.appendChild(el('span', 'v', `via ${u.via}`));
+    sec.appendChild(r);
+  }
+  if (rows.length > UNRES_SHOWN) {
+    sec.appendChild(el('div', 'small mut',
+      `… ${(rows.length - UNRES_SHOWN).toLocaleString()} more`));
+  }
+  return sec;
 }
 
 /** A thumbnail strip of asset paths, clickable through to the asset. */
@@ -1472,17 +1728,36 @@ function strip(host, title, paths, note, limit = 96) {
   if (title) g.appendChild(el('h3', null, title));
   if (note) g.appendChild(el('div', 'note', note));
   const s = el('div', 'relstrip');
-  const seen = new Set();
-  let n = 0;
-  for (const p of paths) {
-    if (seen.has(p)) continue;
-    seen.add(p);
-    if (n++ >= limit) break;
+  // Dedupe FIRST, then cap. It used to cap the raw list and dedupe inside the
+  // loop, so the "… N more" line counted duplicates it was never going to
+  // draw -- a map whose 26 cover layers share 21 frames was told five files
+  // had been held back that did not exist. The line is a claim about what is
+  // not on screen; it has to be counted on the same set the screen is.
+  const uniq = [...new Set(paths)];
+  for (const p of uniq.slice(0, limit)) {
     s.appendChild(assetCell(p, p.split('/').pop()));
   }
   g.appendChild(s);
-  if (paths.length > limit) {
-    g.appendChild(el('div', 'small mut', `… ${paths.length - limit} more`));
+  if (uniq.length > limit) {
+    // The cap is a page-weight limit -- one thumbnail request per cell, and a
+    // map can name 500 -- so it stays as the default. But the ask this panel
+    // answers is "see a map's full art set in one place", and a limit with no
+    // way past it answers a smaller question. Stated, and openable.
+    const more = el('div', 'small mut');
+    more.appendChild(document.createTextNode(
+      `showing ${limit} of ${uniq.length.toLocaleString()} — `));
+    const a = el('a', 'showall',
+      `draw the other ${(uniq.length - limit).toLocaleString()}`);
+    a.href = '#';
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      for (const p of uniq.slice(limit)) {
+        s.appendChild(assetCell(p, p.split('/').pop()));
+      }
+      more.textContent = `all ${uniq.length.toLocaleString()} drawn`;
+    });
+    more.appendChild(a);
+    g.appendChild(more);
   }
   host.appendChild(g);
 }
@@ -2433,36 +2708,114 @@ function renderFacets(data) {
   renderTagFacet(host, data);
 }
 
+/** The Your-tags axis: a search box over the vocabulary, not a wall of chips.
+ *
+ *  Typing narrows the chips in place -- no request, no full re-render, so the
+ *  caret stays where it is. Two things survive the search on purpose:
+ *
+ *    - a SELECTED tag is always drawn, even when the query excludes it. A
+ *      filter you cannot see is a filter you forget is on, and the box is a
+ *      view over the vocabulary, not a second filter on the results.
+ *    - `untagged` is a member of the vocabulary and matches like any other
+ *      name. It is still the one chip with no count: the server sends a count
+ *      per tag and has none for "has no tag", and a made-up number beside it
+ *      would be worse than none.
+ */
 function renderTagFacet(host, data) {
   const counts = data.tagCounts || {};
   const known = { ...state.vocabulary, ...counts };
+  const U = ' untagged';
   const names = Object.keys(known).sort((a, b) => (counts[b] || 0) - (counts[a] || 0) ||
                                                   a.localeCompare(b));
+  //: every selectable name, with the value each one puts in `state.selTags`.
+  const all = [...names.map(t => ({ key: t, label: t, count: counts[t] || 0 })),
+               { key: U, label: 'untagged', count: null }];
+
   const box = el('div', 'facet-axis');
-  box.appendChild(el('div', 'axis-name', 'Your tags'));
-  if (!names.length) {
-    box.appendChild(el('span', 'mut small',
-      'none yet — select an asset and add one in the Tags panel'));
+  const head = el('div', 'axis-name');
+  head.appendChild(el('span', null, 'Your tags'));
+  const note = el('span', 'mut tagcount');
+  head.appendChild(note);
+  box.appendChild(head);
+
+  // Same idiom as the "filter path" inputs in the Categories and Files panes:
+  // a bare `input type=search` that narrows what is already on screen.
+  const q = el('input');
+  q.type = 'search';
+  q.id = 'tag-search';
+  q.placeholder = 'search tags…';
+  q.value = state.tagQuery || '';
+  q.setAttribute('aria-controls', 'tag-chips');
+  q.title = 'Type to narrow the tag list. Tags you have already selected stay ' +
+            'visible whatever you type.';
+  box.appendChild(q);
+
+  const chips = el('div', 'axis-chips');
+  chips.id = 'tag-chips';
+  box.appendChild(chips);
+
+  function paint() {
+    const needle = (state.tagQuery || '').trim().toLowerCase();
+    chips.innerHTML = '';
+    let keptSelected = 0;
+    const show = all.filter(t => {
+      const hit = !needle || t.label.toLowerCase().includes(needle);
+      if (hit) return true;
+      if (state.selTags.has(t.key)) { keptSelected++; return true; }
+      return false;
+    });
+    for (const t of show) {
+      const on = state.selTags.has(t.key);
+      chips.appendChild(chip(t.label, t.count, on, () => {
+        on ? state.selTags.delete(t.key) : state.selTags.add(t.key);
+        loadAppearances();
+      }, 'tag'));
+    }
+    if (!names.length) {
+      chips.appendChild(el('span', 'mut small axis-note',
+        'none yet — select an asset and add one in the Tags panel'));
+    } else if (show.length === keptSelected) {
+      chips.appendChild(el('span', 'mut small axis-note',
+        `no tag matches “${(state.tagQuery || '').trim()}”` +
+        ` — ${all.length} in the list`));
+    }
+    // Say what the box is hiding, rather than letting the list quietly shorten.
+    note.textContent = needle
+      ? `${show.length - keptSelected} of ${all.length}` +
+        (keptSelected ? ` · ${keptSelected} selected kept` : '')
+      : String(all.length);
   }
-  for (const t of names) {
-    const on = state.selTags.has(t);
-    box.appendChild(chip(t, counts[t] || 0, on, () => {
-      on ? state.selTags.delete(t) : state.selTags.add(t);
-      loadAppearances();
-    }, 'tag'));
-  }
-  const U = ' untagged';
-  const onU = state.selTags.has(U);
-  box.appendChild(chip('untagged', null, onU, () => {
-    onU ? state.selTags.delete(U) : state.selTags.add(U);
-    loadAppearances();
-  }, 'tag'));
+
+  q.addEventListener('input', () => { state.tagQuery = q.value; paint(); });
+  // Escape clears the box, the way a search input is expected to behave. Only
+  // then is the event swallowed: on an EMPTY box it must still reach the
+  // global handler, because blurring back to the list is the documented way
+  // out of a text field and this input may not quietly be the exception.
+  q.addEventListener('keydown', ev => {
+    if (ev.key !== 'Escape' || !q.value) return;
+    ev.stopPropagation();
+    ev.preventDefault();
+    q.value = '';
+    state.tagQuery = '';
+    paint();
+  });
+  q.addEventListener('focus', () => { state.tagQueryFocus = true; });
+  q.addEventListener('blur', () => { state.tagQueryFocus = false; });
+
+  paint();
   host.appendChild(box);
+  // `renderFacets` rebuilds this whole subtree after every chip click, which
+  // would drop the caret mid-search. Put it back where it was.
+  if (state.tagQueryFocus) { q.focus(); }
 }
 
 function clearFilters() {
   for (const s of Object.values(state.sel)) s.clear();
   state.selTags.clear();
+  // The tag box narrows nothing but the chip list, yet this button already
+  // empties `#app-search`; leaving one search box full and clearing the other
+  // is the inconsistency, not the extra reset.
+  state.tagQuery = '';
   $('#app-search').value = '';
   loadAppearances();
 }

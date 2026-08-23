@@ -694,6 +694,19 @@ class DMap:
         return out
 
 
+#: An empty slot in a `.pul` -- no tile painted there.  NOT a tile index.
+#:
+#: It lives beside the reader because it is a property of the format, and
+#: because a consumer that does not know it reads 0xFFFF as a reference to
+#: tile 65535 and then reports it as art it could not resolve.  MEASURED
+#: across three installs before the constant was moved here: 27 of CCO's 136
+#: maps, 36 of 5517's 192 and 72 of 7878's 470 place it, and **no `.ani` on
+#: any of the three defines `Puzzle65535`** -- not once, which is what a
+#: sentinel looks like and what a real index does not.  `tools/puzzle.py`
+#: knew this and `tools/mapindex.py` did not.
+PUL_EMPTY = 0xFFFF
+
+
 @dataclass
 class Pul:
     """Puzzle: the tiled background of a map.

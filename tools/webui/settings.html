@@ -7,7 +7,7 @@
 <style>
 /* Local to this page. The shared style.css is built around the browser's
    three-pane layout, and a settings window is one column of prose. */
-.set-wrap { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+.set-wrap { max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
 .set-row { padding: .9rem 0; border-bottom: 1px solid rgba(128,128,128,.25); }
 .set-head { display: flex; align-items: center; gap: .6rem; }
 .set-name { font-weight: 600; min-width: 12rem; }
@@ -23,6 +23,58 @@
 .set-deferred { opacity: .7; }
 .set-foot { margin-top: 1.6rem; display: flex; align-items: center;
             justify-content: space-between; gap: 1rem; }
+
+/* -- sections ---------------------------------------------------------- */
+.set-nav { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0 2rem; }
+.set-nav a { padding: .3rem .7rem; border: 1px solid rgba(128,128,128,.4);
+             border-radius: 4px; text-decoration: none; }
+.set-section { margin: 2.4rem 0; padding-top: .8rem;
+               border-top: 2px solid rgba(128,128,128,.35); }
+.set-section > h3 { margin: 0 0 .3rem; }
+.set-section .set-lede { opacity: .85; margin: .2rem 0 1rem; }
+
+/* The cost block. Deliberately loud, and deliberately ABOVE the button it
+   describes: the complaint that started this work was a user who clicked
+   expecting 9 minutes and waited 36. A warning under the button is a warning
+   read after the click. */
+.set-cost { border: 1px solid rgba(200,140,40,.55);
+            background: rgba(200,140,40,.10);
+            border-radius: 5px; padding: .7rem .9rem; margin: .8rem 0; }
+.set-cost h4 { margin: 0 0 .4rem; font-size: 1em; }
+.set-cost p { margin: .35rem 0; }
+.set-cost .set-measured { font-size: .92em; opacity: .9; }
+
+.set-list { list-style: none; padding: 0; margin: .6rem 0; }
+.set-item { border: 1px solid rgba(128,128,128,.3); border-radius: 5px;
+            padding: .6rem .8rem; margin-bottom: .5rem; }
+.set-item .set-item-head { display: flex; align-items: baseline; gap: .6rem;
+                           flex-wrap: wrap; }
+.set-item .set-path { font-family: var(--mono, monospace); font-size: .9em;
+                      opacity: .85; word-break: break-all; }
+.set-tag { font-size: .78em; text-transform: uppercase; letter-spacing: .04em;
+           padding: .1rem .45rem; border-radius: 3px;
+           border: 1px solid rgba(128,128,128,.5); }
+.set-tag.offline-client { border-color: rgba(90,160,220,.7); }
+.set-tag.private-server { border-color: rgba(190,130,220,.7); }
+.set-tag.unknown { border-color: rgba(200,140,40,.7); }
+.set-verdict { font-size: .9em; }
+.set-verdict.confident { color: #2e8b57; }
+.set-verdict.weak, .set-verdict.tie, .set-verdict.none { color: #c07a1e; }
+.set-rank { font-family: var(--mono, monospace); font-size: .85em;
+            opacity: .85; margin: .3rem 0 0; }
+.set-ask { border-left: 3px solid rgba(200,140,40,.8); padding-left: .7rem;
+           margin: .5rem 0; }
+.set-field { display: flex; gap: .5rem; align-items: center;
+             flex-wrap: wrap; margin: .5rem 0; }
+.set-field input[type=text] { flex: 1 1 22rem; min-width: 14rem;
+                              font-family: var(--mono, monospace); }
+.set-progress { font-family: var(--mono, monospace); font-size: .85em;
+                white-space: pre-wrap; max-height: 12rem; overflow: auto;
+                border: 1px solid rgba(128,128,128,.3); border-radius: 4px;
+                padding: .5rem .7rem; margin: .6rem 0; }
+.set-empty { opacity: .7; font-style: italic; }
+.set-dev { opacity: .8; border: 1px dashed rgba(128,128,128,.5);
+           border-radius: 5px; padding: 1rem; }
 </style>
 </head>
 <body>
@@ -33,12 +85,67 @@
     is what <code>comod settings &lt;name&gt;</code> prints -- one registry,
     two surfaces, so they cannot describe a toggle two different ways.
   </p>
-  <div id="settings-body">loading…</div>
+
+  <nav class="set-nav">
+    <a href="#sec-dirs">Directory management</a>
+    <a href="#sec-health">Health management</a>
+    <a href="#sec-dev">Developer options</a>
+    <a href="#sec-prefs">Preferences</a>
+    <a href="/">&larr; back to the viewer</a>
+  </nav>
+
+  <!-- ============================================ 1. directory management -->
+  <section class="set-section" id="sec-dirs">
+    <h3>Directory management</h3>
+    <p class="set-lede">
+      Which folders this tool has been <em>told</em> are clients. Nothing on
+      this page adopts a directory on its own: a folder found by a scan is
+      offered, and you answer. A tool that adopts directories by itself is one
+      bad guess away from indexing the wrong tree.
+    </p>
+    <div id="dirs-body">loading…</div>
+  </section>
+
+  <!-- =============================================== 2. health management -->
+  <section class="set-section" id="sec-health">
+    <h3>Health management</h3>
+    <p class="set-lede">
+      The one-off builds. Both of these are long, both are resumable, and
+      neither starts by itself. Every estimate below is the tool's own number
+      and is stated <em>before</em> the button, not after it.
+    </p>
+    <div id="health-body">loading…</div>
+  </section>
+
+  <!-- ================================================ 3. developer options -->
+  <section class="set-section" id="sec-dev">
+    <h3>Developer options</h3>
+    <div class="set-dev" id="dev-body">
+      <p><strong>Nothing here yet.</strong></p>
+      <p class="set-help">
+        This section is a placeholder: it is present and labelled so that the
+        developer-facing switches land somewhere already agreed, and it does
+        nothing today. It is shown rather than hidden for the same reason the
+        deferred settings at the bottom of this page are shown — a section
+        that appears when it gains its first control reads as new, when in
+        fact it was planned.
+      </p>
+    </div>
+  </section>
+
+  <!-- ========================================================= preferences -->
+  <section class="set-section" id="sec-prefs">
+    <h3>Preferences</h3>
+    <div id="settings-body">loading…</div>
+  </section>
+
   <p class="set-help" style="margin-top:2rem">
     <a href="/">back to the viewer</a>
   </p>
 </div>
 <script src="/ui/csrf.js"></script>
 <script src="/ui/settings.js"></script>
+<script src="/ui/setdirs.js"></script>
+<script src="/ui/sethealth.js"></script>
 </body>
 </html>
