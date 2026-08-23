@@ -1189,6 +1189,144 @@ def set_installs_root(path) -> Path:
                                          else str(Path(path).resolve())))
 
 
+#: Settings key holding the folder new clients are scanned for.  Stored in the
+#: same per-user document as everything else -- there is one config store.
+CLIENTS_ROOT_KEY = "clients_root"
+
+#: Settings key holding the community-library folder.
+COMMUNITY_LIBRARY_KEY = "community_library"
+
+
+def clients_root() -> tuple:
+    """``(Path|None, why)`` -- the folder holding the client collection.
+
+    Resolved **through the settings this module already owns** and never
+    written anywhere as a literal.  Three sources, most specific first:
+
+    1. ``clients_root`` in the per-user config, if the user has set one.  An
+       explicit answer outranks any derivation.
+    2. The folder that most of the *declared* installs already live in.  The
+       declarations are the user's own (`declare_kind`), so this is still
+       their answer -- read back rather than asked again.  Modal, not
+       common-ancestor: a machine with seven clients under one folder and one
+       in Program Files has a common ancestor of ``C:\\``, which is not a
+       place to scan.
+    3. The parent of the configured install root, as a last resort.
+
+    This lived in `tools/coviewer.py` until the install-path gate was widened
+    (`tests/test_sanitization.py`, check 3).  Its own docstring said why it
+    belongs here: the old gate matched only the Program Files path, "so
+    writing the asset-tree path here would sail past the gate and still be the
+    same defect".  Now that the gate covers the class rather than one prefix,
+    every tool and test that used to carry ``<somewhere>/ConquerAssets/
+    Clients`` needs one obvious function to call, and a resolver that reads
+    this module's config belongs in this module.
+    """
+    doc = read_settings()
+    explicit = str(doc.get(CLIENTS_ROOT_KEY) or "").strip()
+    if explicit:
+        p = Path(explicit)
+        return (p, f"set in {user_config_path()} ({CLIENTS_ROOT_KEY})")
+
+    counts: dict = {}
+    for path in (doc.get(KINDS_KEY) or {}):
+        try:
+            parent = Path(str(path)).resolve().parent
+        except OSError:                              # pragma: no cover
+            continue
+        counts[parent] = counts.get(parent, 0) + 1
+    if counts:
+        # Ties broken by path text so the answer does not depend on dict order.
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0]
+        if best[1] >= 2 and best[0].is_dir():
+            return (best[0], f"where {best[1]} of your declared clients live")
+
+    try:
+        cfg = config_root()
+    except Exception:                                # pragma: no cover
+        cfg = None
+    if cfg:
+        p = Path(cfg[0]).parent
+        if p.is_dir():
+            return (p, f"the folder holding the configured install ({cfg[1]})")
+    return (None, "no clients declared yet, and no folder set -- set one below")
+
+
+#: What `clients_dir` returns when nothing is configured.  A path *under a
+#: file* -- this module -- so it can never be a directory and can never be
+#: created by accident, on any platform.
+_NO_CLIENTS = Path(__file__).resolve() / "_no_clients_root_configured"
+
+
+def clients_dir() -> Path:
+    """`clients_root()[0]`, or a path that cannot exist.  **Never None.**
+
+    Almost every caller wants ``clients_dir() / "5517"`` followed by
+    ``.is_dir()``, and an `Optional` forces each of them to write the same
+    two-line guard -- which is how one of them ends up written wrong and a
+    test that meant to skip raises `TypeError` instead.  The sentinel is a
+    child of *this file*, so the join is legal, the `is_dir()` is False, and
+    nothing can ever make it true.
+
+    Use `clients_root` when you need to tell the person *why* there is no
+    answer; use this when "then there is nothing to measure" is the whole
+    handling.
+    """
+    p, _why = clients_root()
+    return p if p is not None else _NO_CLIENTS
+
+
+def assets_dir() -> Path:
+    """The asset collection -- the folder `Clients/` sits in.  **Never None.**
+
+    ``ConquerAssets/`` holds ``Clients/`` beside ``derived/`` and
+    ``_variants/``: the read-only installs, the expensive artefacts built from
+    them, and the deliberately-modified copies used as controls.  Everything
+    outside ``Clients/`` is addressed *relative to the collection*, which is
+    the relationship `plugins/patch7878.derived_tables` already encodes, so
+    this is the one place that has to be resolved.
+
+    Derived from `clients_dir`, not configured separately -- two settings for
+    a parent and its child is two ways to disagree.
+    """
+    return clients_dir().parent
+
+
+def community_library() -> Optional[Path]:
+    """The COmmunity Library folder the user pointed us at, or None.
+
+    A setting, not a search: the library is a collection the person curates
+    somewhere of their choosing, and there is no marker that makes guessing
+    safe.  Unset means "not set up", which callers must report rather than
+    substitute for.
+    """
+    raw = read_settings().get(COMMUNITY_LIBRARY_KEY)
+    if not raw:
+        return None
+    return Path(str(raw))
+
+
+#: Directory names this project **resolves at runtime instead of hardcoding**.
+#:
+#: Read by `tests/test_sanitization.py` check 3, which fails any shipped
+#: absolute path naming one of them.  It lives here, next to the resolvers,
+#: for one reason: the gate must describe the class by the vocabulary of the
+#: thing that resolves it, not by a list of the machine locations people have
+#: happened to use.  ``C:\\COMod``, ``D:\\Games`` and ``C:\\Program Files``
+#: are all somebody's answer to "where"; these names are the *what*, and they
+#: are stable across every machine.
+#:
+#: Add a name here when you add a tree that `coroot` can find -- the gate
+#: starts guarding it in the same commit.
+RESOLVED_TREE_NAMES: tuple[str, ...] = (
+    "ConquerAssets",        # the asset collection: Clients/, derived/, _variants/
+    "Clients",              # `clients_root` / `clients_dir`
+    "COmmunityLibrary",     # `community_library`
+    "COmmunity Library",    # ...and the spelling with the space
+    "Installed",            # `installs_root`
+)
+
+
 def derived_overrides() -> dict:
     """``{out/-relative path: absolute path}`` the user has pointed us at.
 
@@ -1706,8 +1844,38 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="delete the remembered root")
     ap.add_argument("--search", action="store_true",
                     help="show every candidate considered and its verdict")
+    ap.add_argument("--print", dest="print_what", metavar="WHAT",
+                    choices=("root", "clients", "assets", "library",
+                             "installs"),
+                    help="print one resolved path and nothing else, for shell "
+                         "scripts: root | clients | assets | library | "
+                         "installs. Exit 3 and print nothing if it is not "
+                         "configured, so `if not defined` is a real answer")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+
+    # Before anything else: a caller asking for one path wants one line on
+    # stdout and no report around it.  A .cmd or .ps1 has no other way in --
+    # without this they hardcode the path, which is what check 3 exists to
+    # stop, and telling somebody "resolve it through coroot" is empty if
+    # coroot only speaks Python.
+    if a.print_what:
+        if a.print_what == "clients":
+            p, _why = clients_root()
+        elif a.print_what == "assets":
+            p, _why = clients_root()
+            p = p.parent if p is not None else None
+        elif a.print_what == "library":
+            p = community_library()
+        elif a.print_what == "installs":
+            p = installs_root()
+        else:
+            got = find()
+            p = got.path if got else None
+        if p is None:
+            return 3
+        print(p)
+        return 0
 
     if a.forget:
         gone = forget_root(a.scope if a.scope else "all")

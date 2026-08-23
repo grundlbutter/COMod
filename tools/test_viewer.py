@@ -10894,7 +10894,7 @@ class MapEditorWritesWhatTheRegistryNames(unittest.TestCase):
         """An install and a map that has (or lacks) mask>1 cells."""
         import dmap
         for name in ("6609", "7878", "5517"):
-            root = Path(r"C:\COMod\ConquerAssets\Clients") / name
+            root = coroot.clients_dir() / name
             if not (root / "map" / "map").is_dir():
                 continue
             for m in dmap.map_names(root)[:40]:
@@ -21190,27 +21190,77 @@ class SettingsHealthManagement(unittest.TestCase):
         its own poll. MEASURED in the browser: the run completed, the server
         held the whole transcript, and the page sat on "(no output yet)".
 
-        Asserted with the spawn blocked, so the window is the whole test
-        rather than a few milliseconds.
+        **Every wait here is on a state transition, not on a clock**, and both
+        of the previous version's clocks were bugs rather than style:
+
+        * It let the real `subprocess.Popen` through after releasing its gate,
+          so the test SPAWNED `health.py --bootstrap --no-write` for real and
+          then gave it 20 s to finish. On a tree missing an artefact that is
+          a multi-minute BUILD; on a tree that already has one it returns in
+          under a second -- so the assertion was a stopwatch on the build, and
+          the build's cost is a property of the checkout, not of the code.
+          MEASURED: two runs of an identical tree, `patch5517-76c7f4499934`,
+          disagreed on this one test and on nothing else in `failure_labels`.
+          The failing run BUILT `out/indexes/patch5517-.../meshtex/
+          coverage.json` while this test was executing; the passing run found
+          it already there, so the child had nothing to do and returned inside
+          the deadline. The same side effect un-skipped 12 tests in
+          `MeshTexConfidence`, `MeshUniverseIsPerBase` and `RelatedAssets`,
+          which is how a unit test came to move three other classes' counts.
+        * Its exit condition was `for _ in range(200): if not run.running()`,
+          which cannot distinguish "the runner settled" from "the deadline
+          expired" -- the two states it exists to tell apart.
+
+        So the child is a stub, and the two edges of the lifecycle are waited
+        on directly: `spawning`, set by the fake spawn before it parks, and
+        `run.done`, set by `_run` once the runner is fully settled. The
+        timeouts passed to `wait()` are deadlock guards; the assertion is the
+        boolean `wait()` returns, so a slow machine reports "never
+        transitioned" rather than quietly changing what is being measured.
         """
         import coviewer
         run = coviewer.BootstrapRunner(PROJECT)
-        gate = threading.Event()
-        real = subprocess.Popen
-        # Released on the way out whatever happens below. Without this, an
-        # assertion that fails before `gate.set()` leaves the worker parked
-        # for the full timeout and the report is a 20-second hang on top of
-        # the real failure -- twice as long to read and half as clear.
-        self.addCleanup(gate.set)
 
-        def slow(*a, **k):
-            gate.wait(20)
-            return real(*a, **k)
+        spawning = threading.Event()   # the worker has entered the spawn
+        release = threading.Event()    # ...and the test lets it out again
+        spawned: list = []
 
-        with unittest.mock.patch.object(subprocess, "Popen", slow):
+        class _StubChild:
+            """Enough of `Popen` for `_run`/`_pump`: output, then exit 0."""
+
+            pid = -1
+
+            def __init__(self):
+                self.stdout = io.StringIO(
+                    "[1/1] out/meshtex/coverage.json  (~15 s)\n"
+                    "done in 0 s\n")
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        def stub_popen(argv, *a, **k):
+            spawned.append(list(argv))
+            spawning.set()
+            # Parked until the test says so. Bounded only so a bug in the
+            # test cannot wedge the suite; the release is what is waited on.
+            if not release.wait(30):        # pragma: no cover
+                raise AssertionError("the test never released the spawn")
+            return _StubChild()
+
+        # Released on the way out whatever happens below, so an assertion that
+        # fails before `release.set()` reports itself instead of hanging.
+        self.addCleanup(release.set)
+
+        with unittest.mock.patch.object(subprocess, "Popen", stub_popen):
             res = run.start(False, [])
             self.assertTrue(res["started"])
-            # No child yet, by construction.
+            self.assertTrue(spawning.wait(30),
+                            "the worker thread never reached the spawn")
+            # The worker is parked INSIDE the spawn. This is the window the
+            # bug lived in, held open by the stub rather than sampled.
             self.assertIsNone(run.proc)
             self.assertTrue(run.running(),
                             "a runner that has accepted a job must not "
@@ -21218,14 +21268,179 @@ class SettingsHealthManagement(unittest.TestCase):
             self.assertTrue(run.status()["running"])
             # ...and a second start is refused while it is in that state.
             self.assertFalse(run.start(False, [])["started"])
-            gate.set()
-        for _ in range(200):
-            if not run.running():
-                break
-            time.sleep(0.1)
+            release.set()
+            self.assertTrue(run.done.wait(30),
+                            "the runner never settled after its child exited")
+
+        # `done` is set last, after `returncode`, `finished` and `active`, so
+        # everything below reads a fully settled runner rather than one that
+        # has stopped running and not yet said what happened.
         self.assertFalse(run.running())
         self.assertFalse(run.active)
-        self.assertIsNotNone(run.status()["returncode"])
+        st = run.status()
+        self.assertEqual(st["returncode"], 0)
+        self.assertIn("done in 0 s", st["tail"])
+        self.assertEqual(st["progress"]["done"], 1)
+        # Exactly one child, and it was the bootstrap -- no `--use` was asked
+        # for. If this ever grows a second entry the stub is being handed a
+        # real build again.
+        self.assertEqual(len(spawned), 1, spawned)
+        self.assertIn("--bootstrap", spawned[0])
+
+    def test_a_finished_child_is_not_reported_idle_before_its_output_is_read(self):
+        r"""The same bug the start race was, at the other end, in the two
+        runners the pattern was copied from.
+
+        `ThumbRunner` and `IndexRunner` spawn inside `start()`, so they never
+        had the start window. They had the drain window: `proc.poll()` stops
+        returning None the instant the child exits, but `_pump` may still be
+        emptying the pipe -- and had not yet written `returncode`. A poll
+        landing there reads `running: false, returncode: null`, which is the
+        exact pair `sethealth.js` renders as nothing at all before it
+        `clearInterval`s the poll (`run.running || run.returncode !== null`).
+
+        Held open the same way: the child is already dead from the first
+        `poll()`, and the reader is parked mid-output until the test releases
+        it. Without `active`, `running()` is false for the whole of that.
+        """
+        import coviewer
+        for factory in (
+                lambda: coviewer.ThumbRunner(PROJECT, PROJECT),
+                lambda: coviewer.IndexRunner(PROJECT, PROJECT)):
+            run = factory()
+            with self.subTest(runner=type(run).__name__):
+                draining = threading.Event()
+                release = threading.Event()
+                self.addCleanup(release.set)
+
+                class _DeadChild:
+                    """Exited before the first poll; output still buffered."""
+
+                    pid = -1
+
+                    def __init__(self):
+                        self.stdout = self
+                        self._chars = list("scan 1/1\n")
+
+                    # -- what `_pump` reads it through --------------------
+                    def __iter__(self):
+                        draining.set()
+                        release.wait(30)
+                        yield "scan 1/1"
+                        yield "[1/1] out/thing.json  (~1 s)"
+
+                    def read(self, _n=1):
+                        # ThumbRunner reads a character at a time.
+                        if not draining.is_set():
+                            draining.set()
+                            release.wait(30)
+                        return self._chars.pop(0) if self._chars else ""
+
+                    def poll(self):
+                        return 0
+
+                    def wait(self):
+                        return 0
+
+                with unittest.mock.patch.object(
+                        subprocess, "Popen", lambda *a, **k: _DeadChild()):
+                    if isinstance(run, coviewer.ThumbRunner):
+                        self.assertTrue(run.start("meshes")["started"])
+                    else:
+                        self.assertTrue(run.start()["started"])
+                    self.assertTrue(draining.wait(30),
+                                    "the reader thread never started draining")
+                    # The child is dead by `poll()` and the transcript is not
+                    # in yet. The page must keep polling.
+                    self.assertEqual(run.proc.poll(), 0)
+                    self.assertTrue(
+                        run.running(),
+                        "a runner whose output is still being read reports "
+                        "itself idle, and the page stops polling before the "
+                        "transcript arrives")
+                    self.assertIsNone(run.status()["returncode"])
+                    release.set()
+                    self.assertTrue(run.done.wait(30), "never settled")
+
+                self.assertFalse(run.running())
+                self.assertEqual(run.status()["returncode"], 0)
+
+    def test_the_settled_flag_is_written_last_and_from_a_finally(self):
+        r"""Source-level, by AST, because **no timing test can see this**.
+
+        `done` is what a caller blocks on, so everything a settled runner
+        promises -- `returncode`, `finished`, `active` -- has to be written
+        before it is set. MEASURED as a bite check: moving `self.done.set()`
+        to the TOP of the same `finally` fails THIS test 1/1 and leaves the
+        two tests above passing 50/50 under injected worker jitter. The
+        statements that follow it execute within microseconds
+        of each other, so a waiter almost never lands between them. That is
+        the flaky test's own failure mode wearing the other mask -- an
+        ordering bug whose window is small enough to pass by luck. It is
+        therefore asserted structurally, where the window does not exist.
+
+        `finally`, not merely last, for the reason `_run` already gives: a
+        crash on the way out that skipped the write would leave a runner
+        claiming to run with no exit and no button.
+        """
+        tree = ast.parse((HERE / "coviewer.py").read_text("utf-8"))
+        classes = {n.name: n for n in ast.walk(tree)
+                   if isinstance(n, ast.ClassDef)}
+        for cls_name, meth_name in (("BootstrapRunner", "_run"),
+                                    ("ThumbRunner", "_pump"),
+                                    ("IndexRunner", "_pump")):
+            with self.subTest(runner=cls_name):
+                self.assertIn(cls_name, classes)
+                meth = next((n for n in classes[cls_name].body
+                             if isinstance(n, ast.FunctionDef)
+                             and n.name == meth_name), None)
+                self.assertIsNotNone(meth, f"{cls_name}.{meth_name} is gone")
+
+                # The `finally` that owns the settling, and the order of the
+                # writes inside it.
+                fin = next((n.finalbody for n in ast.walk(meth)
+                            if isinstance(n, ast.Try) and n.finalbody
+                            and "self.done.set()" in
+                            ast.unparse(ast.Module(body=n.finalbody,
+                                                   type_ignores=[]))), None)
+                self.assertIsNotNone(
+                    fin, f"{cls_name}.{meth_name} does not settle from a "
+                         f"`finally`; a crash on the way out would leave the "
+                         f"runner running forever")
+                lines = [ast.unparse(s).strip() for s in fin]
+                self.assertEqual(
+                    lines[-1], "self.done.set()",
+                    f"{cls_name}.{meth_name}: `done` is not the last thing "
+                    f"the `finally` does -- got {lines}")
+
+                # ...and every promise a settled runner makes is written
+                # earlier in the method than the set that publishes it.
+                # Positional, not per-block: the two `_pump`s record the exit
+                # code in the `try` and clear `active` in the `finally`, which
+                # is the same ordering reached a different way.
+                at = {}
+                for node in ast.walk(meth):
+                    if isinstance(node, ast.Assign):
+                        for tgt in node.targets:
+                            name = ast.unparse(tgt).strip()
+                            if name.startswith("self."):
+                                # The LAST write, not the first: an attribute
+                                # written on both sides of the set is still a
+                                # promise made after it was published.
+                                at[name] = max(at.get(name, (0, 0)),
+                                               (node.lineno, node.col_offset))
+                settled = (fin[-1].lineno, fin[-1].col_offset)
+                for attr in ("self.returncode", "self.finished",
+                             "self.active"):
+                    self.assertIn(attr, at,
+                                  f"{cls_name}.{meth_name} never writes "
+                                  f"{attr}")
+                    self.assertLess(
+                        at[attr], settled,
+                        f"{cls_name}.{meth_name}: {attr} is written AFTER "
+                        f"`done` is set, so a caller woken by the transition "
+                        f"can read a runner that has not finished saying "
+                        f"what happened")
 
     def test_a_use_that_does_not_exist_stops_before_the_build(self):
         r"""`health.main` handles `--use` and RETURNS before it looks at

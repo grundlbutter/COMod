@@ -527,9 +527,29 @@ class ThumbRunner:
         self.tail: list[str] = []
         #: "" = the base install; else the library server being rendered.
         self.target_server: str = ""
+        #: True from the moment `start()` accepts until `_pump` has recorded
+        #: the exit code.
+        #:
+        #: This runner spawns INSIDE `start()`, so it never had
+        #: `BootstrapRunner`'s start race. It had the same bug at the other
+        #: end. `proc.poll()` stops returning None the instant the child
+        #: exits, but `_pump` is still draining the pipe -- up to a 64 KB OS
+        #: buffer of progress and tail lines -- and has not yet written
+        #: `returncode` or `finished`. A poll landing in that window reads
+        #: `running: false, returncode: null`, which is precisely the pair
+        #: `sethealth.js` treats as "nothing here": it renders no progress
+        #: block and `clearInterval`s the poll. The run's last words and its
+        #: exit status are then held by the server and never shown -- the
+        #: bootstrap symptom exactly, reached from the far side.
+        self.active = False
+        #: Set whenever the runner is not in flight; see `BootstrapRunner`.
+        self.done = threading.Event()
+        self.done.set()
 
     # -- lifecycle ---------------------------------------------------------
     def running(self) -> bool:
+        if self.active:
+            return True
         return self.proc is not None and self.proc.poll() is None
 
     def start(self, mode: str, jobs: int = 0, limit: int = 0,
@@ -566,6 +586,11 @@ class ThumbRunner:
             self.cancelled = False
             self.progress = {"label": mode, "done": 0, "total": 0}
             self.tail = []
+            # After the spawn (so a Popen that raises does not leave the
+            # runner claiming to run) and before the reader exists (so the
+            # first poll cannot land between the child's exit and the drain).
+            self.active = True
+            self.done.clear()
             threading.Thread(target=self._pump, daemon=True).start()
             _log(f"thumbnails: started {' '.join(argv[1:])}")
             return {"started": True, "cmd": " ".join(argv), **self.status()}
@@ -620,8 +645,15 @@ class ThumbRunner:
                     buf += ch
         except Exception as e:                       # pragma: no cover
             self.tail.append(f"(reader stopped: {e})")
-        self.returncode = proc.wait()
-        self.finished = time.time()
+        try:
+            self.returncode = proc.wait()
+            self.finished = time.time()
+        finally:
+            # In a `finally`, and last: a runner that cannot be woken out of
+            # "running" has no exit and no button, and the only cure would be
+            # restarting the viewer.
+            self.active = False
+            self.done.set()
         _log(f"thumbnails: finished, exit {self.returncode}")
 
     # -- reporting ---------------------------------------------------------
@@ -687,8 +719,16 @@ class IndexRunner:
         self.cancelled = False
         self.progress: dict = {"label": "scan", "done": 0, "total": 0}
         self.tail: list[str] = []
+        #: True from `start()` until `_pump` has recorded the exit code --
+        #: same drain window, same reason, as `ThumbRunner.active`.
+        self.active = False
+        #: Set whenever the runner is not in flight; see `BootstrapRunner`.
+        self.done = threading.Event()
+        self.done.set()
 
     def running(self) -> bool:
+        if self.active:
+            return True
         return self.proc is not None and self.proc.poll() is None
 
     def start(self) -> dict:
@@ -710,6 +750,8 @@ class IndexRunner:
             self.cancelled = False
             self.progress = {"label": "scan", "done": 0, "total": 0}
             self.tail = []
+            self.active = True
+            self.done.clear()
             threading.Thread(target=self._pump, daemon=True).start()
             _log(f"asset index: started {' '.join(argv[1:])}")
             return {"started": True, "cmd": " ".join(argv), **self.status()}
@@ -746,8 +788,12 @@ class IndexRunner:
                     del self.tail[:-40]
         except Exception as e:                       # pragma: no cover
             self.tail.append(f"(reader stopped: {e})")
-        self.returncode = proc.wait()
-        self.finished = time.time()
+        try:
+            self.returncode = proc.wait()
+            self.finished = time.time()
+        finally:
+            self.active = False
+            self.done.set()
         _log(f"asset index: finished, exit {self.returncode}")
 
     def status(self) -> dict:
@@ -842,6 +888,24 @@ class BootstrapRunner:
         #: output yet)" forever. A status that is briefly wrong is a status
         #: that is permanently believed.
         self.active = False
+        #: Set whenever the runner is NOT in flight, cleared by `start()`
+        #: under the lock and set again by `_run`'s `finally` *after*
+        #: `returncode`, `finished` and `active` have all been written.
+        #:
+        #: This is the observable half of `active`. `active` answers "am I
+        #: running?" at an instant; `done` lets a caller BLOCK on the
+        #: transition out of that state instead of sampling the boolean on a
+        #: clock. Every poll-with-a-timeout over `running()` is a race with a
+        #: deadline for an assertion -- it passes on a fast machine, and on a
+        #: slow one it reports the deadline rather than the state. The suite's
+        #: own regression test for the start race was exactly that shape and
+        #: flaked between two runs of an identical tree.
+        #:
+        #: Set (not cleared) in `__init__`: an idle runner that has never
+        #: started is already settled, so `done.wait()` on it must return at
+        #: once rather than hang.
+        self.done = threading.Event()
+        self.done.set()
 
     def running(self) -> bool:
         if self.active:
@@ -876,6 +940,10 @@ class BootstrapRunner:
             self.steps = [" ".join(a[1:]) for a in steps]
             # Set BEFORE the thread exists, or the first poll wins the race.
             self.active = True
+            # Cleared in the same breath and under the same lock, so a caller
+            # that grabs `done` after `start()` returns cannot be handed the
+            # PREVIOUS run's settled event and conclude this one is over.
+            self.done.clear()
             threading.Thread(target=self._run, args=(steps,),
                              daemon=True).start()
             _log("bootstrap: started " + " ; ".join(self.steps))
@@ -932,6 +1000,13 @@ class BootstrapRunner:
             self.returncode = rc
             self.finished = time.time()
             self.active = False
+            # LAST, and inside the same `finally`. Anything waiting on the
+            # transition must observe a runner that is already fully settled:
+            # a `done` set before `returncode` is written would hand a waiter
+            # `running() == False` and `returncode is None` -- the same
+            # "finished but with nothing to show for it" state the start race
+            # produced, at the other end of the run.
+            self.done.set()
         _log(f"bootstrap: finished, exit {rc}")
 
     def _pump(self, proc) -> None:
@@ -1007,8 +1082,11 @@ ORIGIN_CATEGORY = {"official": "offline-client", "server": "private-server"}
 
 #: Settings key holding the folder that `Scan` looks in. Stored in the same
 #: per-user document as everything else (`core/coroot.py`) -- there is one
-#: config store and this is not a second one.
-CLIENTS_ROOT_KEY = "clients_root"
+#: config store and this is not a second one, and since the install-path gate
+#: was widened it is not a second *definition* either: the key and the
+#: resolver now live in `coroot`, and these two names are re-exports so that
+#: every existing caller and test keeps working.
+CLIENTS_ROOT_KEY = coroot.CLIENTS_ROOT_KEY
 
 #: Settings key holding `{root: "what private server this is"}`. A private
 #: server client is declared exactly like any other -- `coroot.declare_kind`
@@ -1041,56 +1119,16 @@ THUMB_COST_CAVEAT = (
     "own estimate for that run was 15-30 minutes.")
 
 
-def clients_root() -> tuple:
-    """``(Path|None, why)`` -- the folder `Scan` looks in for new clients.
-
-    Resolved **through `coroot`** and never written here as a literal. Three
-    sources, most specific first:
-
-    1. ``clients_root`` in the per-user config, if the user has set one. An
-       explicit answer outranks any derivation.
-    2. The folder that most of the *declared* installs already live in. The
-       declarations are the user's own (`coroot.declare_kind`), so this is
-       still their answer -- read back rather than asked again. Modal, not
-       common-ancestor: a machine with seven clients under one folder and one
-       in Program Files has a common ancestor of ``C:\\``, which is not a
-       place to scan.
-    3. The parent of the configured install root, as a last resort.
-
-    Why not the literal. `tests/test_sanitization.py` bans hardcoding the
-    conventional install path, and its check-3 regex only matches the Program
-    Files one -- so writing the asset-tree path here would sail past the gate
-    and still be the same defect: a tool that only works on the machine it was
-    written on. The gate not catching it is not permission.
-    """
-    doc = coroot.read_settings()
-    explicit = str(doc.get(CLIENTS_ROOT_KEY) or "").strip()
-    if explicit:
-        p = Path(explicit)
-        return (p, f"set in {coroot.user_config_path()} ({CLIENTS_ROOT_KEY})")
-
-    counts: dict = {}
-    for path in (doc.get(coroot.KINDS_KEY) or {}):
-        try:
-            parent = Path(str(path)).resolve().parent
-        except OSError:                              # pragma: no cover
-            continue
-        counts[parent] = counts.get(parent, 0) + 1
-    if counts:
-        # Ties broken by path text so the answer does not depend on dict order.
-        best = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0]
-        if best[1] >= 2 and best[0].is_dir():
-            return (best[0], f"where {best[1]} of your declared clients live")
-
-    try:
-        cfg = coroot.config_root()
-    except Exception:                                # pragma: no cover
-        cfg = None
-    if cfg:
-        p = Path(cfg[0]).parent
-        if p.is_dir():
-            return (p, f"the folder holding the configured install ({cfg[1]})")
-    return (None, "no clients declared yet, and no folder set -- set one below")
+#: ``(Path|None, why)`` -- the folder `Scan` looks in for new clients.
+#:
+#: **Re-exported from `coroot`, not defined here.** It resolves entirely out
+#: of the per-user settings document that `coroot` owns, and once the
+#: install-path gate started guarding the whole class of asset-tree paths
+#: rather than the Program Files prefix alone, every tool and test that used
+#: to carry ``<somewhere>/ConquerAssets/Clients`` needed one obvious function
+#: to call. `coroot.clients_root` is that function; see its docstring for the
+#: three sources and why the modal-parent rule is the one that works.
+clients_root = coroot.clients_root
 
 
 def detect_report(root) -> dict:

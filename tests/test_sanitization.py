@@ -16,10 +16,21 @@ ignored), excluding `refs/`, which is vendored third-party material:
      email and machine name.
   2. **No absolute user paths.**  `C:\Users\<someone>\...` anywhere means the
      repo only runs on the machine it was written on.
-  3. **No hardcoded game install path.**  Exactly one file is allowed to
-     contain the conventional install path -- `core/coroot.py`, where it is a
-     discovery *hint* that gets validated, not an assumption.  Everything else
-     must go through `coroot`.
+  3. **No hardcoded install path, of any kind, on any drive.**  A finding is
+     a *drive-rooted absolute path* one of whose segments names something this
+     project **resolves at runtime** -- an install archive, an install
+     directory name, or one of `coroot.RESOLVED_TREE_NAMES`
+     (``ConquerAssets``, ``Clients``, ``COmmunityLibrary``, ``Installed``).
+     The vocabulary is imported from `core/coroot.py`, never copied.
+
+     Scope is *executable code*: python string literals that are not
+     docstrings, plus the whole text of non-prose files (`.ps1`, `.cmd`,
+     `.html`, ...).  Docstrings, comments and `.md`/`.txt`/`.rst` are
+     deliberately out -- this repo records its measurements with real paths in
+     prose and a check that reddens them gets neutered.  `core/coroot.py` is
+     the one file allowed a literal, because validating a discovery hint is
+     its job.  See the long note above `ABS_PATH_RE` for what this used to be,
+     why one vendor prefix was not a check, and what is still not covered.
 
 ## Why the banned list is hashed
 
@@ -86,6 +97,7 @@ not one of the four above. `--views` prints how much each view decoded, because
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import re
@@ -94,6 +106,17 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+
+#: The same path, and deliberately a SECOND name for it.  `REPO` says *which
+#: tree is being scanned* and callers reassign it -- `test_boundary_guards`
+#: points it at a temp directory to exercise `scan` end to end.  This one says
+#: *which checkout this instrument belongs to*, and nothing may reassign it:
+#: check 3's vocabulary is imported from `core/coroot.py`, and it must come
+#: from the checkout that owns this file rather than from whatever tree is
+#: under the microscope.  Conflating the two made the gate raise
+#: `VocabularyUnavailable` on a temp fixture directory, which is a check
+#: reporting on itself instead of on its subject.
+_OWN_REPO = REPO
 
 #: Directories never scanned.  `refs/` is downloaded third-party reference
 #: material (emulator sources, wiki mirrors); its contents are not ours to
@@ -217,14 +240,367 @@ def local_list_is_tracked() -> bool:
 USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-]+)",
                           re.IGNORECASE)
 
-#: The conventional install path.  Allowed in exactly one place.
-INSTALL_PATH_RE = re.compile(r"Program Files[^\"'\n]{0,12}[\\/]+Classic Conquer",
-                             re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# Check 3 -- hardcoded install paths.
+#
+# WHAT THIS USED TO BE, AND WHY THAT WAS NOT A CHECK
+# --------------------------------------------------
+# Until 2026-08-23 this was one regex::
+#
+#     re.compile(r"Program Files[^\"'\n]{0,12}[\\/]+Classic Conquer")
+#
+# -- the *Program Files* install path, and only that one.  Meanwhile the
+# standard home for this project's data on the machine it is developed on is
+# ``C:\COMod`` (``ConquerAssets\Clients``, ``COmmunityLibrary``, ``Installed``),
+# so the path new code was overwhelmingly likely to hardcode was the one path
+# the guard could not see.  Measured with the rule below, over the tree as it
+# stood: **68 findings across 56 files** in this checkout, and **5 across 2**
+# in the tree that actually ships (`tools/extract_comod.py`).  The old check
+# found none of them, and the summary line printed "no hardcoded install
+# paths" on every run.
+#
+# That is this repository's recurring defect and it has its own name in
+# CONTRIBUTING.md: **a guard scoped so it cannot fire on the current layout
+# reads as coverage and is not.**  A check that cannot fail must not print a
+# reassurance, so the verdict line below now names the class it actually
+# checked rather than claiming the general one.
+#
+# THE RULE, AND WHY IT IS A CLASS RATHER THAN A SECOND LITERAL
+# ------------------------------------------------------------
+# Replacing one prefix with a list of two would have exactly the same defect
+# one machine later.  So the rule is split into a *where* and a *what*, and
+# only the *what* is enumerated:
+#
+#   where   ANY drive-rooted absolute path -- any drive letter, any parent.
+#           ``C:\COMod\...``, ``D:\Games\...``, ``E:\junk\...`` are all the
+#           same finding.  Nothing about the front of the path is special,
+#           because the front of the path is precisely the part that differs
+#           per machine.
+#
+#   what    a path segment naming something **this project resolves at
+#           runtime** -- the install archives and install directory names in
+#           `coroot.REQUIRED` / `coroot._INSTALL_DIR_NAMES`, plus the trees in
+#           `coroot.RESOLVED_TREE_NAMES` (``ConquerAssets``, ``Clients``,
+#           ``COmmunityLibrary``, ``Installed``).  The vocabulary is IMPORTED
+#           from `core/coroot.py`, not copied, so declaring a new resolvable
+#           tree guards it in the same commit.
+#
+# The consequence worth stating: this does **not** flag every absolute path.
+# ``C:\Windows\System32``, ``C:\Program Files\7-Zip\7z.exe`` and the
+# deliberately-nonexistent ``C:\nope\gone.dat`` that a test feeds a function
+# are not findings, because none of them names something `coroot` could have
+# answered.  They are not this defect.
+#
+# WHAT IS IN SCOPE, AND WHY NOT EVERYTHING
+# ----------------------------------------
+# This repository documents its measurements with real paths in prose,
+# everywhere -- 35 files under `docs/` quote one, and so do dozens of module
+# docstrings ("measured on ``C:\COMod\ConquerAssets\Clients\6090``").  Those
+# are the record of where a number came from; a check that reddens them is a
+# check somebody neuters within a week, and the value it protects is real.
+# So scope is decided by whether the text can hardcode a path *into a running
+# program*:
+#
+#   * ``.py``  -- every string literal that is **not** a docstring, found by
+#     parsing the file.  Comments are not in the AST and are therefore out by
+#     construction.  A file that will not parse is a FINDING, not a skip: a
+#     scanner that silently stops looking is the thing this file exists to
+#     prevent.
+#   * ``.py``, additionally -- the literal must **be** the path, not mention
+#     it.  ``Path(r"C:\COMod\ConquerAssets\Clients")`` is a location;
+#     ``"REFUSED: it used to default to C:\COMod\...\5065, which"`` is a
+#     sentence, and the message is the point.  Judged by whether the match
+#     spans the whole literal (whitespace and a trailing separator aside).
+#   * anything else that is not prose -- ``.ps1``, ``.cmd``, ``.bat``,
+#     ``.sh``, ``.js``, ``.html``, ``.json``, ``.yml`` ... -- scanned WHOLE.
+#     There is no AST to ask, a shell script has no docstrings, and a batch
+#     file naming an asset tree is a hardcode wherever on the line it sits.
+#   * ``.md``, ``.txt``, ``.rst`` -- OUT.  Prose.  A document cannot make a
+#     program run on one machine only.  This is a deliberate hole and it is
+#     the one that keeps the rest of the check alive.
+#
+# Known gaps, named rather than left implied: a path assembled at runtime
+# (``"C:/" + "COMod"``), a path inside a longer command string
+# (``"cd C:\COMod\ConquerAssets && build"``), a UNC path (``\\host\share``),
+# and a POSIX-rooted path (``/mnt/c/COMod/...``).  None of them has been seen
+# in this tree; all of them would pass.
+# ---------------------------------------------------------------------------
+
+#: Any absolute path into a user profile.  `Public` is a shared, non-personal
+#: Windows account and is not a leak.
+USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-]+)",
+                          re.IGNORECASE)
+
+#: A drive-rooted absolute path, with as many segments as it has.  The drive
+#: letter must not be preceded by an alphanumeric, or ``https://`` matches it
+#: as drive ``s``.  ``<>`` and ``{}`` are inside the segment character class on
+#: purpose: ``D:\<your install>\Clients`` and
+#: ``C:/COMod/ConquerAssets/Clients/{}`` are both still *paths*, and whether
+#: the placeholder excuses them is `PLACEHOLDER_HEAD_RE`'s decision, not a
+#: question of whether this regex can see them at all.  A path the matcher
+#: cannot parse is a path it silently permits.
+ABS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z]:(?=[\\/])"
+    r"(?:[\\/]{1,2}[A-Za-z0-9_.@ ()+#'{}<>*\-]{1,64})+")
+
+_SEP_RE = re.compile(r"[\\/]+")
+
+#: A first segment that announces itself as a fill-in-your-own.  Help text has
+#: to be able to show the shape of the answer -- `coroot`'s own "could not find
+#: the install" message prints ``D:\path\to\Classic Conquer 2.0`` -- and this
+#: is the sanctioned way to write one.  Use it instead of asking for an
+#: allowlist entry.
+#:
+#: **Only the first segment after the drive letter is examined**, and that
+#: restriction is the whole safety of this exemption.  The first segment is the
+#: machine-specific part -- the part that differs between two people's
+#: checkouts -- so a placeholder there means the path names no machine.
+#: Anywhere else it is decoration on a real location:
+#: ``C:\COMod\ConquerAssets\Clients\<build>`` and
+#: ``"C:/COMod/ConquerAssets/Clients/{}".format(b)`` still hardcode
+#: ``C:\COMod``, and both are findings.
+PLACEHOLDER_HEAD_RE = re.compile(r"^(?:path|\.\.\.|<[^>]*>)$", re.IGNORECASE)
+
+#: Prose.  Out of scope -- see the note above.
+PROSE_SUFFIXES = {".md", ".txt", ".rst"}
+
+#: The files allowed to name an install path anyway, and the reason each is.
+#: **Two entries, both the same file.**  `core/coroot.py` is the resolver, and
+#: `CONVENTIONAL_ROOT` is a discovery *hint* it validates before believing --
+#: the one place where naming a location is the job rather than an assumption.
+#: The blender entry is the vendored copy `tools/build_addon.py` generates
+#: from it, so it is not a second decision.
+#: This test is here for its own bite-proof fixtures at the bottom of the file.
+#:
+#: Adding a path here is saying "this file may only work on one machine".
+#: Route through `coroot` instead: `game_root`, `clients_root` / `clients_dir`,
+#: `community_library`, `installs_root`, `find_derived`, `declared_kinds`.
 INSTALL_PATH_ALLOWED = {"core/coroot.py",
                         "blender/io_scene_c3/vendor/coroot.py",
-                        "tests/test_sanitization.py",
-                        "docs/sanitization.md",
-                        "docs/repo_split.md"}
+                        "tests/test_sanitization.py"}
+
+
+#: The two-directional control for check 3, run on EVERY invocation before any
+#: real file is read.  `(relative path, text, should it be a finding, why)`.
+#:
+#: A gate that cannot fail is the defect this check was rewritten to remove, so
+#: it is not enough for the rewrite to have been careful once -- the property
+#: has to be re-measured every run, and by both controls.  A positive-only
+#: control passes a check that flags everything; a negative-only control passes
+#: a check that flags nothing.
+#:
+#: The negatives are not hypothetical.  Every one of them is a shape that
+#: exists in this tree today and that a broader rule reddened when it was
+#: measured: 35 files under `docs/` quote an install path in prose, `coroot`
+#: and `health` print ``D:\path\to\...`` in help text, `colibrary` probes
+#: 7-Zip's own conventional location, `test_dcache` feeds a deliberately
+#: absent path to a cache, and `clientdisplay` REFUSES to default to a path and
+#: says so in the refusal.  A check that reddens those is a check somebody
+#: turns off.
+CHECK3_CONTROLS: "tuple[tuple[str, str, bool, str], ...]" = (
+    # -- POSITIVE: it must still bite --------------------------------------
+    ("tools/_control.py", 'CLIENTS = Path(r"C:\\COMod\\ConquerAssets\\Clients")',
+     True, "a newly hardcoded COMod asset tree, the layout the old check missed"),
+    ("tools/_control.py", 'ROOT = Path("D:/Games/Conquer Online/ini")',
+     True, "another drive, another parent -- the class, not one prefix"),
+    ("tools/_control.py", 'LIB = Path(r"E:\\stuff\\COmmunityLibrary")',
+     True, "the community library, resolved by coroot.community_library"),
+    ("tools/_control.py", 'A = Path(r"C:\\x\\Classic Conquer 2.0\\c3.wdf")',
+     True, "an install directory name and an archive name"),
+    ("_control.cmd", 'set "CLIENT=C:\\COMod\\ConquerAssets\\Clients\\5065"',
+     True, "a non-python file, scanned whole -- no AST to ask"),
+    ("tools/_control.py", 'T = "C:/COMod/ConquerAssets/Clients/{}".format(b)',
+     True, "a placeholder in the TAIL leaves the machine-specific head hardcoded"),
+    ("tools/_control.py", 'U = Path(r"C:\\COMod\\ConquerAssets\\Clients\\<build>")',
+     True, "...and so does an angle-bracket one"),
+    # -- NEGATIVE: it must not bite ----------------------------------------
+    ("docs/_control.md", "measured on C:\\COMod\\ConquerAssets\\Clients\\6090",
+     False, "prose recording where a measurement was made"),
+    ("tools/_control.py",
+     'def f():\n    """Measured on C:\\\\COMod\\\\ConquerAssets\\\\Clients\\\\6090."""\n',
+     False, "the same record, in a docstring"),
+    ("tools/_control.py",
+     '# corpus at C:\\COMod\\ConquerAssets\\derived\\7878-dat-decrypted\nX = 1\n',
+     False, "the same record, in a comment"),
+    ("tools/_control.py", 'HELP = "set CO_ROOT=D:\\\\path\\\\to\\\\Classic Conquer 2.0"',
+     False, "help text using the sanctioned placeholder"),
+    ("tools/_control.py", 'E = r"D:\\<your install>\\Clients\\5065"',
+     False, "the other sanctioned placeholder form, in the head"),
+    ("tools/_control.py",
+     'raise SystemExit("REFUSED: it used to default to one machine\'s "\n'
+     '                 r"C:\\COMod\\ConquerAssets\\Clients\\5065, which is why "\n'
+     '                 "--client-dir is required")',
+     False, "a message ABOUT a path -- the literal is a sentence, not a location"),
+    ("tools/_control.py", 'SEVEN = r"C:\\Program Files\\7-Zip\\7z.exe"',
+     False, "a third-party tool's own location; coroot resolves no such thing"),
+    ("tools/_control.py", 'W = Path(r"C:\\Windows\\System32\\kernel32.dll")',
+     False, "an OS-guaranteed location"),
+    ("tools/_control.py", 'self.assertIsNone(dcache.get(Path("C:/nope/gone.dat")))',
+     False, "a deliberately absent path fed to a function as test input"),
+)
+
+
+def prove_check3_bites(vocab: "set[str]") -> "list[str]":
+    """Run `CHECK3_CONTROLS`.  Empty means the check still works both ways."""
+    broken = []
+    for rel, text, want, why in CHECK3_CONTROLS:
+        got = bool(install_path_findings(rel, text, vocab))
+        if got != want:
+            broken.append(
+                f"control FAILED: {rel} should {'' if want else 'NOT '}have "
+                f"been a finding and was {'' if got else 'not '}-- {why}\n"
+                f"            input: {text!r}")
+    return broken
+
+
+#: One-slot cache for `_install_vocabulary`.  A list rather than a global so
+#: it is obvious there is exactly one, and empty means "not built yet" -- never
+#: "built and empty", which the builder refuses to produce.
+_VOCAB_CACHE: "list[frozenset]" = []
+
+
+class VocabularyUnavailable(RuntimeError):
+    """`core/coroot.py` could not be imported, so check 3 has no vocabulary.
+
+    Fatal, and reported before any file is scanned.  A check that cannot build
+    the list of things it is looking for finds none of them and says PASS,
+    which is the exact failure this whole file is a reaction to.
+    """
+
+
+def _install_vocabulary() -> "set[str]":
+    """Lowercased names that make a drive-rooted path a finding.
+
+    Built from `core/coroot.py` so the gate and the resolver cannot drift:
+    every archive filename in `REQUIRED` (both container generations), every
+    install directory name discovery knows, and every tree in
+    `RESOLVED_TREE_NAMES`.
+
+    ``ini`` -- the third `REQUIRED` entry -- is deliberately excluded.  It is
+    a three-letter directory name that appears in unrelated paths, and the
+    archives beside it already identify an install root.
+
+    Read from `_OWN_REPO`, never `REPO`: the word list belongs to the checkout
+    that owns this test, not to whichever tree is being scanned.  Cached, so a
+    936-file run pays for it once.
+    """
+    if _VOCAB_CACHE:
+        return set(_VOCAB_CACHE[0])
+    path = str(_OWN_REPO / "core")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    try:
+        import coroot                                       # noqa: PLC0415
+    except Exception as e:                                  # noqa: BLE001
+        raise VocabularyUnavailable(
+            f"could not import core/coroot.py ({type(e).__name__}: {e}); "
+            f"check 3 cannot run") from e
+    vocab: set[str] = set()
+    for spec, _kind in coroot.REQUIRED:
+        for alternative in spec.split("|"):
+            for part in alternative.split("+"):
+                if "." in part:                    # an archive, not a dir name
+                    vocab.add(part.lower())
+    vocab |= {n.lower() for n in coroot._INSTALL_DIR_NAMES}
+    vocab |= {n.lower() for n in coroot.RESOLVED_TREE_NAMES}
+    if not vocab:                                           # pragma: no cover
+        raise VocabularyUnavailable("coroot declared no resolvable names")
+    _VOCAB_CACHE.append(frozenset(vocab))
+    return vocab
+
+
+def install_paths_in(text: str, vocab: "set[str]") -> "list[tuple[int, int, str]]":
+    """``[(start, end, path)]`` for every drive-rooted path naming `vocab`."""
+    out = []
+    for m in ABS_PATH_RE.finditer(text):
+        p = m.group(0)
+        segs = [s.strip() for s in _SEP_RE.split(p) if s.strip()][1:]   # drop "C:"
+        if segs and PLACEHOLDER_HEAD_RE.match(segs[0]):
+            continue
+        if any(s.lower() in vocab for s in segs):
+            out.append((m.start(), m.end(), p))
+    return out
+
+
+_ONLY_SPACE_RE = re.compile(r"^\s*$")
+_ONLY_TAIL_RE = re.compile(r"^[\\/\s]*$")
+
+
+def _is_whole_literal(s: str, a: int, b: int) -> bool:
+    """True when the literal IS the path rather than a sentence quoting one."""
+    return bool(_ONLY_SPACE_RE.match(s[:a]) and _ONLY_TAIL_RE.match(s[b:]))
+
+
+def _python_string_literals(text: str) -> "list[tuple[int, str]]":
+    """``[(lineno, value)]`` for every non-docstring string literal.
+
+    Raises `SyntaxError` -- the caller turns that into a finding rather than
+    swallowing it.
+    """
+    tree = ast.parse(text)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    return [(n.lineno, n.value) for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and id(n) not in docstrings]
+
+
+def install_path_findings(rel: str, text: str, vocab: "set[str]",
+                          stats: "dict[str, int] | None" = None) -> "list[str]":
+    """Check 3 for one file, as human sentences.  Empty means clean.
+
+    `stats` accumulates what the check actually looked at -- how many files
+    were in scope, how many were skipped as prose or allowlisted, and how many
+    drive-rooted paths of ANY kind it read.  `main` prints them, because zero
+    findings over zero absolute paths and zero findings over four hundred of
+    them are different results and only the count separates them.
+    """
+    def bump(k, n=1):
+        if stats is not None:
+            stats[k] = stats.get(k, 0) + n
+
+    if rel in INSTALL_PATH_ALLOWED:
+        bump("allowlisted")
+        return []
+    suffix = ("." + rel.rsplit(".", 1)[-1].lower()) if "." in rel else ""
+    if suffix in PROSE_SUFFIXES:
+        bump("prose")
+        return []
+    bump("scanned")
+    bump("absolute paths", len(ABS_PATH_RE.findall(text)))
+
+    advice = ("resolve it through core/coroot.py instead -- game_root, "
+              "clients_root/clients_dir, community_library, installs_root, "
+              "find_derived, declared_kinds.  If it is help text, write the "
+              "variable part as path/to/... or <name>")
+
+    if suffix != ".py":
+        return [f"hardcoded install path {p!r} -- {advice}"
+                for _a, _b, p in install_paths_in(text, vocab)]
+
+    if not install_paths_in(text, vocab):
+        return []                       # cheap reject before paying for a parse
+    try:
+        literals = _python_string_literals(text)
+    except SyntaxError as e:
+        return [f"check 3 could not parse this file ({e}), so its string "
+                f"literals were NOT scanned for hardcoded install paths. A "
+                f"scan that stops looking and reports clean is the failure "
+                f"this message exists to prevent"]
+    bad = []
+    for lineno, value in literals:
+        for a, b, p in install_paths_in(value, vocab):
+            if _is_whole_literal(value, a, b):
+                bad.append(f"line {lineno}: hardcoded install path {p!r} "
+                           f"-- {advice}")
+    return bad
 
 # ---------------------------------------------------------------------------
 # Decompiled source material.
@@ -493,7 +869,9 @@ def source_findings(text: str, *, view: str = "") -> list[str]:
 
 
 def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None,
-         stats: "dict[str, int] | None" = None) -> list[str]:
+         stats: "dict[str, int] | None" = None,
+         vocab: "set[str] | None" = None,
+         path_stats: "dict[str, int] | None" = None) -> list[str]:
     """Findings for one file, as human sentences.  Empty means clean.
 
     `local` is `(tokens, squashed)` from `.sanitize-local`, compared as
@@ -508,6 +886,10 @@ def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None,
     paths, their allowlists are keyed on a path, and "there is a string that
     looks like an install path inside a decoded capture payload" is a different
     claim from "this file hardcodes an install path".
+
+    `vocab` is check 3's word list (`_install_vocabulary`); it is passed in so
+    the whole run builds it once, and rebuilt here when a caller scans a single
+    file.
     """
     try:
         raw = path.read_bytes()
@@ -532,9 +914,9 @@ def scan(path: Path, local: "tuple[set[str], set[str]] | None" = None,
         bad.append(f"absolute user path {m.group(0)!r} -- "
                    "make it relative to the repo or resolve it at runtime")
 
-    if rel not in INSTALL_PATH_ALLOWED and INSTALL_PATH_RE.search(text):
-        bad.append("hardcoded game install path -- resolve it through "
-                   "core/coroot.py instead")
+    bad += install_path_findings(rel, text,
+                                 vocab if vocab is not None
+                                 else _install_vocabulary(), path_stats)
 
     # Decompiled source material.  Unlike everything above, a finding here is
     # not necessarily a bug in the file -- it may be a correct note that simply
@@ -643,13 +1025,45 @@ def main(argv: list[str]) -> int:
     local = load_local_identifiers()
     findings: list[tuple[str, list[str]]] = []
 
+    # Check 3's word list, built once, BEFORE anything is scanned. If it
+    # cannot be built the run stops here: a check whose vocabulary is empty
+    # matches nothing and every file comes back clean.
+    try:
+        vocab = _install_vocabulary()
+    except VocabularyUnavailable as e:
+        print(f"\n*** CHECK 3 CANNOT RUN: {e} ***\n"
+              "    Its vocabulary is declared in core/coroot.py "
+              "(REQUIRED, _INSTALL_DIR_NAMES, RESOLVED_TREE_NAMES) and is\n"
+              "    imported rather than copied, so an unimportable coroot "
+              "means the install-path check has no list to match\n"
+              "    against -- which would report every file clean. Refusing "
+              "to scan.", file=sys.stderr)
+        print(f"\nRESULT: FAIL -- check 3 has no vocabulary; "
+              f"{len(files)} file(s) NOT scanned")
+        return 2
+
+    # ...and the check must prove it can still bite, in BOTH directions,
+    # before it is allowed to report a clean tree.
+    broken = prove_check3_bites(vocab)
+    if broken:
+        print("\n*** CHECK 3'S OWN CONTROLS FAILED ***\n"
+              "    The install-path check no longer behaves as specified, so "
+              "whatever it says about this\n    tree cannot be believed. "
+              "Refusing to scan.\n")
+        for b in broken:
+            print(f"    {b}")
+        print(f"\nRESULT: FAIL -- {len(broken)} of {len(CHECK3_CONTROLS)} "
+              f"check-3 control(s) failed; {len(files)} file(s) NOT scanned")
+        return 2
+
     # A tracked `.sanitize-local` is the one failure this whole mechanism
     # exists to prevent, so it is fatal on its own and reported first.
     tracked = local_list_is_tracked()
 
     view_bytes: dict[str, int] = {}
+    path_stats: dict[str, int] = {}
     for p in files:
-        bad = scan(p, local, view_bytes)
+        bad = scan(p, local, view_bytes, vocab, path_stats)
         rel = p.relative_to(REPO).as_posix()
         if bad:
             findings.append((rel, bad))
@@ -673,6 +1087,25 @@ def main(argv: list[str]) -> int:
               "hex, separated-hex or base64 runs, so the encoded-PII check "
               "did not fire on anything. That is a fact about the tree, not a "
               "pass.")
+    # WHAT CHECK 3 ACTUALLY LOOKED AT, on the same principle. The old version
+    # of this check could not fire on the layout it was guarding and the
+    # summary line said "no hardcoded install paths" anyway. These four
+    # numbers are what makes that visible: a reader who knows this tree holds
+    # hundreds of Windows paths can see whether any reached the check.
+    pos = sum(1 for _r, _t, want, _w in CHECK3_CONTROLS if want)
+    print(f"check 3's own controls: {len(CHECK3_CONTROLS)} passed "
+          f"({pos} that must be findings, {len(CHECK3_CONTROLS) - pos} that "
+          f"must not) -- the check bit in both directions this run")
+    print(f"install paths: {len(vocab)} resolvable name(s) from core/coroot.py, "
+          f"matched against {path_stats.get('absolute paths', 0):,} "
+          f"drive-rooted path(s) in {path_stats.get('scanned', 0)} in-scope "
+          f"file(s); {path_stats.get('prose', 0)} prose file(s) and "
+          f"{path_stats.get('allowlisted', 0)} allowlisted file(s) out of scope")
+    if not path_stats.get("absolute paths"):
+        print("  -- and NOT ONE drive-rooted path was in scope, so check 3 "
+              "compared its vocabulary against nothing. That is a fact about "
+              "the tree, not a pass.")
+
     if local[0] or local[1]:
         print(f"plus your .sanitize-local: {len(local[0])} token, "
               f"{len(local[1])} squashed (contents never printed)")
@@ -707,8 +1140,15 @@ def main(argv: list[str]) -> int:
         print(f"\nRESULT: FAIL -- scanned {len(files)} file(s) against "
               f"{ident} identifier(s), {len(findings)} with findings")
         return 1
-    print("\nno personal identifiers, no absolute user paths, "
-          "no hardcoded install paths")
+    # The verdict states the scope it was reached in. The previous wording --
+    # "no hardcoded install paths" -- was a claim about the general class made
+    # by a check that could only see one vendor prefix, and it stayed true-
+    # sounding through 67 hardcoded paths. A summary that overstates its check
+    # is part of the defect, not a description of it.
+    print("\nno personal identifiers, no absolute user paths, and no "
+          "drive-rooted path naming anything core/coroot.py resolves "
+          "-- in executable code (python string literals that are not "
+          "docstrings, plus non-prose files whole); prose is out of scope")
     print(f"RESULT: PASS -- scanned {len(files)} file(s) against "
           f"{ident} identifier(s), 0 with findings")
     return 0
