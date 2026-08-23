@@ -348,10 +348,17 @@ def check_derived(root=None) -> dict:
         # builder is absent by design as "missing" tells a complete
         # tree it is incomplete; `supply` is the move it can make.
         buildable = (REPO / argv[0]).is_file()
+        # Two different reasons a thing cannot be built here, and only one of
+        # them is a dead end. Without the distinction, an artefact the owner
+        # asked to be able to SUPPLY was reported as "not used by this tree".
+        needs = NOT_APPLICABLE_WITHOUT.get(rel)
+        applicable = needs is None or (REPO / needs[0]).is_file()
         supplied = coroot.derived_override(rel)
         artefacts.append({
             "path": rel, "exists": found,
             "buildable": buildable,
+            "applicable": applicable,
+            "notApplicableWhy": "" if applicable else needs[1],
             "suppliedFrom": str(supplied) if supplied else "",
             "supply": None if buildable else
                       f'py -3 tools/health.py --use "{rel}=<path>"',
@@ -844,13 +851,45 @@ def render_text(rep: dict) -> str:
     add(f"{_MARK[bool(der.get('ok'))] if der.get('ok') else ' warn '}"
         f"derived data in out/  "
         f"({sum(1 for a in der.get('artefacts', []) if a['exists'])}"
-        f"/{len(der.get('artefacts', []))} built)")
+        f"/{sum(1 for a in der.get('artefacts', []) if a.get('applicable', True))}"
+        f" built"
+        + (f", {sum(1 for a in der.get('artefacts', []) if not a.get('applicable', True))}"
+           f" n/a here"
+           if any(not a.get('applicable', True) for a in der.get('artefacts', []))
+           else "")
+        + ")")
     for a in der.get("artefacts", []):
-        state = ("inherited" if a.get("inherited")
-                 else "ok" if a["exists"] else "MISSING")
-        add(f"           {state:<10} {a['path']}"
-            + (f"  {a['bytes'] / 1e6:,.1f} MB" if a["exists"]
-               else f"   <- {a['command']}   (~{a['cost']})"))
+        # Four states, and the last two were being printed as the second.
+        # "MISSING <- py -3 tools/skinbuild.py" told the owner to run a script
+        # this tree does not ship, and "inherited" was claiming a copy found
+        # in a primary checkout when the truth was a path they had supplied.
+        if a.get("suppliedFrom"):
+            state = "supplied"
+        elif a.get("inherited"):
+            state = "inherited"
+        elif a["exists"]:
+            state = "ok"
+        elif not a.get("applicable", True):
+            state = "n/a"
+        elif not a.get("buildable", True):
+            state = "supply?"
+        else:
+            state = "MISSING"
+        line = f"           {state:<10} {a['path']}"
+        if a["exists"]:
+            line += f"  {a['bytes'] / 1e6:,.1f} MB"
+            if state == "supplied":
+                line += f"  <- {a['suppliedFrom']}"
+        elif state == "n/a":
+            # No command: there is nothing here that would run it, and
+            # nothing here that would read the result either.
+            line += f"   not used by this tree -- {a.get('notApplicableWhy', '')}"
+        elif state == "supply?":
+            # Buildable nowhere in THIS tree, but usable if pointed at a copy.
+            line += f"   <- {a['supply']}"
+        else:
+            line += f"   <- {a['command']}   (~{a['cost']})"
+        add(line)
 
     prov = rep.get("provenance") or {}
     if prov.get("available"):
