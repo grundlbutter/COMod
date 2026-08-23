@@ -74,6 +74,8 @@ __all__ = [
     "missing_parts", "looks_like_root", "describe_root",
     "user_config_path", "repo_config_path", "config_root", "save_root",
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
+    "derived_overrides", "derived_override", "set_derived_override",
+    "broken_derived_overrides",
     "PER_BASE", "GLOBAL", "GLOBAL_EXCEPTIONS", "UndeclaredDerived",
     "INDEX_ROOT", "base_fingerprint",
     "base_id", "derived_rel", "derived_path", "declare_kind", "KINDS_KEY",
@@ -1149,6 +1151,48 @@ def derived_path(rel: str, root=None) -> Path:
     return base / derived_rel(rel, root)
 
 
+def derived_overrides() -> dict:
+    """``{out/-relative path: absolute path}`` the user has pointed us at.
+
+    Saved in the same per-user config as everything else, so it survives a
+    pull and is not a per-run flag somebody has to remember.
+    """
+    raw = _read_user_config().get("derived_overrides") or {}
+    return {str(k): str(v) for k, v in raw.items() if k and v}
+
+
+def derived_override(rel: str) -> Optional[Path]:
+    """The named copy of one artefact, if it is named AND actually there.
+
+    A configured path that does not exist returns None rather than a missing
+    Path: the caller falls through to the normal search and the artefact reads
+    as absent, which is true. `health` reports the broken setting separately --
+    silently honouring a path that is not there would turn "you pointed me at
+    the wrong file" into "the artefact does not exist".
+    """
+    named = derived_overrides().get(rel)
+    if not named:
+        return None
+    p = Path(named)
+    return p if p.exists() else None
+
+
+def set_derived_override(rel: str, path) -> Path:
+    """Point one artefact at an existing file, or clear it with ``None``."""
+    cur = dict(derived_overrides())
+    if path is None:
+        cur.pop(rel, None)
+    else:
+        cur[rel] = str(Path(path).resolve())
+    return write_settings(derived_overrides=cur)
+
+
+def broken_derived_overrides() -> dict:
+    """Configured artefact paths that are NOT on disk. Reported, never used."""
+    return {k: v for k, v in derived_overrides().items()
+            if not Path(v).exists()}
+
+
 def find_derived(rel: str, root=None) -> Optional[Path]:
     """Locate a derived artefact (an ``out/...`` path) for **reading**.
 
@@ -1168,6 +1212,14 @@ def find_derived(rel: str, root=None) -> Optional[Path]:
     anything holding two catalogues at once must.
     """
     rel = derived_rel(rel, root)
+    # A path the user pointed us at, first. Some artefacts cannot be built in
+    # every tree -- COMod ships the asset subset, so `out/opcodes.json` has no
+    # builder there and "build me" is advice it cannot take. Naming an
+    # existing copy is the way out, and it has to win over the search below or
+    # it would only work when it was not needed.
+    named = derived_override(rel)
+    if named is not None:
+        return named
     repo = _repo_dir()
     if repo is not None and (repo / rel).exists():
         return repo / rel

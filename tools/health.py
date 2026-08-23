@@ -197,6 +197,29 @@ def check_install(explicit=None) -> dict:
 #: of these artefacts from the primary checkout (`coroot.find_derived`).
 #:
 #: (relative artefact, what produces it, roughly how long, why it matters)
+#: Artefacts that only matter when some other tool ships, as
+#: ``rel -> (tool that must be present, what the artefact is actually for)``.
+#: An artefact nothing in this tree can use is not "missing" and prompting for
+#: a copy sends the owner to find a file nobody here would open.
+#:
+#: The reason string is checked, not guessed. The first version of this map
+#: said `coplay.py` READS the skin manifest; it does not. `skinbuild.py`
+#: writes `manifest.json` and reads it back for its own diffing, and nothing
+#: else opens it -- `client/skins.py` names the path in a help string,
+#: `pageshot.js` in a comment, and `coplay.py` serves the skin's PNGs rather
+#: than its manifest. What is true is that the skin TREE exists for the game
+#: view, and the game view is not shipped here.
+#:
+#: Absent from this map means "relevant wherever it is" -- only name an
+#: artefact here when a specific tool's absence makes it pointless.
+NOT_APPLICABLE_WITHOUT = {
+    "out/skins/classic/manifest.json": (
+        "tools/coplay.py",
+        "the classic UI skin is drawn by the game view; this file is "
+        "skinbuild's own record of that build"),
+}
+
+
 DERIVED = [
     ("out/wdf/c3_names.json",
      ["tools/wdf_recover.py"], "5-9 min",
@@ -321,14 +344,27 @@ def check_derived(root=None) -> dict:
         cmd = "py -3 " + " ".join(argv)
         if root is not None:
             cmd += f' --root "{root}"'
+        # Whether THIS tree can build it. Reporting an artefact whose
+        # builder is absent by design as "missing" tells a complete
+        # tree it is incomplete; `supply` is the move it can make.
+        buildable = (REPO / argv[0]).is_file()
+        supplied = coroot.derived_override(rel)
         artefacts.append({
             "path": rel, "exists": found,
+            "buildable": buildable,
+            "suppliedFrom": str(supplied) if supplied else "",
+            "supply": None if buildable else
+                      f'py -3 tools/health.py --use "{rel}=<path>"',
             "inherited": found and not (
                 REPO / coroot.derived_rel(rel, root)).is_file(),
             "bytes": p.stat().st_size if found else 0,
             "command": cmd, "cost": cost, "why": why,
         })
-    missing = [a for a in artefacts if not a["exists"]]
+    # "not built yet" and "cannot be built here" are different states
+    # and only the first is something to go and do.
+    missing = [a for a in artefacts
+               if not a["exists"] and a["buildable"]]
+    unavailable = [a for a in artefacts if not a["buildable"]]
     return {
         "dir": str(REPO / "out"),
         "artefacts": artefacts,
@@ -376,9 +412,53 @@ def bootstrap(only_missing: bool = True) -> int:
     import subprocess                                # noqa: PLC0415
     todo = [(rel, argv, cost) for rel, argv, cost, _ in DERIVED
             if not only_missing or coroot.find_derived(rel) is None]
+    # An artefact whose BUILDER is not in this tree is not a failure.
+    # COMod ships the asset/modding subset, and out/opcodes.json is
+    # protocol ("protocol, not assets" -- coroot) built from refs/, not
+    # from an install. Offering it and then dying on a missing script told
+    # the owner their tree was broken when it was complete for what it is.
+    # Named rather than dropped: a line that vanishes reads as one nobody
+    # needed, and this one has a way out worth printing.
+    absent = [(rel, argv, cost) for rel, argv, cost in todo
+              if not (REPO / argv[0]).is_file()]
+    todo = [x for x in todo if x not in absent]
+    for rel, argv, _cost in absent:
+        have = coroot.derived_override(rel)
+        if have:
+            print(f"  supplied: {rel}")
+            print(f"        using {have}")
+            continue
+        needs = NOT_APPLICABLE_WITHOUT.get(rel)
+        if needs is not None and not (REPO / needs[0]).is_file():
+            # Neither the builder NOR the tool that gives it a purpose is
+            # here. Asking for a path would be asking for a file nothing
+            # in this tree would open.
+            print(f"  not applicable here: {rel}")
+            print(f"        {needs[1]}, and {needs[0]} is not shipped in "
+                  f"this tree.")
+            continue
+        print(f"  not in this tree: {rel}")
+        print(f"        {argv[0]} is not shipped here, so this artefact "
+              f"cannot be built.")
+        print( "        If you have one built elsewhere, point at it:")
+        print(f'        py -3 tools/health.py --use "{rel}=<path>"')
+    if absent:
+        print()
     if not todo:
-        print("derived data is already built; nothing to do "
-              "(use --bootstrap-all to force)")
+        # Say what is actually true. "already built" over a set that includes
+        # artefacts this tree never built reads as a clean bill of health for
+        # a state nobody checked -- and the two lines above just said they are
+        # not there.
+        have = sum(1 for rel, _a, _c, _w in DERIVED
+                   if coroot.find_derived(rel) is not None)
+        total = len(DERIVED)
+        if have == total:
+            print("derived data is already built; nothing to do "
+                  "(use --bootstrap-all to force)")
+        else:
+            print(f"nothing left to build here: {have} of {total} artefact(s) "
+                  f"present, {total - have} cannot be built in this tree "
+                  f"(named above). Use --bootstrap-all to rebuild what can be.")
         return 0
     print(f"building {len(todo)} artefact(s) into {REPO / 'out'}\n")
     for i, (rel, argv, cost) in enumerate(todo, 1):
@@ -865,6 +945,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Check that this checkout can run.")
     coroot.add_root_argument(ap)
+    ap.add_argument("--use", action="append", metavar="REL=PATH",
+                    help="point a derived artefact at an existing copy, "
+                         "for artefacts this tree cannot build. Repeatable. "
+                         'e.g. --use "out/opcodes.json=D:/co/out/opcodes.json". '
+                         "REL=  with no path clears it.")
     ap.add_argument("--json", action="store_true", help="machine-readable")
     ap.add_argument("--no-write", action="store_true",
                     help="do not write out/health.json")
@@ -877,6 +962,40 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="only audit which derived artefacts can say what "
                          "install they were built from, and exit")
     a = ap.parse_args(argv)
+
+    if a.use:
+        # Handled before anything reads an artefact, so a run that both
+        # supplies a path and reports on it sees the new value.
+        known = {rel for rel, _argv, _c, _w in DERIVED}
+        for spec in a.use:
+            rel, sep, path = spec.partition("=")
+            rel = rel.strip()
+            if not sep:
+                print(f"--use wants REL=PATH; got {spec!r}", file=sys.stderr)
+                return 2
+            if rel not in known:
+                # A typo here would otherwise sit in the config doing
+                # nothing, and the artefact would still read as missing.
+                print(f"{rel!r} is not a derived artefact. Known:",
+                      file=sys.stderr)
+                for k in sorted(known):
+                    print(f"    {k}", file=sys.stderr)
+                return 2
+            path = path.strip().strip(chr(34))
+            if not path:
+                coroot.set_derived_override(rel, None)
+                print(f"cleared: {rel}")
+                continue
+            p = Path(path)
+            if not p.exists():
+                # Refused rather than saved. A stored path that is not
+                # there makes the artefact read as absent anyway, and the
+                # setting then looks like it was ignored.
+                print(f"no such file: {p}", file=sys.stderr)
+                return 2
+            coroot.set_derived_override(rel, p)
+            print(f"{rel}\n    -> {p.resolve()}")
+        return 0
 
     if a.provenance:
         return provenance.main(["--root", str(a.root)] if a.root else [])
