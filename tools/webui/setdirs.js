@@ -912,6 +912,29 @@
     row.appendChild(setBtn);
     box.appendChild(row);
     box.appendChild(out);
+
+    // Scan on arrival, without being asked. The launch-time check in
+    // dirscan.js prompts when it finds an undeclared folder and sends the
+    // user HERE -- and this page rendered nothing until the button was
+    // pressed, so they arrived at an empty section with no sign that one
+    // more click was needed. The popup made a promise this page did not keep.
+    //
+    // This does NOT weaken the standing rule that nothing is declared
+    // silently. `/api/installs/scan` is a GET and a pure read: it OFFERS
+    // folders and declares none. The write path is still
+    // `/api/installs/declare`, still requires an explicit kind, and still has
+    // exactly one call site inside a click handler. Scanning is looking;
+    // declaring is answering.
+    (async () => {
+      try {
+        renderScan(out, await jget('/api/installs/scan'));
+      } catch (e) {
+        // Silent by design: an arrival scan that fails must not shout over a
+        // page opened for some other reason. The button is still there and
+        // still reports its own errors loudly.
+      }
+    })();
+
     return box;
   }
 
