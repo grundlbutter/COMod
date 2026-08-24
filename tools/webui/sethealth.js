@@ -24,9 +24,38 @@
  * A user who clicks a button expecting 9 minutes and waits 36 is the exact
  * complaint that started this work.
  *
+ * AND THE BOOTSTRAP IS FOR A CLIENT YOU PICK
+ * ------------------------------------------
+ * The owner's words: *"Bootstrapping should be done against any client that
+ * the user supplies. Preferably with a checklist in the settings menu."*
+ *
+ * Until 2026-08-23 this page could only say that it did not do that. It
+ * printed the configured install and the browsed install side by side and
+ * admitted "tools/health.py --bootstrap carries no --root", because that was
+ * true and papering over it would have been worse. It carries one now, so the
+ * checklist below is the two-axis thing the ask describes: one row per
+ * DECLARED CLIENT, one checkbox per ARTEFACT, and a cost.
+ *
+ * THE COST IS COMPUTED PER CLIENT, AND THE ROWS ARE NOT INDEPENDENT
+ * ----------------------------------------------------------------
+ * `health.wdf_recover_estimate(root)` measures this box and this install in
+ * about 3 s, so the Estimate column is not the table's range. It is opt-in
+ * per client because it costs a walk of the install.
+ *
+ * And the part a per-client table most easily implies away, which is
+ * therefore printed at the top of it: **what one client costs depends on
+ * which OTHER clients are declared.** wdf_recover pulls every declared DatPkg
+ * client's plaintext index into the wordlist of every client, 85-93% of the
+ * candidates hashed. MEASURED: Clients/5017 is a QUARTER the size of
+ * Clients/5517 and took LONGER -- 2,167 s against 1,675 s -- and with
+ * --no-tpi the same two are 302 s and 571 s, in the order size predicts. The
+ * --no-tpi checkbox is a real user choice with a real price (~795 names only
+ * a DatPkg index resolves) and it is offered as one.
+ *
  * Nothing factual here is hardcoded in the browser: the artefact table, the
- * costs, the counts, the megabytes, the estimate for THIS machine and both
- * caveats all come from /api/bootstrap/status and /api/thumbs/status.
+ * costs, the counts, the megabytes, the client list, the estimate for THIS
+ * machine and every caveat come from /api/bootstrap/status,
+ * /api/bootstrap/checklist and /api/thumbs/status.
  */
 
 'use strict';
@@ -69,36 +98,209 @@
   const useFields = {};   // rel -> the <input> holding a --use path, kept
                           // across re-renders so a poll does not wipe typing
 
+  // ---- checklist state, kept OUTSIDE render() -------------------------
+  // The panel re-renders every 2 s while a job runs. A selection stored in
+  // the DOM would be wiped by the next poll, which on a page whose whole
+  // point is "pick a client" means the button silently reverts to a client
+  // the user did not pick. That is the same class of bug as the one this
+  // section exists to close, so the selection lives here.
+  let book = null;          // /api/bootstrap/checklist, cheap version
+  let pickedRoot = null;    // which client. null = not chosen yet.
+  let pickedArts = null;    // Set of rels, or null = "the missing ones"
+  let noTpi = false;
+  let estimating = false;
+
   function mb(n) { return (n || 0).toFixed(0) + ' MB'; }
+
+  function clientRow(root) {
+    for (const c of ((book && book.clients) || [])) {
+      if (c.root === root) return c;
+    }
+    return null;
+  }
+
+  function chosenArts(row) {
+    if (pickedArts) return pickedArts;
+    // Default: exactly what is missing FOR THIS CLIENT. `row.missing` comes
+    // from check_derived(root), so it is that client's gaps and not the
+    // configured install's.
+    return new Set((row && row.missing) || []);
+  }
+
+  // ------------------------------------------------- the client checklist
+  // One row per DECLARED client, which is the owner's ask made literal:
+  // "Bootstrapping should be done against any client that the user supplies."
+  function checklistBlock() {
+    const wrap = mk('div');
+    wrap.id = 'boot-checklist';
+    wrap.appendChild(mk('h4', null, 'Which client'));
+    if (!book) {
+      wrap.appendChild(mk('div', 'set-help', 'loading the client list…'));
+      return wrap;
+    }
+    // THE COST DRIVER, AND IT IS NOT INSTALL SIZE. Printed above the rows,
+    // not under them, because a per-client table implies per-client
+    // independence and these rows are not independent.
+    const tpi = book.tpiContext || {};
+    if (tpi.why) {
+      const w = mk('div', 'set-cost');
+      w.appendChild(mk('h4', null, 'These rows are not independent'));
+      const p = mk('p', null, tpi.why);
+      p.id = 'boot-tpi-why';
+      w.appendChild(p);
+      wrap.appendChild(w);
+    }
+
+    const tbl = mk('table');
+    tbl.style.width = '100%';
+    tbl.style.borderCollapse = 'collapse';
+    const head = mk('tr');
+    ['', 'Client', 'Base', 'Archives', 'Built', 'wdf_recover here']
+      .forEach(h => {
+        const th = mk('th', null, h);
+        th.style.textAlign = 'left';
+        th.style.paddingRight = '.8rem';
+        head.appendChild(th);
+      });
+    tbl.appendChild(head);
+    let i = 0;
+    for (const c of (book.clients || [])) {
+      const tr = mk('tr');
+      const cell = mk('td');
+      const rb = mk('input');
+      rb.type = 'radio';
+      rb.name = 'boot-client';
+      rb.id = 'boot-client-' + (i++);
+      rb.className = 'boot-client';
+      rb.setAttribute('data-root', c.root);
+      rb.checked = (c.root === pickedRoot);
+      rb.disabled = !c.exists;
+      rb.addEventListener('change', () => {
+        pickedRoot = c.root;
+        // A new client means new gaps. Keeping the previous client's ticks
+        // would tick artefacts this one already has and untick ones it needs.
+        pickedArts = null;
+        render();
+      });
+      cell.appendChild(rb);
+      tr.appendChild(cell);
+      const built = (c.artefacts || []).filter(a => a.exists).length;
+      const est = c.estimate;
+      // `countBasis` rides with the number because the two wordlist modes do
+      // not deserve the same confidence and the number alone cannot say so:
+      // the candidate count is exact to 0.1% with a DatPkg wordlist and
+      // MEASURED at 0.88x-1.79x of the truth without one.
+      const estText = !est ? 'not measured — press Estimate'
+        : (est.ok ? (est.text + (est.countBasis ? '  — ' + est.countBasis : ''))
+                  : ('cannot estimate: ' + (est.why || '?')));
+      [c.name + (c.exists ? '' : ' (missing)'),
+       c.baseId || '?',
+       (c.archives || []).join(', ') || 'none',
+       built + '/' + (c.artefacts || []).length,
+       estText].forEach((v, k) => {
+        const td = mk('td', null, v);
+        td.style.paddingRight = '.8rem';
+        td.style.verticalAlign = 'top';
+        if (k === 0) td.title = c.root;
+        if (k === 4) td.style.opacity = '.9';
+        tr.appendChild(td);
+      });
+      tbl.appendChild(tr);
+    }
+    wrap.appendChild(tbl);
+
+    const btnRow = mk('div', 'set-field');
+    const estBtn = mk('button', 'ghost',
+      estimating ? 'Measuring…' : 'Estimate every client (measures this box)');
+    estBtn.id = 'boot-estimate';
+    estBtn.disabled = estimating;
+    estBtn.addEventListener('click', async () => {
+      estimating = true;
+      say('measuring — a walk of each install plus a hash benchmark…');
+      render();
+      try {
+        book = await jget('/api/bootstrap/checklist?estimate=1&noTpi=' +
+                          (noTpi ? '1' : '0'));
+        say('');
+      } catch (e) { say(String(e.message || e), true); }
+      estimating = false;
+      render();
+    });
+    btnRow.appendChild(estBtn);
+    btnRow.appendChild(mk('span', 'set-help', book.estimateCostNote || ''));
+    wrap.appendChild(btnRow);
+
+    // -- the wordlist tradeoff, as a choice rather than a footnote --------
+    const tpiRow = mk('div', 'set-field');
+    const tpiBox = mk('input');
+    tpiBox.type = 'checkbox';
+    tpiBox.id = 'boot-notpi';
+    tpiBox.checked = noTpi;
+    tpiBox.addEventListener('change', () => {
+      noTpi = tpiBox.checked;
+      // The estimates on screen were measured in the OTHER mode and are now
+      // 7-14x wrong. Dropped rather than left sitting under a changed
+      // checkbox, which is the shape of stale number this page exists to
+      // stop.
+      for (const c of ((book && book.clients) || [])) c.estimate = null;
+      render();
+    });
+    const tpiLab = mk('label', null,
+      'Build the name table WITHOUT the DatPkg wordlist (--no-tpi)');
+    tpiLab.htmlFor = 'boot-notpi';
+    tpiRow.appendChild(tpiBox);
+    tpiRow.appendChild(tpiLab);
+    wrap.appendChild(tpiRow);
+    wrap.appendChild(mk('div', 'set-effect',
+      'Off (the default): every declared DatPkg client’s plaintext index ' +
+      'joins the wordlist of the client you are building, which is 85-93% of ' +
+      'the candidates hashed. On: only this install’s own paths. ' +
+      'MEASURED on Clients/5017 — 2,167 s against 302 s, and on ' +
+      'Clients/5517 1,675 s against 571 s. The price of turning it on is ' +
+      'about 795 filenames that only a DatPkg index can resolve; they stay ' +
+      'unnamed hashes. It changes nothing but out/wdf/.'));
+    return wrap;
+  }
 
   // ------------------------------------------------------------- bootstrap
   function bootstrapBlock(doc) {
     const box = mk('div');
     box.appendChild(mk('h4', 'set-sub', 'Bootstrap the derived data'));
+    if (pickedRoot === null) {
+      pickedRoot = doc.browsing || doc.buildsFor || '';
+    }
     box.appendChild(mk('div', 'set-help',
       'Six generated artefacts the viewer reads. Built once, in dependency ' +
-      'order. Builds for ' + (doc.buildsFor || '(no configured root)') +
-      ' — the configured install root, which is not necessarily the client ' +
-      'you are browsing (' + (doc.browsing || '?') + '): ' +
-      'tools/health.py --bootstrap carries no --root.'));
+      'order, for the client you pick below — tools/health.py --bootstrap ' +
+      'takes a --root and this page passes it. Browsing ' +
+      (doc.browsing || '?') + '; configured install ' +
+      (doc.buildsFor || '(none)') + '.'));
 
-    const arts = (doc.derived || {}).artefacts || [];
+    box.appendChild(checklistBlock());
+
+    const row = clientRow(pickedRoot);
+    const arts = row ? row.artefacts : ((doc.derived || {}).artefacts || []);
+    const want = chosenArts(row);
 
     // -- THE COST, ABOVE THE BUTTON ---------------------------------------
     const cost = mk('div', 'set-cost');
-    cost.appendChild(mk('h4', null, 'What this will cost, before you start it'));
+    cost.appendChild(mk('h4', null,
+      'What this will cost, before you start it' +
+      (pickedRoot ? ' — for ' + pickedRoot : '')));
     const tbl = mk('table');
     tbl.style.width = '100%';
     tbl.style.borderCollapse = 'collapse';
     const thead = mk('tr');
-    ['Artefact', 'State', 'Estimate', 'What it is for'].forEach(h => {
-      const th = mk('th', null, h);
-      th.style.textAlign = 'left';
-      th.style.paddingRight = '.8rem';
-      thead.appendChild(th);
-    });
+    ['', 'Artefact', 'State', 'Estimate', 'Scope', 'What it is for']
+      .forEach(h => {
+        const th = mk('th', null, h);
+        th.style.textAlign = 'left';
+        th.style.paddingRight = '.8rem';
+        thead.appendChild(th);
+      });
     tbl.appendChild(thead);
     let todo = 0;
+    let n = 0;
     for (const a of arts) {
       const tr = mk('tr');
       const state = !a.applicable ? 'n/a here'
@@ -106,20 +308,45 @@
         : a.exists ? (a.inherited ? 'inherited' : 'built')
         : a.buildable ? 'MISSING' : 'not buildable here';
       if (state === 'MISSING') todo += 1;
-      [a.path, state, a.cost || '?', a.why || ''].forEach((v, i) => {
+      // THE CHECKLIST'S OTHER AXIS: which artefacts, not only which client.
+      const cell = mk('td');
+      const cb = mk('input');
+      cb.type = 'checkbox';
+      cb.id = 'boot-art-' + (n++);
+      cb.className = 'boot-art';
+      cb.setAttribute('data-rel', a.path);
+      cb.checked = want.has(a.path);
+      cb.disabled = !a.buildable;
+      cb.addEventListener('change', () => {
+        const s = new Set(chosenArts(row));
+        if (cb.checked) s.add(a.path); else s.delete(a.path);
+        pickedArts = s;
+        render();
+      });
+      cell.appendChild(cb);
+      tr.appendChild(cell);
+      // "shared" rows are labelled as shared rather than duplicated per
+      // client: out/opcodes.json is built from refs/ and opens no install at
+      // all, so a per-client copy of it would be the same bytes twice.
+      const scope = a.perClient ? 'per client'
+        : (a.rootAware ? 'shared, built from one install' : 'shared, no --root');
+      [a.path, state, a.cost || '?', scope, a.why || ''].forEach((v, i) => {
         const td = mk('td', null, v);
         td.style.paddingRight = '.8rem';
         td.style.verticalAlign = 'top';
         if (i === 0) td.style.fontFamily = 'var(--mono, monospace)';
-        if (i === 3) td.style.opacity = '.85';
+        if (i === 4) td.style.opacity = '.85';
         tr.appendChild(td);
       });
       tbl.appendChild(tr);
     }
     cost.appendChild(tbl);
     cost.appendChild(mk('p', null,
-      todo + ' artefact' + (todo === 1 ? '' : 's') + ' would be built by ' +
-      '“Bootstrap”.'));
+      want.size + ' artefact' + (want.size === 1 ? '' : 's') + ' ticked; ' +
+      todo + ' missing for this client.'));
+    if (book && book.sharedNote) {
+      cost.appendChild(mk('p', 'set-measured', book.sharedNote));
+    }
     // The caveat is the server's string, so the page cannot say something
     // milder than the tool believes.
     cost.appendChild(mk('p', 'set-measured', doc.costCaveat || ''));
@@ -181,10 +408,13 @@
     // -- the buttons ------------------------------------------------------
     const run = (doc.run || {});
     const btnRow = mk('div', 'set-field');
+    const label = pickedRoot
+      ? 'Run bootstrap for ' + (row ? row.name : pickedRoot)
+      : 'Run bootstrap';
     const go = mk('button', 'primary',
-                  run.running ? 'Bootstrap running…' : 'Run bootstrap');
+                  run.running ? 'Bootstrap running…' : label);
     go.id = 'boot-start';
-    go.disabled = !!run.running;
+    go.disabled = !!run.running || want.size === 0;
     go.addEventListener('click', async () => {
       const uses = [];
       for (const rel of Object.keys(useFields)) {
@@ -195,14 +425,25 @@
       go.disabled = true;
       say('starting…');
       try {
-        const res = await jpost('/api/bootstrap/start',
-                                { all: allBox.checked, uses: uses });
+        // `root` is the whole point: the run is for the client ticked above,
+        // not for whichever install happens to be configured.
+        const res = await jpost('/api/bootstrap/start', {
+          all: allBox.checked,
+          uses: uses,
+          root: pickedRoot || '',
+          noTpi: noTpi,
+          only: Array.from(want),
+        });
         say(res.started ? 'Running: ' + (res.steps || []).join('  then  ')
                         : (res.reason || 'not started'));
         startPoll();
       } catch (e) { say(String(e.message || e), true); go.disabled = false; }
     });
     btnRow.appendChild(go);
+    if (want.size === 0) {
+      btnRow.appendChild(mk('span', 'set-help',
+        'Nothing is ticked, so there is nothing to run.'));
+    }
     const stop = mk('button', 'ghost', 'Stop');
     stop.id = 'boot-cancel';
     stop.disabled = !run.running;
@@ -225,10 +466,26 @@
       pre.id = 'boot-progress';
       box.appendChild(pre);
       if (!run.running && run.returncode !== null) {
-        box.appendChild(mk('div', run.returncode === 0 ? 'set-help' : 'set-bad',
+        // TWO VERDICTS, NOT ONE. `health.py --bootstrap` runs the health
+        // report after the builders and exits 1 whenever the TREE is
+        // unhealthy — an artefact missing for some OTHER client, a
+        // foreign-provenance one — which on a machine with nine declared
+        // clients is the normal state. Reading that as "your build failed"
+        // told users a bootstrap had broken when every builder had
+        // succeeded and the artefact was on disk. `run.built` is the
+        // builders' own verdict.
+        const ok = run.built === true || run.returncode === 0;
+        box.appendChild(mk('div', ok ? 'set-help' : 'set-bad',
           run.cancelled ? 'Stopped.'
+            : run.built === true && run.returncode !== 0
+              ? 'Built in ' + run.elapsedSeconds + ' s' +
+                (run.root ? ' for ' + run.root : '') + '. The health report ' +
+                'that ran afterwards exited ' + run.returncode + ' — that is ' +
+                'the state of the whole tree, not of this build; the ' +
+                'transcript above says which client is still short of what.'
             : run.returncode === 0
-              ? 'Finished in ' + run.elapsedSeconds + ' s.'
+              ? 'Finished in ' + run.elapsedSeconds + ' s' +
+                (run.root ? ' for ' + run.root : '') + '.'
               : 'Exited ' + run.returncode + ' after ' + run.elapsedSeconds +
                 ' s — the output above says why.'));
       }
@@ -425,6 +682,10 @@
     let boot, thumb, index;
     try {
       boot = await jget('/api/bootstrap/status');
+      // The cheap version, once. The estimate is opt-in and never rides the
+      // 2 s poll: it walks each install and benchmarks the CPU, MEASURED at
+      // 1-14 s per client.
+      if (!book) book = await jget('/api/bootstrap/checklist');
       thumb = await jget('/api/thumbs/status');
       index = await jget('/api/index/status');
     } catch (e) {

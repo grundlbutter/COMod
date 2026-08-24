@@ -828,6 +828,14 @@ class IndexRunner:
 _BOOTSTRAP_PROGRESS_RE = re.compile(
     r"^\[(\d+)/(\d+)\]\s+(\S+)\s*(?:\(~([^)]*)\))?\s*$")
 
+#: `health.bootstrap()`'s own last word, in each of the three ways it can
+#: finish well. Matched because the process EXIT CODE cannot answer "did the
+#: build work": `health.py --bootstrap` goes on to run the health report and
+#: returns 1 for an unhealthy tree, which is not the same question.
+_BOOTSTRAP_OK_RE = re.compile(
+    r"^(derived data built|derived data is already built|"
+    r"nothing left to build here)")
+
 
 class BootstrapRunner:
     r"""Runs `tools/health.py --bootstrap` in a child process, on request only.
@@ -869,6 +877,16 @@ class BootstrapRunner:
         self.cancelled = False
         self.all: bool = False
         self.uses: list = []
+        #: Which client the last accepted start was for -- "" means "the
+        #: configured install", which is what this class could only ever do
+        #: before. Served in `status()` so the page can never label a run with
+        #: a client it was not given.
+        self.root: str = ""
+        self.no_tpi: bool = False
+        self.only: list = []
+        #: Did the BUILDERS succeed -- a different question from the exit
+        #: code. None until a run has said. See `_BOOTSTRAP_OK_RE`.
+        self.built: Optional[bool] = None
         self.progress: dict = {"label": "", "done": 0, "total": 0, "cost": ""}
         self.tail: list[str] = []
         self.steps: list[str] = []
@@ -912,13 +930,40 @@ class BootstrapRunner:
             return True
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, rebuild_all: bool = False, uses: Optional[list] = None) -> dict:
-        """`uses` is a list of `"REL=PATH"` strings, applied before building."""
+    def start(self, rebuild_all: bool = False, uses: Optional[list] = None,
+              root=None, *, no_tpi: bool = False,
+              only: Optional[list] = None) -> dict:
+        """`uses` is a list of `"REL=PATH"` strings, applied before building.
+
+        `root` is **which client to build for**, and it is the whole point of
+        this parameter existing: the page lists every declared install and
+        "Run bootstrap" next to a chosen one has to mean that one. Passing
+        None keeps the old behaviour -- the configured install -- for a
+        machine with a single client.
+
+        `only` restricts the run to named `health.DERIVED` artefacts (the
+        checklist's boxes) and `no_tpi` drops the DatPkg wordlist from
+        `wdf_recover`, which is the single biggest lever on the bill.
+        """
         uses = [str(u) for u in (uses or []) if str(u).strip()]
+        only = [str(o) for o in (only or []) if str(o).strip()]
         with self.lock:
             if self.running():
                 return {"started": False, "reason": "already running",
                         **self.status()}
+            if root:
+                p = Path(str(root))
+                if not p.is_dir():
+                    # Refused rather than silently falling back to the
+                    # configured install. A fallback here is the defect this
+                    # parameter closes, wearing a different hat: the user
+                    # named a client and got somebody else's artefacts.
+                    return {"started": False,
+                            "reason": f"{p} is not a directory, so there is "
+                                      f"no client there to build for. "
+                                      f"Nothing was run.",
+                            **self.status()}
+                root = str(p)
             health_py = str(HERE / "health.py")
             steps = []
             if uses:
@@ -926,11 +971,22 @@ class BootstrapRunner:
                 for u in uses:
                     argv += ["--use", u]
                 steps.append(argv)
-            steps.append([sys.executable, health_py,
-                          "--bootstrap-all" if rebuild_all else "--bootstrap",
-                          "--no-write"])
+            build = [sys.executable, health_py,
+                     "--bootstrap-all" if rebuild_all else "--bootstrap",
+                     "--no-write"]
+            if root:
+                build += ["--root", str(root)]
+            if no_tpi:
+                build.append("--no-tpi")
+            for rel in only:
+                build += ["--only", rel]
+            steps.append(build)
             self.all = bool(rebuild_all)
             self.uses = uses
+            self.root = str(root or "")
+            self.no_tpi = bool(no_tpi)
+            self.only = only
+            self.built = None
             self.started = time.time()
             self.finished = 0.0
             self.returncode = None
@@ -1016,6 +1072,19 @@ class BootstrapRunner:
                 line = line.rstrip()
                 if not line:
                     continue
+                # THE BUILD AND THE REPORT ARE TWO ANSWERS, and the exit code
+                # only carries the second. `health.py --bootstrap` runs the
+                # health report afterwards and returns 1 whenever the TREE is
+                # unhealthy -- an artefact missing for some other client, a
+                # foreign-provenance one -- which on a box with nine declared
+                # clients is the normal state. The page was reading that 1 as
+                # "the bootstrap failed" and telling the user their build had
+                # broken when every builder had succeeded and the artefact was
+                # on disk. `bootstrap()` says which it was, in its own words.
+                if _BOOTSTRAP_OK_RE.match(line):
+                    self.built = True
+                if line.startswith("        LANDED WRONG"):
+                    self.built = False
                 m = _BOOTSTRAP_PROGRESS_RE.match(line)
                 if m:
                     self.progress = {"label": m.group(3),
@@ -1047,6 +1116,17 @@ class BootstrapRunner:
             "startedAt": self.started or 0.0,
             "all": self.all,
             "uses": list(self.uses),
+            # WHICH CLIENT this run was for. "" is "the configured install",
+            # and the page prints the distinction rather than resolving it
+            # here -- a status that silently substitutes the configured path
+            # for "nobody said" is how the old panel came to claim a run was
+            # about a client it had never been given.
+            "root": self.root,
+            "noTpi": self.no_tpi,
+            "only": list(self.only),
+            # None = it never said. True/False = the BUILD's own verdict,
+            # which is not the exit code -- see `_BOOTSTRAP_OK_RE`.
+            "built": self.built,
             "steps": list(self.steps),
             "elapsedSeconds": round(elapsed, 1),
             "returncode": self.returncode,
@@ -1093,30 +1173,531 @@ CLIENTS_ROOT_KEY = coroot.CLIENTS_ROOT_KEY
 #: -- and this is the human name asked for on top, which no plugin can know.
 SERVER_NAMES_KEY = "server_names"
 
+# ---------------------------------------------------------------------------
+# copying a private server into a frozen Offline Client
+# ---------------------------------------------------------------------------
+#
+# WHY THE FEATURE EXISTS, in the owner's words: *"For 'Offline Clients', I want
+# the user to electively choose to create a copy of any Private server they
+# add."*  A private server changes under you -- it patches, it rewrites its own
+# ini/ at shutdown, it is a moving subject.  An Offline Client is a fixed point
+# you can mod and measure against.  The copy is how a user freezes one moment
+# of a live server.
+#
+# **Electively.**  Nothing here runs off the back of a declaration.  The copy
+# is a separate button, behind a stated price, and the copy does not declare
+# what it produced -- the same standing rule the scan obeys.
+#
+# THE INTERRUPTED-COPY DECISION, and why it is BOTH mechanisms
+# ------------------------------------------------------------
+# Interruption is the normal case at these sizes.  The brief offered two
+# defences and this takes both, because measured on this repository each one
+# alone leaves a hole the other closes:
+#
+# 1. **Copy to a temporary name, `os.replace` into place on success.**  The
+#    temp directory is a sibling of the destination, so the rename is
+#    same-volume and instantaneous.  There is therefore no window in which a
+#    partial tree wears the final name.
+#
+# 2. **A marker file, written FIRST and deleted LAST.**  The temp name alone
+#    is not enough, and this is the part worth stating: `api_installs_scan`
+#    enumerates every child directory of the clients root and asks
+#    `coroot.missing_parts`, which is a CONTENT check -- `ini/` plus an
+#    archive.  A copy that has got as far as `ini/` and `c3.wdf` passes that
+#    check while being three percent done, so the scan would offer a torn tree
+#    as a client no matter what the directory is called.  Worse:
+#    `coroot.base_fingerprint` hashes only the top level of `ini/`, so a torn
+#    tree whose `ini/` finished hashes IDENTICAL to its source and would share
+#    the source's `out/indexes/<kind>-<fingerprint>/` namespace.  A name is
+#    something anyone can rename; the marker is a fact about the contents, and
+#    it is what `post_installs_declare` refuses on.
+#
+# Considered and rejected: copying `ini/` last, so a torn tree fails
+# `missing_parts` by construction.  It works, but it makes incompleteness an
+# emergent property of a loop's ordering rather than a recorded fact, and the
+# next person to reorder the walk removes the guard without knowing it.
+
+#: Written into a copy in progress, first thing, and removed immediately
+#: before the rename into place. Its PRESENCE is the definition of "this
+#: directory is not a client, whatever its contents look like".
+COPY_MARKER = ".co-copy-incomplete.json"
+
+#: Appended to the destination name while the copy runs. A sibling of the
+#: destination, so `os.replace` at the end is a same-volume rename.
+COPY_TEMP_SUFFIX = ".co-copying"
+
+#: Settings key: ``{destination root: {from, at, bytes, files}}``. What makes
+#: a folder a *frozen copy* rather than merely another declared install, and
+#: the only reason this module ever overrides a plugin's own category.
+COPIES_KEY = "install_copies"
+
+#: A copy needs the source's size plus room to breathe. Refusing is the whole
+#: point -- half a client is worse than none, and `shutil` will happily fill a
+#: volume before raising.
+COPY_HEADROOM_FRACTION = 0.02
+COPY_HEADROOM_FLOOR = 1 << 30                       # 1 GiB
+
+#: The measured size shown to the user and the size measured again at the
+#: moment of the click may differ -- a live server writes. More than this and
+#: the number on the button was not the number on the disk, so the click is
+#: refused and the new figure is shown instead.
+COPY_DRIFT = 0.01
+
+#: The census, quoted because a copy button that starts moving fifteen
+#: gigabytes without saying so is the defect this whole batch of work exists
+#: to remove. These are `health.WDF_RECOVER_MEASUREMENTS`, which counted the
+#: installs on this machine -- not an estimate and not a guess. The per-copy
+#: figure served to the page is walked from the actual source directory; this
+#: string is the RANGE, so a user can see where their number sits.
+COPY_COST_CAVEAT = (
+    "The size beside the button is walked from this folder just now, not "
+    "looked up. For scale, tools/health.py's census of the installs on this "
+    "machine runs from 1.25 GB / 5,432 files (Clients/5017) to 15.34 GB / "
+    "191,162 files (Clients/7878) — so a copy here is a minutes-long "
+    "job that moves gigabytes, and at the top of that range it is the "
+    "largest single thing this tool will do to your disk. Nothing is copied "
+    "until you click, and a copy that is interrupted is left under a "
+    "temporary name carrying a marker file, so it can never be mistaken for "
+    "a client.")
+
+
+def _gb(n) -> str:
+    """Bytes as the page says them. Decimal GB, because that is the unit the
+    census in `health.WDF_RECOVER_MEASUREMENTS` uses (15.34 GB for 7878 is
+    15.34e9 bytes, 14.28 GiB) and two units in one feature is how a user ends
+    up believing a copy shrank."""
+    n = float(n or 0)
+    if n < 1e6:
+        return f"{n / 1e3:,.0f} kB"
+    if n < 1e9:
+        return f"{n / 1e6:,.1f} MB"
+    return f"{n / 1e9:,.2f} GB"
+
+
+def measure_tree(root, deadline_s: float = 60.0) -> dict:
+    """Walk ``root`` and total it: files, directories, bytes.
+
+    **Computed, never estimated.** MEASURED with this walker on this box,
+    warm cache: `Clients/5017` 5,432 files in 0.02 s, `Clients/7878` 191,162
+    files in 0.87 s. Both file counts equal `health.WDF_RECOVER_MEASUREMENTS`
+    exactly, which is the control -- a walker that disagreed with the census
+    on a tree the census already counted would be reporting its own bugs.
+
+    ``complete`` is False when the deadline ran out, and then ``bytes`` is a
+    LOWER BOUND and is labelled as one all the way to the page. A partial
+    total presented as a total is the same defect as an estimate presented as
+    a measurement.
+    """
+    p = Path(str(root))
+    out = {"root": str(p), "files": 0, "dirs": 0, "bytes": 0,
+           "complete": False, "seconds": 0.0, "unreadable": 0, "error": ""}
+    if not p.is_dir():
+        out["error"] = f"{p} is not a directory"
+        return out
+    started = time.time()
+    stack = [str(p)]
+    while stack:
+        if time.time() - started > deadline_s:
+            out["error"] = (f"stopped after {deadline_s:.0f}s with "
+                            f"{len(stack)} directories still unvisited")
+            out["seconds"] = round(time.time() - started, 2)
+            return out
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            out["dirs"] += 1
+                            stack.append(e.path)
+                        else:
+                            out["files"] += 1
+                            out["bytes"] += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        out["unreadable"] += 1
+        except OSError:
+            out["unreadable"] += 1
+    out["complete"] = True
+    out["seconds"] = round(time.time() - started, 2)
+    return out
+
+
+def read_copy_marker(root) -> Optional[dict]:
+    """The marker inside ``root``, or None. Presence is the whole answer.
+
+    A marker that cannot be parsed still counts as present: the file existing
+    is the fact, and its contents are only there to say *what* was being
+    copied. Reading "unparseable" as "not a marker" would turn a corrupted
+    interruption -- exactly the interruption most likely to corrupt it -- into
+    a folder that looks like a client.
+    """
+    m = Path(str(root)) / COPY_MARKER
+    if not m.is_file():
+        return None
+    try:
+        doc = json.loads(m.read_text("utf-8", errors="replace"))
+        if isinstance(doc, dict):
+            doc["markerPath"] = str(m)
+            return doc
+    except (OSError, ValueError):
+        pass
+    return {"markerPath": str(m),
+            "note": "marker present but unreadable -- still incomplete"}
+
+
+#: A sentinel the process probe emits only if it ran to completion, so
+#: success is a POSITIVE signal. Straight from `clientlock.PROBE_TAG`'s
+#: reasoning: `Get-Process` can exit non-zero with empty stdout AND empty
+#: stderr, which is indistinguishable from a broken probe.
+COPY_PROBE_TAG = "co-copyprobe"
+
+#: **Every** process, not `*Conquer*`. `clientlock` filters by name because it
+#: guards the rig's own client; the question here is "is ANYTHING running out
+#: of this folder", and a private server's client can be called anything at
+#: all. A name filter would answer "nothing is running" about a folder whose
+#: `Zephyr.exe` is in world.
+COPY_PROBE_PS = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "$p=@(Get-Process -ErrorAction SilentlyContinue);"
+    "$rows=@($p|Select-Object Id,Path,ProcessName);"
+    f"[pscustomobject]@{{probe='{COPY_PROBE_TAG}';procs=$rows}}"
+    "|ConvertTo-Json -Compress -Depth 4;exit 0"
+)
+
+
+def processes_under(root, timeout_s: float = 30.0) -> dict:
+    """Which live processes are running out of ``root``.
+
+    Copying a running server's files is a torn read, so this is asked before
+    the copy and the answer is shown either way.
+
+    **Three outcomes, kept distinct, because collapsing them is the recorded
+    C25 defect:** processes found under the root; no process found *and every
+    path readable*; and *could not tell*. `opaque` counts the processes whose
+    image path came back empty -- which on Windows is what you get for a
+    process at a higher integrity level than the querying one, per
+    `accountpreflight.install_dir`. A clean `live: []` with `opaque: 14` is
+    not "nothing is running there", and the page says so.
+
+    Reads image paths only. Nothing is opened, attached to, or signalled --
+    the standing constraint is never to touch a process whose executable path
+    you cannot read, and this never touches one whose path it CAN read either.
+    """
+    out = {"root": str(root), "live": [], "opaque": 0, "checked": 0,
+           "error": "", "conclusive": False}
+    try:
+        target = str(Path(str(root)).resolve()).rstrip("\\/").lower()
+    except OSError:                                  # pragma: no cover
+        target = str(root).rstrip("\\/").lower()
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            COPY_PROBE_PS],
+                           capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError) as e:
+        out["error"] = f"cannot run the process probe: {e}"
+        return out
+    txt = (r.stdout or "").strip()
+    if not txt:
+        out["error"] = "the process probe produced no output at all"
+        return out
+    try:
+        doc = json.loads(txt)
+    except ValueError as e:
+        out["error"] = f"unparseable process probe output: {e}"
+        return out
+    if not isinstance(doc, dict) or doc.get("probe") != COPY_PROBE_TAG:
+        out["error"] = ("process probe envelope missing -- the script did not "
+                        "run to completion, so its output is not an answer")
+        return out
+    rows = doc.get("procs") or []
+    if isinstance(rows, dict):                       # PowerShell unwraps 1
+        rows = [rows]
+    if not isinstance(rows, list):
+        out["error"] = f"unexpected probe shape: {type(rows).__name__}"
+        return out
+    sep = os.sep.lower()
+    for d in rows:
+        if not isinstance(d, dict):
+            continue
+        out["checked"] += 1
+        path = str(d.get("Path") or "")
+        if not path:
+            out["opaque"] += 1
+            continue
+        low = path.lower().replace("/", sep)
+        if low.startswith(target + sep):
+            out["live"].append({"pid": d.get("Id"),
+                                "name": d.get("ProcessName") or "",
+                                "path": path})
+    out["conclusive"] = out["opaque"] == 0
+    return out
+
+
+class CopyRunner:
+    """One private-server copy, on a worker thread.
+
+    A background thread rather than a synchronous POST because the census says
+    this job moves up to 15.34 GB; a request that holds the socket for that
+    long is a hung tab, and there would be nothing to cancel.
+
+    Shaped like `BootstrapRunner` deliberately -- same `start`/`status`/
+    `cancel` triple, same rule that the runner reports itself running BEFORE
+    the work begins, so a page that polls immediately after POSTing start does
+    not conclude the job is already over.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active = False
+        self.thread: Optional[threading.Thread] = None
+        self.cancelled = False
+        self.src = ""
+        self.dest = ""
+        self.temp = ""
+        self.expect_bytes = 0
+        self.expect_files = 0
+        self.bytes = 0
+        self.files = 0
+        self.current = ""
+        self.started = 0.0
+        self.finished = 0.0
+        self.ok: Optional[bool] = None
+        self.error = ""
+        #: Set when a run ends WITHOUT the destination in place. Carries the
+        #: temp directory so the page can name it, because an interrupted copy
+        #: the user cannot see is an interrupted copy the user cannot delete.
+        self.leftover = ""
+        self.done = threading.Event()
+
+    def running(self) -> bool:
+        return self.active
+
+    def start(self, src: Path, dest: Path, temp: Path,
+              expect: dict) -> dict:
+        with self.lock:
+            if self.active:
+                return {"started": False,
+                        "error": "a copy is already running", **self.status()}
+            self.active = True
+            self.cancelled = False
+            self.src, self.dest, self.temp = str(src), str(dest), str(temp)
+            self.expect_bytes = int(expect.get("bytes") or 0)
+            self.expect_files = int(expect.get("files") or 0)
+            self.bytes = self.files = 0
+            self.current = ""
+            self.ok = None
+            self.error = ""
+            self.leftover = ""
+            self.started = time.time()
+            self.finished = 0.0
+            self.done = threading.Event()
+            self.thread = threading.Thread(target=self._run, daemon=True,
+                                           args=(src, dest, temp))
+            self.thread.start()
+        return {"started": True, **self.status()}
+
+    def cancel(self) -> dict:
+        self.cancelled = True
+        _log("copy: cancel requested")
+        return {"cancelled": True, **self.status()}
+
+    def _run(self, src: Path, dest: Path, temp: Path) -> None:
+        import shutil
+        try:
+            temp.mkdir(parents=True, exist_ok=False)
+            # FIRST. Before a single byte of payload, so there is no instant
+            # at which the directory exists without saying what it is.
+            (temp / COPY_MARKER).write_text(json.dumps({
+                "incomplete": True,
+                "copyOf": str(src),
+                "destination": str(dest),
+                "startedAt": time.time(),
+                "expectBytes": self.expect_bytes,
+                "expectFiles": self.expect_files,
+                "writtenBy": "coviewer CopyRunner",
+                "whatThisMeans":
+                    "This directory is a copy that has NOT finished. It is "
+                    "not a client, however complete it looks: "
+                    "coroot.missing_parts is a content check that a "
+                    "three-percent copy can already pass, and "
+                    "coroot.base_fingerprint hashes only ini/, so a torn tree "
+                    "whose ini/ finished hashes identical to its source. "
+                    "Delete this directory, or discard it from Settings.",
+            }, indent=2), "utf-8")
+
+            for dirpath, dirnames, filenames in os.walk(str(src)):
+                if self.cancelled:
+                    raise _CopyCancelled()
+                rel = os.path.relpath(dirpath, str(src))
+                out_dir = temp if rel == "." else temp / rel
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for name in filenames:
+                    if self.cancelled:
+                        raise _CopyCancelled()
+                    s = os.path.join(dirpath, name)
+                    d = out_dir / name
+                    self.current = os.path.join(rel, name) if rel != "." else name
+                    try:
+                        shutil.copy2(s, str(d))
+                        self.files += 1
+                        self.bytes += os.path.getsize(str(d))
+                    except OSError as e:
+                        # A source file that vanished or is locked is the
+                        # torn-read symptom this feature warns about. It is a
+                        # failure, not something to skip past quietly.
+                        raise OSError(f"{s}: {e}") from e
+                del dirnames  # os.walk pruning unused; kept explicit
+
+            # LAST. The marker goes before the rename, so the only directory
+            # that ever wears the destination name is a finished one.
+            (temp / COPY_MARKER).unlink()
+            os.replace(str(temp), str(dest))
+            # Provenance, written AFTER the rename. It records what this
+            # folder is a copy of and when it was frozen -- and it is the only
+            # thing that makes the copy group under Offline Clients rather
+            # than inheriting its source's private-server category.
+            #
+            # It is NOT a declaration. `coroot.KINDS_KEY` is untouched here;
+            # the copy is offered to the user like any other found folder and
+            # declared only on a click.
+            try:
+                copies = dict(coroot.read_settings().get(COPIES_KEY) or {})
+                copies[str(dest.resolve())] = {
+                    "from": str(src), "at": time.time(),
+                    "bytes": self.bytes, "files": self.files,
+                }
+                coroot.write_settings(**{COPIES_KEY: copies})
+                coroot.invalidate_cache()
+            except Exception as e:                   # pragma: no cover
+                # A copy that landed is a copy that landed. Losing the
+                # provenance note must not turn a finished copy into a
+                # reported failure.
+                _log(f"copy: could not record provenance: {e}")
+            self.ok = True
+            _log(f"copy: {src} -> {dest} ({self.bytes:,} bytes, "
+                 f"{self.files:,} files)")
+        except _CopyCancelled:
+            self.ok = False
+            self.error = "cancelled"
+            self.leftover = str(temp)
+            _log(f"copy: cancelled, incomplete tree left at {temp}")
+        except Exception as e:
+            self.ok = False
+            self.error = f"{type(e).__name__}: {e}"
+            self.leftover = str(temp) if temp.exists() else ""
+            _log(f"copy: FAILED -- {self.error}")
+        finally:
+            self.finished = time.time()
+            self.active = False
+            self.done.set()
+
+    def status(self) -> dict:
+        elapsed = ((self.finished or time.time()) - self.started
+                   if self.started else 0.0)
+        pct = (100.0 * self.bytes / self.expect_bytes
+               if self.expect_bytes else 0.0)
+        return {
+            "running": self.running(),
+            "startedAt": self.started or 0.0,
+            "source": self.src,
+            "dest": self.dest,
+            "temp": self.temp,
+            "bytes": self.bytes,
+            "files": self.files,
+            "expectBytes": self.expect_bytes,
+            "expectFiles": self.expect_files,
+            "percent": round(min(pct, 100.0), 1),
+            "current": self.current,
+            "elapsedSeconds": round(elapsed, 1),
+            "ok": self.ok,
+            "error": self.error,
+            "cancelled": self.cancelled,
+            # The destination exists only on success, so this is served rather
+            # than inferred: the page must not offer to declare a path that
+            # the rename never reached.
+            "leftover": self.leftover,
+            "declarable": bool(self.ok) and bool(self.dest),
+        }
+
+
+class _CopyCancelled(Exception):
+    """Internal: the worker's own way out of two nested loops."""
+
 #: Said next to every estimate this page prints, and it is not decoration.
-#: `health.DERIVED` documents `tools/wdf_recover.py` at "5-9 min"; a measured
+#: `health.DERIVED` documented `tools/wdf_recover.py` at "5-9 min"; a measured
 #: run on `Clients/5517` took **2,164 s -- 36 minutes**, four times the top of
-#: the range. The table's numbers came from one install, and the cost of each
-#: artefact is a function of the archives in the install being built from.
+#: the range.
+#:
+#: WHAT WAS WRONG WITH IT, established 2026-08-23 by measuring the whole
+#: population rather than one more install: **not the install.** 5517 is not
+#: four times anything -- Clients/5017 is a quarter its size and costs the
+#: same. `wdf_recover.discover_tpi_roots` pulls every DECLARED DatPkg client's
+#: plaintext index into the wordlist BY DEFAULT, and that one wordlist is
+#: ~8,400 of the ~8,800 directories the enumerator walks. With `--no-tpi`,
+#: which the tool documents as reproducing the older behaviour, 5517 drops
+#: from 237.7M candidate paths to 35.4M -- back inside "5-9 min". The
+#: documented figure was not measured on a smaller install; it was measured
+#: on an earlier tool.
+#:
+#: So the row is now computed rather than quoted: `health.wdf_recover_estimate`
+#: costs the named install in a few seconds and `health.check_derived` puts
+#: its answer in the `cost` column. This caveat stays because the OTHER rows
+#: are still table lookups, and because a computed estimate is still an
+#: estimate.
 BOOTSTRAP_COST_CAVEAT = (
     "These estimates are the ones tools/health.py carries in its own DERIVED "
     "table, and they are PER INSTALL rather than universal. Measured "
     "counter-example: wdf_recover is documented at \u201c5-9 min\u201d and "
     "took 2,164 s \u2014 36 minutes \u2014 on Clients/5517, four times the "
     "top of the range. Read the column as \u201cwhat it cost on the machine "
-    "that wrote the table\u201d, not as what it will cost here.")
+    "that wrote the table\u201d, not as what it will cost here. The "
+    "wdf_recover row is the exception: it is measured for the install named "
+    "above, on this box, when that artefact is missing \u2014 and the reason "
+    "it is slow is not the install's size but the DatPkg wordlist "
+    "wdf_recover pulls in from every declared client, which is 85-93% of the "
+    "candidates it hashes and buys ~795 extra names.")
 
-#: The same warning for thumbnails, and the same reason. `health.THUMB_FACTS`
-#: is one client's census (4,950 meshes / 66,834 textures); CCO is a different
-#: client and was measured at 47,973 textures + 1,352 meshes, 313 MB of PNG
-#: and ~637 MB on disk, with the tool's own estimate at 15-30 minutes. The
-#: cost is PER CLIENT and every client has its own.
+#: What is still not this client's, said where the plan is shown.
+#:
+#: The counts and megabytes ARE this client's now -- `health.thumbnail_corpus`
+#: counts the work list `tools/thumbs.py` will actually build for the install
+#: being browsed -- so the sentence this constant used to carry ("the numbers
+#: below are NOT this client's") is retired rather than softened. Keeping a
+#: warning after the thing it warned about is fixed teaches people to skip the
+#: line, and the line is where the remaining caveats live.
+#:
+#: What is left over is smaller and more specific, and each clause is here
+#: because it is still EXTRAPOLATED over a counted job:
+#:
+#:   * the SECONDS, from one machine's run over one corpus, carried across as
+#:     a per-item rate;
+#:   * the MEGABYTES, from per-pixel constants fitted to one install's art --
+#:     MEASURED 12% (meshes) and 24% (textures) high on Clients/5517;
+#:   * that a cache is still PER CLIENT, which the numbers now changing per
+#:     client demonstrates rather than contradicts.
+#:
+#: The counter-example this comment used to carry -- "47,973 textures + 1,352
+#: meshes" offered as a DIFFERENT client's numbers -- was the same install
+#: before name recovery had run, i.e. the control. It is not restated here
+#: because it is no longer load-bearing, but it is not lost either: see
+#: `C-2026-08-23-claude-thumb-corpus-per-client` in docs/CORRECTIONS.md,
+#: "the counter-example that was the control". The corpus is a STATE, which
+#: is why `thumbnail_corpus` reports `namesRecovered` beside its counts.
 THUMB_COST_CAVEAT = (
-    "Per client, not once. The counts and megabytes below are this run's "
-    "figures for the client currently selected; each client you declare has "
-    "its own cache and its own bill. Measured on Classic Conquer 2.0: 47,973 "
-    "textures + 1,352 meshes, 313 MB of PNG, ~637 MB on disk, and the tool's "
-    "own estimate for that run was 15-30 minutes.")
+    "Per client, not once \u2014 each client you declare has its own cache "
+    "and its own bill. The counts and megabytes above are THIS client's: "
+    "they are the work list tools/thumbs.py will build for it, counted from "
+    "its own meshtex coverage and its own file census rather than read from "
+    "a table. The spread that makes this worth saying is real \u2014 the same "
+    "three figures run 2,562 meshes + 21,586 textures + 187 MB on "
+    "Clients/5017 to 11,068 + 92,256 + 803 MB on Clients/6609, and the table "
+    "they replaced quoted every client Classic Conquer 2.0's 4,950 + 66,834. "
+    "What is still extrapolated is the TIME (0.33 core-seconds a mesh, 0.043 "
+    "a texture, from one 226 s run on 20 workers) and the DISK, whose "
+    "bytes-per-pixel constants were fitted to that same install's art and "
+    "read up to 24% high on a client with simpler models (measured, "
+    "Clients/5517). Both are estimates over a counted job, which is the part "
+    "that changed.")
 
 
 #: ``(Path|None, why)`` -- the folder `Scan` looks in for new clients.
@@ -2976,6 +3557,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/installs/declare": self.post_installs_declare,
                 "/api/installs/forget": self.post_installs_forget,
                 "/api/installs/clientsroot": self.post_installs_clientsroot,
+                "/api/installs/copy": self.post_installs_copy,
+                "/api/installs/copycancel": self.post_installs_copycancel,
+                "/api/installs/copydiscard": self.post_installs_copydiscard,
                 "/api/bootstrap/start": self.post_bootstrap_start,
                 "/api/bootstrap/cancel": self.post_bootstrap_cancel,
                 "/api/mapedit/passability": self.post_mapedit_passability,
@@ -3043,7 +3627,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/installs/dirs": self.api_installs_dirs,
             "/api/installs/scan": self.api_installs_scan,
             "/api/installs/detect": self.api_installs_detect,
+            "/api/installs/copycost": self.api_installs_copycost,
+            "/api/installs/copystatus": self.api_installs_copystatus,
             "/api/bootstrap/status": self.api_bootstrap_status,
+            "/api/bootstrap/checklist": self.api_bootstrap_checklist,
             "/api/files": self.api_files,
             "/api/provenance": self.api_provenance,
             "/api/mesh": self.api_mesh,
@@ -4645,6 +5232,8 @@ class Handler(BaseHTTPRequestHandler):
         import plugins as plugmod
         doc = coroot.read_settings()
         names = dict(doc.get(SERVER_NAMES_KEY) or {})
+        copies = {str(k).lower().replace("\\", "/"): v
+                  for k, v in (doc.get(COPIES_KEY) or {}).items()}
         try:
             configured = str(Path(coroot.game_root()).resolve())
         except Exception:
@@ -4660,6 +5249,27 @@ class Handler(BaseHTTPRequestHandler):
                 resolved = str(p.resolve())
             except OSError:                          # pragma: no cover
                 resolved = str(p)
+            category = ORIGIN_CATEGORY.get(origin, "unknown")
+            # THE ONE PLACE THIS MODULE OVERRIDES A PLUGIN'S CATEGORY, and it
+            # is worth being explicit about because the comment below says it
+            # never does.
+            #
+            # `origin` is a fact about the PARSER: "this plugin reads a private
+            # server's client". `category` is what the folder is TO THE USER,
+            # and the two come apart exactly once -- for a frozen copy. A copy
+            # this tool made of a private server is provably not a private
+            # server: there is no server behind it, it is disconnected from
+            # the source by construction, and the whole reason the owner asked
+            # for it is that it does NOT move. So it groups under Offline
+            # Clients while still being parsed by whatever plugin claimed it.
+            #
+            # The override is keyed on `COPIES_KEY`, which only this module's
+            # own successful copies write. A plugin's claim about a folder
+            # nobody copied is untouched.
+            copy_of = copies.get(str(p).lower().replace("\\", "/")) \
+                or copies.get(resolved.lower().replace("\\", "/"))
+            if copy_of:
+                category = "offline-client"
             rows.append({
                 "root": str(p),
                 "kind": str(kind),
@@ -4668,9 +5278,10 @@ class Handler(BaseHTTPRequestHandler):
                 # The two words the page prints. A plugin with no `origin` is
                 # "unknown" and stays unknown -- inheriting one would be this
                 # module asserting something the plugin declined to.
-                "category": ORIGIN_CATEGORY.get(origin, "unknown"),
+                "category": category,
                 "serverName": str(names.get(str(path))
                                   or names.get(resolved) or ""),
+                "frozenCopy": dict(copy_of) if copy_of else None,
                 "exists": exists,
                 "missing": missing,
                 "usable": exists and not missing,
@@ -4745,6 +5356,15 @@ class Handler(BaseHTTPRequestHandler):
             rep = detect_report(p)
             rep["name"] = p.name
             rep["client"] = not rep["missing"] and not rep["error"]
+            # An interrupted copy sits right here, under the clients root,
+            # and `missing_parts` will pass it as soon as `ini/` and one
+            # archive have landed. It is NOT a candidate, whatever detection
+            # says about it, and the scan says why rather than hiding it --
+            # this is the one place a user finds out the disk is holding a
+            # half-copied tree.
+            rep["incompleteCopy"] = read_copy_marker(p)
+            if rep["incompleteCopy"]:
+                rep["client"] = False
             out["candidates"].append(rep)
         out["newCount"] = sum(1 for c in out["candidates"] if c["client"])
         return self._json(out)
@@ -4791,6 +5411,20 @@ class Handler(BaseHTTPRequestHandler):
         if not p.is_dir():
             return self._json({"ok": False, "path": raw,
                                "error": f"{raw} is not a directory"}, 400)
+        # BEFORE `missing_parts`, and that order is the point. `missing_parts`
+        # is a content check a three-percent copy can already pass, so asking
+        # it first would let a torn tree through on the strength of an `ini/`
+        # that finished. The marker is a fact about the directory that no
+        # amount of copied payload can satisfy.
+        marker = read_copy_marker(p)
+        if marker:
+            return self._json({
+                "ok": False, "path": raw, "incompleteCopy": marker,
+                "error": f"{raw} is a copy that never finished — it still "
+                         f"carries {COPY_MARKER}. It is not a client, and "
+                         f"declaring it would key an index namespace to a "
+                         f"torn tree. Delete it, or discard it from the "
+                         f"Directory Management section."}, 400)
         missing = coroot.missing_parts(p)
         if missing:
             return self._json({
@@ -4895,6 +5529,406 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "clientsRoot": str(root) if root else "",
                            "clientsRootWhy": why})
 
+    # -- API: copy a private server into a frozen Offline Client -------------
+    def _copier(self) -> "CopyRunner":
+        run = getattr(self.server, "copier", None)
+        if run is None:
+            run = CopyRunner()
+            self.server.copier = run                 # type: ignore[attr-defined]
+        return run
+
+    @staticmethod
+    def _copy_name(src: Path, given: str) -> str:
+        """The destination folder name. Given, or derived from the source.
+
+        Rejects anything with a separator or a drive in it: the destination is
+        always a direct child of the clients root, and a name that can climb
+        out of it is a path traversal through a text field.
+        """
+        name = (given or "").strip().strip('"').strip()
+        if not name:
+            stamp = time.strftime("%Y%m%d", time.localtime())
+            name = f"{src.name}-copy-{stamp}"
+        return name
+
+    @staticmethod
+    def _bad_name(name: str) -> str:
+        if not name:
+            return "empty name"
+        if any(c in name for c in "\\/:*?\"<>|"):
+            return (f"{name!r} is not a folder name. The copy is always a "
+                    f"direct child of the clients folder, so the name may "
+                    f"not contain a separator, a drive or a wildcard.")
+        if name in (".", ".."):
+            return f"{name!r} is not a folder name"
+        if name.endswith(COPY_TEMP_SUFFIX):
+            return (f"{name!r} ends in {COPY_TEMP_SUFFIX}, which is the "
+                    f"reserved name for a copy in progress.")
+        return ""
+
+    def _copy_plan(self, arg_root: str, arg_name: str) -> dict:
+        """Everything both the cost read and the copy POST need to agree on.
+
+        One function, because a price quoted by one code path and charged by
+        another is the classic way for the number on the button to stop being
+        the number on the disk.
+        """
+        out: dict = {"blockers": [], "warnings": []}
+        raw = (arg_root or "").strip().strip('"')
+        if not raw:
+            out["blockers"].append("no source folder given")
+            return out
+        src = Path(raw)
+        out["source"] = str(src)
+        if not src.is_dir():
+            out["blockers"].append(f"{raw} is not a directory")
+            return out
+        try:
+            src_res = src.resolve()
+        except OSError:                              # pragma: no cover
+            src_res = src
+
+        # The source must be a client, and must not itself be a torn copy.
+        marker = read_copy_marker(src)
+        if marker:
+            out["blockers"].append(
+                f"{raw} is itself an unfinished copy (it carries "
+                f"{COPY_MARKER}). Copying a torn tree makes two.")
+            return out
+        missing = coroot.missing_parts(src)
+        if missing:
+            out["blockers"].append(
+                f"{raw} is not a Conquer Online client: missing "
+                + ", ".join(missing))
+            return out
+
+        # ...and it must be something the user ADDED. The owner's ask is a
+        # copy of a private server *they add*, and the provenance record is
+        # keyed to the declaration; an undeclared folder has no kind to
+        # record and no place in this list.
+        declared = {}
+        for k, v in (coroot.read_settings().get(coroot.KINDS_KEY) or {}).items():
+            try:
+                declared[str(Path(str(k)).resolve()).lower()] = str(v)
+            except OSError:                          # pragma: no cover
+                declared[str(k).lower()] = str(v)
+        kind = declared.get(str(src_res).lower(), "")
+        out["sourceKind"] = kind
+        if not kind:
+            out["blockers"].append(
+                f"{raw} is not a declared install. Declare it first — the "
+                f"copy records what it was a copy OF, and an undeclared "
+                f"folder has no answer to that.")
+
+        sys.path.insert(0, str(PROJECT))
+        import plugins as plugmod
+        plug = plugmod.for_kind(kind) if kind else None
+        origin = getattr(plug, "origin", "unknown") if plug else "unknown"
+        out["sourceOrigin"] = origin
+        out["sourceCategory"] = ORIGIN_CATEGORY.get(origin, "unknown")
+        names = coroot.read_settings().get(SERVER_NAMES_KEY) or {}
+        out["sourceServerName"] = str(names.get(str(src))
+                                      or names.get(str(src_res)) or "")
+
+        root, why = clients_root()
+        out["clientsRoot"] = str(root) if root else ""
+        out["clientsRootWhy"] = why
+        if root is None or not Path(root).is_dir():
+            out["blockers"].append(
+                "there is no clients folder to copy into: " + why)
+            return out
+        root = Path(root)
+
+        name = self._copy_name(src, arg_name)
+        bad = self._bad_name(name)
+        out["name"] = name
+        if bad:
+            out["blockers"].append(bad)
+            return out
+        dest = root / name
+        temp = root / (name + COPY_TEMP_SUFFIX)
+        out["dest"] = str(dest)
+        out["temp"] = str(temp)
+        if dest.exists():
+            out["blockers"].append(
+                f"{dest} already exists. Pick another name — this never "
+                f"writes into a folder that is already there.")
+        if temp.exists():
+            out["blockers"].append(
+                f"{temp} already exists, which means a previous copy under "
+                f"this name was interrupted. Discard it first.")
+        try:
+            if src_res == dest.resolve() or str(dest.resolve()).lower().startswith(
+                    str(src_res).lower() + os.sep):
+                out["blockers"].append(
+                    "the destination is inside the source; that copies "
+                    "itself forever.")
+        except OSError:                              # pragma: no cover
+            pass
+        return out
+
+    def api_installs_copycost(self, arg):
+        r"""What copying this install would cost, BEFORE anything is offered.
+
+        Every number here is walked or read from the filesystem at the moment
+        of the call:
+
+        * ``source`` is `measure_tree` over the real directory -- bytes, files
+          and directories, with ``complete`` false if the walk was cut short.
+        * ``free`` / ``total`` are `shutil.disk_usage` on the DESTINATION
+          volume, which is the one that can fill.
+        * ``live`` is `processes_under` on the source, with its ``opaque``
+          count intact, so "nothing is running there" and "I could not tell"
+          stay different answers.
+        * ``fingerprint`` is `coroot.base_fingerprint`, served because a
+          byte-identical copy will hash the same and therefore SHARE the
+          source's ``out/indexes/<kind>-<fingerprint>/`` namespace. Checked,
+          not assumed: see the note the page prints.
+
+        A read. Nothing is written and nothing is started.
+        """
+        import shutil as _shutil
+        plan = self._copy_plan(arg("root", ""), arg("name", ""))
+        plan["caveat"] = COPY_COST_CAVEAT
+        plan["marker"] = COPY_MARKER
+        plan["tempSuffix"] = COPY_TEMP_SUFFIX
+        src = plan.get("source") or ""
+        if not src or not Path(src).is_dir():
+            plan["ok"] = False
+            return self._json(plan)
+
+        plan["measure"] = measure_tree(src)
+        need = int(plan["measure"]["bytes"])
+        headroom = max(int(need * COPY_HEADROOM_FRACTION), COPY_HEADROOM_FLOOR)
+        plan["headroom"] = headroom
+        plan["required"] = need + headroom
+        vol = plan.get("clientsRoot") or src
+        try:
+            usage = _shutil.disk_usage(vol)
+            plan["volume"] = str(vol)
+            plan["free"] = usage.free
+            plan["total"] = usage.total
+            plan["enoughSpace"] = usage.free >= need + headroom
+            if not plan["enoughSpace"]:
+                plan["blockers"].append(
+                    f"not enough room on {vol}: the copy needs "
+                    f"{_gb(need)} plus {_gb(headroom)} of headroom and there "
+                    f"is {_gb(usage.free)} free. Refused rather than "
+                    f"half-copied.")
+        except OSError as e:
+            plan["free"] = plan["total"] = 0
+            plan["enoughSpace"] = False
+            plan["blockers"].append(f"cannot read free space on {vol}: {e}")
+        if not plan["measure"]["complete"]:
+            plan["blockers"].append(
+                "the size walk did not finish, so the figure above is a "
+                "LOWER BOUND, not the cost. " + plan["measure"]["error"])
+
+        live = processes_under(src)
+        plan["live"] = live
+        if live["live"]:
+            plan["blockers"].append(
+                f"{len(live['live'])} process(es) are running out of {src} "
+                f"(" + ", ".join(f"{p['name']} pid {p['pid']}"
+                                 for p in live["live"]) +
+                "). Copying a live server is a torn read: files change under "
+                "the walk and the copy is of no single moment. Close it "
+                "first.")
+        elif live["error"]:
+            plan["warnings"].append(
+                "could not tell whether anything is running out of this "
+                "folder — " + live["error"] + ". A copy of a live server is "
+                "a torn read.")
+        elif live["opaque"]:
+            plan["warnings"].append(
+                f"no process was seen under this folder, but {live['opaque']} "
+                f"of {live['checked']} running processes would not give up "
+                f"their image path (that is what an elevated process looks "
+                f"like to this probe). So this is 'none found', not 'none'.")
+
+        fp = ""
+        try:
+            fp = coroot.base_fingerprint(src)
+        except Exception:                            # pragma: no cover
+            fp = ""
+        plan["fingerprint"] = fp
+        plan["sourceBaseId"] = (f"{plan.get('sourceKind') or 'unknown'}-{fp}"
+                                if fp else "unkeyed")
+        plan["fingerprintNote"] = (
+            "coroot.base_fingerprint hashes the top level of ini/ only, so a "
+            "byte-identical copy hashes the same. Declared under the same "
+            "plugin the copy therefore SHARES out/indexes/"
+            + plan["sourceBaseId"] + "/ with its source — which is correct "
+            "while they are identical (the index is about the table layer, "
+            "and the layers are the same bytes), and self-correcting the "
+            "moment the live server patches: its fingerprint moves, it gets "
+            "a fresh namespace, and the frozen copy keeps the old one. The "
+            "trap is the other direction: a copy torn in a SUBDIRECTORY "
+            "still hashes identical, which is why an unfinished copy is "
+            "refused by its marker and not by its fingerprint.")
+        plan["ok"] = not plan["blockers"]
+        return self._json(plan)
+
+    def post_installs_copy(self, body: bytes, arg):
+        r"""Start the copy. Declares nothing.
+
+        ``confirmBytes`` is REQUIRED and is the figure the page showed. It is
+        not bookkeeping: the plan is measured again here, and a drift of more
+        than `COPY_DRIFT` is refused with the new number. That makes "the cost
+        was stated before the click" a property the server enforces rather
+        than a property the page promises — a page that never called
+        `copycost` cannot produce the field, and a tree that moved between the
+        read and the click cannot be copied against a stale price.
+
+        On success the destination exists and is UNDECLARED. The page then
+        runs detection on it and offers it, through the one declare call site
+        the whole UI has.
+        """
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        if "confirmBytes" not in doc:
+            return self._json({
+                "ok": False,
+                "error": "confirmBytes is required. Ask /api/installs/"
+                         "copycost first and send back the size it reported — "
+                         "nothing this large starts without the cost having "
+                         "been stated."}, 400)
+        try:
+            confirm = int(doc.get("confirmBytes") or 0)
+        except (TypeError, ValueError):
+            return self._json({"ok": False,
+                               "error": "confirmBytes must be a number"}, 400)
+
+        plan = self._copy_plan(str(doc.get("path") or ""),
+                               str(doc.get("name") or ""))
+        src = plan.get("source") or ""
+        if not src or not Path(src).is_dir():
+            return self._json({"ok": False, **plan}, 400)
+        m = measure_tree(src)
+        plan["measure"] = m
+        if not m["complete"]:
+            plan["blockers"].append(
+                "the size walk did not finish, so the copy would run against "
+                "an unknown total. " + m["error"])
+        else:
+            drift = abs(m["bytes"] - confirm)
+            # A floor of one allocation unit, not one megabyte. The first
+            # version used 1 MiB and a test that quartered the price of a
+            # 72 kB fixture sailed through it -- a tolerance wide enough to
+            # swallow the whole subject is not a tolerance.
+            allow = max(int(m["bytes"] * COPY_DRIFT), 4096)
+            if drift > allow:
+                plan["blockers"].append(
+                    f"the folder is {_gb(m['bytes'])} now, and the button "
+                    f"said {_gb(confirm)}. That is a difference of "
+                    f"{_gb(drift)}, more than the {COPY_DRIFT:.0%} this "
+                    f"allows — something is writing to it. Refused; re-read "
+                    f"the cost.")
+        import shutil as _shutil
+        try:
+            usage = _shutil.disk_usage(plan.get("clientsRoot") or src)
+            need = m["bytes"] + max(int(m["bytes"] * COPY_HEADROOM_FRACTION),
+                                    COPY_HEADROOM_FLOOR)
+            plan["free"] = usage.free
+            if usage.free < need:
+                plan["blockers"].append(
+                    f"not enough room: needs {_gb(need)} with headroom, "
+                    f"{_gb(usage.free)} free. Refused rather than "
+                    f"half-copied.")
+        except OSError as e:                         # pragma: no cover
+            plan["blockers"].append(f"cannot read free space: {e}")
+
+        live = processes_under(src)
+        plan["live"] = live
+        if live["live"]:
+            plan["blockers"].append(
+                f"{len(live['live'])} process(es) are running out of {src}. "
+                f"That copy would be a torn read. Refused.")
+        if plan["blockers"]:
+            return self._json({"ok": False, **plan}, 409)
+
+        run = self._copier()
+        res = run.start(Path(src), Path(plan["dest"]), Path(plan["temp"]),
+                        {"bytes": m["bytes"], "files": m["files"]})
+        if not res.get("started"):
+            return self._json({"ok": False, **plan, **res}, 409)
+        _log(f"copy: started {src} -> {plan['dest']} "
+             f"({m['bytes']:,} bytes, {m['files']:,} files)")
+        return self._json({"ok": True, **plan, **res})
+
+    def api_installs_copystatus(self, arg):
+        """Progress of the running (or last) copy. A read."""
+        run = self._copier()
+        return self._json({"copy": run.status(), "marker": COPY_MARKER})
+
+    def post_installs_copycancel(self, body: bytes, arg):
+        """Stop the copy.
+
+        The partial tree is deliberately LEFT on disk, under its temporary
+        name and still carrying its marker. Deleting gigabytes on the way out
+        of a cancel is a second long operation nobody asked for, and the user
+        may want to look at what landed. `copydiscard` removes it on request.
+        """
+        run = self._copier()
+        return self._json(run.cancel())
+
+    def post_installs_copydiscard(self, body: bytes, arg):
+        r"""Delete one unfinished copy.
+
+        The only destructive endpoint in Directory Management, and it is
+        fenced by two conditions that must BOTH hold:
+
+        1. the directory carries `COPY_MARKER` -- so it is provably an
+           unfinished copy this tool made, not a client;
+        2. it is a direct child of the clients root -- so a path from a text
+           field cannot aim this at anything else.
+
+        Neither condition alone is enough. A folder under the clients root is
+        just a folder; a marker in a folder somewhere else is still not a
+        licence to recurse-delete an arbitrary path off an HTTP request.
+        """
+        import shutil as _shutil
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as e:
+            return self._error(400, f"bad JSON: {e}")
+        raw = str(doc.get("path") or "").strip().strip('"')
+        if not raw:
+            return self._error(400, "no path given")
+        p = Path(raw)
+        if not p.is_dir():
+            return self._json({"ok": False, "path": raw,
+                               "error": f"{raw} is not a directory"}, 400)
+        if not read_copy_marker(p):
+            return self._json({
+                "ok": False, "path": raw,
+                "error": f"{raw} does not carry {COPY_MARKER}, so it is not "
+                         f"an unfinished copy. This endpoint deletes nothing "
+                         f"else."}, 400)
+        root, why = clients_root()
+        ok_parent = False
+        if root:
+            try:
+                ok_parent = p.resolve().parent == Path(root).resolve()
+            except OSError:                          # pragma: no cover
+                ok_parent = False
+        if not ok_parent:
+            return self._json({
+                "ok": False, "path": raw,
+                "error": f"{raw} is not a direct child of the clients folder "
+                         f"({root or 'none: ' + why}). Delete it yourself — "
+                         f"this endpoint will not recurse outside that "
+                         f"folder."}, 400)
+        try:
+            _shutil.rmtree(str(p))
+        except OSError as e:
+            return self._json({"ok": False, "path": raw,
+                               "error": f"could not delete: {e}"}, 500)
+        _log(f"copy: discarded unfinished copy {p}")
+        return self._json({"ok": True, "path": raw, "discarded": True})
+
     # -- API: bootstrap ------------------------------------------------------
     def _bootstrapper(self) -> "BootstrapRunner":
         run = getattr(self.server, "bootstrapper", None)
@@ -4916,11 +5950,15 @@ class Handler(BaseHTTPRequestHandler):
             "run": run.status(),
             "derived": derived,
             "costCaveat": BOOTSTRAP_COST_CAVEAT,
-            # `bootstrap()` builds for the CONFIGURED root, not for whichever
-            # base the browser is looking at -- its argv carries no --root.
-            # Named so the page can say which install it is about.
+            # The DEFAULT client, not the only one. `bootstrap()` now takes a
+            # --root and this endpoint's `derived` block is already resolved
+            # for the base being browsed, so the page offers a choice and this
+            # is what it starts on. Both are still served: they are different
+            # facts and the page used to have to state both because it could
+            # not act on the difference.
             "buildsFor": str(coroot.read_settings().get("game_root") or ""),
             "browsing": str(self.server.game_root or ""),  # type: ignore[attr-defined]
+            "rootChoosable": True,
             "known": [rel for rel, _a, _c, _w in health.DERIVED],
             "allExplains":
                 "“Bootstrap” builds only what is MISSING and skips "
@@ -4929,7 +5967,13 @@ class Handler(BaseHTTPRequestHandler):
                 "is there or not, overwriting it — so it pays the full "
                 "cost of the table above every time, including the "
                 "36-minute one. Use it when an artefact is present but "
-                "suspect; use plain bootstrap otherwise.",
+                "suspect; use plain bootstrap otherwise. The Estimate column "
+                "is computed for this install only for artefacts that are "
+                "MISSING — an estimate costs a walk of the install, and "
+                "paying it on every poll for rows nobody is going to build "
+                "would cost more than it saves. For a present artefact, ask "
+                "for the number directly: py -3 tools/health.py --estimate "
+                "--root <install>.",
         })
 
     def post_bootstrap_start(self, body: bytes, arg):
@@ -4947,8 +5991,52 @@ class Handler(BaseHTTPRequestHandler):
                 spec = f"{rel}={path}" if rel else ""
             if spec:
                 uses.append(spec)
+        known = {rel for rel, _a, _c, _w in health.DERIVED}
+        only = [str(r) for r in (doc.get("only") or []) if str(r) in known]
+        # An `only` list that the filter emptied is NOT the same request as no
+        # list at all: the first asked for specific artefacts and named none
+        # this tool has, the second asked for everything. Collapsing them
+        # would answer a typo by building all six, including the 36-minute one.
+        if doc.get("only") and not only:
+            return self._json({
+                "started": False,
+                "reason": "none of the artefacts you named are in "
+                          "health.DERIVED: " +
+                          ", ".join(str(r) for r in doc["only"]),
+                **self._bootstrapper().status()})
         run = self._bootstrapper()
-        return self._json(run.start(bool(doc.get("all")), uses))
+        return self._json(run.start(
+            bool(doc.get("all")), uses,
+            str(doc.get("root") or "").strip().strip('"') or None,
+            no_tpi=bool(doc.get("noTpi")), only=only))
+
+    def api_bootstrap_checklist(self, arg):
+        r"""THE CHECKLIST: every declared client x every derived artefact.
+
+        Answers the owner's ask -- *"Bootstrapping should be done against any
+        client that the user supplies. Preferably with a checklist in the
+        settings menu."* -- with data rather than with the configured install
+        repeated nine times.
+
+        `estimate=1` measures `wdf_recover`'s cost per client on THIS box
+        instead of quoting the table. It is opt-in because it is not free:
+        MEASURED 1-14 s per client, so eight declared clients is up to a
+        minute, and it must never ride on the status poll. `noTpi=1` costs the
+        same clients in the cheaper wordlist mode.
+        """
+        roots = None
+        one = str(arg("root", "") or "").strip().strip('"')
+        if one:
+            roots = [one]
+        try:
+            book = health.bootstrap_checklist(
+                roots,
+                estimate=(arg("estimate", "0") == "1"),
+                no_tpi=(arg("noTpi", "0") == "1"))
+        except Exception as e:                           # pragma: no cover
+            return self._error(500, f"{type(e).__name__}: {e}")
+        book["costCaveat"] = BOOTSTRAP_COST_CAVEAT
+        return self._json(book)
 
     def post_bootstrap_cancel(self, body: bytes, arg):
         return self._json(self._bootstrapper().cancel())
@@ -5290,8 +6378,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_thumbs_status(self, arg):
         runner = self.server.thumbs                    # type: ignore[attr-defined]
+        # Both arguments, and for the same reason: the panel is about the
+        # view the browser is on. `server_name` picks a community library's
+        # own cache; `game_root` picks WHICH INSTALL, and without it the
+        # plan was computed for the configured client while the panel's own
+        # `forClient` line named another.
         state = health.thumbnail_state(
-            getattr(self.server, "server_name", ""))
+            getattr(self.server, "server_name", ""),
+            root=getattr(self.server, "game_root", None))
         out = {"state": state, "run": runner.status() if runner else None,
                "prompt": (self._thumbs_off_reason() is None
                           and health.should_prompt(state)),

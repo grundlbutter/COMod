@@ -164,6 +164,40 @@ def _norm(p: str) -> str:
     return p.replace("\\", "/").strip().lstrip("/").lower()
 
 
+def pooled_names() -> tuple[set[str], bool]:
+    """The recovered WDF filenames, normalised -- ``(names, any_table_read)``.
+
+    **GLOBAL, not per-base.**  The TQ hash is a pure function of the filename
+    string, so a recovered name is true in *any* install; `coroot.GLOBAL`
+    says so for `out/wdf/` and `out/dll/wdf_name_recovery` and this reads
+    them through `find_derived` accordingly.  A name here is not a promise
+    that a given install ships the bytes -- see `_build_universe`.
+
+    Lifted out of `_build_universe` so that a caller which needs the *size*
+    of the asset universe can compute it without constructing an index and
+    paying its `rglob` (36.8 s on Clients/7878).  `health.thumbnail_corpus`
+    is that caller, and the alternative -- restating this loading beside it
+    -- is the drift `tests/test_health_thumbs.py` exists to make impossible.
+    """
+    names: set[str] = set()
+    loaded = False
+    for fn in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
+        f = coroot.find_derived(fn)
+        if f is not None:
+            names.update(_norm(v) for v in
+                         json.loads(f.read_text("utf-8")).values())
+            loaded = True
+    f = coroot.find_derived("out/dll/wdf_name_recovery.json")
+    if f is not None:
+        try:
+            names.update(_norm(v) for v in
+                         json.loads(f.read_text("utf-8"))["resolved"].values())
+            loaded = True
+        except Exception:
+            pass
+    return names, loaded
+
+
 def _flat_ini(path: Path) -> dict[str, str]:
     """`id=path` tables (3dobj.ini, 3dtexture.ini, 3DEffectObj.ini, *motion.ini).
 
@@ -296,23 +330,7 @@ class MeshTextureIndex:
             if p.is_file():
                 loose.add(_norm(str(p.relative_to(self.root))))
         self.universe.update(loose)
-        pooled: set[str] = set()
-        self.names_loaded = False
-        for fn in ("out/wdf/c3_names.json", "out/wdf/data_names.json"):
-            f = coroot.find_derived(fn)
-            if f is not None:
-                pooled.update(_norm(v) for v in
-                              json.loads(f.read_text("utf-8")).values())
-                self.names_loaded = True
-        f = coroot.find_derived("out/dll/wdf_name_recovery.json")
-        if f is not None:
-            try:
-                pooled.update(
-                    _norm(v) for v in
-                    json.loads(f.read_text("utf-8"))["resolved"].values())
-                self.names_loaded = True
-            except Exception:
-                pass
+        pooled, self.names_loaded = pooled_names()
         self.universe.update(pooled)
         #: Pooled names with no loose file behind them -- unconfirmed against
         #: this install until `_in_this_install` says otherwise.

@@ -684,8 +684,25 @@ def main() -> int:
         # one more dictionary sweep over the newly-learned basenames
         known2 = set(r.found.values())
         bases = {n[n.rfind("/") + 1:] for n in known2}
+        # Built ONCE, not once per directory. `bases` is already fixed before
+        # this loop -- names found *during* the cross pass never feed back into
+        # it -- so the suffix list is loop-invariant, and rebuilding it per
+        # directory cost 9,045 x 12,598 = 114M redundant concatenations on
+        # Clients/5517. `try_prefixed` only iterates the sequence, so one
+        # shared list is safe.
+        #
+        # It is worth 3.4 s, MEASURED, and that is the whole point: the cross
+        # pass is ~1,230 s of a ~2,100 s run, so this is ~0.16% of it, while
+        # `health.WDF_RECOVER_MODEL` records this same client at 2,164 s and
+        # 1,675 s on one box and configuration -- 29% apart. The change is
+        # ~180x below the noise floor of any before/after wall clock. Do not
+        # "verify" it by timing a run; it was verified by replaying both forms
+        # over 240,800 candidates and comparing `tested`/`found`/`origin`
+        # exactly. For the same reason `prefixed_efficiency` does not need
+        # re-fitting: 0.826 -> ~0.827, inside a band that is +/-29% by design.
+        sfx = ["/" + b for b in bases]
         for d in dirs:
-            r.try_prefixed(d, ["/" + b for b in bases])
+            r.try_prefixed(d, sfx)
         r.report("dir x basename cross", t0)
 
     # ---- verify + emit -----------------------------------------------------

@@ -21114,6 +21114,679 @@ class SettingsDirectoryManagement(unittest.TestCase):
                          coroot.read_settings()[coroot.KINDS_KEY])
         self.assertTrue((self.clients / "bbb").is_dir())
 
+    # -- copying a private server into a frozen Offline Client --------------
+    #
+    # The owner's ask, verbatim: *"For 'Offline Clients', I want the user to
+    # electively choose to create a copy of any Private server they add."*
+    #
+    # Four rulings ride on this feature and each has a test below that has
+    # been shown to FAIL without the code it guards:
+    #
+    # 1. the disk cost is stated before the click, COMPUTED;
+    # 2. a half-finished copy must not look like a client;
+    # 3. the copy is a new install and is DECLARED like any other, on a click;
+    # 4. a running server is not copied out from under itself.
+
+    def _rich_client(self, p: Path, payload=1 << 20):
+        """A fake client with real `ini/` content, so `base_fingerprint` has
+        something to hash. `_fake_client`'s empty `ini/` fingerprints to a
+        constant and would make every namespace assertion below vacuous."""
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "c3.wdf").write_bytes(b"\xAB" * payload)
+        (p / "data.wdf").write_bytes(b"\xCD" * 4096)
+        (p / "ini").mkdir(exist_ok=True)
+        (p / "ini" / "itemtype.dat").write_bytes(b"item" * 64)
+        (p / "ini" / "monster.ini").write_bytes(b"[m]\nname=x\n")
+        (p / "c3" / "deep").mkdir(parents=True, exist_ok=True)
+        (p / "c3" / "deep" / "thing.c3").write_bytes(b"\x01" * 2048)
+        return p
+
+    def _shard(self):
+        """A declared private server with content, ready to be copied."""
+        p = self._rich_client(self.clients / "shard")
+        kinds = dict(coroot.read_settings()[coroot.KINDS_KEY])
+        kinds[str(p)] = "cco"
+        coroot.write_settings(**{coroot.KINDS_KEY: kinds})
+        coroot.invalidate_cache()
+        return p
+
+    @staticmethod
+    def _hand_count(root):
+        files = bytes_ = 0
+        for d, _dirs, fs in os.walk(str(root)):
+            for f in fs:
+                files += 1
+                bytes_ += os.path.getsize(os.path.join(d, f))
+        return files, bytes_
+
+    def test_the_size_walk_agrees_with_an_independent_count(self):
+        """CONTROL for every cost assertion below.
+
+        `measure_tree` is the instrument the whole feature's honesty rests
+        on: if it under-reports, the page states a price that is not the
+        price and the volume fills anyway. So it is checked against a second
+        walk written differently (`os.walk` + `getsize`, not `scandir` +
+        `DirEntry.stat`), on a tree with a subdirectory in it.
+        """
+        src = self._rich_client(self.clients / "measured")
+        m = self.coviewer.measure_tree(str(src))
+        files, bytes_ = self._hand_count(src)
+        self.assertTrue(m["complete"], m["error"])
+        self.assertEqual((m["files"], m["bytes"]), (files, bytes_))
+        self.assertGreater(m["dirs"], 0, "the walk never entered c3/deep")
+
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
+    def test_the_size_walk_agrees_with_the_recorded_census(self):
+        r"""The second control, and the one that could not be faked.
+
+        `tools/health.py`'s `WDF_RECOVER_MEASUREMENTS` counted these installs
+        independently and months earlier. A walker that agrees with a fixture
+        it built itself has proved nothing; a walker that reproduces a count
+        somebody else recorded has. Checked on whichever censused installs are
+        actually present.
+        """
+        import health                                  # noqa: PLC0415
+        checked = 0
+        for name, row in health.WDF_RECOVER_MEASUREMENTS.items():
+            if not name.startswith("Clients/"):
+                continue
+            cand = Path(ROOT).parent / name.split("/", 1)[1]
+            if not cand.is_dir():
+                continue
+            m = self.coviewer.measure_tree(str(cand), deadline_s=300)
+            if not m["complete"]:                     # pragma: no cover
+                continue
+            checked += 1
+            self.assertEqual(
+                m["files"], row["files"],
+                f"{name}: walked {m['files']:,} files, the census recorded "
+                f"{row['files']:,}")
+            # The census stores DECIMAL GB, which is also the unit `_gb`
+            # prints. 1% because the census was rounded to two places.
+            self.assertAlmostEqual(
+                m["bytes"] / 1e9, row["gb"], delta=max(row["gb"] * 0.01, 0.02),
+                msg=f"{name}: walked {m['bytes'] / 1e9:.2f} GB, census says "
+                    f"{row['gb']} GB")
+        if not checked:                                # pragma: no cover
+            self.skipTest("no censused install present")
+
+    def test_the_cost_read_computes_and_writes_nothing(self):
+        """The price is walked from the tree, not looked up -- and asking for
+        it is a read, the same rule the scan obeys."""
+        src = self._shard()
+        cfg = coroot.user_config_path()
+        before = cfg.read_bytes()
+        h = self._handler()
+        args = {"root": str(src), "name": ""}
+        h.api_installs_copycost(lambda k, d="": args.get(k, d))
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200, doc)
+        files, bytes_ = self._hand_count(src)
+        self.assertEqual(doc["measure"]["bytes"], bytes_)
+        self.assertEqual(doc["measure"]["files"], files)
+        self.assertTrue(doc["ok"], doc["blockers"])
+        self.assertEqual(str(Path(doc["dest"]).parent), str(self.clients))
+        self.assertTrue(doc["dest"].endswith("-copy-" +
+                                             time.strftime("%Y%m%d")))
+        self.assertEqual(cfg.read_bytes(), before,
+                         "asking what a copy would cost wrote to the config")
+
+    def test_the_cost_read_states_free_space_and_refuses_when_it_will_not_fit(self):
+        r"""A copy that cannot fit is refused, not begun.
+
+        `shutil.disk_usage` is stubbed rather than filling the volume, and it
+        is stubbed to a value BETWEEN the payload and the payload plus
+        headroom -- so this fails if the headroom is dropped, which is the
+        actual defect (a copy that exactly fills a disk has still broken the
+        machine).
+        """
+        src = self._shard()
+        _files, bytes_ = self._hand_count(src)
+        need = bytes_ + max(int(bytes_ * self.coviewer.COPY_HEADROOM_FRACTION),
+                            self.coviewer.COPY_HEADROOM_FLOOR)
+        class Usage:
+            def __init__(self, total, used, free):
+                self.total, self.used, self.free = total, used, free
+        args = {"root": str(src), "name": ""}
+        with unittest.mock.patch.object(
+                shutil, "disk_usage",
+                return_value=Usage(need * 2, need, bytes_ + 4096)):
+            h = self._handler()
+            h.api_installs_copycost(lambda k, d="": args.get(k, d))
+        _code, doc = h._sent[-1]
+        self.assertFalse(doc["enoughSpace"])
+        self.assertFalse(doc["ok"])
+        self.assertTrue(any("not enough room" in b for b in doc["blockers"]),
+                        doc["blockers"])
+        self.assertEqual(doc["free"], bytes_ + 4096)
+        self.assertEqual(doc["required"], need)
+
+    def test_a_copy_cannot_be_started_without_the_size_having_been_stated(self):
+        """`confirmBytes` is what makes "the cost was stated before the click"
+        a server-side fact instead of a promise the page makes about itself.
+        There is no gate over `tools/webui/*`, so a rule the page alone
+        enforces is a rule nothing enforces."""
+        src = self._shard()
+        h = self._handler()
+        h.post_installs_copy(json.dumps({"path": str(src)}).encode(),
+                             lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("confirmBytes", doc["error"])
+        self.assertFalse(doc["ok"])
+        self.assertFalse(list(self.clients.glob("*" +
+                                                self.coviewer.COPY_TEMP_SUFFIX)))
+
+    def test_a_price_that_moved_under_the_button_is_refused(self):
+        """The tree is measured again at the click and compared with the
+        figure the button carried. A live server writes; this is the symptom
+        reaching the user instead of a copy of no single moment."""
+        src = self._shard()
+        _files, bytes_ = self._hand_count(src)
+        h = self._handler()
+        h.post_installs_copy(json.dumps({
+            "path": str(src), "confirmBytes": bytes_ // 4}).encode(),
+            lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 409, doc)
+        self.assertTrue(any("said" in b and "now" in b
+                            for b in doc["blockers"]), doc["blockers"])
+        # ...and the same request with the right number is accepted, or the
+        # assertion above would pass on a copy endpoint that refuses
+        # everything.
+        h2 = self._handler()
+        h2.post_installs_copy(json.dumps({
+            "path": str(src), "name": "priced",
+            "confirmBytes": bytes_}).encode(), lambda k, d="": d)
+        code2, doc2 = h2._sent[-1]
+        self.assertEqual(code2, 200, doc2.get("blockers") or doc2)
+        h2.server.copier.done.wait(60)
+
+    def test_an_undeclared_folder_cannot_be_copied(self):
+        """The copy records what it is a copy OF, and an undeclared folder
+        has no answer to that."""
+        src = self._rich_client(self.clients / "stranger")
+        h = self._handler()
+        args = {"root": str(src), "name": ""}
+        h.api_installs_copycost(lambda k, d="": args.get(k, d))
+        _code, doc = h._sent[-1]
+        self.assertFalse(doc["ok"])
+        self.assertTrue(any("not a declared install" in b
+                            for b in doc["blockers"]), doc["blockers"])
+
+    def test_the_copy_lands_intact_and_declares_nothing(self):
+        r"""The whole happy path, on a synthetic install.
+
+        Deliberately NOT a real 15 GB copy: the mechanism is proved small and
+        the scale is reasoned from `health.WDF_RECOVER_MEASUREMENTS`. What is
+        checked is that the destination is byte-for-byte the source, that the
+        temporary name is gone, that no marker survives into it -- and that
+        `coroot.KINDS_KEY` is untouched, because a folder that exists is
+        OFFERED and never adopted.
+        """
+        src = self._shard()
+        files, bytes_ = self._hand_count(src)
+        kinds_before = dict(coroot.read_settings()[coroot.KINDS_KEY])
+        h = self._handler()
+        h.post_installs_copy(json.dumps({
+            "path": str(src), "name": "shard-frozen",
+            "confirmBytes": bytes_}).encode(), lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200, doc.get("blockers") or doc)
+        self.assertTrue(doc["started"])
+        run = h.server.copier
+        self.assertTrue(run.done.wait(120), "the copy never finished")
+        st = run.status()
+        self.assertIs(st["ok"], True, st["error"])
+        dest = Path(st["dest"])
+        self.assertTrue(dest.is_dir())
+        self.assertFalse(Path(st["temp"]).exists(), "temp survived the rename")
+        self.assertFalse((dest / self.coviewer.COPY_MARKER).exists(),
+                         "the marker survived into a finished copy")
+        self.assertEqual(self._hand_count(dest), (files, bytes_))
+        self.assertEqual((st["files"], st["bytes"]), (files, bytes_))
+        # THE RULING. Nothing is declared.
+        self.assertEqual(dict(coroot.read_settings()[coroot.KINDS_KEY]),
+                         kinds_before,
+                         "the copy declared itself")
+        self.assertIn(str(dest.resolve()),
+                      coroot.read_settings()[self.coviewer.COPIES_KEY],
+                      "the provenance note was not recorded")
+        # ...and the page is told it may now OFFER it, which is a different
+        # field from "it is declared".
+        self.assertTrue(st["declarable"])
+
+    def test_an_interrupted_copy_is_marked_and_never_wears_the_final_name(self):
+        r"""Interruption is the normal case at census sizes, so it is the
+        case with the test.
+
+        Cancelled mid-walk by a `copy2` that flips the flag after the first
+        file -- deterministic, and it needs no clock. What must hold
+        afterwards: the destination name was never created, the partial tree
+        is still under the temporary name, and it still carries its marker.
+        """
+        src = self._shard()
+        _files, bytes_ = self._hand_count(src)
+        real = shutil.copy2
+        h = self._handler()
+
+        def stop_after_one(s, d, *a, **k):
+            out = real(s, d, *a, **k)
+            h.server.copier.cancelled = True
+            return out
+
+        with unittest.mock.patch.object(shutil, "copy2", stop_after_one):
+            h.post_installs_copy(json.dumps({
+                "path": str(src), "name": "torn",
+                "confirmBytes": bytes_}).encode(), lambda k, d="": d)
+            code, doc = h._sent[-1]
+            self.assertEqual(code, 200, doc.get("blockers") or doc)
+            self.assertTrue(h.server.copier.done.wait(60))
+        st = h.server.copier.status()
+        self.assertIs(st["ok"], False)
+        self.assertFalse(st["declarable"])
+        self.assertFalse((self.clients / "torn").exists(),
+                         "a cancelled copy took the destination name")
+        temp = Path(st["temp"])
+        self.assertTrue(temp.is_dir(), "the partial tree vanished silently")
+        self.assertEqual(st["leftover"], str(temp))
+        self.assertTrue((temp / self.coviewer.COPY_MARKER).is_file(),
+                        "the partial tree carries no marker")
+        marker = self.coviewer.read_copy_marker(temp)
+        self.assertTrue(marker["incomplete"])
+        self.assertEqual(marker["copyOf"], str(src))
+
+    def test_a_torn_tree_looks_exactly_like_a_client_by_every_other_test(self):
+        r"""THE CONTROL that makes the marker non-vacuous, and the measured
+        reason the temporary name alone is not enough.
+
+        A copy interrupted after `ini/` and the two small archives is
+        **0.3% of the source by bytes** (measured on the synthetic install
+        here; the same shape at 7878 is a few megabytes of 15.34 GB) and:
+
+          * `coroot.missing_parts` passes it -- that check is content, and
+            the content it looks for lands early;
+          * `coroot.base_fingerprint` returns the SAME twelve characters as
+            the source, because it hashes only the top level of `ini/`.
+
+        So a torn tree declared under its source's plugin would key the
+        identical `out/indexes/<kind>-<fingerprint>/` namespace and be
+        indistinguishable from a healthy install by anything cheap. If this
+        test ever goes green in the other direction -- torn trees failing
+        `missing_parts` or hashing differently -- the marker's justification
+        has changed and the docstring above it is stale.
+        """
+        src = self._shard()
+        torn = self.clients / ("half" + self.coviewer.COPY_TEMP_SUFFIX)
+        (torn / "ini").mkdir(parents=True)
+        for f in (src / "ini").iterdir():
+            (torn / "ini" / f.name).write_bytes(f.read_bytes())
+        (torn / "c3.wdf").write_bytes((src / "c3.wdf").read_bytes()[:512])
+        (torn / "data.wdf").write_bytes((src / "data.wdf").read_bytes())
+        self.assertFalse(coroot.missing_parts(torn),
+                         "a 0.3% copy no longer passes missing_parts")
+        self.assertEqual(coroot.base_fingerprint(torn),
+                         coroot.base_fingerprint(src),
+                         "a torn tree no longer hashes like its source")
+        frac = (self.coviewer.measure_tree(str(torn))["bytes"]
+                / self.coviewer.measure_tree(str(src))["bytes"])
+        self.assertLess(frac, 0.01,
+                        f"the fixture is not actually torn ({frac:.1%})")
+
+    def test_declaring_an_unfinished_copy_is_refused(self):
+        """The marker is checked BEFORE `missing_parts`, because
+        `missing_parts` would let it through -- see the control above."""
+        src = self._shard()
+        torn = self.clients / ("half" + self.coviewer.COPY_TEMP_SUFFIX)
+        (torn / "ini").mkdir(parents=True)
+        for f in (src / "ini").iterdir():
+            (torn / "ini" / f.name).write_bytes(f.read_bytes())
+        (torn / "c3.wdf").write_bytes(b"\xAB" * 512)
+        (torn / "data.wdf").write_bytes(b"\xCD" * 4096)
+        cfg = coroot.user_config_path()
+        # Without the marker it declares, which is what makes the assertion
+        # below about the MARKER rather than about the fixture.
+        import plugins as plugmod                      # noqa: PLC0415
+        plug = plugmod.for_kind("cco")
+        with unittest.mock.patch.object(type(plug), "confidence",
+                                        lambda *a, **k: 0.95):
+            h = self._handler()
+            h.post_installs_declare(json.dumps({
+                "path": str(torn), "kind": "cco"}).encode(), lambda k, d="": d)
+            code, doc = h._sent[-1]
+            self.assertEqual(code, 200, doc)
+            coroot.forget_kind(str(torn))
+            coroot.invalidate_cache()
+
+            (torn / self.coviewer.COPY_MARKER).write_text(
+                json.dumps({"incomplete": True, "copyOf": str(src)}), "utf-8")
+            before = cfg.read_bytes()
+            h2 = self._handler()
+            h2.post_installs_declare(json.dumps({
+                "path": str(torn), "kind": "cco"}).encode(), lambda k, d="": d)
+            code2, doc2 = h2._sent[-1]
+        self.assertEqual(code2, 400, doc2)
+        self.assertIn(self.coviewer.COPY_MARKER, doc2["error"])
+        self.assertTrue(doc2["incompleteCopy"]["incomplete"])
+        self.assertEqual(cfg.read_bytes(), before)
+
+    def test_an_unreadable_marker_still_counts_as_a_marker(self):
+        """The interruption most likely to corrupt the marker is the one that
+        most needs it. Unparseable is not "absent"."""
+        d = self.clients / "corrupt"
+        d.mkdir()
+        (d / self.coviewer.COPY_MARKER).write_bytes(b"\x00\xff not json")
+        got = self.coviewer.read_copy_marker(d)
+        self.assertIsNotNone(got)
+        self.assertIn("unreadable", got["note"])
+        self.assertIsNone(self.coviewer.read_copy_marker(self.clients / "aaa"))
+
+    def test_the_scan_reports_an_unfinished_copy_and_will_not_offer_it(self):
+        """It is not filtered out. This is the only place a user finds out
+        the disk is holding a torn tree, so the scan names it."""
+        src = self._shard()
+        torn = self.clients / ("half" + self.coviewer.COPY_TEMP_SUFFIX)
+        (torn / "ini").mkdir(parents=True)
+        for f in (src / "ini").iterdir():
+            (torn / "ini" / f.name).write_bytes(f.read_bytes())
+        (torn / "c3.wdf").write_bytes(b"\xAB" * 512)
+        (torn / "data.wdf").write_bytes(b"\xCD" * 4096)
+        (torn / self.coviewer.COPY_MARKER).write_text("{}", "utf-8")
+        import plugins as plugmod                      # noqa: PLC0415
+
+        class Fake:
+            name = "patch5017"
+            label = "Official patch client 5017"
+            origin = "official"
+
+        # Forced confident, for the same reason
+        # `test_the_scan_offers_and_declares_nothing` forces it: an
+        # unforced fixture scores nothing, and then "it was not offered" is
+        # true for a reason that has nothing to do with the marker.
+        with unittest.mock.patch.object(plugmod, "rank",
+                                        return_value=[(Fake(), 0.95)]):
+            h = self._handler()
+            h.api_installs_scan(lambda k, d="": d)
+        _code, doc = h._sent[-1]
+        rows = {c["name"]: c for c in doc["candidates"]}
+        self.assertIn(torn.name, rows, list(rows))
+        row = rows[torn.name]
+        self.assertEqual(row["verdict"], "confident",
+                         "the forced ranking did not reach the scan, so this "
+                         "test cannot fail")
+        self.assertFalse(row["missing"], "the fixture is not client-shaped")
+        self.assertFalse(row["client"], "a torn tree was offered as a client")
+        self.assertTrue(row["incompleteCopy"])
+        self.assertNotIn(torn.name, [c["name"] for c in doc["candidates"]
+                                     if c["client"]])
+
+    def test_discard_deletes_a_marked_child_and_refuses_everything_else(self):
+        r"""The only destructive endpoint in Directory Management, fenced by
+        two conditions that must BOTH hold. Each is tested alone, because a
+        fence tested only as a pair passes when one rail is missing."""
+        marked = self.clients / ("gone" + self.coviewer.COPY_TEMP_SUFFIX)
+        marked.mkdir()
+        (marked / self.coviewer.COPY_MARKER).write_text("{}", "utf-8")
+        (marked / "payload.bin").write_bytes(b"x" * 1024)
+
+        # (a) under the clients root, no marker -> refused
+        plain = self.clients / "plain"
+        plain.mkdir()
+        h = self._handler()
+        h.post_installs_copydiscard(json.dumps({"path": str(plain)}).encode(),
+                                    lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 400)
+        self.assertIn(self.coviewer.COPY_MARKER, doc["error"])
+        self.assertTrue(plain.is_dir())
+
+        # (b) marked, but outside the clients root -> refused
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / self.coviewer.COPY_MARKER).write_text("{}", "utf-8")
+        h = self._handler()
+        h.post_installs_copydiscard(json.dumps({"path": str(outside)}).encode(),
+                                    lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 400)
+        self.assertIn("clients folder", doc["error"])
+        self.assertTrue(outside.is_dir())
+
+        # (c) both -> deleted
+        h = self._handler()
+        h.post_installs_copydiscard(json.dumps({"path": str(marked)}).encode(),
+                                    lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 200, doc)
+        self.assertFalse(marked.exists())
+
+    def test_a_recorded_copy_groups_as_offline_without_relabelling_its_plugin(self):
+        r"""The one place this module overrides a plugin's category, and the
+        assertion keeps the two halves apart.
+
+        `origin` stays `server` -- that is a fact about the PARSER and this
+        module does not get to contradict it. `category` becomes
+        `offline-client`, because a copy has no server behind it. The source
+        row is checked in the same breath: if the override leaked to every
+        row of that plugin, that assertion goes red.
+        """
+        src = self.clients / "bbb"                     # declared `cco`
+        copy = self._rich_client(self.clients / "bbb-frozen")
+        kinds = dict(coroot.read_settings()[coroot.KINDS_KEY])
+        kinds[str(copy)] = "cco"
+        coroot.write_settings(**{
+            coroot.KINDS_KEY: kinds,
+            self.coviewer.COPIES_KEY: {
+                str(copy.resolve()): {"from": str(src), "at": 1.0,
+                                      "bytes": 123, "files": 4}}})
+        coroot.invalidate_cache()
+        h = self._handler()
+        h.api_installs_dirs(lambda k, d="": d)
+        _code, doc = h._sent[-1]
+        rows = {r["root"]: r for r in doc["installs"]}
+        self.assertEqual(rows[str(copy)]["origin"], "server")
+        self.assertEqual(rows[str(copy)]["category"], "offline-client")
+        self.assertEqual(rows[str(copy)]["frozenCopy"]["from"], str(src))
+        self.assertEqual(rows[str(src)]["category"], "private-server",
+                         "the override leaked to the source")
+        self.assertIn(str(copy), [r["root"] for r in doc["offlineClients"]])
+        self.assertIn(str(src), [r["root"] for r in doc["privateServers"]])
+
+    def test_the_process_probe_keeps_could_not_tell_apart_from_nothing(self):
+        r"""C25, applied to a second probe.
+
+        Three outcomes: found, none-found-and-every-path-readable, and could
+        not tell. A probe that returns an empty list on failure reports a
+        live server as safe to copy. `opaque` is the count of processes whose
+        image path came back empty -- which on this box is a LOT, and is what
+        an elevated process looks like to a non-elevated query
+        (`accountpreflight.install_dir` records the same trap).
+        """
+        cov = self.coviewer
+
+        class R:
+            def __init__(self, out):
+                self.stdout, self.stderr, self.returncode = out, "", 0
+
+        tag = cov.COPY_PROBE_TAG
+        here = str(self.clients / "aaa")
+        good = json.dumps({"probe": tag, "procs": [
+            {"Id": 1, "Path": here + r"\Conquer.exe", "ProcessName": "Conquer"},
+            {"Id": 2, "Path": "", "ProcessName": "Secret"},
+            {"Id": 3, "Path": r"C:\Windows\explorer.exe",
+             "ProcessName": "explorer"}]})
+        with unittest.mock.patch("subprocess.run", return_value=R(good)):
+            got = cov.processes_under(here)
+        self.assertEqual([p["pid"] for p in got["live"]], [1])
+        self.assertEqual(got["opaque"], 1)
+        self.assertEqual(got["checked"], 3)
+        self.assertFalse(got["conclusive"], "an opaque process is not a clean "
+                                            "bill of health")
+        self.assertEqual(got["error"], "")
+
+        # A path that merely STARTS with the root's characters is not under
+        # it -- `C:\...\aaa-old\game.exe` would be a false positive that
+        # blocks a legitimate copy forever.
+        near = json.dumps({"probe": tag, "procs": [
+            {"Id": 9, "Path": here + r"-old\game.exe", "ProcessName": "g"}]})
+        with unittest.mock.patch("subprocess.run", return_value=R(near)):
+            got = cov.processes_under(here)
+        self.assertEqual(got["live"], [])
+        self.assertTrue(got["conclusive"])
+
+        # Every failure mode is an ERROR, never an empty list.
+        for out, why in ((R(""), "silence"),
+                         (R("not json"), "garbage"),
+                         (R(json.dumps({"procs": []})), "no envelope")):
+            with unittest.mock.patch("subprocess.run", return_value=out):
+                got = cov.processes_under(here)
+            self.assertTrue(got["error"], why)
+            self.assertFalse(got["conclusive"], why)
+
+    def test_a_live_process_under_the_source_blocks_the_copy(self):
+        """Never copy a running server's files out from under it: the walk
+        reads files that are changing, so the result is of no single moment."""
+        src = self._shard()
+        _files, bytes_ = self._hand_count(src)
+        live = {"root": str(src), "opaque": 0, "checked": 3, "error": "",
+                "conclusive": True,
+                "live": [{"pid": 7, "name": "Zephyr",
+                          "path": str(src / "Zephyr.exe")}]}
+        with unittest.mock.patch.object(self.coviewer, "processes_under",
+                                        return_value=live):
+            h = self._handler()
+            h.post_installs_copy(json.dumps({
+                "path": str(src), "name": "live",
+                "confirmBytes": bytes_}).encode(), lambda k, d="": d)
+        code, doc = h._sent[-1]
+        self.assertEqual(code, 409, doc)
+        self.assertTrue(any("torn read" in b for b in doc["blockers"]),
+                        doc["blockers"])
+        self.assertFalse((self.clients / "live").exists())
+        self.assertFalse(
+            (self.clients / ("live" + self.coviewer.COPY_TEMP_SUFFIX)).exists())
+
+    def test_a_name_cannot_climb_out_of_the_clients_folder(self):
+        """The destination is always a direct child. A name is a name."""
+        src = self._shard()
+        for bad in (r"..\..\Windows", "sub/dir", r"D:\elsewhere", ".."):
+            args = {"root": str(src), "name": bad}
+            h = self._handler()
+            h.api_installs_copycost(lambda k, d="": args.get(k, d))
+            _code, doc = h._sent[-1]
+            self.assertFalse(doc["ok"], f"{bad!r} was accepted")
+            self.assertNotIn("dest", doc, f"{bad!r} produced a destination")
+
+    def test_the_cost_caveat_carries_the_census_range_it_claims(self):
+        """The page quotes a range at the user; the range has to be the one
+        `health.WDF_RECOVER_MEASUREMENTS` actually holds, or it is a number
+        somebody typed."""
+        import health                                  # noqa: PLC0415
+        gbs = [r["gb"] for r in health.WDF_RECOVER_MEASUREMENTS.values()
+               if r.get("gb")]
+        cav = self.coviewer.COPY_COST_CAVEAT
+        self.assertIn(f"{min(gbs):.2f} GB", cav)
+        self.assertIn(f"{max(gbs):.2f} GB", cav)
+        big = max(health.WDF_RECOVER_MEASUREMENTS.values(),
+                  key=lambda r: r.get("gb") or 0)
+        self.assertIn(f"{big['files']:,} files", cav)
+
+    # -- the browser half, for the copy --------------------------------------
+    def test_the_page_states_the_cost_before_the_start_control_exists(self):
+        r"""Document order is not enough here and the assertion says why.
+
+        `sethealth.js` is checked by "the cost block is appended before the
+        button". This panel is stronger: the start control is not created at
+        all until a cost read has returned, and it carries that read's byte
+        count. So what is asserted is that every `dirs-copy-start` in the
+        file is downstream of the `copycost` fetch AND of a `confirmBytes`.
+        """
+        js = _strip_js_comments((WEBUI_PAGES / "setdirs.js").read_text("utf-8"))
+        self.assertIn("/api/installs/copycost", js)
+        self.assertEqual(js.count("'dirs-copy-start'"), 1,
+                         "more than one start control to keep honest")
+        at = js.index("'dirs-copy-start'")
+        self.assertIn("/api/installs/copycost", js[:at],
+                      "the start control is built before the cost is read")
+        post = js.index("'/api/installs/copy'")
+        self.assertIn("confirmBytes", js[at:],
+                      "the start control does not carry the price it showed")
+        self.assertGreater(post, at, "the copy POST is not inside the "
+                                     "control the cost read created")
+
+    def test_renaming_the_destination_does_not_rebuild_the_start_control(self):
+        r"""A regression pin for a defect this feature actually had, FOUND BY
+        DRIVING IT and invisible to every other test here.
+
+        The first version re-read the cost on the name field's `change` event
+        and rebuilt the action row from scratch. `change` fires on **blur** --
+        so typing a name and then pressing Copy, which is the obvious gesture,
+        blurred the field, the async handler cleared the row, and the button
+        was removed from under the pointer between `mousedown` and `click`.
+        Measured in headless Chrome: the `click` listener fired on the OLD
+        node, the POST was never sent, and the page said nothing at all. Both
+        halves of that are bad -- the lost click and the silence.
+
+        The cure is that the control is created once and thereafter MUTATED:
+        renaming relabels it, and only an explicit re-read may remove it. The
+        price is a property of the source, not of the destination name, and
+        every name/space/liveness condition is re-checked server-side at the
+        POST anyway.
+
+        Source-level, so it survives without a browser in the loop. The
+        primary evidence is the drive; this is the pin that stops it coming
+        back.
+        """
+        js = _strip_js_comments((WEBUI_PAGES / "setdirs.js").read_text("utf-8"))
+        self.assertNotIn("nameIn.addEventListener('change', refreshCost)", js,
+                         "the name field re-reads the cost on blur again, "
+                         "which deletes the button the user is clicking")
+        self.assertIn("nameIn.addEventListener('change', labelStart)", js)
+        self.assertIn("nameIn.addEventListener('input', labelStart)", js)
+        # The only thing that may remove the control is `dropStart`, and the
+        # only caller of `dropStart` is the explicit cost read.
+        self.assertEqual(js.count("dropStart()"), 2,
+                         "dropStart is defined once and called once")
+        at = js.index("async function refreshCost")
+        self.assertIn("dropStart();", js[at:at + 400],
+                      "the control is dropped somewhere other than a re-read")
+
+    def test_the_page_still_has_exactly_one_declare_call_site(self):
+        r"""The copy finishes into an OFFER, not a declaration, and it must
+        reuse the page's single declare path rather than growing a second.
+
+        `test_the_page_never_declares_without_a_gesture` already counts the
+        call sites; this states the reason so that a future change that adds
+        a second one has to argue with a test that names the rule instead of
+        with a bare count.
+        """
+        js = _strip_js_comments((WEBUI_PAGES / "setdirs.js").read_text("utf-8"))
+        self.assertEqual(js.count("'/api/installs/declare'"), 1)
+        # The copy panel reaches it through `candidateCard`, the same
+        # function the scan and both Add forms use.
+        at = js.index("offerDeclare")
+        self.assertIn("candidateCard", js[at:at + 2000],
+                      "the finished copy does not go through candidateCard")
+
+    def test_every_copy_endpoint_the_page_calls_is_a_route_of_that_method(self):
+        """The join `test_setup_page.py` does for setup.js, for the four
+        routes this feature added. A renamed handler is otherwise a 404 the
+        user meets and no test does."""
+        src = (PROJECT / "tools" / "coviewer.py").read_text("utf-8")
+        js = _strip_js_comments((WEBUI_PAGES / "setdirs.js").read_text("utf-8"))
+        gets, posts = set(), set()
+        for m in re.finditer(r"jget\('(/api/installs/[a-z]+)", js):
+            gets.add(m.group(1))
+        for m in re.finditer(r"jpost\('(/api/installs/[a-z]+)'", js):
+            posts.add(m.group(1))
+        self.assertIn("/api/installs/copycost", gets)
+        self.assertIn("/api/installs/copystatus", gets)
+        self.assertLessEqual({"/api/installs/copy", "/api/installs/copycancel",
+                              "/api/installs/copydiscard"}, posts)
+        for path in gets | posts:
+            self.assertIn(f'"{path}": self.', src,
+                          f"{path} is called by the page and routed nowhere")
+
     # -- the browser half ---------------------------------------------------
     def test_the_page_never_declares_without_a_gesture(self):
         """Source-level, against the STRIPPED js so a comment cannot pass it.
@@ -21148,22 +21821,36 @@ class SettingsHealthManagement(unittest.TestCase):
         cls.coviewer = coviewer
 
     def test_the_cost_caveats_carry_the_measurements_that_refute_the_table(self):
-        r"""The estimates in `health.DERIVED` and `health.THUMB_FACTS` came
-        from ONE install and the tool repeats them for every install. Both
-        counter-examples are served with them, in the server's own strings, so
-        the page cannot say something milder than the tool believes."""
+        r"""The estimates in `health.DERIVED` came from ONE install and the
+        tool repeats them for every install. The counter-example is served
+        with them, in the server's own string, so the page cannot say
+        something milder than the tool believes."""
         boot = self.coviewer.BOOTSTRAP_COST_CAVEAT
         self.assertIn("2,164 s", boot)
         self.assertIn("36 minutes", boot)
         self.assertIn("5-9 min", boot)
         self.assertIn("PER INSTALL", boot)
+
+    def test_the_thumbnail_caveat_no_longer_disowns_its_own_numbers(self):
+        r"""This assertion used to be the mirror image of itself: it pinned
+        that `THUMB_COST_CAVEAT` said the counts above it were NOT this
+        client's, because they were `health.THUMB_FACTS` -- one install's
+        4,950 + 66,834 printed for all eight.
+
+        `health.thumbnail_corpus` counts the client now, so the sentence is
+        gone and this test is inverted rather than deleted: a fix that let
+        the old wording survive would leave the page warning about a defect
+        it no longer has, and a warning kept past its subject is how people
+        learn to skip the line. What remains extrapolated -- the seconds and
+        the disk constants -- is pinned in
+        `tests/test_health_thumbs.py::TheCaveatSaysWhatIsStillExtrapolated`.
+        """
         thumb = self.coviewer.THUMB_COST_CAVEAT
         self.assertIn("Per client, not once", thumb)
-        self.assertIn("47,973", thumb)
-        self.assertIn("1,352", thumb)
-        self.assertIn("313 MB", thumb)
-        self.assertIn("637 MB", thumb)
-        self.assertIn("15-30 minutes", thumb)
+        self.assertIn("are THIS client's", thumb)
+        for retired in ("are NOT this client's", "health.THUMB_FACTS",
+                        "15-30 minutes"):
+            self.assertNotIn(retired, thumb)
 
     def test_the_page_prints_the_cost_before_the_button(self):
         """Document order, from the source: the `.set-cost` block is appended

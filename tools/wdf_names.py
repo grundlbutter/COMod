@@ -12,9 +12,29 @@ candidate paths and matching.  Candidates come from:
 Writes out/dll/wdf_name_recovery.txt and .json.
 
     py -3 tools/wdf_names.py
+    py -3 tools/wdf_names.py --root "C:/.../Clients/6609"
+
+WHICH INSTALL THIS IS ABOUT, AND WHY THE FLAG HAD TO BE ADDED
+-------------------------------------------------------------
+**The wordlist is harvested from an install**, so what this recovers depends
+entirely on which client it ran against -- and until 2026-08-23 the answer was
+always ``coroot.default_root()``, read at IMPORT, with no way to say otherwise.
+A user bootstrapping the client they were looking at got the configured
+client's names.
+
+The OUTPUT stays shared (``coroot.GLOBAL`` lists
+``out/dll/wdf_name_recovery``): a WDF entry's name is recovered by hashing a
+candidate string, the TQ hash is a pure function of that string, so an entry
+resolved here is true in every install.  Pointing this at a second client
+therefore TOPS UP one table rather than producing a rival one.
+
+Shared output and install-independent input are different claims, and only the
+first one holds here.  ``tools/build_opcodes.py`` is the one builder in
+``health.DERIVED`` for which both hold, and it is the one offered no ``--root``.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import struct
@@ -27,6 +47,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 import coroot                            # noqa: E402
 from tqhash import tq_hash, normalise_path            # noqa: E402
 
+#: The install used when nobody names one.  Kept for callers that import this
+#: module, and NOT read by `harvest` or `main` any more -- a module constant
+#: resolved at import names whichever install was configured *then*, which is
+#: exactly the bug `--root` closes.
 ROOT = coroot.default_root()
 OUT = Path(__file__).resolve().parents[1] / "out" / "dll"
 WDFS = ["c3.wdf", "data.wdf"]
@@ -44,18 +68,21 @@ def read_wdf(path: Path):
     return [struct.unpack_from("<IIII", blob, i * 16) for i in range(count)]
 
 
-def harvest() -> set[str]:
+def harvest(root: Path | None = None) -> set[str]:
+    """Candidate paths, walked out of ``root`` -- the install this run is
+    about, not the one that happened to be configured at import."""
+    root = Path(root) if root is not None else coroot.default_root()
     cands: set[str] = set()
 
     # 1. loose files, as-is and re-rooted under each package name
-    packages = [p.stem for p in (ROOT.glob("*.wdf"))]
-    for p in ROOT.rglob("*"):
+    packages = [p.stem for p in (root.glob("*.wdf"))]
+    for p in root.rglob("*"):
         try:
             if not p.is_file():
                 continue
         except OSError:
             continue
-        rel = p.relative_to(ROOT).as_posix()
+        rel = p.relative_to(root).as_posix()
         top = rel.split("/", 1)[0].lower()
         if top in ("bin", "debug", "log", ".sentry-native", "launcherresources"):
             continue
@@ -67,7 +94,7 @@ def harvest() -> set[str]:
 
     # 2. path-like strings inside ini/ and map/
     for sub, pats in (("ini", ("*.ini", "*.json")), ("map", ("*.DMap",))):
-        d = ROOT / sub
+        d = root / sub
         if not d.is_dir():
             continue
         for pat in pats:
@@ -84,16 +111,32 @@ def harvest() -> set[str]:
     return cands
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    coroot.add_root_argument(ap)
+    a = ap.parse_args(argv)
+    root = coroot.game_root(a.root)
     OUT.mkdir(parents=True, exist_ok=True)
+    # Printed, not assumed. This tool used to be silent about which install it
+    # walked, so a run against the wrong client was indistinguishable from a
+    # run against the right one.
+    print(f"install: {root}")
     resolved: dict[int, str] = {}
     tables = {}
     for w in WDFS:
-        p = ROOT / w
+        p = root / w
         if not p.exists():
             continue
         tables[w] = read_wdf(p)
         print(f"{w}: {len(tables[w])} entries")
+    if not tables:
+        # A shared artefact must not be OVERWRITTEN with an empty one because
+        # somebody pointed this at a DatPkg client. out/dll/wdf_name_recovery
+        # is coroot.GLOBAL -- every install reads the same file -- so a zero
+        # -entry rewrite here destroys another client's recovered names.
+        print(f"no {' or '.join(WDFS)} under {root} -- nothing to recover, "
+              f"and the shared table is left alone rather than emptied.")
+        return 0
 
     wanted = {}
     for w, ents in tables.items():
@@ -101,8 +144,8 @@ def main():
             wanted.setdefault(h, []).append((w, off, size, space))
     print(f"{len(wanted)} distinct hashes to resolve")
 
-    cands = harvest()
-    print(f"{len(cands)} candidate paths harvested")
+    cands = harvest(root)
+    print(f"{len(cands)} candidate paths harvested from {root}")
 
     seen = set()
     for c in cands:
@@ -144,7 +187,8 @@ def main():
     for d, n in per_dir.most_common(15):
         print(f"   {d:24s} {n}")
     print(f"wrote {OUT/'wdf_name_recovery.txt'}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

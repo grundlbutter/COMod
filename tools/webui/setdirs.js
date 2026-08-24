@@ -80,6 +80,18 @@
     'unknown': 'Unclassified',
   };
 
+  /* Decimal GB, matching `coviewer._gb` and matching the unit
+   * `health.WDF_RECOVER_MEASUREMENTS` counts in (15.34 GB for 7878 is
+   * 15.34e9 bytes). Two units in one feature is how a user comes to believe
+   * a copy shrank on the way across. */
+  function gb(n) {
+    n = Number(n || 0);
+    if (n < 1e6) return (n / 1e3).toFixed(0) + ' kB';
+    if (n < 1e9) return (n / 1e6).toFixed(1) + ' MB';
+    return (n / 1e9).toFixed(2) + ' GB';
+  }
+  const num = n => Number(n || 0).toLocaleString();
+
   /* The four verdicts in the words a person needs, not the tokens.
    * `confident` is the only one that answers; the rest ASK. */
   function verdictLine(d) {
@@ -163,6 +175,36 @@
     const rk = rankingBlock(d);
     if (rk) li.appendChild(rk);
 
+    // BEFORE the `missing` branch, deliberately. An interrupted copy can
+    // already satisfy `missing_parts` — that check is content, and a
+    // three-percent copy that got as far as ini/ and one archive passes it.
+    // So the marker is asked about first, and it is the answer.
+    if (d.incompleteCopy) {
+      li.appendChild(mk('div', 'set-bad',
+        'NOT A CLIENT — this is a copy that never finished. It still ' +
+        'carries its marker file' +
+        (d.incompleteCopy.copyOf ? ', and says it was a copy of ' +
+                                   d.incompleteCopy.copyOf : '') + '.'));
+      li.appendChild(mk('div', 'set-help',
+        'It is refused by the marker rather than by its contents on ' +
+        'purpose: a torn tree whose ini/ finished hashes identical to its ' +
+        'source, so it would share the source’s index namespace and look ' +
+        'entirely healthy. The declare endpoint refuses it too.'));
+      const row = mk('div', 'set-field');
+      const del = mk('button', 'ghost', 'Discard this unfinished copy');
+      del.addEventListener('click', async () => {
+        del.disabled = true;
+        try {
+          await jpost('/api/installs/copydiscard', { path: d.root });
+          say('Deleted ' + d.root + '.');
+          li.textContent = '';
+          li.appendChild(mk('div', 'set-help', 'Deleted ' + d.root + '.'));
+        } catch (e) { say(String(e.message || e), true); del.disabled = false; }
+      });
+      row.appendChild(del);
+      li.appendChild(row);
+      return li;
+    }
     if (d.missing && d.missing.length) {
       // Shown rather than filtered out: "why is 5065_old not offered" is a
       // question this page should be able to answer.
@@ -237,6 +279,307 @@
     return li;
   }
 
+  // ------------------------------------------- copy a private server, frozen
+  /* THE PRICE IS PRINTED BEFORE THE BUTTON EXISTS.
+   *
+   * Not "above" it in the stylesheet — the start control is not appended to
+   * the DOM until a cost read has come back, and it carries that read's byte
+   * count as `confirmBytes`. The server requires that field and re-measures
+   * against it, so a page that skipped the cost read cannot start a copy and
+   * a tree that moved between the read and the click cannot be copied
+   * against a stale price. The rule is enforced on both sides rather than
+   * being a promise this file makes.
+   *
+   * Every figure shown is walked or read at the moment of the call: bytes,
+   * files and directories from the source tree, free space from the
+   * destination volume, and a process probe for a live server. None of them
+   * is a table lookup, and the one estimate on the page — the census range —
+   * is labelled as somebody else's install.
+   */
+  function copyPanel(r, host) {
+    host.textContent = '';
+    const box = mk('div', 'set-cost');
+    host.appendChild(box);
+    box.appendChild(mk('h4', null, 'Copy ' + (r.serverName || r.label) +
+                                   ' into a frozen Offline Client'));
+    box.appendChild(mk('p', null,
+      'A private server changes under you — it patches, and it rewrites its ' +
+      'own ini/ every time it shuts down. A copy is a fixed point: mods and ' +
+      'measurements get a subject that does not move. The copy is a NEW ' +
+      'install and is declared separately; nothing is declared by this ' +
+      'button.'));
+
+    const nameRow = mk('div', 'set-field');
+    nameRow.appendChild(mk('label', null, 'Copy into'));
+    const nameIn = mk('input');
+    nameIn.type = 'text';
+    nameIn.id = 'dirs-copy-name';
+    nameIn.style.flex = '0 1 18rem';
+    nameRow.appendChild(nameIn);
+    const recheck = mk('button', 'ghost', 'Re-read the cost');
+    recheck.id = 'dirs-copy-recost';
+    nameRow.appendChild(recheck);
+    box.appendChild(nameRow);
+
+    const cost = mk('div');
+    cost.id = 'dirs-copy-cost';
+    box.appendChild(cost);
+    const act = mk('div');
+    act.id = 'dirs-copy-act';
+    box.appendChild(act);
+    const prog = mk('div');
+    prog.id = 'dirs-copy-prog';
+    box.appendChild(prog);
+    const after = mk('div');
+    after.id = 'dirs-copy-after';
+    box.appendChild(after);
+
+    const closeRow = mk('div', 'set-field');
+    const close = mk('button', 'ghost', 'Close');
+    close.addEventListener('click', () => { host.textContent = ''; });
+    closeRow.appendChild(close);
+    box.appendChild(closeRow);
+
+    let poll = null;
+    //: The last SUCCESSFUL cost read. The start control does not exist until
+    //: this is set, and it is what the click sends back as `confirmBytes`.
+    let priced = null;
+    //: The start control itself, created once and thereafter MUTATED.
+    //
+    // MEASURED IN THE BROWSER, and the reason this is not simply rebuilt on
+    // every read: the first version re-read the cost on the name field's
+    // `change` event and rebuilt the action row from scratch. `change` fires
+    // on BLUR -- so pressing Copy right after typing a name blurred the
+    // field, the handler cleared the row, and the button was removed from
+    // under the pointer between mousedown and click. The click went nowhere
+    // and the page said nothing. Driven headless: the POST was never sent.
+    //
+    // So the node is stable. Renaming the destination does not re-read the
+    // price either, because the price is a property of the SOURCE and the
+    // name changes only where it lands -- and every name, conflict, space and
+    // liveness condition is re-checked server-side at the POST anyway, which
+    // is the authority. Re-reading is a button of its own.
+    let goBtn = null;
+
+    function bar(pct) {
+      const outer = mk('div');
+      outer.style.cssText = 'height:.6rem;border:1px solid currentColor;' +
+                            'border-radius:.3rem;overflow:hidden;margin:.4rem 0';
+      const inner = mk('div');
+      inner.style.cssText = 'height:100%;background:currentColor;width:' +
+                            Math.max(0, Math.min(100, pct)) + '%';
+      outer.appendChild(inner);
+      return outer;
+    }
+
+    function showStatus(s) {
+      prog.textContent = '';
+      if (!s || (!s.running && s.ok === null && !s.startedAt)) return;
+      prog.appendChild(mk('div', 'set-measured',
+        (s.running ? 'Copying — ' : 'Last copy — ') +
+        gb(s.bytes) + ' of ' + gb(s.expectBytes) + ', ' +
+        num(s.files) + ' of ' + num(s.expectFiles) + ' files, ' +
+        s.elapsedSeconds + 's'));
+      prog.appendChild(bar(s.percent));
+      if (s.current) prog.appendChild(mk('div', 'set-path', s.current));
+      if (s.running) {
+        const row = mk('div', 'set-field');
+        const stop = mk('button', 'ghost', 'Cancel this copy');
+        stop.id = 'dirs-copy-cancel';
+        stop.addEventListener('click', async () => {
+          stop.disabled = true;
+          try { await jpost('/api/installs/copycancel', {}); }
+          catch (e) { say(String(e.message || e), true); }
+        });
+        row.appendChild(stop);
+        prog.appendChild(row);
+        return;
+      }
+      if (s.ok === false) {
+        prog.appendChild(mk('div', 'set-bad',
+          'The copy did not finish: ' + (s.error || 'unknown')));
+        if (s.leftover) {
+          prog.appendChild(mk('div', 'set-help',
+            'What landed is at ' + s.leftover + ' — under a temporary name ' +
+            'and still carrying its marker file, so nothing will mistake it ' +
+            'for a client. It was deliberately not deleted; deleting ' +
+            'gigabytes on the way out of a cancel is a second long job ' +
+            'nobody asked for.'));
+          const row = mk('div', 'set-field');
+          const del = mk('button', 'ghost', 'Discard the unfinished copy');
+          del.id = 'dirs-copy-discard';
+          del.addEventListener('click', async () => {
+            del.disabled = true;
+            try {
+              await jpost('/api/installs/copydiscard', { path: s.leftover });
+              say('Deleted ' + s.leftover + '.');
+              await refreshCost();
+              await tick();
+            } catch (e) { say(String(e.message || e), true); del.disabled = false; }
+          });
+          row.appendChild(del);
+          prog.appendChild(row);
+        }
+        return;
+      }
+      if (s.ok === true && s.declarable) offerDeclare(s.dest);
+    }
+
+    /* The copy is finished and UNDECLARED, which is the standing rule: a
+     * folder that exists is OFFERED, never adopted. It goes through the same
+     * detection and the same single declare call site as any other found
+     * folder — there is no second path to the config from here. */
+    async function offerDeclare(dest) {
+      if (after.dataset.done === dest) return;
+      after.dataset.done = dest;
+      after.textContent = '';
+      after.appendChild(mk('div', 'set-help',
+        'The copy is on disk at ' + dest + ' and is NOT declared. It is a ' +
+        'new install with its own detection — answer it below.'));
+      try {
+        const d = await jget('/api/installs/detect?root=' +
+                             encodeURIComponent(dest));
+        d.name = dest;
+        const ul = mk('ul', 'set-list');
+        ul.appendChild(candidateCard(d, {
+          label: 'Declare this frozen copy',
+        }));
+        after.appendChild(ul);
+      } catch (e) {
+        after.appendChild(mk('div', 'set-bad', String(e.message || e)));
+      }
+    }
+
+    async function tick() {
+      let s;
+      try { s = (await jget('/api/installs/copystatus')).copy; }
+      catch (e) { return; }
+      showStatus(s);
+      if (s.running && !poll) poll = setInterval(tick, 1000);
+      if (!s.running && poll) { clearInterval(poll); poll = null; }
+    }
+
+    function dropStart() {
+      act.textContent = '';
+      goBtn = null;
+      priced = null;
+    }
+
+    function labelStart() {
+      if (!goBtn || !priced) return;
+      goBtn.textContent = 'Copy ' + gb(priced.bytes) + ' to ' +
+                          (nameIn.value.trim() || priced.name);
+    }
+
+    async function refreshCost() {
+      cost.textContent = '';
+      dropStart();
+      cost.appendChild(mk('div', 'set-help', 'measuring…'));
+      let c;
+      try {
+        c = await jget('/api/installs/copycost?root=' +
+                       encodeURIComponent(r.root) + '&name=' +
+                       encodeURIComponent(nameIn.value.trim()));
+      } catch (e) {
+        cost.textContent = '';
+        cost.appendChild(mk('div', 'set-bad', String(e.message || e)));
+        return;
+      }
+      cost.textContent = '';
+      if (!nameIn.value.trim() && c.name) nameIn.value = c.name;
+
+      const m = c.measure || {};
+      cost.appendChild(mk('p', 'set-measured',
+        'THIS COPY: ' + gb(m.bytes) + ' — ' + num(m.files) + ' files in ' +
+        num(m.dirs) + ' directories, walked from ' + c.source + ' in ' +
+        (m.seconds || 0) + 's' +
+        (m.complete ? '.' : ' — INCOMPLETE WALK, so that is a lower bound.') +
+        (m.unreadable ? ' ' + num(m.unreadable) + ' entries could not be ' +
+                        'read and are not in the total.' : '')));
+      cost.appendChild(mk('p', 'set-measured',
+        'DESTINATION: ' + (c.dest || '(none)') + ' — ' + gb(c.free) +
+        ' free on that volume, and this needs ' + gb(m.bytes) + ' plus ' +
+        gb(c.headroom) + ' of headroom (' + gb(c.required) + ' in all). ' +
+        (c.enoughSpace ? 'That fits.'
+                       : 'That does NOT fit, so it is refused rather than ' +
+                         'half-copied.')));
+
+      const live = c.live || {};
+      if (live.live && live.live.length) {
+        cost.appendChild(mk('p', 'set-bad',
+          'RUNNING: ' + live.live.map(p => p.name + ' (pid ' + p.pid + ')')
+            .join(', ') + ' is running out of this folder. Copying a live ' +
+          'server is a torn read — files change under the walk, so the copy ' +
+          'is of no single moment. Close it first.'));
+      } else if (live.error) {
+        cost.appendChild(mk('p', 'set-bad',
+          'COULD NOT TELL whether anything is running there: ' + live.error));
+      } else {
+        cost.appendChild(mk('p', 'set-help',
+          'Nothing found running out of this folder — ' +
+          num(live.checked) + ' processes checked' +
+          (live.opaque
+            ? ', but ' + num(live.opaque) + ' of them would not give up ' +
+              'their image path (that is what an elevated process looks ' +
+              'like to this probe), so this is ‘none found’, not ‘none’.'
+            : ', every image path readable.')));
+      }
+
+      if (c.fingerprint) {
+        cost.appendChild(mk('p', 'set-help',
+          'Derived data: this install fingerprints as ' + c.fingerprint +
+          ' (namespace ' + c.sourceBaseId + '). ' + c.fingerprintNote));
+      }
+      cost.appendChild(mk('p', 'set-help', c.caveat));
+
+      (c.warnings || []).forEach(w =>
+        cost.appendChild(mk('p', 'set-bad', w)));
+      if (!c.ok) {
+        (c.blockers || []).forEach(b =>
+          cost.appendChild(mk('p', 'set-bad', 'Refused: ' + b)));
+        // No start control at all. A disabled button still reads as "this is
+        // the thing you would click"; an absent one cannot be clicked by a
+        // script, a keyboard, or a stale hit-test.
+        return;
+      }
+
+      priced = { bytes: m.bytes, name: c.name || '' };
+      const row = mk('div', 'set-field');
+      const go = mk('button', 'primary', '');
+      go.id = 'dirs-copy-start';
+      go.addEventListener('click', async () => {
+        go.disabled = true;
+        say('starting the copy…');
+        try {
+          await jpost('/api/installs/copy', {
+            path: r.root, name: nameIn.value.trim(),
+            // The number the button was labelled with, sent back so the
+            // server can refuse a click made against a stale price.
+            confirmBytes: priced.bytes,
+          });
+          say('Copying. Nothing is declared when it finishes — you will be ' +
+              'asked.');
+          after.dataset.done = '';
+          await tick();
+        } catch (e) { say(String(e.message || e), true); go.disabled = false; }
+      });
+      row.appendChild(go);
+      act.appendChild(row);
+      goBtn = go;
+      labelStart();
+    }
+
+    recheck.addEventListener('click', refreshCost);
+    // Relabel only. NOT a re-read -- see the note on `goBtn`: `change` fires
+    // on blur, and an async rebuild there deletes the control the user is in
+    // the middle of clicking.
+    nameIn.addEventListener('input', labelStart);
+    nameIn.addEventListener('change', labelStart);
+    refreshCost();
+    tick();
+    return box;
+  }
+
   /* An already-declared install. */
   function installCard(r) {
     const li = mk('li', 'set-item');
@@ -251,6 +594,17 @@
     if (r.serverName) {
       li.appendChild(mk('div', 'set-help',
         'Private server: ' + r.serverName + ' — parsed with ' + r.label));
+    }
+    if (r.frozenCopy) {
+      const when = new Date((r.frozenCopy.at || 0) * 1000);
+      li.appendChild(mk('div', 'set-help',
+        'Frozen copy of ' + r.frozenCopy.from + ', taken ' +
+        (isNaN(when.getTime()) ? 'at an unknown time'
+                               : when.toLocaleString()) + ' — ' +
+        gb(r.frozenCopy.bytes) + ' in ' + num(r.frozenCopy.files) +
+        ' files. It is listed as an Offline Client because there is no ' +
+        'server behind it: the parser plugin is still whatever claimed it, ' +
+        'but the folder does not move.'));
     }
     if (!r.exists) {
       li.appendChild(mk('div', 'set-bad',
@@ -270,6 +624,27 @@
                   : 'No asset index built for this client yet — the ' +
                     'Health section below offers it.'));
     }
+    // The owner's ask: *"For 'Offline Clients', I want the user to
+    // electively choose to create a copy of any Private server they add."*
+    // Electively — so it is a button on the server's own row, opening a
+    // panel that states the price, and it is offered only where it means
+    // something: a private server that is actually on disk and complete.
+    // Copying a frozen copy is not refused by the server, but offering it
+    // here would suggest it is the point of the feature.
+    const copyHost = mk('div');
+    if (r.category === 'private-server' && r.usable && !r.frozenCopy) {
+      const crow = mk('div', 'set-field');
+      const cbtn = mk('button', 'ghost',
+                      'Copy this into a frozen Offline Client…');
+      cbtn.id = 'dirs-copy-open';
+      cbtn.title = 'Shows what it would cost in bytes and files, and how ' +
+                   'much room is left, before anything is copied.';
+      cbtn.addEventListener('click', () => copyPanel(r, copyHost));
+      crow.appendChild(cbtn);
+      li.appendChild(crow);
+    }
+    li.appendChild(copyHost);
+
     const row = mk('div', 'set-field');
     const forget = mk('button', 'ghost', 'Forget this declaration');
     forget.title = 'Removes the declaration only. The folder is not touched.';
@@ -543,8 +918,22 @@
   function renderScan(out, res) {
     out.textContent = '';
     if (res.error) { out.appendChild(mk('div', 'set-bad', res.error)); return; }
-    const usable = (res.candidates || []).filter(c => c.client);
-    const rejected = (res.candidates || []).filter(c => !c.client);
+    const all = res.candidates || [];
+    const torn = all.filter(c => c.incompleteCopy);
+    const usable = all.filter(c => c.client);
+    const rejected = all.filter(c => !c.client && !c.incompleteCopy);
+    // Not inside the collapsed "other folders" details. A half-copied tree
+    // is the one thing here that is actively costing the user disk and can
+    // be deleted, so it is the one thing the scan must not fold away.
+    if (torn.length) {
+      out.appendChild(mk('div', 'set-bad',
+        torn.length + ' unfinished cop' + (torn.length === 1 ? 'y' : 'ies') +
+        ' under ' + res.clientsRoot + '. These are not clients and never ' +
+        'will be — they are taking up room.'));
+      const ul = mk('ul', 'set-list');
+      torn.forEach(c => ul.appendChild(candidateCard(c)));
+      out.appendChild(ul);
+    }
     if (!usable.length) {
       out.appendChild(mk('div', 'set-empty',
         'Nothing new: every client folder under ' + res.clientsRoot +

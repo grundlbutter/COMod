@@ -131,6 +131,52 @@ def _apply_output(server: str = "", root=None) -> None:
 #: makes `--resume` re-render everything instead of silently mixing versions.
 RENDERER_VERSION = 1
 
+#: Output edge in px, and the disk each thumbnail costs at it.  Named rather
+#: than written twice, because `health.thumbnail_corpus` prices a run from
+#: exactly these numbers and `--dry-run` prints it -- two estimates of one
+#: job that could otherwise disagree.
+DEFAULT_SIZE = 256
+DEFAULT_TEX_SIZE = 128
+#: **BYTES OF PNG per output pixel -- not size on disk.**  The unit is stated
+#: because getting it wrong is not hypothetical: `health.THUMB_FACTS` carried
+#: 486 MB for the texture half where the run's own manifest records 359.6, a
+#: 35% gap, because 486 was ALLOCATED CLUSTERS while `st.bytes` beside it on
+#: the same panel was bytes.  A file whose mean is 5.4 KB occupies 8 KB of a
+#: 4 KiB-cluster volume; if you want that number, compute it, do not confuse
+#: it with this one.
+#:
+#: PROVENANCE, per the same rule the cost model is held to.  Fitted on the
+#: full render of **Classic Conquer 2.0**'s corpus -- 4,950 meshes + 66,834
+#: textures, `--size 256 --ss 2 --tex-size 128` palettised, 226 s on 20
+#: workers.  Read back from that run's own `manifest.json` -- which is filed
+#: under some OTHER install's base key, differing per checkout (`patch6090`
+#: here, `cco-3f201d08bbc5` on the integration tree), itself an artefact of
+#: the `--root` defect `load_worklist` documents.  It predicts 118.4 MB of
+#: mesh PNG against
+#: 118.1 recorded and 361.4 MB of texture PNG against 359.6 -- 0.5%.
+#: `docs/thumbnails.md` section 1 has carried those same measured figures
+#: throughout, which is how the 486 was caught.
+#:
+#: **It reads HIGH on a different corpus, and the margin is not small.**  The
+#: same read against **Clients/5517**'s manifest (4,245 meshes + 36,046
+#: textures) gives 0.326 and 0.25 -- 12% and 24% under these -- because the
+#: number is a property of the ART, not of the renderer: simpler models and
+#: flatter skins compress further.  So this is an upper bound outside the
+#: install it was fitted on, and `coviewer.THUMB_COST_CAVEAT` says so where
+#: the figure is shown.
+MESH_BYTES_PER_PIXEL = 0.365
+TEXTURE_BYTES_PER_PIXEL = 0.33
+#: Not measured on a full corpus -- the 4x figure quoted for `--tex-truecolor`
+#: since this tool was written, carried across unchanged and unverified.
+TEXTURE_TRUECOLOR_BYTES_PER_PIXEL = 1.27
+#: Bytes of JSON per manifest entry, across `manifest.json` and
+#: `manifest_meshes.json` together.  MEASURED on two real runs and nothing
+#: else: **26,886,959 B over 71,784 entries** (375 B; the Classic Conquer 2.0
+#: run above) and **15,587,780 B over 40,291** (387 B; Clients/5517).  It was
+#: a flat 27 MB, i.e. the first of those totals charged whole to a client
+#: with a twentieth of the entries.
+MANIFEST_BYTES_PER_ENTRY = 380
+
 # ---- camera / shading constants, all lifted from tools/webui/gl.js ---------
 #
 # gl.js's own default is yaw = +0.9, pitch = 0.28 -- but that puts the eye at
@@ -702,12 +748,24 @@ def out_path(kind: str, logical: str) -> Path:
     return OUT_DIR / kind / (stem + ".png")
 
 
-def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]]:
+def load_worklist(idx_path: Optional[Path] = None,
+                  root=None) -> tuple[list[Job], list[str]]:
     """Mesh work list, straight out of `out/meshtex/coverage.json` (a linked
     worktree reads the primary checkout's copy).
 
     Falls back to building a `meshtex.MeshTextureIndex` live (~2 min, it has to
     parse every `.c3`) if that file has not been generated.
+
+    ``root`` names WHICH INSTALL the list is for, and defaults to the
+    configured one.  It has to be passed, and `main` passes `--root`:
+    `out/meshtex/` is per-base, so resolving it without a root answers for
+    whichever install the config names.  MEASURED before this argument
+    existed: ``--root Clients/5017 --all --textures --dry-run`` reported
+    4,973 meshes and 66,907 textures -- Classic Conquer 2.0's corpus to the
+    unit -- while 5017's own is 2,562 and 21,586.  `_apply_output` already
+    keyed the OUTPUT by the root (C55), so the run wrote one client's work
+    list into another client's namespace.  Same shape as C21 and C55; this
+    is the third and last half of it.
     """
     if idx_path is None:
         import coroot
@@ -718,7 +776,7 @@ def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]
         # 5517 both reported the same 5042 meshes. `docs/CORRECTIONS.md` C21.
         # `find_derived` returning None is the honest answer, and it lands on
         # the live rebuild this function's own docstring promises.
-        idx_path = coroot.find_derived("out/meshtex/coverage.json")
+        idx_path = coroot.find_derived("out/meshtex/coverage.json", root)
     if idx_path is not None and idx_path.is_file():
         doc = json.loads(idx_path.read_text("utf-8"))
         jobs, unmatched = [], []
@@ -736,7 +794,7 @@ def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]
 
     import meshtex
     jobs, unmatched = [], []
-    with meshtex.MeshTextureIndex() as mi:
+    with meshtex.MeshTextureIndex(root or DEFAULT_ROOT) as mi:
         for logical in mi.all_meshes():
             best = mi.best(logical)
             if best is None:
@@ -748,10 +806,23 @@ def load_worklist(idx_path: Optional[Path] = None) -> tuple[list[Job], list[str]
     return jobs, unmatched
 
 
-def texture_universe() -> list[str]:
-    """Every `.dds` the client can open (loose + recovered archive names)."""
+def texture_universe(root=None) -> list[str]:
+    """Every `.dds` the client can open (loose + recovered archive names).
+
+    ``root`` for the same reason as `load_worklist`: without it this returned
+    the CONFIGURED install's textures whatever `--root` said, so `--root
+    Clients/5017` queued 66,907 of Classic Conquer 2.0's texture paths
+    against 5017, whose own universe is 21,586.
+
+    Only `health.thumbnail_corpus` wants the *count* rather than the list,
+    and it does not call this: constructing the index costs an `rglob` that
+    runs to 36.8 s on Clients/7878, which is not a price a 1.5 s status poll
+    can pay.  It counts the same union from `install_census` +
+    `meshtex.pooled_names` instead, and `tests/test_health_thumbs.py` pins
+    the two against each other on a real install.
+    """
     import meshtex
-    with meshtex.MeshTextureIndex() as mi:
+    with meshtex.MeshTextureIndex(root or DEFAULT_ROOT) as mi:
         return sorted(mi.textures)
 
 
@@ -1331,8 +1402,9 @@ def main(argv: list[str]) -> int:
                     help="skip entries whose content hash is unchanged "
                          "(this is the default; --no-resume forces a re-render)")
     ap.add_argument("--no-resume", action="store_true")
-    ap.add_argument("--size", type=int, default=256, help="output edge, px")
-    ap.add_argument("--tex-size", type=int, default=128,
+    ap.add_argument("--size", type=int, default=DEFAULT_SIZE,
+                    help="output edge, px")
+    ap.add_argument("--tex-size", type=int, default=DEFAULT_TEX_SIZE,
                     help="output edge for texture thumbnails, px")
     ap.add_argument("--tex-truecolor", action="store_true",
                     help="keep texture thumbnails 24-bit instead of palettising "
@@ -1378,7 +1450,7 @@ def main(argv: list[str]) -> int:
     if a.one:
         _init_worker(a.root, opts)
         import meshtex
-        with meshtex.MeshTextureIndex() as mi:
+        with meshtex.MeshTextureIndex(a.root) as mi:
             best = mi.best(a.one)
         job = Job(a.one, "mesh", best.texture if best else None,
                   best.method if best else "", best.confidence if best else 0.0,
@@ -1418,7 +1490,7 @@ def main(argv: list[str]) -> int:
     unmatched: list[str] = []
     if a.all:
         mesh_jobs, unmatched = (server_worklist(view) if view
-                                else load_worklist())
+                                else load_worklist(root=a.root))
         for j in mesh_jobs:
             j.old_key = (entries.get(j.logical) or {}).get("key", "")
         if a.limit:
@@ -1428,10 +1500,11 @@ def main(argv: list[str]) -> int:
     if a.textures:
         used = {j.texture for j in mesh_jobs if j.texture}
         if not used:
-            wl, _ = server_worklist(view) if view else load_worklist()
+            wl, _ = (server_worklist(view) if view
+                     else load_worklist(root=a.root))
             used = {j.texture for j in wl if j.texture}
         for t in (server_texture_universe(view) if view
-                  else texture_universe()):
+                  else texture_universe(a.root)):
             if a.only_unmatched_textures and t in used:
                 continue
             tex_jobs.append(Job(t, "texture",
@@ -1445,11 +1518,11 @@ def main(argv: list[str]) -> int:
               f"{sum(1 for j in mesh_jobs if j.old_key)}")
         print(f"  meshes with no texture match (skipped)  : {len(unmatched)}")
         print(f"texture thumbnails to consider: {len(tex_jobs)}")
-        # bytes per output pixel, measured over the full corpus:
-        # mesh RGBA 0.365, texture palettised 0.33, texture truecolour 1.27
-        est_mesh = len(mesh_jobs) * (a.size * a.size * 0.365)
-        est_tex = len(tex_jobs) * (a.tex_size * a.tex_size *
-                                   (1.27 if a.tex_truecolor else 0.33))
+        est_mesh = len(mesh_jobs) * (a.size * a.size * MESH_BYTES_PER_PIXEL)
+        est_tex = len(tex_jobs) * (
+            a.tex_size * a.tex_size
+            * (TEXTURE_TRUECOLOR_BYTES_PER_PIXEL if a.tex_truecolor
+               else TEXTURE_BYTES_PER_PIXEL))
         print(f"estimated disk: meshes {est_mesh/1e6:.0f} MB, "
               f"textures {est_tex/1e6:.0f} MB, "
               f"total {(est_mesh+est_tex)/1e6:.0f} MB")
