@@ -698,12 +698,34 @@
       go.disabled = true;
       say('switching…');
       try {
-        await jpost('/api/base', { path: 'install:' + res.kind });
-        say('The viewer is now on ' + res.kind +
-            '. The Health section below is about this client.');
+        const b = await jpost('/api/base', { path: 'install:' + res.kind });
+        // Report where the user IS, not where they were. `say()` writes to
+        // one shared note at the top of Directory Management, and the next
+        // statement scrolls the page to Health -- so the only acknowledgement
+        // of the click was left behind off-screen, and the button read as
+        // having done nothing. Confirm in the offer box itself, which is next
+        // to the pointer, and confirm again at the destination.
+        row.remove();
+        const done = mk('div', 'set-note');
+        done.id = 'dirs-build-offer-done';
+        done.textContent =
+          'The viewer is now on ' + res.kind +
+          (b && b.root ? ' (' + b.root + ')' : '') + '. ' +
+          (b && b.indexed === false
+            ? 'It has no asset index yet -- the Health section below offers '
+              + 'to build one.'
+            : 'The Health section below is about this client.');
+        box.appendChild(done);
+        say('');
         if (window.coSetHealth) await window.coSetHealth.render();
         const sec = document.querySelector('#sec-health');
-        if (sec) sec.scrollIntoView({ behavior: 'smooth' });
+        if (sec) {
+          const flag = mk('div', 'set-note');
+          flag.textContent = 'Showing ' + res.kind + ', switched just now.';
+          sec.insertBefore(flag, sec.firstChild ? sec.firstChild.nextSibling
+                                                : null);
+          sec.scrollIntoView({ behavior: 'smooth' });
+        }
       } catch (e) { say(String(e.message || e), true); go.disabled = false; }
     });
     row.appendChild(go);
