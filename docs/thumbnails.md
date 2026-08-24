@@ -2,7 +2,9 @@
 
 A square PNG preview for **every `.c3` mesh that resolves to a texture**
 (4,950 of 4,964 — the work list is `tools/meshtex.py`'s answer, not a new one),
-plus one for **every `.dds` in the client's texture namespace** (66,834).
+plus one for **every `.dds` in the client's texture namespace** (66,834 on the
+install these figures were measured on -- the count is per client, and
+`health.thumbnail_corpus` computes it; see section 9, "Per client, not once").
 
 Tool: **`tools/thumbs.py`**. Output: `out/thumbs/` (gitignored) with
 `manifest.json`. Consumers should read the manifest, never guess paths.
@@ -44,6 +46,11 @@ authoritative.
 ---
 
 ## 1. Headline
+
+**One install's run.** Every figure in this table is Classic Conquer 2.0's,
+and the corpus is per client -- see section 9. What generalises here is the
+per-item rates (0.33 core-seconds a mesh, 0.043 a texture, 24 KB and 5.4 KB of
+PNG); what does not is the counts and the totals they multiply out to.
 
 | | |
 |---|---:|
@@ -417,13 +424,59 @@ otherwise `thumbs.py` builds a live `meshtex.MeshTextureIndex`, which takes
 about two minutes because it has to parse every `.c3`. Regenerate that file
 with `py -3 tools/meshtex.py --coverage --verify` if the asset tree changes.
 
-Disk, measured: **505 MB** total — 118 MB for 4,950 mesh PNGs (24 KB mean),
-360 MB for 66,834 texture PNGs (5.4 KB mean), 27 MB of manifests. `--dry-run`
-estimates from the same per-pixel constants.
+Disk, measured, **on that install**: **505 MB** total — 118 MB for 4,950 mesh
+PNGs (24 KB mean), 360 MB for 66,834 texture PNGs (5.4 KB mean), 27 MB of
+manifests. These are **bytes of PNG**, not size on disk; a 5.4 KB mean file
+occupies 8 KB of a 4 KiB-cluster volume, and conflating the two is what put
+486 MB in `health.THUMB_FACTS` against the 359.6 recorded here. `--dry-run`
+and `health.thumbnail_corpus` both estimate from the same per-pixel constants
+(`thumbs.MESH_BYTES_PER_PIXEL` and friends), which reproduce this row to 0.5%.
 
 ---
 
-## 9. Known limits
+## 9. Per client, not once
+
+The counts above are **one install's**, and the spread between installs is
+large enough that a single table is wrong in both directions. Measured across
+three declared clients, using the work list `thumbs.py` itself builds:
+
+| client | meshes | textures | disk (PNG) |
+|---|---:|---:|---:|
+| Clients/5017 | 2,562 | 21,586 | 187 MB |
+| Classic Conquer 2.0 | 4,973 | 66,908 | 508 MB |
+| Clients/6609 | 11,068 | 92,257 | 803 MB |
+
+`health.thumbnail_corpus(root)` computes that row for whichever client is
+selected, and the Settings panel's plan is built from it. It counts the mesh
+half by calling `thumbs.load_worklist` on that base's own
+`out/meshtex/coverage.json` — the very list the run iterates — and the texture
+half from `health.install_census` + `meshtex.pooled_names`, which is the same
+union `thumbs.texture_universe` enumerates but without constructing a
+`MeshTextureIndex` (36.8 s on Clients/7878, against a 1.5 s status poll).
+`tests/test_health_thumbs.py` asserts the two agree exactly on a real install.
+
+**A client with no `coverage.json` has no mesh count**, and building one live
+costs ~2 minutes, which a status poll may not start. `thumbnail_corpus`
+returns `ok: False` with a `why` naming the missing file, `meshes: 0`, and the
+texture half still counted; the plan marks `corpusMeasured: false` and prints
+`"not counted yet"` instead of a duration for the mesh-bearing options. It
+does **not** fall back to another install's corpus — that substitution is the
+defect this replaced.
+
+Two things are still extrapolated over that counted job: the **seconds**, from
+one 226 s run on 20 workers carried across as a per-item rate, and the
+**disk**, whose per-pixel constants were fitted to Classic Conquer 2.0's art
+and read 12% (meshes) and 24% (textures) high on Clients/5517.
+
+`tools/thumbs.py` honours `--root` in its work list as of
+`C-2026-08-23-claude-thumb-corpus-per-client`. Before that it did not: the
+output directory was keyed to the root but the enumeration was not, so
+`--root <a client>` rendered the *configured* install's asset list into that
+client's namespace.
+
+---
+
+## 10. Known limits
 
 1. **One texture per mesh.** Only `meshtex`'s *best* match is rendered, even
    though a body mesh legitimately has a whole armour family of skins

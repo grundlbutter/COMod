@@ -111,12 +111,18 @@ entirely on the machine, anywhere from about four minutes on a fast many-core
 desktop to **15–30 minutes or more** on a laptop. The viewer therefore **asks**,
 and never starts a run on its own.
 
-The prompt states the real cost and offers:
+The prompt states the real cost and offers. **The numbers in it are counted
+for the client being browsed, not quoted** — `health.thumbnail_corpus` builds
+the same work list `tools/thumbs.py` will, so the figures move with the
+client. Measured across three declared installs: 2,562 meshes + 21,586
+textures + 187 MB on Clients/5017, 4,973 + 66,908 + 508 MB on Classic Conquer
+2.0, 11,068 + 92,257 + 803 MB on Clients/6609. A single table cannot say that,
+and the one that used to sit here quoted all three the middle row's figures.
 
 | | |
 |---|---|
-| **Meshes only** | 4,950 images, 124 MB, roughly a third of the time. What the character builder and Models mode use. The better default. |
-| **Everything** | adds 66,834 texture thumbnails, 486 MB — most of the time and nearly all of the disk. |
+| **Meshes only** | every mesh with a matched texture, roughly a third of the time. What the character builder and Models mode use. The better default. |
+| **Everything** | adds a thumbnail for every `.dds` the client can open — most of the time and nearly all of the disk. |
 | **Not now** / **stop asking** | remembered, so it does not nag. |
 
 Declining leaves the viewer fully working: assets without a thumbnail show a
