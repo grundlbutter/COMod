@@ -211,8 +211,8 @@ function renderModelViewerLink() {
   const p = new URLSearchParams({ mesh });
   if (state.texPath) p.set('tex', state.texPath);
   const a = el('a', 'navlink-inline', '→ Open this mesh in the model viewer');
-  a.href = '/builder#' + p.toString();
-  a.title = 'Same geometry and skin, on the builder\u2019s model stage: ' +
+  a.href = '/models#' + p.toString();
+  a.title = 'Same geometry and skin, on the Model Viewer\u2019s stage: ' +
             'zoom, camera and lighting, without needing a catalogue entry.';
   host.appendChild(a);
   const what = el('div', 'mut small');
@@ -415,7 +415,10 @@ async function boot() {
   // Collapsible detail panels -- the same cards.js the builder uses. This page
   // had the `cursor: pointer` on every `.card h2` and NO listener behind it,
   // which is the "I can see the cursor change, but it doesnt collaps" bug.
-  CardPanels.init('coviewer.collapsed', 'btn-collapse-all');
+  // No button id: the header's "Collapse panels" control was removed (the
+  // card headers are each collapsible, so it was a second way to say the
+  // same thing). `C` below still toggles the lot.
+  CardPanels.init('coviewer.collapsed');
   bindControls();
   bindKeys();
   if (viewer) {
@@ -2632,8 +2635,10 @@ function bindKeys() {
           case 'w': $('#chk-wire').click(); break;
           case 'g': $('#chk-grid').click(); break;
           case 's': $('#chk-sockets').click(); break;
-          case 'c': CardPanels.toggleAll(); $('#btn-collapse-all').textContent =
-            CardPanels.anyOpen() ? 'Collapse panels' : 'Expand panels'; break;
+          // No label to keep in step now that the button is gone -- and
+          // this line used to dereference it unconditionally, so leaving
+          // the removal to the HTML alone would have thrown here.
+          case 'c': CardPanels.toggleAll(); break;
           default: return;
         }
     }

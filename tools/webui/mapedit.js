@@ -227,7 +227,10 @@ function toast(msg, ms) {
 // ------------------------------------------------------------------ boot
 
 async function boot() {
-  CardPanels.init('comapedit.collapsed', 'btn-collapse-all');
+  // No button id -- the header's "Collapse panels" control was removed. The
+  // card headers each collapse their own and `c` below still toggles all of
+  // them, so the behaviour is untouched.
+  CardPanels.init('comapedit.collapsed');
   wire();
   const data = await api('/api/mapedit/maps');
   app.maps = data.rows;

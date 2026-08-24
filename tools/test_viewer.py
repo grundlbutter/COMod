@@ -6431,8 +6431,13 @@ class CollapsiblePanels(unittest.TestCase):
                 f"{page}: every card needs a .cardbody to hide")
             self.assertIn("/ui/cards.js", html,
                           f"{page}: the behaviour has to be loaded")
-            self.assertIn('id="btn-collapse-all"', html,
-                          f"{page}: collapse-everything must be reachable")
+            # The header's "Collapse panels" button is GONE, deliberately: the
+            # panels are each collapsible from their own header, so it was a
+            # second control for what the headers already do. Asserted as an
+            # absence because the removal is the point -- and because the
+            # keyboard route below is what actually had to survive it.
+            self.assertNotIn('id="btn-collapse-all"', html,
+                             f"{page}: the duplicate collapse button is back")
 
     def test_the_behaviour_lives_in_one_place(self):
         """Two pages, one implementation. The drift between them is what let
@@ -7100,16 +7105,27 @@ class ModelModeUi(unittest.TestCase):
 
     def setUp(self):
         self.html = (self.WEBUI / "builder.html").read_text("utf-8")
+        self.models = (self.WEBUI / "models.html").read_text("utf-8")
         self.js = (self.WEBUI / "builder.js").read_text("utf-8")
         self.css = (self.WEBUI / "style.css").read_text("utf-8")
 
-    def test_the_mode_switch_exists_and_both_rails_are_reachable(self):
-        for need in ('id="mode-character"', 'id="mode-model"',
-                     'id="model-rail"', 'id="model-list"', 'id="model-kinds"',
-                     'id="card-model"', 'id="card-monster"'):
-            self.assertIn(need, self.html, f"builder.html is missing {need}")
-        self.assertIn("setMode('model')", self.js)
-        self.assertIn("setMode('character')", self.js)
+    def test_the_model_surface_is_a_page_and_the_builder_no_longer_carries_it(self):
+        """Model mode was a SWITCH on the builder, so the one surface for
+        monsters, NPCs, ghosts, mounts, roles and effects had no address --
+        it could not be linked or offered as a tab without the tab really
+        being a control on another page.
+
+        The half that matters is the second loop: a split that leaves the old
+        markup behind on the builder is two rails again, one of them dead."""
+        for need in ('id="model-rail"', 'id="model-list"', 'id="model-kinds"',
+                     'id="card-model"', 'id="card-monster"',
+                     'data-co-page="models"'):
+            self.assertIn(need, self.models, f"models.html is missing {need}")
+        for gone in ('id="mode-character"', 'id="mode-model"',
+                     'id="model-rail"', 'id="card-model"', 'id="card-monster"'):
+            self.assertNotIn(gone, self.html,
+                             f"builder.html still carries {gone}")
+        self.assertIn("const IS_MODELS = PAGE === 'models';", self.js)
 
     def test_every_hideable_control_can_actually_be_hidden(self):
         r"""`.hidden` is one class; `label.chk` is element+class and wins.
@@ -7177,8 +7193,13 @@ class ModelModeUi(unittest.TestCase):
                       m.group(1))
 
     def test_the_keyboard_reference_documents_the_new_keys(self):
-        for k in ("<kbd>M</kbd>", "<kbd>[</kbd>"):
-            self.assertIn(k, self.html)
+        # `M` moves BETWEEN the two pages now, so both help tables name it.
+        # `[` and `]` step a model's actions and belong only where models are.
+        self.assertIn("<kbd>M</kbd>", self.html)
+        self.assertIn("<kbd>M</kbd>", self.models)
+        self.assertIn("<kbd>[</kbd>", self.models)
+        self.assertNotIn("<kbd>[</kbd>", self.html,
+                         "the builder documents a key its page cannot use")
 
 
 class TerrainMesh(unittest.TestCase):
@@ -11143,12 +11164,26 @@ class MapEditorUi(unittest.TestCase):
         self.assertEqual(html.count("cardbody"), len(cards))
         self.assertIn('src="/ui/cards.js"', html)
         self.assertIn('src="/ui/mapmodel.js"', html)
-        self.assertIn('id="btn-collapse-all"', html)
+        # The header button was removed; `c` in mapedit.js still toggles the
+        # lot and each header still collapses its own card.
+        self.assertNotIn('id="btn-collapse-all"', html)
+        self.assertIn("CardPanels.toggleAll()", self.read("mapedit.js"))
 
-    def test_the_page_is_reachable_from_the_other_two(self):
-        for page in ("index.html", "builder.html"):
-            self.assertIn('href="/mapedit"', self.read(page),
-                          f"{page} must link to the MapEditor")
+    def test_the_page_is_reachable_from_every_other_page(self):
+        """It used to be checked page by page, which is how five hand-rolled
+        navs came to disagree. There is one bar now (`webui/nav.js`), so the
+        reachable check is asked of the one definition -- and of every page
+        actually consuming it, which is the half a per-page `href` grep could
+        never see."""
+        nav = self.read("nav.js")
+        self.assertIn("href: '/mapedit'", nav,
+                      "the MapEditor must be a tab in the one nav")
+        webui = PROJECT / "tools" / "webui"
+        for page in ("index.html", "builder.html", "models.html",
+                     "mapedit.html", "settings.html", "swap.html"):
+            html = (webui / page).read_text("utf-8")
+            self.assertIn('id="co-nav"', html, f"{page} has no bar host")
+            self.assertIn('src="/ui/nav.js"', html, f"{page} never loads it")
 
     def test_zoom_is_a_scale_and_never_a_projection(self):
         """The camera is derived, not chosen (`docs/map_scenery.md` §6), so the

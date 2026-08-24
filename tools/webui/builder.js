@@ -41,6 +41,36 @@
 
 'use strict';
 
+/* WHICH OF THE TWO PAGES THIS IS.
+ *
+ * `builder.html` and `models.html` are two documents, two routes and one
+ * engine -- this file. They share the stage, the action dropdown, the
+ * playback loop and the camera, because for a monster and for a character
+ * those genuinely are the same job (see the header above). They do NOT share
+ * markup: there is no slot rail or picker on the Model Viewer and no model
+ * rail on the builder, so each page carries only what it uses.
+ *
+ * Read from `data-co-page`, which is also what nav.js lights the tab from --
+ * one declaration per page, not two that can disagree. Never sniffed from the
+ * URL: `/models`, `/models/` and `/models.html` are the same page and a
+ * sniffer has to be taught each one.
+ */
+const PAGE = (document.body && document.body.dataset.coPage) || 'builder';
+const IS_MODELS = PAGE === 'models';
+
+/* Old links keep working. A fragment never reaches the server, so this is the
+ * only place `/builder#model=…` and `/builder#mesh=…` can be honoured -- and
+ * they must be: those URLs were the shareable output of `Copy link` and of
+ * the browser's "open this mesh in the model viewer", so they are in people's
+ * scrollback. `replace`, not `assign`, so Back does not bounce between the
+ * two pages. Redirected, not refused, and not silently ignored. */
+if (!IS_MODELS) {
+  const h = new URLSearchParams(location.hash.replace(/^#/, ''));
+  if (h.get('model') || h.get('mesh')) {
+    location.replace('/models' + location.hash);
+  }
+}
+
 const $ = s => document.querySelector(s);
 const el = (tag, cls, txt) => {
   const e = document.createElement(tag);
@@ -63,8 +93,11 @@ const lbl = v => VALUE_LABEL[v] || v;
 
 // ---------------------------------------------------------------- state
 const B = {
-  /** 'character' (slots + appearances) or 'model' (monsters, NPCs, ...). */
-  mode: 'character',
+  /** 'character' (slots + appearances) or 'model' (monsters, NPCs, ...).
+   *  Now fixed by WHICH PAGE this is -- it was a control, and the control is
+   *  what the tab bar could not honestly offer. Kept as a field because the
+   *  shared stage, action and rebuild paths branch on it throughout. */
+  mode: IS_MODELS ? 'model' : 'character',
   slots: [],
   slotById: {},
   config: null,
@@ -299,7 +332,10 @@ async function boot() {
   B.config = await api('/api/builder?bodyType=' + encodeURIComponent(B.bodyType));
   B.slots = B.config.slots;
   B.slotById = Object.fromEntries(B.slots.map(s => [s.name, s]));
-  $('#compat-note').textContent = B.config.compatNote;
+  // /api/builder is still asked for on both pages: it carries
+  // `defaultFrameMs`, which the shared playback loop below needs. Only the
+  // slot furniture it also carries is builder-only.
+  if (!IS_MODELS) $('#compat-note').textContent = B.config.compatNote;
 
   try {
     const saved = JSON.parse(localStorage.getItem(ANIM_KEY) || 'null');
@@ -308,17 +344,22 @@ async function boot() {
   } catch (e) { /* ignore */ }
   B.anim.speed = B.anim.speed || B.config.defaultFrameMs || 41;
   restoreAura();
-  if (!restored || !restored.body) await applyDefaultLoadout();
-  else await refreshLoadoutNames();
+  // Building the starting character touches the slot rail, which does not
+  // exist on the Model Viewer -- and would be work done for a figure that
+  // page never draws.
+  if (!IS_MODELS) {
+    if (!restored || !restored.body) await applyDefaultLoadout();
+    else await refreshLoadoutNames();
+  }
   restoreModelState();
   await fillActions();
-  renderSlots();
+  if (!IS_MODELS) renderSlots();
   renderAnimPanel();
   applyMode({ rebuild: false });
-  if (B.mode === 'model') await loadModelList({ select: B.model.key });
+  if (IS_MODELS) await loadModelList({ select: B.model.key });
   await rebuild({ reframe: true });
   renderCollect();
-  if (B.mode === 'character') showLookFor('body');
+  if (!IS_MODELS) showLookFor('body');
 }
 
 async function applyDefaultLoadout() {
@@ -639,7 +680,11 @@ async function resetAll() {
 // hand cursor and did nothing.
 
 function restoreCollapsed() {
-  CardPanels.init(COLLAPSE_KEY, 'btn-collapse-all');
+  // No button id: the header's "Collapse panels" control was removed. Every
+  // card header still collapses its own card on click and `C` still toggles
+  // all of them -- the button was a second way to say what the headers
+  // already say, not the behaviour itself.
+  CardPanels.init(COLLAPSE_KEY);
   // `B.collapsed` is a live view for the console and for tests, not a second
   // copy: CardPanels owns the state and this must never shadow it.
   Object.defineProperty(B, 'collapsed', {
@@ -1868,7 +1913,8 @@ function restoreModelState() {
   try {
     const s = JSON.parse(localStorage.getItem(MODEL_KEY) || 'null');
     if (s && typeof s === 'object') {
-      if (s.mode === 'model' || s.mode === 'character') B.mode = s.mode;
+      // `mode` is NOT restored: it is the page now. A stale 'model' in
+      // storage used to be able to open the builder on the other rail.
       B.adhoc = s.adhoc || null;
       B.model.key = s.key || '';
       B.model.action = s.action || '';
@@ -1882,16 +1928,15 @@ function restoreModelState() {
     }
   } catch (e) { /* ignore */ }
   // A link that names a model wins over whatever was last open.
+  if (!IS_MODELS) return;               // the builder has no model to restore
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
   if (h.get('model')) {
-    B.mode = 'model';
     B.adhoc = null;
     B.model.key = h.get('model');
     if (h.get('action')) B.model.action = h.get('action');
     if (h.get('zoom')) B.model.zoom = +h.get('zoom') || 100;
   } else if (h.get('mesh')) {
     // ...and a link that names a bare mesh path wins the same way.
-    B.mode = 'model';
     B.adhoc = { mesh: h.get('mesh'), tex: h.get('tex') || '' };
     B.model.key = '';
     if (h.get('zoom')) B.model.zoom = +h.get('zoom') || 100;
@@ -1923,20 +1968,24 @@ function saveModelState() {
  *  because the loadout and the model selection are separate state. */
 function applyMode({ rebuild: doRebuild = true } = {}) {
   const model = B.mode === 'model';
-  $('#mode-character').classList.toggle('on', !model);
-  $('#mode-model').classList.toggle('on', model);
-  $('#mode-character').setAttribute('aria-selected', String(!model));
-  $('#mode-model').setAttribute('aria-selected', String(model));
-  $('#slots-rail').classList.toggle('hidden', model);
-  $('#model-rail').classList.toggle('hidden', !model);
-  $('#card-model').classList.toggle('hidden', !model);
-  $('#card-look').classList.toggle('hidden', model);
-  $('#card-fx').classList.toggle('hidden', model);
-  $('#clips-label').classList.toggle('hidden', !model);
+  // Each page ships only its own rails and cards, so most of what this used
+  // to toggle is simply absent on the other page. `hide` is null-tolerant on
+  // purpose: the alternative is a list of ids that has to stay in step with
+  // two documents, which is the drift this whole change exists to remove.
+  const hide = (sel, on) => {
+    const n = $(sel);
+    if (n) n.classList.toggle('hidden', on);
+  };
+  hide('#slots-rail', model);
+  hide('#model-rail', !model);
+  hide('#card-model', !model);
+  hide('#card-look', model);
+  hide('#card-fx', model);
+  hide('#clips-label', !model);
   // `B.model.kind` is the FILTER chip; the selected model's own kind lives on
   // its payload. Conflating the two is how a monster panel ends up on a ghost.
-  $('#card-monster').classList.toggle(
-    'hidden', !(model && B.model.data && B.model.data.kind === 'monster'));
+  hide('#card-monster',
+       !(model && B.model.data && B.model.data.kind === 'monster'));
   if (model) {
     let had = false;
     for (const s of AURA_HANDS) {
@@ -1951,19 +2000,15 @@ function applyMode({ rebuild: doRebuild = true } = {}) {
   if (doRebuild) rebuild({ reframe: true });
 }
 
-async function setMode(mode) {
+/** Switching mode is now switching PAGE.
+ *
+ *  It used to swap one rail for another in place. That is what made "Model
+ *  Viewer" a control on the builder rather than a place, which a tab bar
+ *  cannot represent without lying. `M` and any remaining caller land on the
+ *  other route instead; each page then boots in its own mode. */
+function setMode(mode) {
   if (mode === B.mode) return;
-  animPause();
-  stopModelEffect();
-  B.mode = mode;
-  B.anim.cache = {};
-  applyMode({ rebuild: false });
-  if (mode === 'model' && !B.model.list.length) {
-    await loadModelList({ select: B.model.key });
-  }
-  await fillActions();
-  await rebuild({ reframe: true });
-  if (mode === 'character') showLookFor('body');
+  location.href = mode === 'model' ? '/models' : '/builder';
 }
 
 // ---------------------------------------------------------------- the list
@@ -3185,7 +3230,7 @@ function copyModelLink() {
   const p = new URLSearchParams({ model: B.model.key });
   if (B.model.action) p.set('action', B.model.action);
   if (B.model.zoom !== 100) p.set('zoom', String(B.model.zoom));
-  const url = location.origin + '/builder#' + p.toString();
+  const url = location.origin + '/models#' + p.toString();
   location.hash = p.toString();
   navigator.clipboard.writeText(url).then(
     () => toast('model link copied'),
@@ -3194,42 +3239,14 @@ function copyModelLink() {
 
 // ---------------------------------------------------------------- controls
 function bindControls() {
-  $('#btn-more-slots').addEventListener('click', () => {
-    $('#slot-cards-more').classList.toggle('hidden');
-    renderSlots();
-  });
-  $('#btn-share').addEventListener('click', copyLink);
-  $('#btn-reset-all').addEventListener('click', resetAll);
-  // panel collapse (header button, per-card headers and `C`) is CardPanels',
-  // bound in restoreCollapsed() before this runs — one implementation, shared
-  // with the asset browser page.
-  $('#picker-close').addEventListener('click', cancelPicker);
-  $('#picker-clear').addEventListener('click', async () => {
-    const slot = B.picker.slot;
-    closePicker();
-    if (slot) await unequip(slot);
-  });
-  $('#picker-search').addEventListener('input', debounce(loadPickerOptions, 220));
-  $('#picker').addEventListener('click', e => {
-    if (e.target.id === 'picker') cancelPicker();
-  });
+  // The two pages' OWN controls. Split rather than null-guarded one line at a
+  // time: which controls a page has is a fact about the page, and forking here
+  // means a missing element is a bug rather than a silently skipped binding.
+  if (IS_MODELS) bindModelControls(); else bindCharacterControls();
 
-  $('#mode-character').addEventListener('click', () => setMode('character'));
-  $('#mode-model').addEventListener('click', () => setMode('model'));
-  $('#model-search').addEventListener('input', debounce(e => {
-    B.model.q = e.target.value.trim();
-    loadModelList();
-  }, 220));
-  $('#model-path').addEventListener('input', debounce(e => {
-    B.model.path = e.target.value.trim();
-    saveModelState();
-    loadPathList();
-  }, 260));
-  $('#chk-clips').addEventListener('change', e => {
-    B.model.distinctOnly = e.target.checked;
-    saveModelState();
-    fillModelActions();
-  });
+  // panel collapse (per-card headers and `C`) is CardPanels', bound in
+  // restoreCollapsed() before this runs — one implementation, shared with the
+  // asset browser page. The header button that also did it is gone.
 
   $('#anim-action').addEventListener('change', async e => {
     // An ad-hoc mesh drives this select itself (fillAdhocActions), and its
@@ -3307,6 +3324,47 @@ function bindControls() {
     applySuperFx();
     syncAuraControl();
     refreshWeaponPanel();
+  });
+}
+
+/** Builder-only: the slot rail, the picker, and the character's own buttons.
+ *  None of this markup exists on models.html. */
+function bindCharacterControls() {
+  $('#btn-more-slots').addEventListener('click', () => {
+    $('#slot-cards-more').classList.toggle('hidden');
+    renderSlots();
+  });
+  $('#btn-share').addEventListener('click', copyLink);
+  $('#btn-reset-all').addEventListener('click', resetAll);
+  $('#picker-close').addEventListener('click', cancelPicker);
+  $('#picker-clear').addEventListener('click', async () => {
+    const slot = B.picker.slot;
+    closePicker();
+    if (slot) await unequip(slot);
+  });
+  $('#picker-search').addEventListener('input', debounce(loadPickerOptions, 220));
+  $('#picker').addEventListener('click', e => {
+    if (e.target.id === 'picker') cancelPicker();
+  });
+}
+
+/** Model Viewer only: the model rail and the clip filter. None of this markup
+ *  exists on builder.html. */
+function bindModelControls() {
+  $('#btn-share').addEventListener('click', copyLink);
+  $('#model-search').addEventListener('input', debounce(e => {
+    B.model.q = e.target.value.trim();
+    loadModelList();
+  }, 220));
+  $('#model-path').addEventListener('input', debounce(e => {
+    B.model.path = e.target.value.trim();
+    saveModelState();
+    loadPathList();
+  }, 260));
+  $('#chk-clips').addEventListener('change', e => {
+    B.model.distinctOnly = e.target.checked;
+    saveModelState();
+    fillModelActions();
   });
 }
 

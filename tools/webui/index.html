@@ -6,10 +6,13 @@
 <link rel="stylesheet" href="/ui/style.css">
 <link rel="stylesheet" href="/ui/setup.css">
 </head>
-<body>
+<body data-co-page="viewer">
+
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
 
 <header>
-  <h1>CO Asset Viewer</h1>
+  <h1>Asset Viewer</h1>
   <label id="path-label" class="hidden"
          title="What to browse — an installed client, or a private server's own client. The parser plugin follows the path, so tables, id conventions and linkages all change with it. Each keeps its own derived indexes.">
     Path
@@ -17,21 +20,16 @@
   </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
-  <a class="navlink" href="/builder" id="link-builder"
-     title="Build a character: pick a body, then hair, headgear and weapons that fit it. Your loadout carries over.">→ Character builder</a>
-  <a class="navlink" href="/mapedit" id="link-mapedit"
-     title="Draw a world map as the game draws it — background, base puzzle, TERRAIN and COVER — and edit its art.">→ MapEditor</a>
-  <a class="navlink" href="/swap.html" id="link-swap"
-     title="Swap an asset: pick from your library on the left, choose what it replaces on the right. Stages the change -- nothing reaches the install until you install it.">&rarr; Swap</a>
-  <button id="btn-collapse-all" class="ghost"
-          title="Collapse / expand every panel on the right (C)">Collapse panels</button>
-  <button id="btn-health" class="ghost"
-          title="Where the game install was found, what is installed, and the state of the thumbnail cache">Health &amp; thumbnails</button>
+  <!-- Going anywhere is the site bar's job now (nav.js), and staging is its
+       button. What is left here is what belongs to THIS page and nowhere
+       else. "Health & thumbnails" left entirely: it lives on Settings, whose
+       Health management section is the same report, and firstrun.js still
+       opens it by itself when something is actually wrong. "Collapse panels"
+       left too -- every card header collapses on click (cards.js) and `C`
+       still toggles the lot, so the behaviour is intact and only the button
+       is gone. -->
   <button id="btn-library" class="ghost"
           title="Choose the COmmunity Library folder — where this tool stores private-server clients it has imported, so they can be browsed here.">Asset library</button>
-  <button id="btn-mods" class="ghost">Mod staging</button>
-  <a class="navlink" href="/settings" id="link-settings"
-     title="Which folders are declared as clients, the one-off builds and what they cost, and the preference toggles.">→ Settings</a>
 </header>
 
 <main>
@@ -205,6 +203,15 @@
           Keep this asset in the library&#39;s curated Collection &mdash; filed by
           category, viewable, and stageable over an existing asset as a swap.
           Its motion files come along with it.
+        </p>
+        <!-- /swap's entry point. It is deliberately NOT a sixth tab: it is
+             this page's swap flow given the whole window, not a section of
+             the tool, and nav.js maps it back under Asset Viewer so the bar
+             still lights exactly one tab while you are on it. It lives in
+             the Collection card because collecting is the step before it. -->
+        <p class="small" style="margin:0 0 8px">
+          <a href="/swap" class="navlink-inline"
+             title="Pick from your library on the left, choose what it replaces on the right. Stages the change — nothing reaches the install until you install it.">Swap an asset &rarr;</a>
         </p>
         <div id="collect-body"></div>
       </div>

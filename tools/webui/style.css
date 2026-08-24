@@ -23,6 +23,59 @@ body {
   display: flex; flex-direction: column; overflow: hidden;
 }
 
+/* ---- the site bar (nav.js) ----------------------------------------------
+ *
+ * One row, first thing in <body>, IDENTICAL on every page -- that sameness is
+ * the feature, so nothing here may be scoped to a page or overridden by one.
+ * It sits ABOVE each page's own header furniture rather than inside it: the
+ * five pages have five different shells (the viewer is a fixed three-pane
+ * flexbox, settings is one scrolling column, swap is two panes and a middle),
+ * and a bar that lives inside those shells cannot be the same in all of them.
+ *
+ * `flex: 0 0 auto` because `body` is a column flexbox on the viewer pages and
+ * an unconstrained bar would be squeezed by the pane below it.
+ *
+ * WRAP, never scroll and never ellipsis. At a narrow width the tablist drops
+ * onto a second line and the bar gets taller. A tab pushed off the right edge
+ * is still in the DOM, still passes `assertIn`, and is unclickable -- which is
+ * the exact failure `elementFromPoint` hit-testing is run against. */
+.co-tabs {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 6px 14px; background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.co-gap { flex: 1 1 auto; }
+.co-tablist { display: flex; flex-wrap: wrap; gap: 4px; margin-left: auto; }
+
+.co-tab {
+  display: inline-block;
+  padding: 6px 12px; border-radius: 6px 6px 0 0;
+  border: 1px solid transparent; border-bottom: 2px solid transparent;
+  color: var(--mut); text-decoration: none; white-space: nowrap;
+  font-size: 12px; letter-spacing: .2px;
+}
+/* An inactive tab has to LOOK operable -- that is half the owner's ask. The
+ * hover lift is the affordance; the cursor alone is the mistake cards.js was
+ * written to undo. */
+.co-tab:hover { color: var(--fg); background: var(--panel); border-color: var(--line); }
+.co-tab.on {
+  color: var(--fg); background: var(--bg);
+  border-color: var(--line); border-bottom-color: var(--accent);
+  font-weight: 600; cursor: default;
+}
+.co-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The staging button. Sits at the far left with the spacer between it and the
+ * tabs, so its being a different KIND of thing is carried by position. It is
+ * styled as a button, not as a tab: no bottom rule, no active state. */
+.co-stage {
+  padding: 5px 12px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel);
+  color: var(--fg); font: inherit; font-size: 12px; cursor: pointer;
+}
+.co-stage:hover { border-color: var(--accent); }
+
 header {
   display: flex; align-items: center; gap: 14px;
   padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel);

@@ -8,7 +8,12 @@
 /* Local to this page. The shared style.css is built around the browser's
    three-pane layout; this page is two panes of equal weight with the swap
    itself between them, because seeing both halves is the whole point. */
-.sw-wrap { display: flex; flex-direction: column; height: 100vh; }
+/* `height: 100vh` before the site bar existed. `body` is a column flexbox
+   (style.css) and the bar is a row in it, so a hard 100vh here overflows by
+   exactly the bar's height and `overflow: hidden` eats the bottom of the
+   page -- the install buttons among it. Take what is left instead. */
+.sw-wrap { display: flex; flex-direction: column; flex: 1 1 auto;
+           min-height: 0; }
 .sw-top { padding: .6rem 1rem; border-bottom: 1px solid rgba(128,128,128,.25);
           display: flex; align-items: baseline; gap: 1rem; }
 .sw-top h2 { margin: 0; font-size: 1.1rem; }
@@ -158,15 +163,21 @@
 .sw-step { margin: .5rem 0; }
 </style>
 </head>
-<body>
+<!-- /swap is a real route and deliberately NOT a sixth tab: it is the Asset
+     Viewer's swap flow given the whole window, not a section of the tool.
+     nav.js maps it back under Asset Viewer (CoNav.UNDER), so the bar still
+     lights exactly one tab here, and the Collection card on the viewer is
+     where you come in from. -->
+<body data-co-page="swap">
+
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
+
 <div class="sw-wrap">
   <div class="sw-top">
     <h2>Swap an asset</h2>
     <span class="sw-sub">Pick what you want on the left, what it replaces on
       the right. The file paths are worked out for you.</span>
-    <span style="margin-left:auto">
-      <button id="btn-mods" class="sw-go" type="button">Mod staging</button>
-      <a href="/">back to the viewer</a></span>
   </div>
   <div id="sw-writable"></div>
   <div class="sw-body">

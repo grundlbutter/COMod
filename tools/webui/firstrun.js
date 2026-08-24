@@ -462,15 +462,18 @@
   }
 
   // ------------------------------------------------------------------ wire
-  const btn = q('#btn-health');
-  if (btn) {
-    btn.addEventListener('click', async () => {
-      if (!host.classList.contains('hidden')) { close(); return; }
-      open();
-      card.textContent = 'checking…';
-      await refresh();
-    });
-  }
+  // There is no manual opener any more. `#btn-health` was the "Health &
+  // thumbnails" button in index.html, and that button is gone -- the report it
+  // showed lives on the Settings page, whose Health management section is the
+  // same data. Looking up an id nobody defines is not harmless: it reads as a
+  // wired control to anyone maintaining this file, and `test_firstrun_optin`
+  // exists to refuse exactly that.
+  //
+  // The AUTO-open below is unaffected and is the path that matters. It sits
+  // outside this block (it always did), so removing the button did not remove
+  // the behaviour -- a distinction worth stating, because the commit that took
+  // the button out claimed in a comment that firstrun "still opens it by
+  // itself", and that claim happened to be true only by the brace structure.
 
   // Auto-open on first run only: something is actually wrong, or there are no
   // thumbnails and the question has not been answered yet. A healthy, already
@@ -485,6 +488,6 @@
         render(rep);
         open();
       }
-    } catch (e) { /* the page still works; the button is there if wanted */ }
+    } catch (e) { /* the page still works; Settings has the same report */ }
   })();
 })();

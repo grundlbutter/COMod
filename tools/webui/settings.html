@@ -161,7 +161,17 @@ html, body { height: auto; overflow: visible; display: block; }
 .set-list[hidden] { display: none; }
 </style>
 </head>
-<body>
+<body data-co-page="settings">
+
+<!-- The same bar as every other page. This page is the test of that
+     claim: it opts OUT of the viewer's fixed-viewport flex shell (see the
+     rule below), it has no stage and no panels, and it still consumes the
+     bar unmodified. `.set-nav` under the heading is NOT a second site nav
+     -- it jumps between this page's own sections, which is why it stayed
+     and why its one outbound link ("back to the viewer") did not. -->
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
+
 <div class="set-wrap">
   <h2>Settings</h2>
   <p class="set-help">
@@ -175,7 +185,6 @@ html, body { height: auto; overflow: visible; display: block; }
     <a href="#sec-health">Health management</a>
     <a href="#sec-dev">Developer options</a>
     <a href="#sec-prefs">Preferences</a>
-    <a href="/">&larr; back to the viewer</a>
   </nav>
 
   <!-- ============================================ 1. directory management -->
@@ -219,11 +228,15 @@ html, body { height: auto; overflow: visible; display: block; }
     <div id="settings-body">loading…</div>
   </section>
 
-  <p class="set-help" style="margin-top:2rem">
-    <a href="/">back to the viewer</a>
-  </p>
 </div>
+<!-- Mod staging is on EVERY page, including this one. There is no drawer in
+     this file: nav.js injects the standard one when a page has none of its
+     own, and wires it through the same swap.js the other four pages use. That
+     is the check on the design -- if Settings needed a special case, the bar
+     would not really be one thing. `csrf.js` is what makes the install POSTs
+     from that drawer acceptable to the server. -->
 <script src="/ui/csrf.js"></script>
+<script src="/ui/swap.js"></script>
 <script src="/ui/settings.js"></script>
 <script src="/ui/setdirs.js"></script>
 <script src="/ui/sethealth.js"></script>

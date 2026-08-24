@@ -6,17 +6,18 @@
 <link rel="stylesheet" href="/ui/style.css">
 <link rel="stylesheet" href="/ui/mapedit.css">
 </head>
-<body>
+<body data-co-page="mapedit">
+
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
 
 <header>
-  <h1>CO MapEditor</h1>
+  <h1>Map Editor</h1>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
-  <a class="navlink" href="/" title="Find any asset, see where it comes from, swap a texture">← Asset browser</a>
-  <a class="navlink" href="/builder" title="Build a character out of appearances">Character builder</a>
-  <button id="btn-collapse-all" class="ghost"
-          title="Collapse / expand every panel on the right (C)">Collapse panels</button>
-  <button id="btn-mods" class="ghost">Mod staging</button>
+  <!-- Going anywhere is the site bar's job (nav.js) and staging is its
+       button. Collapse panels left: each card header collapses its own card
+       and `C` still toggles the lot, so only the duplicate control went. -->
 </header>
 
 <main>

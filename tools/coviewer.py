@@ -4206,6 +4206,16 @@ class Handler(BaseHTTPRequestHandler):
         # The character builder is its own page, not a panel on the browser.
         if path in ("/builder", "/builder/", "/builder.html"):
             return self._static("builder.html")
+        # ...and so is the Model Viewer. It used to be the builder's second
+        # MODE, reached by a switch in that page's header, which meant the one
+        # surface for monsters, NPCs, ghosts, mounts, roles and effects had no
+        # address: it could not be linked, bookmarked, or offered as a tab
+        # without the tab really being a control on someone else's page.
+        # Two documents, two routes, one engine (webui/builder.js) -- the
+        # stage, actions, playback and camera genuinely are the same job, and
+        # models.html says so in its own header.
+        if path in ("/models", "/models/", "/models.html"):
+            return self._static("models.html")
         # ...and so is the MapEditor: a map wants the whole window, and the
         # browser's three-pane layout is built around a 3D viewport.
         if path in ("/mapedit", "/mapedit/", "/mapedit.html"):

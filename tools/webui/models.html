@@ -2,45 +2,75 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>CO Character Builder</title>
+<title>CO Model Viewer</title>
 <link rel="stylesheet" href="/ui/style.css">
 </head>
-<body class="builder" data-co-page="builder">
+<!-- The Model Viewer. Its own page at /models, not a mode of the builder.
+
+     WHY IT SPLIT OFF
+       It was `builder.html`'s second mode: one `#modeswitch` swapped the slot
+       rail for a model rail and hid four cards. That made "Model Viewer" a
+       control on another page rather than a place, so the tab bar could not
+       honestly offer it -- a tab that is really a toggle on someone else's
+       page is the exact thing the bar must not contain.
+
+     WHAT IS GENUINELY SHARED, AND WHY THAT IS FINE
+       The stage, the action dropdown, the playback loop and the camera are
+       the same job for a monster and for a character, and builder.js says so
+       in its own header. So this page loads the SAME `builder.js`: two
+       documents, two routes, one engine. What is NOT shared is the markup --
+       there is no slot rail and no picker here, and there is no model rail on
+       the builder -- so neither page carries the other's dead elements.
+       `builder.js` reads `data-co-page` to know which of the two it is in.
+
+     OLD LINKS
+       `/builder#model=…` and `/builder#mesh=…` are redirected here by
+       builder.js, fragment intact. They are not broken and they are not
+       silently ignored. -->
+<body class="builder" data-co-page="models">
 
 <div id="co-nav"></div>
 <script src="/ui/nav.js"></script>
 
 <header>
-  <h1>Character Builder</h1>
+  <h1>Model Viewer</h1>
   <label id="path-label" class="hidden"
-         title="What this stage is drawing from — an installed client, or a private server's own client. The parser plugin follows the path, so the tables, id conventions and socket map all change with it. Your loadout, action and frame are kept across the switch, which is how you tell a regression in this tool from a difference between the clients.">
+         title="What this stage is drawing from — an installed client, or a private server's own client. The parser plugin follows the path, so the tables, id conventions and socket map all change with it. Your model, action and frame are kept across the switch, which is how you tell a regression in this tool from a difference between the clients.">
     Path
     <select id="path-select"></select>
   </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
-  <!-- Going anywhere is the site bar's job (nav.js) and staging is its
-       button. Collapse panels left: the card headers each collapse on click
-       and `C` still toggles all of them, so only the duplicate control went.
-       What stays here is what acts on THIS character. -->
-  <button id="btn-share" class="ghost" title="A link that restores this exact character">Copy link</button>
-  <button id="btn-reset-all" class="ghost" title="Back to the starting character">Reset</button>
+  <button id="btn-share" class="ghost" title="A link that restores this exact model and action">Copy link</button>
 </header>
 
 <main id="build-main">
 
-  <!-- ------------------------------------------------ left: the slots -->
-  <aside id="slots-rail">
+  <!-- ------------------------------------------------ left: the model list -->
+  <!-- A monster is not a character with different art: c3/monster/103/ is one
+       FILE per action, most of them carrying their own geometry, and there are
+       no equip slots to fill. That is why this page exists rather than being a
+       slot on the builder. -->
+  <aside id="model-rail">
     <div class="rail-head">
-      <b>Your character</b>
-      <span class="mut small">click a slot to choose</span>
+      <b>Models</b>
+      <span class="mut small">pick one, then an action</span>
     </div>
-    <div id="slot-cards"></div>
-    <div id="slot-more-wrap">
-      <button id="btn-more-slots" class="ghost tiny">More slots ▾</button>
-      <div id="slot-cards-more" class="hidden"></div>
-    </div>
-    <div id="compat-note" class="small mut"></div>
+    <!-- The catalogue is discovered by the client's own directory
+         convention (c3/monster/<id>/, c3/npc/<id>/), so a namespace that
+         does not use it -- a recovered garment archive, the Collection --
+         has models the catalogue cannot see. "By path" lists meshes under
+         a prefix in whatever view is selected, which is the only route to
+         those. -->
+    <div id="model-source" class="facet-axis"></div>
+    <input id="model-search" type="search" placeholder="search monsters, NPCs, effects…" autocomplete="off">
+    <input id="model-path" class="hidden" type="search" autocomplete="off"
+           placeholder="path prefix, e.g. collection/npcs/"
+           title="Only meshes whose logical path starts with this. Leave empty for every mesh in the view.">
+    <div id="model-kinds" class="facet-axis"></div>
+    <div id="model-crumbs" class="facet-axis hidden"></div>
+    <div id="model-list" class="list" tabindex="0"></div>
+    <div id="model-count" class="small mut"></div>
   </aside>
 
   <!-- ------------------------------------------------ centre: the stage -->
@@ -62,21 +92,16 @@
           speed <input type="range" id="anim-speed" min="20" max="80" step="1" value="41"></label>
         <span id="anim-label" class="mut small"></span>
       </span>
+      <label class="chk" id="clips-label"
+             title="ini/3dmotion.ini gives monster 103 eighty action codes over sixteen files — 404, 405, 407 and 903 are all 401.c3. Untick to see every code the ini declares, alias or not.">
+        <input type="checkbox" id="chk-clips" checked> distinct clips only</label>
       <label class="chk" id="lock-label"
-             title="Freeze the camera completely so two characters sit in exactly the same frame. (L)">
+             title="Freeze the camera completely so two models sit in exactly the same frame. (L)">
         <input type="checkbox" id="chk-lock"> lock camera</label>
       <label class="chk"><input type="checkbox" id="chk-grid" checked> grid</label>
       <label class="chk"><input type="checkbox" id="chk-wire"> wireframe</label>
-      <!-- One switch per weapon hand. A character can hold a weapon in each
-           hand and each aura is its own control: both, either, or neither. -->
-      <label class="chk hidden" id="aura-label-r_weapon"
-             title="The always-on glow a Super weapon carries, right hand (A)">
-        <input type="checkbox" id="chk-aura-r_weapon"> aura R</label>
-      <label class="chk hidden" id="aura-label-l_weapon"
-             title="The always-on glow a Super weapon carries, left hand (Shift+A)">
-        <input type="checkbox" id="chk-aura-l_weapon"> aura L</label>
       <button id="btn-focus" class="ghost" title="Zoom to the head (F)">Focus head</button>
-      <button id="btn-reset" class="ghost" title="Re-frame the character (R)">Reset view</button>
+      <button id="btn-reset" class="ghost" title="Re-frame the model (R)">Reset view</button>
       <button id="btn-shot" class="ghost" title="Save the current frame to out/viewer/shots/">Save PNG</button>
       <button id="btn-help" class="ghost" title="Keyboard shortcuts (?)">?</button>
       <span id="fx-wrap" class="hidden">
@@ -91,6 +116,16 @@
   <!-- ------------------------------------------------ right: collapsible -->
   <aside id="right">
 
+    <section class="card" id="card-model" data-card="model">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>This model</h2>
+      <div class="cardbody" id="model-body"><div class="mut small">pick a model on the left</div></div>
+    </section>
+
+    <section class="card hidden" id="card-monster" data-card="monster">
+      <h2><button class="cardtoggle" aria-expanded="true">▾</button>monster.json properties</h2>
+      <div class="cardbody" id="monster-body"></div>
+    </section>
+
     <section class="card" id="card-collect" data-card="collect">
       <h2>Collection</h2>
       <div class="cardbody">
@@ -103,19 +138,9 @@
       </div>
     </section>
 
-    <section class="card" id="card-look" data-card="look">
-      <h2><button class="cardtoggle" aria-expanded="true">▾</button>Colour &amp; variants</h2>
-      <div class="cardbody" id="look-body"><div class="mut small">pick a slot on the left</div></div>
-    </section>
-
     <section class="card" id="card-anim" data-card="anim">
       <h2><button class="cardtoggle" aria-expanded="true">▾</button>Animation</h2>
       <div class="cardbody" id="anim-body"></div>
-    </section>
-
-    <section class="card" id="card-fx" data-card="fx">
-      <h2><button class="cardtoggle" aria-expanded="true">▾</button>Weapon effects</h2>
-      <div class="cardbody" id="fx-body"><div class="mut small">equip a weapon to see its effects</div></div>
     </section>
 
     <section class="card" id="card-detail" data-card="detail">
@@ -126,31 +151,6 @@
   </aside>
 </main>
 
-<!-- ------------------------------------------------ the slot picker -->
-<div id="picker" class="hidden" role="dialog" aria-modal="false" aria-label="Choose an item">
-  <div class="picker-inner">
-    <div class="picker-head">
-      <div>
-        <h2 id="picker-title">Choose</h2>
-        <div id="picker-sub" class="small mut"></div>
-      </div>
-      <button id="picker-close" class="ghost" title="Close (Esc)">✕</button>
-    </div>
-    <input id="picker-search" type="search" placeholder="search by name, id or colour…" autocomplete="off">
-    <div id="picker-facets"></div>
-    <div id="picker-list" class="list" tabindex="0"></div>
-    <div class="picker-foot">
-      <span id="picker-count" class="small mut"></span>
-      <div class="spacer"></div>
-      <button id="picker-clear" class="ghost tiny">Leave this slot empty</button>
-    </div>
-    <div class="small mut keyhint">
-      <kbd>↑</kbd><kbd>↓</kbd> item · <kbd>←</kbd><kbd>→</kbd> colour ·
-      <kbd>Enter</kbd> keep it · <kbd>Esc</kbd> close — the character updates as you move
-    </div>
-  </div>
-</div>
-
 <div id="help" class="hidden">
   <div class="help-inner">
     <div class="drawer-head">
@@ -159,25 +159,16 @@
     </div>
     <table class="keys">
       <tr><th colspan="2">Choosing</th></tr>
-      <tr><td><kbd>M</kbd></td><td>go to the <b>Model Viewer</b> (monsters, NPCs, ghosts, mounts, roles, effects) — its own page</td></tr>
-      <tr><td><kbd>B</kbd> <kbd>H</kbd> <kbd>R</kbd><i>/</i><kbd>1</kbd>–<kbd>4</kbd></td>
-          <td>open the body / head / right-hand / left-hand picker</td></tr>
-      <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>previous / next item, previewed live on the character</td></tr>
-      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>previous / next colour of the item you are on</td></tr>
+      <tr><td><kbd>M</kbd></td><td>go to the <b>Character Builder</b> — its own page</td></tr>
+      <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>previous / next model, previewed live</td></tr>
       <tr><td><kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Home</kbd> <kbd>End</kbd></td><td>jump</td></tr>
-      <tr><td><kbd>Enter</kbd></td><td>keep it and close</td></tr>
-      <tr><td><kbd>Esc</kbd></td><td>close the picker (what you were previewing stays equipped)</td></tr>
+      <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>previous / next action of this model</td></tr>
       <tr><th colspan="2">Stage</th></tr>
       <tr><td><kbd>Space</kbd></td><td>play / pause the animation</td></tr>
       <tr><td><kbd>L</kbd></td><td>lock / unlock the camera</td></tr>
-      <tr><td><kbd>R</kbd></td><td>re-frame the character</td></tr>
+      <tr><td><kbd>R</kbd></td><td>re-frame the model</td></tr>
       <tr><td><kbd>F</kbd></td><td>zoom to the head</td></tr>
       <tr><td><kbd>G</kbd> <kbd>W</kbd></td><td>grid · wireframe</td></tr>
-      <tr><td><kbd>A</kbd></td><td>the right hand&#39;s Super aura on / off (shift-<kbd>A</kbd> the left hand&#39;s &mdash; they are independent)</td></tr>
-      <!-- Q and shift-Q are up and down, so unlike the aura they cannot spare
-           a key for the second hand. They step whichever slot the Colour &
-           variants panel is showing instead: 3 / 4 move it between the hands. -->
-      <tr><td><kbd>Q</kbd></td><td>step the weapon in the <b>Colour &amp; variants</b> panel up a quality (shift-<kbd>Q</kbd> down) &mdash; <kbd>3</kbd> / <kbd>4</kbd> point that panel at the right or left hand, and <kbd>Q</kbd> still works with that picker open</td></tr>
       <tr><td><kbd>C</kbd></td><td>collapse / expand every panel on the right (each panel header also collapses its own)</td></tr>
       <tr><td>drag / wheel / shift-drag</td><td>orbit · zoom · pan</td></tr>
     </table>
@@ -201,12 +192,6 @@
       backups and its <code>uninstall</code> revert.
     </p>
     <div id="stage-list"></div>
-    <!-- Which install to write to. There is usually more than one Conquer on a
-         machine -- a baseline, a community client, a copy kept for comparison --
-         and "install" silently meaning whichever one the viewer happens to be
-         browsing is a guess made on the user's behalf about a folder that gets
-         written to. Backups and the revert manifest are kept per install root,
-         so each one can be reverted on its own. -->
     <label class="small mut" style="display:block;margin-top:8px">
       Install into
       <select id="install-select" style="max-width:100%"></select>
