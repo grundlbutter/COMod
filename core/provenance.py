@@ -84,7 +84,7 @@ import coroot
 
 __all__ = [
     "SCHEMA", "KEY", "MATCH", "FOREIGN", "UNSTAMPED", "UNKNOWN",
-    "stamp", "wrap", "unwrap", "verdict", "describe",
+    "stamp", "optional_stamp", "wrap", "unwrap", "verdict", "describe",
     "orphaned_namespaces", "migration_plan",
     "read_json", "write_json", "sidecar_path", "stamp_file", "read_stamp",
     "Artefact", "audit",
@@ -201,6 +201,34 @@ def describe(doc: Any) -> str:
     when = st.get("generated") or "?"
     tool = st.get("tool") or "?"
     return f"{who}, built {when} by {tool}"
+
+
+def optional_stamp(root, tool: str = "") -> Optional[dict]:
+    """`stamp` for a caller that must not fail, and must not lie either.
+
+    Two answers only: a stamp that names a real install, or ``None``.
+
+    `stamp` itself never fails -- `base_id` degrades to ``unkeyed`` when the
+    fingerprint cannot be computed, which is right for an artefact keyed by
+    directory and **wrong for a record embedded in data that travels**. An
+    ``unkeyed`` stamp resolves against no install while reading exactly like a
+    measured one, which is the failure mode this module was written to end.
+    ``None`` is the honest answer and every reader here already has a state
+    for it.
+
+    Used by the collectors, which write provenance into COmmunity Library
+    entries: an entry copied to another machine must either name a source
+    install that machine can check, or say plainly that nothing recorded one.
+    """
+    if root is None:
+        return None
+    try:
+        st = stamp(root, tool=tool)
+    except Exception:
+        return None
+    if str(st.get("base_id") or "") in ("", "unkeyed"):
+        return None
+    return st
 
 
 # ---------------------------------------------------------------------------

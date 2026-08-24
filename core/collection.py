@@ -31,6 +31,44 @@ An entry records where it came from and what it may replace:
     swapFor       the logical path this is intended to replace, if any
     sha           content hashes, so a re-collect is recognised
     collectedAt   ISO-8601 UTC
+    provenance    WHICH INSTALL the bytes came from -- see below
+
+`server` AND `provenance` ARE DIFFERENT QUESTIONS
+-------------------------------------------------
+`server` is a **library-local view name**: the folder under
+``<library>/servers/`` the collector was browsing, ``""`` meaning "the base
+install being served".  `by_source` and `_unique_id` both key on it, so it is
+part of an entry's *identity* and re-collect semantics -- not a label that can
+be repurposed.
+
+More decisively, it cannot answer the question at all.  Assets collected from
+CCO and from patch5517 both carry ``server = ""``, because in both cases the
+collector was browsing the base install rather than an imported client.  A
+reader asking "which client's conventions describe these bytes?" gets the same
+answer for two clients that disagree.
+
+`provenance` is the answer, and it is `core/provenance.stamp()`'s record
+verbatim -- ``{schema, base_id, kind, fingerprint, install, generated, tool}``.
+``base_id`` is ``<kind>-<fingerprint>`` where the fingerprint is a sha256 over
+``ini/``, which is exactly the layer that differs between installs and exactly
+what `RolePart.ini [Dumy]` is read from.  **No absolute paths**: `provenance`
+forbids them by design, so an entry copied to another machine still names its
+source install in terms that machine can check.
+
+WHY THIS MATTERS TO SOMETHING VISIBLE
+-------------------------------------
+Which mesh chunks are attachment points rather than geometry is
+``ini/RolePart.ini [Dumy]``, and that list is per install: CCO and 7878
+declare 52 names including ``v_zero``; 5065/5165/5517/6609/Zephyr declare 7.
+A chunk not on the list is *drawn* -- the textured box at a model's feet.  A
+library entry previewed while some other install is being served was being
+classified with the served install's vocabulary, which is right for install
+assets and wrong for library ones.  The entry has to carry its own answer.
+
+``provenance`` is ``None`` -- or, on entries written before this field
+existed, absent -- when nothing recorded it.  That is **not** the same as
+"came from the install you happen to be serving", and no reader may treat it
+so silently; `provenance_state` is how a caller says which of the two it has.
 
 The category set is deliberately the game's own vocabulary rather than a
 generic "models/textures" split, because the point is finding a thing to put
@@ -88,6 +126,53 @@ MAP_ROLES = ("puzzle", "ani", "art")
 #: thumbnails, tags and model stage with no second code path.
 PROFILE_NAME = "collection"
 PROFILE_TAG = "Collection"
+
+#: The entry key holding `core/provenance.stamp()`'s record.  Spelled once so
+#: a reader grepping for it finds every site.
+PROVENANCE_KEY = "provenance"
+
+#: What a reader knows about an entry's source install.  Three states, and the
+#: middle one is the whole reason there are three: an entry can *have* a
+#: recorded install that this machine cannot produce, and that is a different
+#: fact from having none.
+#:
+#: `PROV_UNRECORDED` is the resting state of every entry collected before the
+#: field existed, and it **cannot be repaired retroactively** -- `sourceMesh`
+#: is a logical path, which names a location inside a client and not which
+#: client.  Guessing one would manufacture a provenance that reads exactly
+#: like a measured one.
+PROV_RECORDED = "recorded"       # a stamp is present and well-formed
+PROV_UNRECORDED = "unrecorded"   # nothing recorded it; do not guess
+PROV_MALFORMED = "malformed"     # something is there and is not a stamp
+
+
+def entry_provenance(entry: dict) -> Optional[dict]:
+    """The stamp on an entry, or ``None``.
+
+    Never raises and never invents: a missing, null, non-dict or
+    `base_id`-less value is all one answer -- *nothing vouches for this* --
+    because a reader that told them apart would still have to do the same
+    thing about all four.
+    """
+    st = (entry or {}).get(PROVENANCE_KEY)
+    if not isinstance(st, dict):
+        return None
+    return st if str(st.get("base_id") or "").strip() else None
+
+
+def provenance_state(entry: dict) -> str:
+    """`PROV_RECORDED`, `PROV_UNRECORDED` or `PROV_MALFORMED`.
+
+    Split out from `entry_provenance` because a caller *rendering* the state
+    wants to distinguish "nobody recorded it" from "something is there and I
+    cannot read it" -- the second is a bug report, the first is history.
+    """
+    raw = (entry or {}).get(PROVENANCE_KEY)
+    if raw is None or raw == "":
+        return PROV_UNRECORDED
+    if entry_provenance(entry) is not None:
+        return PROV_RECORDED
+    return PROV_MALFORMED
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 
@@ -558,12 +643,25 @@ class Collection:
             server: str = "", source_mesh: str = "",
             source_texture: str = "", swap_for: str = "",
             note: str = "",
-            parts: Iterable[tuple[str, str, str, bytes]] = ()) -> dict:
+            parts: Iterable[tuple[str, str, str, bytes]] = (),
+            provenance: Optional[dict] = None) -> dict:
         """Copy one mesh (and its skins) into a category folder.
 
         Re-collecting the same source updates that entry in place rather than
         making a second copy: the collection is a set of decisions, and the
         same decision twice is still one decision.
+
+        ``provenance`` is `core/provenance.stamp()`'s record for the install
+        the bytes were read out of.  It is **passed in, not computed here**:
+        this module knows a library, not a game root, and `provenance` reaches
+        `coroot` for the fingerprint.  A caller with no root passes ``None``
+        and the entry says so -- see `provenance_state`.
+
+        Deliberately NOT part of the `by_source` dedup key.  Re-collecting the
+        same logical path from a *different* install is the same decision made
+        again about the same slot, and the newer stamp replaces the older one;
+        keying on it would leave two entries claiming one source path with
+        nothing to choose between them.
         """
         if category not in CATEGORIES:
             raise CollectionError(
@@ -650,6 +748,13 @@ class Collection:
             "parts": part_recs,
             "sha": {"mesh": _sha(mesh_bytes), "skins": skin_shas},
             "collectedAt": _now(),
+            # Always written, `None` included. A key that is PRESENT and null
+            # says "a collector that knew about provenance had none to give";
+            # an ABSENT key says "written before the field existed". Both read
+            # as `PROV_UNRECORDED`, so nothing branches on the difference --
+            # but the difference is on disk if a later question needs it, and
+            # it costs one word to keep.
+            PROVENANCE_KEY: dict(provenance) if provenance else None,
         }
         # a per-entry sidecar, so a folder is self-describing even if the
         # index is lost or the folder is copied somewhere else

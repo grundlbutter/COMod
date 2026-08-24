@@ -71,8 +71,55 @@
     }
   }
 
+  /* Which install a library entry's art came from -- and, when that could not
+     be answered, that the model on screen was classified with the install
+     being SERVED instead.
+
+     This is a fallback that has to announce itself. Attachment points are
+     whatever `ini/RolePart.ini [Dumy]` lists, and that list is per install:
+     CCO and 7878 declare 52 names, 5065/5165/5517/6609/Zephyr declare 7. A
+     chunk not on the list is drawn as geometry, so art collected from CCO and
+     classified under 5517 grows textured boxes -- `v_zero` sitting on the
+     ground at the model's feet. Nothing fails; a short list parses fine and
+     simply stops hiding sockets, which is why the only symptom is something
+     that reads as bad art. */
+  const PROV_UI = {
+    resolved:   { cls: 'sw-ok',
+                  head: p => 'Classified as ' + (p.kind || p.baseId) + ' art' },
+    unrecorded: { cls: 'sw-none',
+                  head: p => 'Source install not recorded' },
+    unresolved: { cls: 'sw-unknown',
+                  head: p => 'Collected from ' + (p.kind || p.baseId)
+                             + ', which is not declared here' },
+    malformed:  { cls: 'sw-fault',
+                  head: p => 'This entry’s provenance record is unreadable' },
+  };
+
+  function drawProvenance(p) {
+    const host = $('#donor-prov');
+    if (!host) return;
+    host.textContent = '';
+    if (!p) return;
+    const ui = PROV_UI[p.state] || PROV_UI.malformed;
+    const box = el('div', 'sw-state ' + ui.cls);
+    box.appendChild(el('b', null, ui.head(p)));
+    const d = el('div', 'sw-detail', p.note || '');
+    box.appendChild(d);
+    // Named explicitly rather than left to the note, because "the install on
+    // screen" is only useful if you are told WHICH install that is.
+    if (p.usingServed) {
+      box.appendChild(el('div', 'sw-detail',
+        'Drawn with ' + (p.servedKind || 'the install on screen')
+        + '’s socket list. Chunks it does not name are drawn as geometry.'));
+    }
+    host.appendChild(box);
+  }
+
   async function draw(side, mesh, texture, libId) {
     const v = V[side].viewer, msg = $('#msg-' + side);
+    // Cleared before the fetch, not after: a stale provenance box left
+    // standing over a different model is the same lie in a smaller font.
+    if (side === 'donor') drawProvenance(null);
     if (!v) return;
     if (!mesh && !libId) {
       v.clear(); v.draw();
@@ -95,6 +142,7 @@
       msg.textContent = 'could not load ' + (mesh || libId) + ': ' + say(e);
       return;
     }
+    if (side === 'donor') drawProvenance(d.provenance || null);
     if (!d.meshes || !d.meshes.length) {
       v.clear(); v.draw();
       msg.textContent = d.note || 'no drawable geometry in ' + mesh;
@@ -120,6 +168,33 @@
   }
 
   /* ------------------------------------------------------------ LEFT pane */
+
+  let repaintDonor = null;  // set by drawLibrary so the toggle can repaint
+
+  /* -------------------------------------------- what makes a row "no parts"
+   *
+   * MEASURED FROM THE RENDERER, not from the library file and not from a
+   * summary of it. The row prints "no parts" when `e.parts` is falsy, and
+   * `e.parts` is not the library's `parts` list -- `/api/swap/library` sends
+   * `len(entry["parts"] or [])`, a COUNT. So the label has always meant
+   * "the collected part list is empty", and the toggle now means exactly
+   * that, by calling the same predicate the label calls.
+   *
+   * Checked against the owner's library on 2026-08-24: 36 entries, 7 of them
+   * printing "no parts" -- Exp Bonus Icon, EXP Bonus Icon, Pervade (Effects),
+   * Flag w Stone Base, Gold and Blue Chest (NPCs), base-800915 (Other),
+   * Minecraft Sword (Weapons). All 7 carry `"parts": []` in
+   * Collection/collection.json, so the label and the data agree; an earlier
+   * count of 4 with no Effects was a smaller, older library, not a different
+   * meaning.
+   *
+   * WHAT THE COUNT CANNOT TELL APART, stated because it is the one place this
+   * could go wrong later: a missing `parts` key, a null one and an empty list
+   * all arrive as 0, so "we collected no parts" and "this entry never had a
+   * parts field" read identically. Neither state exists in the library today
+   * (0 of 36 entries), so nothing is being hidden by the collapse right now.
+   */
+  const hasNoParts = e => !e.parts;
 
   function drawLibrary() {
     const host = $('#donor-list');
@@ -162,15 +237,20 @@
     const paint = () => {
       host.textContent = '';
       const q = ($('#donor-q').value || '').toLowerCase();
-      let n = 0;
+      const hideNoParts = !!($('#swap-hide-noparts') || {}).checked;
+      let n = 0, hidden = 0;
       for (const e of LIB.entries) {
         if (cat && e.category !== cat) continue;
         if (q && (e.name + ' ' + e.sourceMesh).toLowerCase().indexOf(q) < 0) continue;
+        // ONE question, asked in both places, for the same reason the right
+        // pane's `hasIssue` exists: a filter that decides "no parts" its own
+        // way is free to drift from the label the row prints beside it.
+        if (hideNoParts && hasNoParts(e)) { hidden++; continue; }
         n++;
         const row = el('div', 'sw-item');
         row.appendChild(el('span', null, e.name || e.id));
         row.appendChild(el('span', 'sw-id', e.category +
-          (e.parts ? ' · ' + e.parts + ' part(s)' : ' · no parts')));
+          (hasNoParts(e) ? ' · no parts' : ' · ' + e.parts + ' part(s)')));
         row.onclick = () => {
           V.donor.sel = e;
           for (const x of host.querySelectorAll('.sw-item')) x.classList.remove('on');
@@ -180,8 +260,20 @@
         };
         host.appendChild(row);
       }
-      if (!n) host.appendChild(el('div', 'sw-note', 'no library entry matches'));
+      // The same rule the right pane's filters follow: a shortened list that
+      // says nothing about what it removed reads as the whole library.
+      const shown = el('div', 'sw-count');
+      shown.textContent = 'showing ' + n + ' of ' + (n + hidden) +
+        ' entr' + ((n + hidden) === 1 ? 'y' : 'ies') +
+        (hidden ? ' — ' + hidden + ' with no parts hidden' : '') +
+        ((cat || q) ? '  (within the category and search above)' : '');
+      host.insertBefore(shown, host.firstChild);
+      if (!n) host.appendChild(el('div', 'sw-note',
+        hidden ? 'Everything that matches has no parts; the toggle above is '
+                 + 'hiding all ' + hidden + '.'
+               : 'no library entry matches'));
     };
+    repaintDonor = paint;
     for (const c of cats) {
       const chip = el('span', 'sw-kind', c);
       chip.onclick = () => {
@@ -205,6 +297,8 @@
   let targetKind = 'npc';
   let WRITABLE = null;   // /api/swap/writable -- probed, not guessed
   let LASTSTAGE = null;  // what the last stage call reported
+  let MODIFIED = null;   // /api/swap/modified -- comod's OWN install record
+  let repaintTarget = null;  // set by drawNpcSet so the filter bar can repaint
 
   const TARGET_KINDS = [
     { key: 'npc', label: 'NPCs',
@@ -344,12 +438,141 @@
                  headline: 'Could not read the ' + targetKind + ' list.',
                  detail: e.message };
     }
+    // Before the paint, not after: the rows carry a "COMod" mark, so painting
+    // first would show every row unmarked for as long as this call takes and
+    // then silently change under the reader.
+    await loadModified();
     drawNpcSet();
+  }
+
+  /* ---------------------------------------------- what makes a row grey
+   *
+   * ONE predicate, used by the dimming and by the "hide issues" toggle, so
+   * the toggle cannot come to mean something other than what the eye sees.
+   * It is NOT read off the CSS: `sw-dim` is applied here, from `art`, which
+   * `/api/swap/npcset` computes per group by asking the open install's asset
+   * root whether each of the three motion files (standby, blaze, rest)
+   * resolves. `art` is:
+   *
+   *   ok          all three resolve
+   *   partial     some do -- the standby often DRAWS PERFECTLY WELL, so a
+   *               partial row is greyed but still swappable
+   *   unresolved  none do
+   *   unknown     the resolver THREW. Not the same as missing, and kept apart
+   *               deliberately so a broken lookup cannot read as absent art.
+   *
+   * So "an issue resolving" is exactly `art !== 'ok'`, which is what the
+   * owner's tooltip says and what the greying already showed.
+   */
+  const hasIssue = g => g.art !== 'ok';
+
+  /* ------------------------------------------- what "modified" can mean
+   *
+   * `/api/swap/modified` answers "what has COMod changed in this install?"
+   * from comod's own dated install record -- NOT "what differs from the
+   * vendor's pristine client", which for a private server has no answer,
+   * because a live shard's files are whatever its operator last pushed and
+   * there is no original edition of them to diff against. The control is
+   * labelled for what it does.
+   *
+   * Two signals, of different reach, and both are needed:
+   *   - a row's TABLE entry differs from the copy COMod displaced  (per row)
+   *   - the ART the row points at is a file COMod wrote            (per group,
+   *     correctly: overwriting group 001's art changes all 38 of its NPCs)
+   */
+  function isModified(g, m) {
+    if (!MODIFIED || !MODIFIED.recorded) return false;
+    if (MODIFIED.tableAllRows) return true;
+    if (m && MODIFIED.rowTypes && MODIFIED.rowTypes.indexOf(m.type) >= 0) return true;
+    const files = MODIFIED.files || [];
+    const paths = g.paths || {};
+    for (const k in paths) {
+      if (paths[k] && files.indexOf(paths[k]) >= 0) return true;
+    }
+    return false;
+  }
+
+  // A total order by construction. `type` is unique across CCO's 437 rows
+  // today, but a comparator that RELIES on that would leave equal rows in
+  // whatever order the last filter produced, and 92 groups means sorting by
+  // group leaves ties of up to 49 -- a list that reshuffles under you between
+  // renders. The final key is the row's position in the server's payload,
+  // which is fixed for a given load, so ties can never be arbitrary.
+  const cmpText = (a, b) => {
+    const x = String(a || '').toLowerCase(), y = String(b || '').toLowerCase();
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+  const cmpNum = (a, b) => {
+    const x = (typeof a === 'number') ? a : Infinity;
+    const y = (typeof b === 'number') ? b : Infinity;
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+
+  function sortRows(rows, how) {
+    // sort by name  : name, then npc.json `type`, then payload order
+    // sort by group : motion group, then name, then `type`, then payload order
+    const byName = (a, b) => cmpText(a.label, b.label) ||
+                             cmpNum(a.type, b.type) || (a.idx - b.idx);
+    const byGroup = (a, b) => cmpNum(a.g.groupKey, b.g.groupKey) || byName(a, b);
+    rows.sort(how === 'group' ? byGroup : byName);
+    return rows;
+  }
+
+  // One entry per NPC -- the flat list, and the default. `m` is the member;
+  // `g` is the group it shares art with, kept on every row because that is
+  // the warning, not decoration.
+  function flatRows() {
+    const out = [];
+    let i = 0;
+    for (const g of NPCSET.groups) {
+      for (const m of (g.members || [])) {
+        out.push({ g: g, m: m, idx: i++,
+                   label: m.name || '(unnamed)', type: m.type });
+      }
+    }
+    return out;
+  }
+
+  // The old view, kept: one row per group with a representative and a count.
+  function groupRows() {
+    return NPCSET.groups.map((g, i) => ({
+      g: g, m: null, idx: i,
+      label: (g.members[0] && g.members[0].name) || '(unnamed)',
+      type: (g.members[0] && g.members[0].type)
+    }));
+  }
+
+  // A member the server's cap dropped is an NPC that cannot be reached from
+  // this pane, so it is COUNTED and SAID rather than left off silently.
+  function cappedAway() {
+    let n = 0;
+    for (const g of NPCSET.groups) {
+      if (g.membersCapped || (g.members || []).length < g.count) {
+        n += g.count - (g.members || []).length;
+      }
+    }
+    return n;
+  }
+
+  function selectMember(g, m) {
+    // The clicked NPC becomes members[0] and the rest of the cohort follows.
+    // Everything downstream -- `whichRow`, which identifies the row by `type`,
+    // the instructions call, and the mid pane's cohort list -- reads
+    // members[0], so this is what makes an un-named member actionable at all.
+    // The group, its count and its paths are carried through unchanged.
+    if (!m) return g;
+    const rest = (g.members || []).filter(x => x !== m);
+    const sel = {};
+    for (const k in g) sel[k] = g[k];
+    sel.members = [m].concat(rest);
+    sel.member = m;
+    return sel;
   }
 
   function drawNpcSet() {
     const host = $('#target-list');
     host.textContent = '';
+    repaintTarget = null;
     if (!NPCSET) { host.appendChild(el('div', 'sw-note', 'loading...')); return; }
     if (NPCSET.error || !NPCSET.groups.length) {
       const b = el('div', 'sw-note');
@@ -370,58 +593,226 @@
         (NPCSET.dropped || []).join(', ')));
       host.appendChild(b);
     }
+    const cut = cappedAway();
+    if (cut) {
+      const b = el('div', 'sw-note');
+      b.appendChild(el('strong', null,
+        cut + ' NPC(s) are not listed individually.'));
+      b.appendChild(el('div', null, 'Their groups returned more members than '
+        + 'the endpoint sends. They are counted in every "N others move with '
+        + 'it" below, but there is no row to click for them.'));
+      host.appendChild(b);
+    }
+    // The count line, and it is not cosmetic: with four controls able to
+    // shorten this list, "showing 12 of 437" is what keeps a filter from
+    // reading as missing data.
+    const count = el('div', 'sw-count');
+    host.appendChild(count);
+    const rowHost = el('div');
+    host.appendChild(rowHost);
 
     const paint = () => {
-      for (const x of Array.from(host.querySelectorAll('.sw-item, .sw-grp'))) x.remove();
+      rowHost.textContent = '';
       const q = ($('#target-q').value || '').toLowerCase();
-      let n = 0;
-      for (const g of NPCSET.groups) {
-        const names = g.members.map(m => m.name).join(' ').toLowerCase();
-        if (q && (g.group + ' ' + names).indexOf(q) < 0) continue;
-        n++;
-        const row = el('div', 'sw-item');
-        const who = g.count === 1 ? (g.members[0].name || '(unnamed)')
-                                  : g.members[0].name + ' +' + (g.count - 1) + ' more';
-        row.appendChild(el('span', null, who));
-        const tag = (g.count > 1
-                       ? 'group ' + g.group + ' \u00b7 ' + g.count + ' NPC(s)'
-                       : String(g.group)) +
-                    (g.art === 'ok' ? '' : ' \u00b7 art ' + g.art);
-        row.appendChild(el('span', 'sw-id', tag));
-        if (g.art !== 'ok') { row.classList.add('sw-dim'); row.title = g.artNote; }
-        row.onclick = () => {
-          V.target.sel = g;
-          for (const x of host.querySelectorAll('.sw-item')) x.classList.remove('on');
-          row.classList.add('on');
-          // Keyed on whether the STANDBY resolves, not on the summary
-          // label: `partial` means some action is missing while the standby
-          // draws perfectly well, and refusing to draw it would hide a model
-          // the install does ship. Measured on CCO: group 118 is exactly
-          // that case.
-          const standbyOk = g.resolves && g.resolves.standby_motion === true;
-          if (!standbyOk) {
-            // The row is listed because the TABLE names it -- dropping it
-            // would read as "that NPC does not exist". But asking the
-            // renderer for a file the install does not ship produces a
-            // failure that looks like a broken viewer instead of a client
-            // that never shipped the art. Say which it is, and draw nothing.
-            const v = V.target.viewer, m = $('#msg-target');
-            if (v) { v.clear(); v.draw(); }
-            m.style.display = '';
-            m.textContent = 'This NPC is in npc.json, but the art it names ('
-              + (g.paths.standby_motion || 'no path') + ') is not in this '
-              + 'install. Nothing to draw, and nothing to split from.';
-          } else {
-            draw('target', g.paths.standby_motion, g.texture || '');
-          }
-          drawMid();
-        };
-        host.appendChild(row);
+      const collapsed = !!($('#swap-collapse') || {}).checked;
+      const hideIssues = !!($('#swap-hide-issues') || {}).checked;
+      const modOnly = !!($('#swap-modified-only') || {}).checked;
+      const how = (($('#swap-sort') || {}).value) || 'name';
+
+      const all = collapsed ? groupRows() : flatRows();
+      const shown = sortRows(all.filter(r => {
+        const hay = collapsed
+          ? (r.g.group + ' ' + (r.g.members || []).map(m => m.name).join(' '))
+          : (r.label + ' ' + r.g.group);
+        if (q && hay.toLowerCase().indexOf(q) < 0) return false;
+        if (hideIssues && hasIssue(r.g)) return false;
+        if (modOnly) {
+          if (collapsed) {
+            if (!(r.g.members || []).some(m => isModified(r.g, m))) return false;
+          } else if (!isModified(r.g, r.m)) return false;
+        }
+        return true;
+      }), how);
+
+      for (const r of shown) rowHost.appendChild(collapsed ? groupRow(r)
+                                                           : npcRow(r));
+      const unit = collapsed ? 'group' : 'NPC';
+      count.textContent = 'showing ' + shown.length + ' of ' + all.length +
+        ' ' + unit + (all.length === 1 ? '' : 's') +
+        (shown.length === all.length ? '' : ' \u2014 ' +
+         (all.length - shown.length) + ' hidden by the filters above');
+      if (!shown.length) {
+        rowHost.appendChild(el('div', 'sw-note',
+          all.length ? 'Nothing matches. ' + all.length + ' ' + unit + '(s) are '
+                       + 'here; the search box and the toggles above hide the rest.'
+                     : 'nothing matches'));
       }
-      if (!n) host.appendChild(el('div', 'sw-note sw-grp', 'nothing matches'));
     };
+
+    const mark = (row, r) => {
+      // Selection is by identity of the row's member (or its group when
+      // collapsed), not by DOM node: a repaint replaces every node, and a
+      // selection that lived on the node would vanish when you changed the
+      // sort.
+      const cur = V.target.sel;
+      if (!cur) return;
+      if (r.m ? (cur.member === r.m) : (cur.groupKey === r.g.groupKey && !cur.member))
+        row.classList.add('on');
+    };
+
+    function pick(row, g, m) {
+      V.target.sel = selectMember(g, m);
+      for (const x of rowHost.querySelectorAll('.sw-item')) x.classList.remove('on');
+      row.classList.add('on');
+      // Keyed on whether the STANDBY resolves, not on the summary label:
+      // `partial` means some action is missing while the standby draws
+      // perfectly well, and refusing to draw it would hide a model the
+      // install does ship. Measured on CCO: group 118 is exactly that case.
+      const standbyOk = g.resolves && g.resolves.standby_motion === true;
+      if (!standbyOk) {
+        // The row is listed because the TABLE names it -- dropping it would
+        // read as "that NPC does not exist". But asking the renderer for a
+        // file the install does not ship produces a failure that looks like a
+        // broken viewer instead of a client that never shipped the art. Say
+        // which it is, and draw nothing.
+        const v = V.target.viewer, msg = $('#msg-target');
+        if (v) { v.clear(); v.draw(); }
+        msg.style.display = '';
+        msg.textContent = 'This NPC is in npc.json, but the art it names ('
+          + (g.paths.standby_motion || 'no path') + ') is not in this '
+          + 'install. Nothing to draw, and nothing to split from.';
+      } else {
+        draw('target', g.paths.standby_motion, g.texture || '');
+      }
+      drawMid();
+    }
+
+    // ONE NPC. The sharing fact is on the row, in words, next to the name --
+    // not in a header above 437 rows. The people this list is for are the ones
+    // reaching a member that was never the representative, and for whom "this
+    // swap also moves 37 others" is the surprise.
+    function npcRow(r) {
+      const g = r.g, m = r.m;
+      const row = el('div', 'sw-item swap-npc-row ' +
+                     (g.count > 1 ? 'swap-shared' : 'swap-alone'));
+      row.appendChild(el('span', 'sw-who', r.label));
+      const tag = el('span', 'sw-id');
+      tag.appendChild(el('span', null, 'group ' + g.group + ' \u00b7 '));
+      const others = g.count - 1;
+      tag.appendChild(el('span', 'sw-share',
+        others > 0 ? others + ' other' + (others === 1 ? '' : 's')
+                     + ' move' + (others === 1 ? 's' : '') + ' with it'
+                   : 'only this NPC'));
+      if (hasIssue(g)) tag.appendChild(el('span', null, ' \u00b7 art ' + g.art));
+      row.appendChild(tag);
+      // WHICH others, by name, on the row itself. The full cohort is also
+      // listed unabbreviated in the middle pane the moment you select it.
+      const names = (g.members || []).filter(x => x !== m)
+                                     .map(x => x.name || '(unnamed)');
+      const who = others > 0
+        ? ('A swap here also moves, on group ' + g.group + ':\n  '
+           + names.join('\n  ')
+           + (names.length < others
+              ? '\n  ... and ' + (others - names.length) + ' more not sent'
+              : ''))
+        : ('Nothing else uses group ' + g.group + '; a swap here moves this '
+           + 'NPC alone.');
+      row.title = who + (hasIssue(g) ? '\n\n' + (g.artNote || '') : '');
+      if (hasIssue(g)) row.classList.add('sw-dim');
+      if (isModified(g, m)) {
+        const b = el('span', 'sw-id', ' \u00b7 COMod');
+        b.title = 'COMod\u2019s install record says it changed this row or '
+                + 'the art it points at.';
+        tag.appendChild(b);
+      }
+      mark(row, r);
+      row.onclick = () => pick(row, g, m);
+      return row;
+    }
+
+    // The group as a unit, unchanged in meaning from before the expansion.
+    function groupRow(r) {
+      const g = r.g;
+      const row = el('div', 'sw-item');
+      const who = g.count === 1 ? (g.members[0].name || '(unnamed)')
+                                : g.members[0].name + ' +' + (g.count - 1) + ' more';
+      row.appendChild(el('span', null, who));
+      const tag = (g.count > 1
+                     ? 'group ' + g.group + ' \u00b7 ' + g.count + ' NPC(s)'
+                     : String(g.group)) +
+                  (hasIssue(g) ? ' \u00b7 art ' + g.art : '');
+      row.appendChild(el('span', 'sw-id', tag));
+      if (hasIssue(g)) { row.classList.add('sw-dim'); row.title = g.artNote; }
+      mark(row, r);
+      row.onclick = () => pick(row, g, null);
+      return row;
+    }
+
+    repaintTarget = paint;
     $('#target-q').oninput = paint;
     paint();
+  }
+
+  // The filter bar is wired ONCE, at boot, and calls whatever paint the
+  // current list installed. Re-binding it inside drawNpcSet would stack a
+  // handler per load and repaint the pane N times on one click.
+  function wireFilters() {
+    const go = () => { if (repaintTarget) repaintTarget(); };
+    for (const id of ['#swap-hide-issues', '#swap-modified-only',
+                      '#swap-collapse']) {
+      const n = $(id);
+      if (n) n.onchange = go;
+    }
+    const s = $('#swap-sort');
+    if (s) s.onchange = go;
+    // The library pane's own filter. Wired here, once, for the same reason:
+    // drawLibrary() re-runs whenever the library reloads and re-binding
+    // inside it would stack a handler per load.
+    const np = $('#swap-hide-noparts');
+    if (np) np.onchange = () => { if (repaintDonor) repaintDonor(); };
+  }
+
+  async function loadModified() {
+    // A failure to READ the record is not "nothing is modified": that would
+    // make the toggle hide every row and read as a clean install.
+    try {
+      MODIFIED = await api('/api/swap/modified?root=' +
+                           encodeURIComponent(targetPath || ''));
+    } catch (e) {
+      MODIFIED = { recorded: false, error: true, files: [], rowTypes: [],
+                   headline: 'The install record would not read.',
+                   detail: say(e) };
+    }
+    const box = $('#lbl-modified-only');
+    if (!box) return;
+    const cb = $('#swap-modified-only');
+    const base = 'Show only what COMod\u2019s own install record says it '
+      + 'changed in this install. It cannot tell you what differs from the '
+      + 'vendor\u2019s original client: a private server has no pristine '
+      + 'edition to compare against.';
+    let extra = '';
+    if (MODIFIED.error) {
+      extra = '\n\nRIGHT NOW: ' + (MODIFIED.headline || '') + ' '
+            + (MODIFIED.detail || '') + ' Nothing can be filtered on.';
+    } else if (!MODIFIED.recorded) {
+      extra = '\n\nRIGHT NOW: ' + (MODIFIED.headline || '')
+            + ' ' + (MODIFIED.detail || '');
+    } else {
+      extra = '\n\nRIGHT NOW: ' + (MODIFIED.detail || '')
+            + (MODIFIED.tableAmbiguous
+               ? '\n' + MODIFIED.headline + ' ' + MODIFIED.detail : '')
+            + (MODIFIED.tableError
+               ? '\n' + MODIFIED.headline + ' ' + MODIFIED.detail : '');
+    }
+    box.title = base + extra;
+    // A toggle that can only ever empty the list is disabled with its reason
+    // on it, rather than offered and then blamed for showing nothing.
+    const dead = MODIFIED.error || !MODIFIED.recorded;
+    if (cb) {
+      cb.disabled = !!dead;
+      if (dead) cb.checked = false;
+    }
+    box.style.opacity = dead ? '.55' : '';
   }
 
   /* -------------------------------------------------------------- the mid */
@@ -437,7 +828,12 @@
                       : 'Now pick the NPC on the right that it replaces.'));
       return;
     }
-    host.appendChild(el('div', null, (D.name || D.id) + ' → group ' + T.group));
+    // Name the NPC, not just the group. The pane now lets you pick a member
+    // that is not the representative, so "group 001" alone no longer says
+    // which of its 38 rows is about to change.
+    const picked = (T.members && T.members[0] && T.members[0].name) || '';
+    host.appendChild(el('div', null, (D.name || D.id) + ' → ' +
+      (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group)));
 
     // The scope choice, and SPLIT is the default because sharing is the
     // common case: most standby groups on CCO are used by more than one NPC,
@@ -499,7 +895,7 @@
         b.onclick = () => { scope = val; drawMid(); };
         return b;
       };
-      host.appendChild(mk('one', 'Replace this NPC only',
+      host.appendChild(mk('one', 'Replace ' + (picked || 'this NPC') + ' only',
                           'gives it private art; the other ' + (T.count - 1) +
                           ' keep theirs'));
       host.appendChild(mk('all', 'Replace all ' + T.count,
@@ -841,8 +1237,17 @@
       // ONE source of truth: this runs tools/npcsplit.py and shows what it
       // says. The page does not recompute the free set, the cohort, or the
       // OLD values -- a UI that re-derives them will drift from the command.
-      const who = (T.members[0] && T.members[0].name) || '';
-      plan = await api('/api/swap/instructions?npc=' + encodeURIComponent(who));
+      // The SAME identity staging uses. `whichRow` answers by `type` because
+      // names repeat in npc.json, and this call used to send the name alone --
+      // so on a duplicate name the plan on screen could describe a different
+      // row than the one being staged, with nothing to see. Reachable now in
+      // a way it was not before: the list is one row per NPC, so both rows
+      // called Shelley are individually clickable.
+      const row = whichRow(T);
+      plan = await api('/api/swap/instructions?npc=' +
+                       encodeURIComponent(row.name) +
+                       ((row.type === undefined || row.type === null) ? ''
+                        : '&type=' + encodeURIComponent(row.type)));
     } catch (e) {
       host.textContent = '';
       const b = el('div', 'sw-note');
@@ -858,7 +1263,9 @@
   }
 
   function renderPlan(host, plan, D, T) {
-    host.appendChild(el('div', null, (D.name || D.id) + ' \u2192 group ' + T.group +
+    const picked = (T.members && T.members[0] && T.members[0].name) || '';
+    host.appendChild(el('div', null, (D.name || D.id) + ' \u2192 ' +
+      (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group) +
       (scope === 'one' ? '  (this NPC only)' : '  (all ' + T.count + ')')));
 
     if (plan.headline) {
@@ -941,6 +1348,7 @@
     }
     drawMid();
     wireDrawer();
+    wireFilters();
     refreshWritable();
   }
 

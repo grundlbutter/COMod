@@ -32,6 +32,7 @@ Layers:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import html
 import io
@@ -460,16 +461,205 @@ def set_active_root(root) -> None:
     ACTIVE_ROOT = Path(root) if root is not None else None
 
 
+#: A PER-THREAD override of `ACTIVE_ROOT`, for bytes that did not come from
+#: the install being served.
+#:
+#: `ACTIVE_ROOT` answers "which install is on screen", which is the right
+#: question for an asset read out of that install and the WRONG one for a
+#: COmmunity Library entry: a model collected from CCO and previewed while
+#: patch5517 is being served is CCO's art, and CCO's `[Dumy]` list is what
+#: describes it. Classified under 5517's seven names, nine of its eleven
+#: chunks stop being recognised as attachment points and get drawn -- `v_zero`
+#: among them, the textured box on the ground at the model's feet.
+#:
+#: **Thread-local and not another global.** `ViewerServer` is a
+#: `ThreadingHTTPServer`: a second request served while a library preview is
+#: decoding would otherwise be classified with the library entry's vocabulary,
+#: which is the same defect with the roots swapped. The scope of the override
+#: is exactly one decode on one thread.
+_SOCKET_OVERRIDE = threading.local()
+
+
+@contextlib.contextmanager
+def socket_root(root):
+    """Classify chunks with ``root``'s `[Dumy]` list for this block only.
+
+    ``root=None`` is a no-op rather than "fall back to nothing", so a caller
+    that could not resolve an install gets the served one's answer -- the same
+    answer it got before this existed. That is a defensible default and a
+    silent one, so every caller here also *reports* which it used; see
+    `api_swap_libmesh`.
+    """
+    prev = getattr(_SOCKET_OVERRIDE, "root", None)
+    _SOCKET_OVERRIDE.root = Path(root) if root is not None else prev
+    try:
+        yield
+    finally:
+        _SOCKET_OVERRIDE.root = prev
+
+
+def socket_test_root():
+    """The root the socket test would use right now: override, else served."""
+    return getattr(_SOCKET_OVERRIDE, "root", None) or ACTIVE_ROOT
+
+
 def is_socket_chunk(name: str) -> bool:
     """True when a PHY chunk is an attachment point rather than geometry."""
     if attach is not None:
+        root = socket_test_root()
         try:
-            if ACTIVE_ROOT is not None:
-                return attach.is_socket_name(name, ACTIVE_ROOT)
+            if root is not None:
+                return attach.is_socket_name(name, root)
             return attach.is_socket_name(name)
         except Exception:                                # pragma: no cover
             pass
     return (name or "").lower() in SOCKET_NAMES
+
+
+# ---------------------------------------------------------------------------
+# library provenance: which install a COLLECTED asset came from
+# ---------------------------------------------------------------------------
+#
+# The rule, and it is the owner's: **library entries carry their own
+# provenance.** An entry in the COmmunity Library is not an asset of the
+# install being served -- it was collected out of some other client, and the
+# vocabulary that describes it (`ini/RolePart.ini [Dumy]`, which decides what
+# is an attachment point and what gets drawn) belongs to THAT client.
+#
+# The link between the two is `coroot.base_id`: `<kind>-<sha256 over ini/>`.
+# Both halves earn their place. The fingerprint is what actually distinguishes
+# two installs and is computed over exactly the layer `[Dumy]` is read from;
+# the kind is what makes a mismatch legible in a message ("collected from
+# cco", not "collected from 9f2c1e...").
+#
+# Nothing here guesses. Four states, and the UI says which one it is in.
+
+#: `coroot.base_id` hashes ~37 MB of `ini/` -- about 50 ms. Resolving one
+#: library preview walks every declared install, and this box has eight, so an
+#: uncached resolve would put ~400 ms on every click. Keyed by (root, declared
+#: kind) so a RE-DECLARATION -- which deliberately changes the namespace, see
+#: `coroot.base_id` -- misses instead of serving the previous kind's id.
+_BASE_ID_CACHE: dict[tuple, str] = {}
+_BASE_ID_LOCK = threading.Lock()
+
+#: The resolution verdicts.  `PROV_UNRECORDED` and `PROV_UNRESOLVED` both end
+#: up drawing with the served install's vocabulary; they are kept apart
+#: because they are different things to tell a user and different things to
+#: do about it. "Nothing recorded where this came from" is history and cannot
+#: be repaired. "This came from patch7878 and you have not declared one" is a
+#: setup step.
+PROV_RESOLVED = "resolved"
+PROV_UNRESOLVED = "unresolved"
+PROV_UNRECORDED = "unrecorded"
+PROV_MALFORMED = "malformed"
+
+
+def _cached_base_id(root, kind: str) -> str:
+    key = (os.path.normcase(os.path.abspath(str(root))), str(kind))
+    with _BASE_ID_LOCK:
+        hit = _BASE_ID_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        bid = coroot.base_id(root)
+    except Exception:                                    # pragma: no cover
+        bid = ""
+    # `unkeyed` means the fingerprint itself failed -- a broken or vanished
+    # install. Not cached: a root that gets fixed mid-process must be
+    # re-read, exactly as `attach._DUMY_CACHE` refuses to cache a failure.
+    if bid and bid != "unkeyed":
+        with _BASE_ID_LOCK:
+            _BASE_ID_CACHE[key] = bid
+    return bid
+
+
+def declared_roots() -> list[tuple[str, str]]:
+    """``[(root, kind)]`` for every install the user has declared, on disk.
+
+    A plain read of `coroot.declared_kinds`, filtered to roots that still
+    exist. Deliberately NOT `ViewerHandler._declared_bases`: that one resolves
+    parser plugins and computes index state, neither of which this question
+    needs, and it is a method on a request handler.
+    """
+    out = []
+    for path, kind in (coroot.declared_kinds() or {}).items():
+        p = Path(str(path))
+        try:
+            if p.is_dir():
+                out.append((str(p), str(kind)))
+        except OSError:                                  # pragma: no cover
+            continue
+    return out
+
+
+def _served_kind(root) -> str:
+    """The declared kind of the install on screen, or ``""``.
+
+    Never `coroot.kind_for_root(None)`: with no served root that resolves the
+    *environment's* install and names a client the user is not looking at.
+    """
+    if root is None:
+        return ""
+    try:
+        return coroot.kind_for_root(root) or ""
+    except Exception:                                    # pragma: no cover
+        return ""
+
+
+def resolve_provenance(entry: dict, served=None) -> dict:
+    """Where a library entry's bytes came from, and what to classify them with.
+
+    Returns a dict the API and the UI both use verbatim::
+
+        state       resolved | unresolved | unrecorded | malformed
+        baseId      the recorded `<kind>-<fingerprint>`, "" if none
+        kind        the recorded install kind ("cco", "patch5517", ...)
+        install     the recorded install's FOLDER NAME, for a human
+        root        the install to classify with, or None
+        usingServed True when `root` is the served install rather than the
+                    entry's own -- i.e. the answer is a fallback
+        note        one sentence, written for the person looking at the model
+
+    **`usingServed` is the field this whole change exists for.** Falling back
+    to the served install is defensible -- it is what the viewer did before,
+    and it is right about as often as the two installs agree. Falling back
+    *silently* is the defect: a short `[Dumy]` list does not fail to parse, it
+    just stops hiding attachment points, so the only symptom is a box that
+    reads as bad art. Every caller must be able to say which answer it got.
+    """
+    from collection import (entry_provenance, provenance_state,
+                            PROV_MALFORMED as _MALFORMED)
+    served_p = Path(served) if served is not None else None
+    st = entry_provenance(entry)
+    if st is None:
+        bad = provenance_state(entry) == _MALFORMED
+        return {
+            "state": PROV_MALFORMED if bad else PROV_UNRECORDED,
+            "baseId": "", "kind": "", "install": "",
+            "root": served_p, "usingServed": served_p is not None,
+            "note": ("this entry's provenance record is unreadable, so it is "
+                     "drawn with the install on screen"
+                     if bad else
+                     "nothing recorded which install this was collected from, "
+                     "so it is drawn with the install on screen"),
+        }
+
+    want = str(st.get("base_id") or "")
+    kind = str(st.get("kind") or "") or want.partition("-")[0]
+    install = str(st.get("install") or "")
+    for root, declared in declared_roots():
+        if _cached_base_id(root, declared) == want:
+            return {"state": PROV_RESOLVED, "baseId": want, "kind": kind,
+                    "install": install, "root": Path(root),
+                    "usingServed": False,
+                    "note": f"collected from {kind or want}"}
+    return {
+        "state": PROV_UNRESOLVED, "baseId": want, "kind": kind,
+        "install": install, "root": served_p,
+        "usingServed": served_p is not None,
+        "note": (f"collected from {kind or want}, which is not declared on "
+                 f"this machine -- drawn with the install on screen instead"),
+    }
 
 
 def _log(msg: str) -> None:
@@ -4068,6 +4258,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/skintarget": self.api_skintarget,
             "/api/swap/writable": self.api_swap_writable,
             "/api/swap/record": self.api_swap_record,
+            "/api/swap/modified": self.api_swap_modified,
             "/api/swap/library": self.api_swap_library,
             "/api/swap/targets": self.api_swap_targets,
             "/api/swap/npcset": self.api_swap_npcset,
@@ -4694,6 +4885,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                                  # pragma: no cover
             return []
 
+    def _collect_stamp(self) -> Optional[dict]:
+        r"""`core/provenance.stamp()` for the install these bytes came from.
+
+        **The CATALOGUE's root, not the served one**, and on this endpoint
+        they can differ: `post_collect` reads through `self.cat`, which is a
+        `ServerView` over the base install when a COmmunity Library server is
+        open. Stamping the served root there would record the wrong client for
+        every asset collected out of an imported one -- the same class of
+        error this stamp exists to end, committed while writing it down.
+
+        Returns ``None`` rather than raising when the root cannot be
+        fingerprinted: an entry with no provenance is a state the reader
+        already handles and says out loud, and refusing the collect would lose
+        the asset over a label.
+        """
+        root = getattr(getattr(self, "cat", None), "root", None) \
+            or getattr(self.server, "game_root", None)
+        try:
+            import provenance as prov
+            st = prov.optional_stamp(root, "coviewer")
+        except Exception as e:                           # pragma: no cover
+            _log(f"collect: no provenance stamp ({type(e).__name__}: {e})")
+            return None
+        if st is None:
+            _log("collect: no provenance recorded (the source install could "
+                 "not be fingerprinted)")
+        return st
+
     def post_collect(self, body: bytes, arg):
         r"""Copy one asset into the collection.
 
@@ -4755,7 +4974,8 @@ class Handler(BaseHTTPRequestHandler):
                 server=getattr(self.server, "server_name", ""),
                 source_mesh=mesh, source_texture=tex,
                 swap_for=str(doc.get("swapFor") or ""),
-                note=str(doc.get("note") or ""), parts=parts)
+                note=str(doc.get("note") or ""), parts=parts,
+                provenance=self._collect_stamp())
         except Exception as e:
             return self._error(400, str(e))
         _log(f"collect: wrote {entry['id']} "
@@ -5194,9 +5414,19 @@ class Handler(BaseHTTPRequestHandler):
                     unknown_why.append("%s: %s" % (q, e))
             n_ok = sum(1 for v in resolves.values() if v is True)
             n_unknown = sum(1 for v in resolves.values() if v is None)
+            # The cap was 60 while the pane drew ONE ROW PER GROUP and this
+            # list was only the mid-pane's cohort readout. The pane now draws
+            # one row per NPC out of this same list, so a member the cap drops
+            # is an NPC the user cannot reach -- exactly the defect the
+            # expansion was asked for. 500 cannot truncate a real npc.json
+            # (CCO's whole table is 437 rows, and one group cannot exceed the
+            # table), and `membersCapped` states it rather than letting a
+            # short list read as a short group.
+            MEMBER_CAP = 500
             out.append({
                 "group": label, "groupKey": g, "count": len(slot["members"]),
-                "members": slot["members"][:60],
+                "members": slot["members"][:MEMBER_CAP],
+                "membersCapped": len(slot["members"]) > MEMBER_CAP,
                 "simpleObjects": sorted(slot["simpleObjects"]),
                 "meshes": slot["meshes"], "paths": paths, "resolves": resolves,
                 "art": ("unknown" if n_unknown else
@@ -5256,7 +5486,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False,
                                "headline": "npcsplit.py is not in this tree.",
                                "detail": str(tool), "text": ""})
+        # `type` is the row's identity; `npc` is a label. Names REPEAT in
+        # npc.json -- on CCO three rows are called Blacksmith and two are
+        # called Shelley, on different motion groups -- so a plan asked for by
+        # name can describe a different row than the one on screen, and
+        # nothing about the answer would look wrong. npcsplit takes `--type`
+        # for exactly this and treats it as overriding `--npc`. Optional, so a
+        # caller that only has a name still works.
         cmd = [_sys.executable, str(tool), "--root", root, "--npc", npc]
+        npc_type = str(arg("type", "") or "").strip()
+        if npc_type:
+            try:
+                cmd += ["--type", str(int(npc_type))]
+            except ValueError:
+                return self._error(400, "type= must be an integer; got %r"
+                                        % npc_type)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=300)
@@ -5272,9 +5516,10 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({
             "ok": r.returncode == 0,
             "exit": r.returncode,
-            "npc": npc, "root": root,
-            "command": "py -3 tools\\npcsplit.py --root \"%s\" --npc \"%s\""
-                       % (root, npc),
+            "npc": npc, "root": root, "type": npc_type,
+            "command": ("py -3 tools\\npcsplit.py --root \"%s\" --npc \"%s\"%s"
+                        % (root, npc,
+                           (" --type %s" % npc_type) if npc_type else "")),
             "headline": ("" if r.returncode == 0 else
                          "npcsplit refused rather than guessing (exit %d)."
                          % r.returncode),
@@ -5315,13 +5560,37 @@ class Handler(BaseHTTPRequestHandler):
                                "the library index names %s but the file is not "
                                "there" % rel})
         data = f.read_bytes()
-        out = c3_to_json(data, rel)
+        # A LIBRARY entry is classified with ITS OWN install's `[Dumy]` list,
+        # not the served one's. Serving patch5517 and previewing art collected
+        # from CCO, the served vocabulary declares 7 names against CCO's 52 and
+        # nine of the model's chunks stop being recognised as attachment
+        # points -- they get drawn, `v_zero` as a textured box on the ground
+        # at the model's feet. `resolve_provenance` says which vocabulary it
+        # found; `socket_root` scopes it to this decode and this thread.
+        prov = resolve_provenance(entry,
+                                  getattr(self.server, "game_root", None))
+        with socket_root(prov["root"] if not prov["usingServed"] else None):
+            out = c3_to_json(data, rel)
         if not out.get("meshes"):
             out.setdefault("note", "no drawable geometry in %s" % rel)
         skins = entry.get("skins") or []
         if skins:
             out["guessedTexture"] = "lib:" + str(skins[0])
         out["libraryEntry"] = want
+        # Reported on EVERY response, resolved ones included. A field that
+        # appears only when something is wrong is a field nobody learns to
+        # read, and the state the user most needs to recognise -- "drawn with
+        # the install on screen" -- is the one that looks like success.
+        out["provenance"] = {
+            "state": prov["state"], "baseId": prov["baseId"],
+            "kind": prov["kind"], "install": prov["install"],
+            "usingServed": bool(prov["usingServed"]),
+            # `kind_for_root(None)` resolves the ENVIRONMENT's install, which
+            # is not the one on screen and would name a client the user is not
+            # looking at. No served root means no served kind.
+            "servedKind": _served_kind(getattr(self.server, "game_root", None)),
+            "note": prov["note"],
+        }
         return self._json(out)
 
     def api_swap_libtex(self, arg):
@@ -9543,6 +9812,36 @@ class Handler(BaseHTTPRequestHandler):
                            "head": data[:32].hex()})
 
     # -- API: geometry -----------------------------------------------------
+    def _collected_entry(self, logical: str):
+        """The Collection entry a logical path names, or ``None``.
+
+        Only when the Collection itself is the open view. `Collection.publish`
+        keys its filemap `collection/<Category>/<stem><ext>` -- the profile
+        name, then the entry's own `mesh` rel -- so the mapping back is a
+        prefix strip and a case-insensitive compare, not a guess.
+
+        Returns ``None`` cheaply and for every ordinary asset: this runs on
+        the hot mesh path and must cost nothing when no library is configured.
+        """
+        try:
+            from collection import PROFILE_NAME
+        except Exception:                                # pragma: no cover
+            return None
+        if getattr(self.server, "server_name", "") != PROFILE_NAME:
+            return None
+        key = str(logical or "").replace("\\", "/").lower()
+        pre = PROFILE_NAME.lower() + "/"
+        if not key.startswith(pre):
+            return None
+        rel = key[len(pre):]
+        col = self._collection()
+        if col is None:
+            return None
+        for e in col.entries:
+            if str(e.get("mesh") or "").replace("\\", "/").lower() == rel:
+                return e
+        return None
+
     def api_mesh(self, arg):
         logical = arg("path")
         if not logical:
@@ -9553,7 +9852,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, f"not found: {logical}")
         if not data.startswith(b"MAXFILE"):
             return self._error(400, f"not a C3 container: {logical}")
-        out = c3_to_json(data, logical)
+        # Browsing the Collection is the SECOND way to reach collected art --
+        # the swap page's preview is the first -- and it has the same defect:
+        # the bytes belong to whichever client they were collected from, while
+        # the socket vocabulary follows the install being served. One entry, so
+        # one answer; `_collected_entry` returns None for every ordinary asset
+        # and this path is then exactly what it was.
+        entry = self._collected_entry(logical)
+        prov = None
+        if entry is not None:
+            prov = resolve_provenance(entry,
+                                      getattr(self.server, "game_root", None))
+        with socket_root(prov["root"] if prov and not prov["usingServed"]
+                         else None):
+            out = c3_to_json(data, logical)
+        if prov is not None:
+            out["provenance"] = {
+                "state": prov["state"], "baseId": prov["baseId"],
+                "kind": prov["kind"], "install": prov["install"],
+                "usingServed": bool(prov["usingServed"]),
+                "servedKind": _served_kind(
+                    getattr(self.server, "game_root", None)),
+                "note": prov["note"],
+            }
         if not out.get("meshes"):
             # Old-client convention: 3-digit action files in a look directory
             # are MOTI-only -- the model itself is the long-id sibling. Say
@@ -10049,6 +10370,176 @@ class Handler(BaseHTTPRequestHandler):
                                      "them back newest first."
                                      % (len(rows),
                                         "y" if len(rows) == 1 else "ies")})
+
+    def api_swap_modified(self, arg):
+        r"""Which NPC rows COMod ITSELF changed in this install.
+
+        THE QUESTION THIS DOES **NOT** ANSWER, stated first because the swap
+        page's toggle is worded from it. "Modified from stock" needs a
+        pristine baseline to diff against. A numbered client has one -- the
+        vendor shipped it. **A private server has none**: a live shard's files
+        are whatever its operator last pushed, and there is no edition of them
+        anywhere to compare with. Since the right pane is specifically the
+        private-server side, that question has no answer for its own subject,
+        and inventing one by diffing against some other client would report
+        the operator's own content as a modification.
+
+        So this answers the question that IS answerable and is the one the
+        user can act on: **what has COMod changed here?** `comod` records
+        every install as a dated entry naming each logical file it wrote, and
+        backs up whatever it displaced. That record is the evidence.
+
+        TWO SIGNALS, and they are different in kind:
+
+        * ``files`` -- the union of the logical paths every entry wrote. A row
+          whose art path is in this set had its art written by COMod. This is
+          GROUP-WIDE by nature: overwriting `c3/npc/999001100.c3` changes the
+          look of all 38 NPCs on group 001, and all 38 should read as changed.
+        * ``rowTypes`` -- the rows of ``ini/npc.json`` that differ from the
+          EARLIEST backed-up copy of that table. A split edits one row's
+          motion ids, and the recorded file is the whole table; without this
+          diff the only honest answer would be "every row", which is useless.
+          Rows are keyed on ``type``, never on ``name``: names repeat in
+          npc.json (three rows are called Blacksmith).
+
+        WHERE IT REFUSES RATHER THAN GUESSING. A comparison that could not be
+        made must not render as "nothing was modified" -- that is a filter
+        that hides the thing it was asked to show:
+
+        * the table is recorded but no entry backed one up  ->  COMod ADDED
+          the table, so every row is its doing: ``tableAllRows``.
+        * the backup copy will not parse                    ->  ``tableError``.
+        * ``type`` is missing or repeats on either side      ->  the join is
+          not a join; ``tableAmbiguous``, and the caller shows a note instead
+          of a silently short list.
+        """
+        import json as _json
+        import comod
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        empty = {"root": root, "recorded": False, "entries": 0, "files": [],
+                 "rowTypes": [], "rowNames": [], "tableAllRows": False,
+                 "tableRecorded": False, "tableAmbiguous": "",
+                 "tableError": "", "tableBaseline": ""}
+        try:
+            man = comod.load_manifest(Path(root))
+        except Exception as e:
+            d = dict(empty)
+            d.update({"error": True,
+                      "headline": "The install record would not read.",
+                      "detail": "%s: %s" % (type(e).__name__, e),
+                      "basis": "comod.load_manifest refused"})
+            return self._json(d)
+        entries = list((man or {}).get("entries", []))
+        if not entries:
+            d = dict(empty)
+            d.update({"headline": "COMod has installed nothing here.",
+                      "detail": "Nothing in this install is COMod's doing, so "
+                                "the filter would hide every row.",
+                      "basis": "comod's install record, which is empty"})
+            return self._json(d)
+
+        TABLE = "ini/npc.json"
+        files, table_recorded = [], False
+        for e in entries:
+            for f in e.get("files", []):
+                lg = str(f.get("logical", "")).replace("\\", "/").lstrip("/")
+                if not lg:
+                    continue
+                if lg.lower() == TABLE:
+                    table_recorded = True
+                if lg not in files:
+                    files.append(lg)
+
+        d = dict(empty)
+        d.update({"recorded": True, "entries": len(entries),
+                  "files": sorted(files), "tableRecorded": table_recorded})
+
+        if not table_recorded:
+            d["detail"] = ("COMod wrote %d file(s) here across %d entr%s, and "
+                           "none of them is %s -- so no NPC row's table entry "
+                           "was changed, only art." %
+                           (len(files), len(entries),
+                            "y" if len(entries) == 1 else "ies", TABLE))
+            d["basis"] = "comod's install record"
+            d["headline"] = ""
+            return self._json(d)
+
+        # The EARLIEST backed-up copy is the one that predates COMod. A later
+        # entry's backup holds what the entry before it left behind, so
+        # diffing against the newest would report only the last install's
+        # edits as "modified by COMod" and call the first install's stock.
+        base_text, base_from = None, ""
+        for e in entries:
+            try:
+                b = comod.entry_backup(Path(root), e) / "ini" / "npc.json"
+            except Exception:
+                continue
+            if b.is_file():
+                base_text = b.read_text(encoding="utf-8", errors="replace")
+                base_from = e.get("backup") or "backup"
+                break
+        if base_text is None:
+            d["tableAllRows"] = True
+            d["headline"] = "COMod created this install's %s." % TABLE
+            d["detail"] = ("The record names %s but no entry backed one up, "
+                           "so there was none before COMod wrote it. Every "
+                           "row here is COMod's." % TABLE)
+            d["basis"] = "comod's install record, with no displaced original"
+            return self._json(d)
+        d["tableBaseline"] = base_from
+
+        live = Path(root) / "ini" / "npc.json"
+        try:
+            old = _json.loads(base_text)
+            new = _json.loads(live.read_text(encoding="utf-8",
+                                             errors="replace"))
+        except Exception as e:
+            d["tableError"] = "%s: %s" % (type(e).__name__, e)
+            d["headline"] = "The two copies of %s could not be compared." % TABLE
+            d["detail"] = ("A comparison that failed is not the same as no "
+                           "modification; no row is claimed either way.")
+            d["basis"] = "comod's backup of %s, which would not parse" % TABLE
+            return self._json(d)
+
+        def keyed(rows):
+            out = {}
+            for r in rows:
+                if not isinstance(r, dict):
+                    return None, "a row is not an object"
+                t = r.get("type")
+                if not isinstance(t, int):
+                    return None, "a row carries no integer `type`"
+                if t in out:
+                    return None, "`type` %d appears twice" % t
+                out[t] = r
+            return out, ""
+
+        o, why_o = keyed(old if isinstance(old, list) else [])
+        n, why_n = keyed(new if isinstance(new, list) else [])
+        if o is None or n is None:
+            d["tableAmbiguous"] = (why_o or why_n)
+            d["headline"] = "%s cannot be joined row by row." % TABLE
+            d["detail"] = ("Rows are matched on `type`, and %s. The table was "
+                           "changed by COMod, but which rows cannot be said."
+                           % (why_o or why_n))
+            d["basis"] = "comod's backup of %s, which will not join" % TABLE
+            return self._json(d)
+
+        types = sorted([t for t in n if t not in o or n[t] != o[t]])
+        d["rowTypes"] = types
+        d["rowNames"] = [str(n[t].get("name", "") or "") for t in types]
+        d["headline"] = ""
+        d["detail"] = ("COMod wrote %d file(s) here across %d entr%s. %d of "
+                       "the %d rows in %s differ from the copy it displaced "
+                       "(backup %s)." %
+                       (len(files), len(entries),
+                        "y" if len(entries) == 1 else "ies",
+                        len(types), len(n), TABLE, base_from))
+        d["basis"] = ("comod's install record and its own backup of %s -- "
+                      "what COMod changed, NOT what differs from a vendor "
+                      "original, which a private server does not have"
+                      % TABLE)
+        return self._json(d)
 
     def _run_comod(self, extra: list[str], root: str = ""):
         """Every write to the game install goes through comod.py, never through

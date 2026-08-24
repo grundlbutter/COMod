@@ -46,6 +46,39 @@
            border-left: 2px solid rgba(128,128,128,.5); margin-bottom: .3rem; }
 .sw-search { width: 100%; box-sizing: border-box; margin: .4rem 0; }
 
+/* The right pane's filter bar. Two toggles and a sort, sitting directly above
+   the list they act on -- a control that changes what a list contains has to
+   be visible from the list, or its effect reads as missing data. */
+.sw-filters { display: flex; flex-wrap: wrap; align-items: center;
+              gap: .5rem .9rem; padding: .1rem 0 .45rem;
+              border-bottom: 1px solid rgba(128,128,128,.25);
+              margin-bottom: .35rem; font-size: .85em; }
+/* The shared style.css uppercases every <label>, which is right for the form
+   captions it was written for and wrong here: it turns "modified by COMod
+   only" into "MODIFIED BY COMOD ONLY", and the casing of COMod is the part of
+   that label doing the work -- it names whose modifications are being shown.
+   Overridden locally rather than in style.css, which other pages rely on. */
+.sw-chk { display: inline-flex; align-items: center; gap: .3rem;
+          cursor: pointer; user-select: none;
+          text-transform: none; letter-spacing: normal;
+          font-size: .95em; opacity: 1; }
+.sw-chk input { cursor: pointer; margin: 0; }
+.sw-sortsel { flex: 0 1 11rem; min-width: 9rem; }
+
+/* An expanded row is ONE NPC. The group tag is not decoration on it: it is
+   the warning that a swap here moves everyone else on that group, so a shared
+   row carries a visible accent and an unshared one does not. */
+.swap-npc-row { align-items: baseline; }
+.swap-npc-row .sw-who { flex: 1 1 auto; min-width: 0;
+                        overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; }
+.swap-npc-row .sw-id { flex: 0 0 auto; text-align: right; }
+.swap-shared { border-left: 3px solid rgba(220,150,40,.75);
+               padding-left: .25rem; }
+.swap-shared .sw-share { opacity: .95; color: rgb(214,150,60); }
+.swap-alone .sw-share { opacity: .55; }
+.sw-count { padding: .3rem .4rem; font-size: .8em; opacity: .75; }
+
 /* An empty parts list is a fault until proven otherwise, so the states are
    not styled alike: `fault` and `unknown` are loud, `none` is a statement,
    and only `ok` is quiet. */
@@ -146,9 +179,21 @@
       <div class="sw-kinds" id="donor-kinds"></div>
       <div class="sw-stage"><canvas id="gl-donor"></canvas>
         <div class="sw-msg" id="msg-donor">pick a kind</div></div>
+      <!-- WHICH INSTALL this entry's art came from, and therefore whose
+           `[Dumy]` list decided which chunks are attachment points and which
+           got drawn. Always shown once an entry is picked, resolved ones
+           included: the state a reader most needs to recognise -- "drawn with
+           the install on screen" -- is the one that looks like success. -->
+      <div id="donor-prov"></div>
       <div class="sw-pick">
         <input class="sw-search" id="donor-q" type="search"
                placeholder="filter" autocomplete="off">
+        <div class="sw-filters" id="donor-filters">
+          <label class="sw-chk" id="lbl-hide-noparts"
+                 title="Hide library entries with no parts">
+            <input type="checkbox" id="swap-hide-noparts"><span>hide assets with no parts</span>
+          </label>
+        </div>
         <div id="donor-list"></div>
       </div>
       <div class="sw-parts" id="donor-parts"></div>
@@ -170,6 +215,25 @@
       <div class="sw-pick">
         <input class="sw-search" id="target-q" type="search"
                placeholder="filter" autocomplete="off">
+        <div class="sw-filters" id="target-filters">
+          <label class="sw-chk" id="lbl-hide-issues"
+                 title="Hide assets with issues resolving">
+            <input type="checkbox" id="swap-hide-issues"><span>hide issues</span>
+          </label>
+          <label class="sw-chk" id="lbl-modified-only"
+                 title="Show only what COMod's own install record says it changed in this install. It cannot tell you what differs from the vendor's original client: a private server has no pristine edition to compare against.">
+            <input type="checkbox" id="swap-modified-only"><span>modified by COMod only</span>
+          </label>
+          <select class="sw-sel sw-sortsel" id="swap-sort"
+                  title="sort by name: A-Z, ties broken by the row's npc.json type. sort by group: motion group ascending, then name, then type.">
+            <option value="name">sort by name</option>
+            <option value="group">sort by group</option>
+          </select>
+          <label class="sw-chk" id="lbl-collapse"
+                 title="Collapse the list back to one row per motion group, with a representative name and a member count. The expanded list is the default; this is the old view kept for seeing a group as a unit.">
+            <input type="checkbox" id="swap-collapse"><span>collapse to groups</span>
+          </label>
+        </div>
         <div id="target-list"></div>
       </div>
       <div class="sw-parts" id="target-parts"></div>
