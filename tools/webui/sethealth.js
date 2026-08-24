@@ -303,7 +303,13 @@
     let n = 0;
     for (const a of arts) {
       const tr = mk('tr');
+      // `refusedWhy` outranks `suppliedFrom`, and the order is the whole
+      // point: the override gate can decline a supplied artefact, and a row
+      // that then read "supplied" while the artefact reads as MISSING is the
+      // most confusing state this page can show -- the setting is there, the
+      // file is there, and nothing says why it is not being used.
       const state = !a.applicable ? 'n/a here'
+        : a.refusedWhy ? 'REFUSED'
         : a.suppliedFrom ? 'supplied'
         : a.exists ? (a.inherited ? 'inherited' : 'built')
         : a.buildable ? 'MISSING' : 'not buildable here';
@@ -384,8 +390,18 @@
         useFields[a.path] = inp;
       }
       row.appendChild(inp);
-      if (a.suppliedFrom) {
-        row.appendChild(mk('span', 'set-help', 'currently supplied'));
+      if (a.refusedWhy) {
+        // The server's own sentences, whole. A shortened refusal is a refusal
+        // the user cannot act on, and the reason it was refused is the only
+        // thing that tells them whether to fix the file or clear the setting.
+        const w = mk('div', 'set-help', a.refusedWhy);
+        w.style.whiteSpace = 'pre-wrap';
+        row.appendChild(w);
+      } else if (a.suppliedFrom) {
+        row.appendChild(mk('span', 'set-help',
+          a.verified ? 'currently supplied — verified'
+                     : 'currently supplied — NOT verified, no check exists ' +
+                       'for this artefact'));
       } else if (!a.buildable) {
         row.appendChild(mk('span', 'set-help', 'not buildable here'));
       }

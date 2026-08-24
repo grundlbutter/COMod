@@ -1327,6 +1327,15 @@ def check_derived(root=None) -> dict:
             "applicable": applicable,
             "notApplicableWhy": "" if applicable else needs[1],
             "suppliedFrom": str(supplied) if supplied else "",
+            # What the override gate did with `suppliedFrom`, if anything.
+            # A supplied artefact that reads as MISSING is otherwise the most
+            # confusing state this page can show: the setting is there, the
+            # file is there, and the row says "not built". `refusedWhy` is
+            # the sentence that explains it, and `verified` distinguishes
+            # "checked and accepted" from "nothing here judges this kind" so
+            # the page never implies a check it did not make.
+            "refusedWhy": coroot.refused_derived_overrides().get(rel, ""),
+            "verified": bool(supplied) and coroot.is_verifiable(rel) and found,
             "supply": None if buildable else
                       f'py -3 tools/health.py --use "{rel}=<path>"',
             "inherited": found and not (
@@ -2960,8 +2969,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 # setting then looks like it was ignored.
                 print(f"no such file: {p}", file=sys.stderr)
                 return 2
+            # THE GATE, AT THE MOMENT THE USER ACTS. `coroot.find_derived`
+            # enforces it on every read and is the real guarantee -- a file
+            # can be swapped after this runs -- but a refusal discovered here
+            # is the one the user can do something about, and it arrives
+            # attached to the command that caused it instead of as a stderr
+            # line during some later tool's run.
+            v = coroot.override_verdict(rel, p,
+                                        Path(a.root) if a.root else None)
+            if not v.permits(on_unknown=(coroot.REFUSE
+                                         if coroot.is_verifiable(rel)
+                                         else coroot.PERMIT)):
+                print(v.detail, file=sys.stderr)
+                print("not saved.", file=sys.stderr)
+                return 2
             coroot.set_derived_override(rel, p)
             print(f"{rel}\n    -> {p.resolve()}")
+            if v.is_permit:
+                print(f"    verified: {v.detail}")
+            elif v.is_unknown:
+                # Said out loud rather than left implied. This is the residual
+                # the gate deliberately leaves, and a user who reads "saved"
+                # with nothing else would reasonably assume it was checked.
+                print(f"    NOT verified -- {'; '.join(v.unseen)}")
         return 0
 
     if a.provenance:

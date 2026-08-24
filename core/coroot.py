@@ -54,8 +54,11 @@ CLI::
     py -3 core/coroot.py --set "D:\\Games\\Classic Conquer 2.0"
     py -3 core/coroot.py --forget
 
-Pure stdlib, no imports from the rest of the project: it is vendored verbatim
-into the Blender addon by ``tools/build_addon.py``.
+Pure stdlib but for two project modules, both vendored alongside it into the
+Blender addon by ``tools/build_addon.py``: ``core/verdict.py`` for the
+three-state answer the override gate returns, and -- reached lazily, and only
+when a user-named artefact is actually read -- ``tools/profilecheck.py``, the
+verifier that gate consults.  See *the override gate*, below.
 """
 
 from __future__ import annotations
@@ -65,8 +68,71 @@ import os
 import string
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Iterator, Optional
+
+
+def _sibling(name: str, extra_dirs=()):
+    """Import a project module without assuming how THIS one was imported.
+
+    Three import styles are live in this tree and the override gate has to
+    work under all three::
+
+        import coroot                # `core/` on sys.path -- most callers
+        from core import coroot      # the repo root on it -- e.g.
+                                     # tests/test_backup_suffixes.py
+        from .vendor import coroot   # the Blender addon's package
+
+    A module-scope ``from verdict import ...`` resolves under the FIRST and
+    under neither of the other two.  Measured, not guessed: it took
+    `test_backup_suffixes` red with ``ModuleNotFoundError: No module named
+    'verdict'`` -- and it did so from a test that has nothing to do with this
+    gate, which is the point.  So the import is spelled through `importlib`,
+    which has one spelling covering all three, and falls back to loading the
+    file that sits beside this one.
+
+    Spelled this way it is invisible to `test_vendor_sync`'s
+    unrewritten-import walk, which can only see import *statements*.  The
+    addon shape is covered instead by `tests/test_override_gate.VendoredAddon`,
+    which imports the vendored package the way Blender does -- with neither
+    `core/` nor `tools/` on `sys.path` -- and drives the gate through it.
+    """
+    mod = sys.modules.get(name)
+    if mod is not None:
+        return mod
+    import importlib                                     # noqa: PLC0415
+    pkg = __package__ or ""
+    if pkg:
+        try:
+            return importlib.import_module("." + name, pkg)
+        except ImportError:
+            pass
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pass
+    import importlib.util                                # noqa: PLC0415
+    for d in (Path(__file__).resolve().parent, *extra_dirs):
+        f = Path(d) / f"{name}.py"
+        if not f.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"_coroot_{name}", f)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)                   # type: ignore[union-attr]
+            return m
+        except Exception:                                # noqa: BLE001
+            continue
+    return None
+
+
+_verdict = _sibling("verdict")
+if _verdict is None:                                     # pragma: no cover
+    raise ImportError(
+        "coroot's derived-override gate needs core/verdict.py and could not "
+        "find it beside this file. Do not degrade to a two-state answer here: "
+        "that is the defect verdict.py exists to make unrepresentable.")
+Verdict, PERMIT, REFUSE = _verdict.Verdict, _verdict.PERMIT, _verdict.REFUSE
 
 __all__ = [
     "ENV_VAR", "CONVENTIONAL_ROOT", "REQUIRED", "RootNotFound",
@@ -76,7 +142,12 @@ __all__ = [
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
     "installs_root", "set_installs_root",
     "derived_overrides", "derived_override", "set_derived_override",
-    "broken_derived_overrides",
+    "broken_derived_overrides", "VERIFIED_DERIVED", "is_verifiable",
+    "override_verdict", "refused_derived_overrides",
+    "unverified_derived_overrides",
+    # Re-exported from `verdict` so a caller of `override_verdict` can state
+    # its `on_unknown` policy without a second import.
+    "PERMIT", "REFUSE",
     "PER_BASE", "GLOBAL", "GLOBAL_EXCEPTIONS", "UndeclaredDerived",
     "INDEX_ROOT", "base_fingerprint",
     "base_id", "derived_rel", "derived_path", "declare_kind", "KINDS_KEY",
@@ -1441,6 +1512,274 @@ def broken_derived_overrides() -> dict:
             if not Path(v).exists()}
 
 
+# ---------------------------------------------------------------------------
+# the override gate
+# ---------------------------------------------------------------------------
+#
+# WHY AN OVERRIDE NEEDS A GATE AT ALL.  `derived_override` was a developer
+# convenience: a tree that cannot BUILD an artefact can be pointed at a copy
+# (`health.py --use REL=PATH`), and COMod -- which ships the asset subset and
+# no `build_opcodes.py` -- is the reason it exists.  Harmless, because the only
+# thing on the other end was a file the same developer had just built.
+#
+# `tools/profilecheck.py` changes what is on the other end.  A pre-bootstrap
+# profile is precomputed derived data the user did NOT derive, and shipping it
+# is worth ~2,000 s of bootstrap.  Once profiles arrive that way, an override
+# that returns whatever path it was handed is an **injection path for
+# unverified derived data**, and it bypasses the entire verification design --
+# which exists precisely because a stamp is not a check: `profilecheck` reads
+# the user's own `c3.wdf`/`data.wdf` and refuses a sound-but-wrong-client table
+# at 0% applicability, and nothing in it reads a provenance claim.
+#
+# THE SPLIT THIS GATE HAS TO GET RIGHT.  Not every derived artefact is a name
+# table.  A verifier that refuses everything it does not understand breaks
+# `--use` for the five artefacts `profilecheck` has no opinion about, and that
+# flag has an owner ruling behind it: an artefact this tree cannot build must
+# remain suppliable.  One that passes everything it does not understand is the
+# old defect wearing a check.  So the two questions are kept apart, and the
+# answer is a `verdict.Verdict` rather than a bool so that "I could not look"
+# cannot collapse into "nothing to worry about":
+#
+#   * **Is a verifier's DOMAIN this artefact?**  `is_verifiable`, answered from
+#     `VERIFIED_DERIVED` below.  Outside the domain the gate returns UNKNOWN
+#     and `find_derived` honours the override anyway -- see the policy comment
+#     at that call site for why, and `unverified_derived_overrides` for how it
+#     stays visible rather than silent.
+#   * **Inside the domain, what does the verifier say?**  PERMIT or REFUSE
+#     from `profilecheck`, or UNKNOWN when the check could not be RUN at all
+#     (no reachable verifier, no install to check against).  Inside the domain
+#     UNKNOWN fails closed: being unable to check is not a pass.
+
+#: Derived artefacts a verifier exists for, **by filename**.
+#:
+#: Held here rather than imported from `profilecheck` on purpose.  The domain
+#: question must stay answerable in a tree where the verifier cannot be
+#: reached -- otherwise "I could not import the verifier" would silently shrink
+#: the guarded set to nothing, which is exactly the failure the gate exists to
+#: prevent, arriving through the gate itself.  A filename, not an `out/...`
+#: path, because the same table is legitimately supplied from anywhere.
+#:
+#: `tests/test_override_gate.py` pins this equal to `profilecheck.ARCHIVES`, so
+#: teaching that module a new table extends the gate in the same commit or goes
+#: red.  Add a name here only with the verifier that judges it.
+VERIFIED_DERIVED: frozenset = frozenset({"c3_names.json", "data_names.json"})
+
+_VERIFIER_UNSET = object()
+_verifier: object = _VERIFIER_UNSET
+#: ``{cache key: Verdict}``.  The check costs a WDF index read plus one forward
+#: hash per shipped name -- MEASURED 0.42 s for 24,431 entries on 5517 -- and
+#: `find_derived` is called per request by the viewer.  Keyed on the file's
+#: identity (path, size, mtime) so replacing the file re-checks it.
+_override_verdicts: dict = {}
+_refused_overrides: dict = {}
+_unverified_overrides: dict = {}
+_refusals_announced: set = set()
+
+
+def is_verifiable(rel: str) -> bool:
+    """Whether any verifier has an opinion about this artefact's KIND.
+
+    False is not "safe"; it is "unexamined".  The caller decides what to do
+    with that, and `find_derived` writes down which it chose.
+    """
+    return PurePath(str(rel)).name in VERIFIED_DERIVED
+
+
+def _profilecheck():
+    """`tools/profilecheck`, or None if it cannot be reached from here.
+
+    Reached through `_sibling` because the verifier sits beside this file in
+    the Blender addon and one directory across in a checkout, and because no
+    single import statement covers both.  A miss is None, and None fails
+    CLOSED inside a verifier's domain -- never a quiet pass.
+    """
+    global _verifier
+    if _verifier is not _VERIFIER_UNSET:
+        return _verifier
+    repo = _repo_dir()
+    extra = [repo / "tools"] if repo is not None else []
+    try:
+        _verifier = _sibling("profilecheck", extra)
+    except Exception:                                    # noqa: BLE001
+        _verifier = None
+    return _verifier
+
+
+def _name_table_stem(pc, rel: str) -> Optional[str]:
+    """Which archive of `pc.ARCHIVES` this filename is the table for."""
+    name = PurePath(str(rel)).name
+    for stem, fn in pc.ARCHIVES:
+        if fn == name:
+            return stem
+    return None
+
+
+def _load_name_table(path) -> tuple:
+    """``(table, why_not)`` -- the first-pass dump's nested shape included.
+
+    `coassets._read_name_table` accepts ``{"resolved": {...}}`` as well as the
+    flat map, so the gate must too; refusing a shape the reader accepts would
+    make the gate, not the artefact, the thing that broke.
+    """
+    try:
+        raw = json.loads(Path(path).read_text("utf-8"))
+    except OSError as e:
+        return None, f"cannot be read: {e}"
+    except ValueError as e:
+        return None, f"is not JSON: {e}"
+    if isinstance(raw, dict) and "resolved" in raw:
+        raw = raw["resolved"]
+    if not isinstance(raw, dict) or not raw:
+        return None, ("is not a name table: expected a non-empty JSON object "
+                      'of {"<hex hash>": "<asset path>"}')
+    return raw, ""
+
+
+def _refusal_text(rel, path, why, clauses=()) -> str:
+    """What failed, and what to do about it.
+
+    A bare "refused" turns a safety feature into a mystery and the user's next
+    move is to delete the setting -- so every refusal names the artefact, the
+    path, the clause that failed, and the two commands that resolve it.
+    """
+    lines = [f"refusing the derived override for {rel}",
+             f"    -> {path}",
+             f"  {why}"]
+    for clause, says in clauses:
+        lines.append(f"  {clause}: {says}")
+    lines += [
+        "  This artefact is verified before it is used, because a supplied "
+        "name table is derived data you did not derive.",
+        "  To see the full check:  py -3 tools/profilecheck.py --out-dir "
+        f"\"{Path(path).parent}\"",
+        f"  To clear the setting:   py -3 tools/health.py --use \"{rel}=\"",
+    ]
+    return "\n".join(lines)
+
+
+def _override_verdict_uncached(rel, path, root):
+    pc = _profilecheck()
+    if pc is None:
+        # Inside the domain this is UNKNOWN, not permit. The tree that cannot
+        # reach the verifier is exactly the tree an unverified profile would
+        # land in unnoticed, which is why `profilecheck.py` ships with the
+        # gate rather than after it.
+        return Verdict.unknown(
+            ["tools/profilecheck.py could not be imported from here"],
+            _refusal_text(rel, path,
+                          "the verifier for this artefact could not be "
+                          "reached, so it was not checked"))
+    stem = _name_table_stem(pc, rel)
+    if stem is None:
+        return Verdict.unknown(
+            [f"no verifier in this tree judges {PurePath(str(rel)).name}"],
+            f"{rel} is outside every verifier's domain")
+    table, why_not = _load_name_table(path)
+    if table is None:
+        return Verdict.refuse(_refusal_text(rel, path, f"the file {why_not}"))
+    try:
+        r = Path(root) if root else game_root()
+    except Exception:                                    # noqa: BLE001
+        r = None
+    if r is None or not Path(r).is_dir():
+        return Verdict.unknown(
+            ["no install is configured, so applicability could not be read "
+             "from this user's own archives"],
+            _refusal_text(rel, path,
+                          "there is no install to check it against. "
+                          "Set one (py -3 tools/health.py --set <path>) or "
+                          "pass --root, then try again"))
+    try:
+        rep = pc.check(r, {stem: table})
+        arc = rep["archives"].get(stem) or {}
+        if not arc.get("checked"):
+            return Verdict.unknown(
+                [f"{arc.get('why') or stem + '.wdf could not be read'}"],
+                _refusal_text(rel, path,
+                              f"it could not be checked against {r}: "
+                              f"{arc.get('why') or 'archive unreadable'}"))
+        v = pc.verdict(rep, {}, r)
+    except Exception as e:                               # noqa: BLE001
+        # A verifier that crashed did not clear anything. UNKNOWN, and the
+        # call site inside the domain turns that into a refusal.
+        return Verdict.unknown(
+            [f"the verifier raised {type(e).__name__}: {e}"],
+            _refusal_text(rel, path,
+                          f"the verifier raised {type(e).__name__}: {e}"))
+    if v.get("accept"):
+        return Verdict.permit(
+            f"{rel}: {v['verified_named']} of {v['archive_entries']} entries "
+            f"named, {v['coverage_pct']}% coverage, 0 unsound "
+            f"(tools/profilecheck.py, re-derived against {r})")
+    bad = [(c["clause"], c["says"]) for c in v["clauses"]
+           if "REFUSED" in c["says"] or c["clause"] == "blocked"]
+    return Verdict.refuse(_refusal_text(
+        rel, path, f"tools/profilecheck.py refuses it against {r}:", bad))
+
+
+def override_verdict(rel: str, path, root=None):
+    """`verdict.Verdict` on a user-named copy of one derived artefact.
+
+    PERMIT only when a verifier looked and accepted.  REFUSE when one looked
+    and rejected.  UNKNOWN when none looked -- and UNKNOWN carries *which*
+    kind of blindness it was in `.unseen`, because the two mean opposite
+    things: outside the domain nothing was ever going to look, while inside it
+    something should have and could not.
+    """
+    p = Path(path)
+    try:
+        st = p.stat()
+        ident = (str(p), st.st_size, st.st_mtime_ns)
+    except OSError:
+        ident = (str(p), -1, -1)
+    key = (str(rel), ident, str(root or ""))
+    hit = _override_verdicts.get(key)
+    if hit is None:
+        hit = _override_verdict_uncached(rel, p, root)
+        _override_verdicts[key] = hit
+    return hit
+
+
+def _note_override(rel, path, v) -> None:
+    """Record -- and, once, announce -- what the gate did with an override."""
+    if v.is_permit:
+        _refused_overrides.pop(str(rel), None)
+        _unverified_overrides.pop(str(rel), None)
+        return
+    if v.is_unknown and not is_verifiable(rel):
+        _unverified_overrides[str(rel)] = str(path)
+        return
+    _refused_overrides[str(rel)] = v.detail
+    key = (str(rel), str(path), v.state)
+    if key not in _refusals_announced:
+        _refusals_announced.add(key)
+        # stderr, once per process per setting. A refusal the user never sees
+        # reads as "the artefact does not exist", which is the report that
+        # gets the setting deleted instead of fixed.
+        print(f"coroot: {v.detail}", file=sys.stderr)
+
+
+def refused_derived_overrides() -> dict:
+    """``{rel: why}`` for overrides the gate has refused **this process**.
+
+    Populated by `find_derived`, so it answers for the artefacts that were
+    actually asked for.  `health.py` walks all of `DERIVED`, which is what
+    makes it a complete report there.
+    """
+    return dict(_refused_overrides)
+
+
+def unverified_derived_overrides() -> dict:
+    """``{rel: path}`` honoured with **no verification**, because no verifier
+    in this tree has an opinion about that artefact.
+
+    Not a fault and not a warning to act on -- it is the honest name for the
+    residual the gate deliberately leaves, kept reportable so that "we check
+    supplied artefacts" is never read as covering these.
+    """
+    return dict(_unverified_overrides)
+
+
 def find_derived(rel: str, root=None) -> Optional[Path]:
     """Locate a derived artefact (an ``out/...`` path) for **reading**.
 
@@ -1467,7 +1806,28 @@ def find_derived(rel: str, root=None) -> Optional[Path]:
     # it would only work when it was not needed.
     named = derived_override(rel)
     if named is not None:
-        return named
+        # THE GATE. `on_unknown` is stated here rather than defaulted because
+        # the two UNKNOWNs mean opposite things and only this call site knows
+        # which one it is holding:
+        #
+        #   * inside a verifier's domain -> REFUSE. A name table that could
+        #     not be checked has not been checked, and the whole point of
+        #     `profilecheck` is that a supplied table is not trusted on a
+        #     claim. Failing closed costs a user who cannot reach the verifier
+        #     the override; the message says how to proceed.
+        #   * outside every domain -> PERMIT. `out/opcodes.json` is not a name
+        #     table and nothing in this tree can judge one, so refusing it
+        #     would delete a working feature (owner ruling: an artefact this
+        #     tree cannot build must remain suppliable) in exchange for no
+        #     verification at all. The residual is REPORTED rather than
+        #     assumed away -- `unverified_derived_overrides`.
+        v = override_verdict(rel, named, root)
+        _note_override(rel, named, v)
+        if v.permits(on_unknown=(REFUSE if is_verifiable(rel) else PERMIT)):
+            return named
+        # Fall through rather than return None: a refused override must not
+        # also hide a copy this checkout legitimately holds. Same reason
+        # `derived_override` falls through on a path that is not there.
     repo = _repo_dir()
     if repo is not None and (repo / rel).exists():
         return repo / rel
@@ -1729,6 +2089,12 @@ def invalidate_cache() -> None:
     global _primary_checkout
     _cache.clear()
     _primary_checkout = _PRIMARY_UNSET
+    # The override gate's answers are about a file AND the install it was
+    # checked against; changing the root changes the second half.
+    _override_verdicts.clear()
+    _refused_overrides.clear()
+    _unverified_overrides.clear()
+    _refusals_announced.clear()
 
 
 def find(explicit=None, *, use_cache: bool = True) -> Optional[Found]:

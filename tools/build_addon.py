@@ -63,7 +63,48 @@ VENDORED = {
     "c3phy.py": [],
     # The install-root resolver.  Vendored so the addon locates the game the
     # same way every CLI does, instead of carrying its own hardcoded path.
+    #
+    # STILL no rewrites, and its two project imports are the reason to say so
+    # out loud rather than leave the empty list looking untouched. `coroot`
+    # reaches `verdict` and `profilecheck` through `coroot._sibling`, which
+    # resolves them relative to whatever package it finds itself in, so there
+    # is no import statement here to rewrite. That is not a dodge of the
+    # rewrite table: a *statement* has one correct spelling per import style
+    # and this module is imported three ways (see `_sibling`), so a rewritten
+    # statement would fix the addon and break `from core import coroot`.
     "coroot.py": [],
+    # The three-state safety answer the override gate returns. Pure stdlib and
+    # imports nothing from the project, so no rewrites.
+    #
+    # WHY THESE TWO ARE VENDORED AT ALL: the addon reads name tables ONLY
+    # through a user-set override -- `_repo_dir()` is None once the zip is
+    # installed, so there is no checkout to fall back to -- which makes it the
+    # consumer most exposed to an unverified table AND the one most damaged by
+    # a gate that cannot run. Unvendored, the `profilecheck` lookup misses, the
+    # gate answers UNKNOWN, and inside a verifier's domain UNKNOWN fails
+    # closed: every supplied name table in Blender refused. Correct,
+    # fail-safe, and a regression.
+    "verdict.py": [],
+    # The name-table verifier the gate consults. `main()` is unreachable from
+    # the addon (and exempt from the vendored-import walk), but `check` and
+    # `verdict` are exactly what runs there.
+    "profilecheck.py": [
+        ('sys.path.insert(0, str(Path(__file__).resolve().parent))\n'
+         'sys.path.insert(0, str(Path(__file__).resolve().parent.parent '
+         '/ "core"))\n'
+         'import coroot                                            '
+         '# noqa: E402\n'
+         'from tqhash import tq_hash                               '
+         '# noqa: E402\n'
+         'from wdf import WdfArchive                               '
+         '# noqa: E402',
+         'from . import coroot                                     '
+         '# noqa: E402\n'
+         'from .tqhash import tq_hash                              '
+         '# noqa: E402\n'
+         'from .wdf import WdfArchive                              '
+         '# noqa: E402'),
+    ],
     "c3write.py": [
         # Both bootstrap lines go: inside the addon these are a package, so
         # there is no sys.path to fix up and nothing named `core/` to find.
