@@ -44,6 +44,25 @@
 .set-cost p { margin: .35rem 0; }
 .set-cost .set-measured { font-size: .92em; opacity: .9; }
 
+/* The folder picker and the all-clients list. Scrolled rather than clipped:
+   this box has one row per folder and one per declared client -- 16 and 8 on
+   this machine, and more on a bigger one -- and a list that ran off the
+   bottom would put its own Save button somewhere a click cannot reach. The
+   max-height is on the LIST, so the buttons under it stay in the flow. */
+.set-grouplist, .set-clientlist { max-height: 20rem; overflow-y: auto;
+            border: 1px solid rgba(128,128,128,.3); border-radius: 5px;
+            padding: .4rem .6rem; margin: .6rem 0; }
+.set-grouprow { display: flex; align-items: baseline; gap: .55rem;
+            padding: .18rem 0; cursor: pointer; }
+.set-clientrow { padding: .3rem 0;
+            border-bottom: 1px solid rgba(128,128,128,.18); }
+.set-clientrow:last-child { border-bottom: none; }
+.set-groupname { font-family: var(--mono, monospace); font-size: .92em;
+            min-width: 11rem; word-break: break-all; }
+.set-groupcount { font-size: .88em; opacity: .85; }
+.set-clientrow .set-measured { font-size: .85em; opacity: .8;
+            margin: .15rem 0 .1rem 0; }
+
 .set-list { list-style: none; padding: 0; margin: .6rem 0; }
 .set-item { border: 1px solid rgba(128,128,128,.3); border-radius: 5px;
             padding: .6rem .8rem; margin-bottom: .5rem; }

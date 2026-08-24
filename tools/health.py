@@ -1923,6 +1923,12 @@ def _thumbnail_corpus_uncached(root) -> dict:
     # 106 MB, 30-60 s" for an install that is not there. A global fact printed
     # as a per-client one, which is the defect this module was just rewritten
     # to remove, reintroduced one layer down.
+    # Per-group counts, filled in beside each half as it is counted, so a
+    # half that REFUSED leaves its dict empty rather than absent-or-zero.
+    # Same rule as `megabytes`: the mesh dict being empty when `ok` is False
+    # is "not counted", and the plan must not read it as "no groups".
+    groups: dict = {"mesh": {}, "texture": {}}
+    out["groups"] = groups
     census = install_census(root, paths=True)
     if not Path(root).is_dir():
         out["why"] = (f"{root} is not a directory -- no install there to "
@@ -1938,6 +1944,10 @@ def _thumbnail_corpus_uncached(root) -> dict:
     pooled, names_loaded = meshtex.pooled_names()
     universe = census["paths"] | pooled
     out["textures"] = sum(1 for p in universe if p.endswith(".dds"))
+    for p in universe:
+        if p.endswith(".dds"):
+            g = thumbs.logical_group(p)
+            groups["texture"][g] = groups["texture"].get(g, 0) + 1
     out["c3Files"] = sum(1 for p in universe if p.endswith(".c3"))
     out["namesRecovered"] = names_loaded
     out["looseFiles"] = census["files"]
@@ -1969,6 +1979,9 @@ def _thumbnail_corpus_uncached(root) -> dict:
         out["why"] = f"{cov.name} is unreadable: {type(e).__name__}: {e}"
         return out
     out["meshes"] = len(jobs)
+    for j in jobs:
+        g = thumbs.logical_group(j.logical)
+        groups["mesh"][g] = groups["mesh"].get(g, 0) + 1
     out["unmatchedMeshes"] = len(unmatched)
     out["coverage"] = str(cov)
     out["ok"] = True
@@ -2038,7 +2051,106 @@ def human_duration(seconds: int) -> str:
     return f"{m:.0f} min" if m < 90 else f"{m / 60:.1f} h"
 
 
-def thumbnail_state(server: str = "", root=None) -> dict:
+#: The token that means "every group, including ones this client grows
+#: later".  Stored rather than expanding the group list at save time: a
+#: saved list of today's groups would silently EXCLUDE a folder added by a
+#: later patch, and the user who ticked "everything" would never be told.
+SELECT_ALL = "all"
+
+#: The owner's answer, served beside the "all clients" total rather than
+#: written into the page.  It is a RECOMMENDATION AGAINST the button it sits
+#: next to, and the brief was explicit that it is not a tooltip: it renders
+#: at the same weight as the button, because the total above it is the
+#: largest number on the page and a total with no advice reads as a target.
+THUMB_ALL_ADVICE = (
+    "Recommended: don't. Generate thumbnails only for the clients you are "
+    "actively working on. The declared clients' corpora differ by ~30x, "
+    "every one of them is resumable on its own, and a client you are not "
+    "opening gets nothing from a cache it never reads -- so the cost above "
+    "buys you nothing for most of it. Pick the clients (and the folders "
+    "inside them) you are actually browsing.")
+
+
+def _selected_groups(corpus: dict, root=None, paths=None) -> dict:
+    r"""Which groups a run would cover, and the counts that belong to them.
+
+    Returns ``{"all": bool, "groups": [...], "meshes": n, "textures": n,
+    "known": [...], "unknown": [...], "measured": bool}``.
+
+    Three states, and they are three rather than two because collapsing any
+    pair of them is a defect this codebase has already paid for once:
+
+    * ``paths is None`` -- nobody passed a selection, so read the saved one
+      for this root.  If there is none saved, that is **every group**.
+    * ``paths == SELECT_ALL`` (or a list containing it) -- every group,
+      explicitly, and it stays every group when the client grows a folder.
+    * a list of group names -- those groups.  Names not in this client's
+      corpus are reported in ``unknown`` rather than dropped: a selection
+      saved against client A and read against client B would otherwise
+      silently become a smaller job with no sign that anything was lost.
+
+    ``measured`` is ``corpus["ok"]`` carried forward, because the MESH half
+    of a selection is only as countable as the mesh census under it.  When
+    the census refused, ``groups["mesh"]`` is empty and every mesh group
+    counts zero -- which is "not counted", not "nothing to do", and the
+    caller must not print a duration over it.  Same rule, same reason, as
+    `thumbnail_corpus`' absent ``megabytes``.
+    """
+    gm = (corpus.get("groups") or {}).get("mesh") or {}
+    gt = (corpus.get("groups") or {}).get("texture") or {}
+    if paths is None:
+        paths = coroot.thumbnail_paths(root)
+    if paths is None or paths == SELECT_ALL or (
+            not isinstance(paths, str) and SELECT_ALL in set(paths or ())):
+        return {"all": True, "groups": sorted(set(gm) | set(gt)),
+                "meshes": corpus.get("meshes", 0),
+                "textures": corpus.get("textures", 0),
+                "known": sorted(set(gm) | set(gt)), "unknown": [],
+                "measured": bool(corpus.get("ok"))}
+    if isinstance(paths, str):
+        paths = [paths]
+    want = [str(p).strip().lower() for p in paths if str(p).strip()]
+    have = set(gm) | set(gt)
+    known = sorted({w for w in want if w in have})
+    unknown = sorted({w for w in want if w not in have})
+    return {"all": False, "groups": sorted(set(want)),
+            "meshes": sum(gm.get(g, 0) for g in known),
+            "textures": sum(gt.get(g, 0) for g in known),
+            "known": known, "unknown": unknown,
+            "measured": bool(corpus.get("ok"))}
+
+
+def _group_rows(corpus: dict, sel: dict) -> list[dict]:
+    r"""One row per selectable group: its counts, its disk, and whether it is
+    currently ticked.  Ordered biggest first, because the reason to look at
+    this list at all is to find the buckets worth not rendering.
+
+    ``meshesCounted`` is per row and is `corpus["ok"]`, not a property of the
+    row: when the mesh census refused there are no mesh groups at all, so a
+    texture-only row would otherwise look like a group that genuinely has no
+    meshes.  The UI prints "not counted yet" against the mesh column on the
+    strength of this flag, exactly as `span` does for the options.
+    """
+    gm = (corpus.get("groups") or {}).get("mesh") or {}
+    gt = (corpus.get("groups") or {}).get("texture") or {}
+    picked = set(sel["known"])
+    rows = []
+    for g in sorted(set(gm) | set(gt)):
+        m, t = gm.get(g, 0), gt.get(g, 0)
+        mb = thumbnail_megabytes(m, t)
+        rows.append({
+            "group": g,
+            "meshes": m,
+            "textures": t,
+            "megabytes": mb["meshes"] + mb["textures"] + mb["manifests"],
+            "selected": sel["all"] or g in picked,
+            "meshesCounted": bool(corpus.get("ok")),
+        })
+    rows.sort(key=lambda r: (-(r["meshes"] + r["textures"]), r["group"]))
+    return rows
+
+
+def thumbnail_state(server: str = "", root=None, paths=None) -> dict:
     """What the thumbnail cache currently holds, and what filling it would
     cost.  With ``server``, reports that library view's own cache
     (out/thumbs/servers/<name>/) instead of the install's.
@@ -2053,6 +2165,19 @@ def thumbnail_state(server: str = "", root=None) -> dict:
     computed from `thumbnail_corpus(root)`, which is the point of the whole
     exercise.  Defaults to the configured install, which is right for the
     console report and for a viewer serving only that one.
+
+    ``paths`` is WHICH GROUPS of this install to quote for -- the same
+    `thumbs.logical_group` names `thumbs.py --include` takes, so the number
+    on the page and the number the run does come from one partition.  A
+    `None` default reads the saved selection for this root out of
+    `coroot.thumbnail_paths`; pass an explicit list to override it, and
+    `"all"` to force the whole corpus.
+
+    **`None` means "every group", not "no groups".**  They are the same
+    falsy value in Python and opposite jobs, and the direction of the mistake
+    is the bad one: a selection that failed to load would quote -- and start
+    -- the full corpus, which is the bill the user was trying not to pay.
+    `_selected_groups` is the single place that distinguishes them.
     """
     import thumbs                                   # noqa: PLC0415
 
@@ -2092,8 +2217,17 @@ def thumbnail_state(server: str = "", root=None) -> dict:
 
     corpus = thumbnail_corpus(root)
     state["corpus"] = corpus
-    want_m = corpus["meshes"]
-    want_t = corpus["textures"]
+    sel = _selected_groups(corpus, root, paths)
+    state["selection"] = sel
+    # The PLAN is quoted for the selection; `status` stays measured against
+    # the WHOLE corpus. Deliberate: "complete" is a statement about the
+    # cache, and judging it against a subset would let a user who ticked one
+    # small group be told the cache is complete while most of the client has
+    # no thumbnail. The selection's own progress is `selection.status`.
+    want_m = sel["meshes"]
+    want_t = sel["textures"]
+    full_m = corpus["meshes"]
+    full_t = corpus["textures"]
     have_m, have_t = state["meshes"], state["textures"]
     if have_m == 0 and have_t == 0:
         state["status"] = "none"
@@ -2102,15 +2236,21 @@ def thumbnail_state(server: str = "", root=None) -> dict:
         # It is not assumed either way: `partial` is what a cache of unknown
         # completeness is, and the reason travels in `corpus.why`.
         state["status"] = "partial"
-    elif have_m >= want_m * 0.95 and have_t >= want_t * 0.95:
+    elif have_m >= full_m * 0.95 and have_t >= full_t * 0.95:
         state["status"] = "complete"
-    elif have_m >= want_m * 0.95:
+    elif have_m >= full_m * 0.95:
         state["status"] = "meshes-only"
     else:
         state["status"] = "partial"
 
     jobs = default_jobs()
-    mb = corpus.get("megabytes") or thumbnail_megabytes(want_m, want_t)
+    # From the SELECTION's counts, never from `corpus["megabytes"]`. Those
+    # two are the same number when everything is ticked and only then; the
+    # cached corpus figure charged a one-group selection the whole client's
+    # disk -- MEASURED here at 312 MB against a selection that is 32 -- which
+    # is a quoted constant wrong by 10x, i.e. this task's own defect
+    # reintroduced by the code meant to fix it.
+    mb = thumbnail_megabytes(want_m, want_t)
     # The manifests are one file pair for the whole run, so a meshes-only
     # option carries its share of them rather than all or none.
     mesh_mb = mb["meshes"] + round(
@@ -2134,6 +2274,21 @@ def thumbnail_state(server: str = "", root=None) -> dict:
             return "not counted yet"
         return f"{human_duration(low)}-{human_duration(high)}"
 
+    def span_n(low: int, high: int, counted: bool, n: int) -> str:
+        """`span`, plus the case a selection introduced: a row with nothing
+        in it.
+
+        `estimate_seconds` floors at 20 s, and the texture row is a
+        SUBTRACTION of two floored figures -- so a selection whose groups
+        hold no textures printed "0 images, 0 s-0 s", a duration over an
+        empty job that reads like a measured near-instant one. Empty because
+        you did not tick it and empty because there is nothing there are the
+        same zero, and this is the side that knows which.
+        """
+        if counted and n == 0:
+            return "nothing selected for this"
+        return span(low, high, counted)
+
     counted_m = corpus["ok"]
     # The texture row used to pass `True` unconditionally, on the reasoning
     # that the census answers textures without meshtex. True -- until the
@@ -2144,6 +2299,12 @@ def thumbnail_state(server: str = "", root=None) -> dict:
     counted_t = corpus.get("texturesCounted", False)
     unknown = (" This client's mesh work list has not been counted, so the "
                "number above is not an estimate: " + corpus.get("why", ""))
+    # The flag that makes the argv below DO what the counts above say. It is
+    # built from `known` and not from what the user typed, so a group saved
+    # against another client cannot reach `thumbs.py` -- it would be refused
+    # there anyway, but refused after the user pressed Start.
+    inc = ([] if sel["all"] or not sel["known"]
+           else ["--include", ",".join(sel["known"])])
     state["plan"] = {
         "cpus": os.cpu_count(),
         "jobs": jobs,
@@ -2154,6 +2315,13 @@ def thumbnail_state(server: str = "", root=None) -> dict:
         # under it, and when the mesh census is missing the mesh rows below
         # are zero rather than somebody else's corpus.
         "corpusMeasured": corpus["ok"],
+        # The selection the rows below are quoted for, and the groups it
+        # could have been. `selectedAll` rather than an empty list meaning
+        # everything: see `_selected_groups`.
+        "selectedAll": sel["all"],
+        "selectedGroups": sel["known"],
+        "unknownGroups": sel["unknown"],
+        "groups": _group_rows(corpus, sel),
         "corpusFor": corpus["root"],
         "corpusWhy": corpus.get("why", ""),
         "options": [
@@ -2162,26 +2330,28 @@ def thumbnail_state(server: str = "", root=None) -> dict:
                 "label": "Meshes only  (recommended)",
                 "count": want_m,
                 "megabytes": mesh_mb,
-                "estimate": span(m_low, m_high, counted_m and counted_t),
+                "estimate": span_n(m_low, m_high, counted_m and counted_t,
+                                   want_m),
                 "why": (f"The {want_m:,} model thumbnails are what the "
                         "character builder and model mode use. This is the "
                         "half that matters and about a third of the cost."
                         if counted_m else
                         "The model thumbnails are what the character builder "
                         "and model mode use." + unknown),
-                "argv": ["--all", "--resume"],
+                "argv": ["--all", "--resume", *inc],
             },
             {
                 "id": "all",
                 "label": "Everything (meshes + textures)",
                 "count": want_m + want_t,
                 "megabytes": total_mb,
-                "estimate": span(a_low, a_high, counted_m and counted_t),
+                "estimate": span_n(a_low, a_high, counted_m and counted_t,
+                                   want_m + want_t),
                 "why": (f"Adds thumbnails for all {want_t:,} textures. Nice "
                         "for browsing the texture library; most of the time "
                         "and nearly all of the disk.")
                        + ("" if counted_m else unknown),
-                "argv": ["--all", "--textures", "--resume"],
+                "argv": ["--all", "--textures", "--resume", *inc],
             },
             {
                 "id": "textures",
@@ -2192,9 +2362,10 @@ def thumbnail_state(server: str = "", root=None) -> dict:
                 # census itself is what refused.
                 "count": want_t,
                 "megabytes": total_mb - mesh_mb,
-                "estimate": span(a_low - m_low, a_high - m_high, counted_t),
+                "estimate": span_n(a_low - m_low, a_high - m_high,
+                                   counted_t, want_t),
                 "why": "Use this later, after meshes, to fill in the rest.",
-                "argv": ["--textures", "--resume"],
+                "argv": ["--textures", "--resume", *inc],
             },
         ],
         "declining": "The viewer works without any of this. Assets that have "
@@ -2206,6 +2377,75 @@ def thumbnail_state(server: str = "", root=None) -> dict:
     state["decision"] = coroot.read_settings().get("thumbnails") or None
     state["ok"] = state["status"] in ("complete", "meshes-only")
     return state
+
+
+def thumbnail_all_clients(paths=None) -> dict:
+    r"""Every declared client's thumbnail job, and the total of the ones that
+    could be counted.
+
+    This is the "all" affordance the owner asked for, and the owner asked for
+    it **with a recommendation against it in the same breath**: generate for
+    the clients you are actively working on.  That sentence is served from
+    here (`advice`) rather than written into the page, for the same reason
+    `costCaveat` is -- the number it qualifies is computed here, and advice
+    that lives away from its number goes stale in the copy nobody edits.
+
+    **The refusal state is the point of the shape of this function.**  A
+    client with no `out/meshtex/coverage.json` cannot have its mesh half
+    counted, and the total must not pretend otherwise:
+
+    * ``clients[i].corpusMeasured`` is False for such a client, its
+      ``meshes`` is 0 meaning NOT COUNTED, and its ``why`` says so.
+    * ``totalMeasured`` is False as soon as ONE client refused, and
+      ``unmeasured`` names them.  A total over eight clients of which two
+      could not be counted is a lower bound, and it is labelled one --
+      ``megabytes`` and ``images`` are the sum of what WAS counted, never a
+      sum with a substituted constant standing in for the rest.
+    * There is no ``estimate`` key when ``totalMeasured`` is False.  Absent,
+      not zero: a duration over an uncounted job is the defect
+      `thumbnail_state.span` exists to prevent, one level up.
+
+    Costs come from `thumbnail_corpus` per client -- the live estimator, one
+    census each -- and never from a table.  On this box that is eight
+    censuses; they are cached per install by `_THUMB_CORPUS_CACHE`, which is
+    what makes this affordable to render beside a button.
+    """
+    roots = sorted(coroot.declared_kinds())
+    out: dict = {"clients": [], "images": 0, "megabytes": 0,
+                 "totalMeasured": True, "unmeasured": [],
+                 "advice": THUMB_ALL_ADVICE}
+    for r in roots:
+        corpus = thumbnail_corpus(r)
+        sel = _selected_groups(corpus, r, paths)
+        row = {
+            "root": r,
+            "kind": coroot.declared_kinds().get(r, ""),
+            "corpusMeasured": corpus["ok"],
+            "texturesCounted": corpus.get("texturesCounted", False),
+            "selectedAll": sel["all"],
+            "selectedGroups": sel["known"],
+            "meshes": sel["meshes"],
+            "textures": sel["textures"],
+            "why": corpus.get("why", ""),
+        }
+        if corpus["ok"]:
+            mb = thumbnail_megabytes(sel["meshes"], sel["textures"])
+            row["megabytes"] = mb["meshes"] + mb["textures"] + mb["manifests"]
+            out["megabytes"] += row["megabytes"]
+            out["images"] += sel["meshes"] + sel["textures"]
+        else:
+            # No `megabytes` key, deliberately -- absent, not zero. A zero
+            # here would sum into the total as a measured empty job.
+            out["totalMeasured"] = False
+            out["unmeasured"].append(r)
+        out["clients"].append(row)
+    if out["totalMeasured"] and out["clients"]:
+        low, high = estimate_seconds(
+            default_jobs(),
+            sum(c["meshes"] for c in out["clients"]),
+            sum(c["textures"] for c in out["clients"]))
+        out["estimate"] = f"{human_duration(low)}-{human_duration(high)}"
+    return out
 
 
 def remember_thumbnail_choice(choice: str) -> dict:
@@ -2543,6 +2783,16 @@ def render_text(rep: dict) -> str:
         if status == "none" and plan:
             add(f"         nothing generated yet. Estimates for this machine "
                 f"({plan.get('cpus')} cores, {plan.get('jobs')} workers):")
+            # The rows below are quoted for the SAVED FOLDER SELECTION, and a
+            # subset printed without saying so is the same mistake as one
+            # client's corpus quoted for another -- one scope in.
+            if plan.get("selectedAll") is False:
+                picked = plan.get("selectedGroups") or []
+                add(f"         for {len(picked)} selected folder(s) of "
+                    f"{len(plan.get('groups') or [])}: "
+                    f"{', '.join(picked) if picked else '(none)'}"
+                    f" -- NOT the whole client. Change it under "
+                    f"Settings > Health & thumbnails > Which folders.")
             for opt in plan.get("options", [])[:2]:
                 add(f"           {opt['label']:<34} "
                     f"{opt['estimate']:>12}   {opt['megabytes']:>4} MB")

@@ -1051,6 +1051,80 @@ def declared_kinds() -> dict:
     return dict(read_settings().get(KINDS_KEY) or {})
 
 
+#: Settings key: ``{absolute root: ["c3/mesh", ...] | "all"}`` -- which
+#: logical groups the user wants thumbnails rendered for, PER CLIENT.
+#:
+#: Per client and not global for the reason the whole thumbnail estimator was
+#: just rewritten: the corpora differ ~30x and they do not even hold the same
+#: folders, so one list applied to every install is a fact about one client
+#: printed as a fact about all of them.
+THUMB_PATHS_KEY = "thumbnail_paths"
+
+
+def _root_key(root=None) -> str:
+    """The spelling `THUMB_PATHS_KEY` and `KINDS_KEY` are keyed by.
+
+    Resolved and normalised, because the same install arrives here spelled
+    three ways -- `CO_ROOT` with forward slashes, `--root` with backslashes,
+    and the picker's already-resolved path -- and a selection saved under one
+    spelling and read under another is a selection that silently reverts to
+    "every group", i.e. to the bill the user was avoiding.
+    """
+    if root is None:
+        root = read_settings().get("game_root")
+    if not root:
+        return ""
+    try:
+        return str(Path(root).resolve()).replace("\\", "/").rstrip("/").lower()
+    except OSError:
+        return str(root).replace("\\", "/").rstrip("/").lower()
+
+
+def thumbnail_paths(root=None):
+    """The saved group selection for ``root``, or **None** if there is none.
+
+    ``None`` and ``[]`` are different answers and the caller must keep them
+    apart: nothing saved means "every group", an empty list means the user
+    unticked everything.  Returning ``[]`` for "nothing saved" would start a
+    full-corpus run for someone who had chosen the opposite.
+    """
+    saved = read_settings().get(THUMB_PATHS_KEY) or {}
+    if not isinstance(saved, dict):
+        return None
+    key = _root_key(root)
+    if key in saved:
+        v = saved[key]
+        return v if isinstance(v, str) else list(v or [])
+    # Tolerate an entry stored before this normalisation existed.
+    for k, v in saved.items():
+        if str(k).replace("\\", "/").rstrip("/").lower() == key:
+            return v if isinstance(v, str) else list(v or [])
+    return None
+
+
+def set_thumbnail_paths(root, groups) -> Path:
+    """Remember which groups ``root`` should render.  Returns the file written.
+
+    ``groups`` is a list of `thumbs.logical_group` names, the string ``"all"``
+    for every group, or ``None`` to forget the selection (which is not the
+    same as ``[]``; see `thumbnail_paths`).
+    """
+    doc = read_settings()
+    saved = dict(doc.get(THUMB_PATHS_KEY) or {})
+    key = _root_key(root)
+    if not key:
+        raise ValueError("no install named, so there is nothing to key the "
+                         "thumbnail selection to")
+    if groups is None:
+        saved.pop(key, None)
+    elif isinstance(groups, str):
+        saved[key] = groups
+    else:
+        saved[key] = sorted({str(g).strip().lower()
+                             for g in groups if str(g).strip()})
+    return write_settings(**{THUMB_PATHS_KEY: saved})
+
+
 def kind_for_root(root=None) -> str:
     """The plugin name the user declared for ``root``, or ``""``.
 

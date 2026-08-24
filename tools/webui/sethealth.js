@@ -493,6 +493,224 @@
     return box;
   }
 
+  // -------------------------------------------------- which folders (paths)
+  /** The per-group checkbox list, priced from the live estimator.
+   *
+   *  Every number here is served: `plan.groups` is built by
+   *  `health._group_rows` from `thumbnail_corpus`, one census of THIS
+   *  client. Nothing in this function knows a count, a size or a folder
+   *  name, which is the property that stops it from becoming the table the
+   *  whole rewrite removed.
+   */
+  function pathBlock(doc) {
+    const box = mk('div', 'set-paths');
+    const plan = (doc.state || {}).plan || {};
+    const rows = plan.groups || [];
+    box.appendChild(mk('h4', 'set-sub', 'Which folders'));
+    if (!rows.length) {
+      box.appendChild(mk('div', 'set-help',
+        'No folders could be listed for this client — the census above ' +
+        'says why. Nothing to choose between until it can be counted.'));
+      return box;
+    }
+    box.appendChild(mk('div', 'set-help',
+      'Thumbnails are rendered per folder, and the folders are very ' +
+      'uneven — untick the big ones you do not browse. These are the ' +
+      'client’s own folders and its own counts, not a fixed list.'));
+
+    // The unmeasured mesh half, said once and at the top of the list rather
+    // than repeated per row: when this client has no mesh work list every
+    // Meshes column below is 0 MEANING NOT COUNTED, and a reader who takes
+    // it as "this folder has no models" would untick exactly the folders
+    // that will turn out to be the expensive ones.
+    if (rows.length && rows[0].meshesCounted === false) {
+      box.appendChild(mk('div', 'set-measured',
+        'The Meshes column reads “not counted” for every folder: this ' +
+        'client has no mesh work list yet, so the model half of each row ' +
+        'is unknown rather than zero. The Textures column is measured and ' +
+        'is this client’s.'));
+    }
+
+    const sel = new Set(plan.selectedGroups || []);
+    const all = plan.selectedAll !== false;
+    const boxes = [];
+    const tot = mk('div', 'set-measured');
+    const refresh = () => {
+      let m = 0, t = 0, mb = 0, n = 0;
+      for (const b of boxes) {
+        if (!b.el.checked) continue;
+        n++; m += b.row.meshes; t += b.row.textures; mb += b.row.megabytes;
+      }
+      const counted = rows[0].meshesCounted !== false;
+      tot.textContent = n === 0
+        ? 'Nothing ticked — a run would render nothing. Tick at least one ' +
+          'folder, or leave them all ticked for the whole client.'
+        : 'Ticked: ' + n + ' of ' + rows.length + ' folders — ' +
+          (counted ? m.toLocaleString() + ' meshes' : 'meshes not counted') +
+          ' + ' + t.toLocaleString() + ' textures, about ' + mb + ' MB. ' +
+          'The saved figure comes back from the server when you save.';
+    };
+
+    const list = mk('div', 'set-grouplist');
+    for (const row of rows) {
+      const line = mk('label', 'set-grouprow');
+      const cb = mk('input');
+      cb.type = 'checkbox';
+      cb.checked = all || sel.has(row.group);
+      cb.dataset.group = row.group;
+      cb.className = 'thumb-group';
+      cb.addEventListener('change', refresh);
+      boxes.push({ el: cb, row: row });
+      line.appendChild(cb);
+      line.appendChild(mk('span', 'set-groupname', row.group));
+      line.appendChild(mk('span', 'set-groupcount',
+        (row.meshesCounted === false
+          ? 'meshes not counted'
+          : row.meshes.toLocaleString() + ' meshes') +
+        ' · ' + row.textures.toLocaleString() + ' textures · ' +
+        row.megabytes + ' MB'));
+      list.appendChild(line);
+    }
+    box.appendChild(list);
+
+    const btns = mk('div', 'set-field');
+    const tick = (v) => () => {
+      for (const b of boxes) b.el.checked = v;
+      refresh();
+    };
+    const allBtn = mk('button', 'ghost', 'Tick all');
+    allBtn.id = 'thumb-paths-all';
+    allBtn.addEventListener('click', tick(true));
+    const noneBtn = mk('button', 'ghost', 'Untick all');
+    noneBtn.id = 'thumb-paths-none';
+    noneBtn.addEventListener('click', tick(false));
+    const save = mk('button', 'primary', 'Save folder selection');
+    save.id = 'thumb-paths-save';
+    save.addEventListener('click', async () => {
+      save.disabled = true;
+      const picked = boxes.filter(b => b.el.checked).map(b => b.row.group);
+      try {
+        // `all: true` when every folder is ticked, rather than the list of
+        // today's folders: a client that grows a folder in a later patch
+        // must keep rendering it, and a saved list would silently exclude
+        // it with nothing on screen to say so.
+        const body = picked.length === rows.length
+          ? { all: true } : { groups: picked };
+        const res = await jpost('/api/thumbs/paths', body);
+        say('folder selection saved — ' +
+            (res.selection === 'all' ? 'every folder'
+                                     : (res.selection || []).length +
+                                       ' folders'));
+        render();
+      } catch (e) { say(String(e.message || e), true); save.disabled = false; }
+    });
+    btns.appendChild(save);
+    btns.appendChild(allBtn);
+    btns.appendChild(noneBtn);
+    refresh();
+    box.appendChild(tot);
+    box.appendChild(btns);
+    if ((plan.unknownGroups || []).length) {
+      box.appendChild(mk('div', 'set-measured',
+        'Saved for this client but not present in it: ' +
+        plan.unknownGroups.join(', ') + '. Those contribute nothing to the ' +
+        'counts above — they are named rather than dropped so a selection ' +
+        'carried over from another client is visible instead of silently ' +
+        'shrinking the job.'));
+    }
+    return box;
+  }
+
+  // ------------------------------------------------- every declared client
+  /** The owner's "all": offered, totalled BEFORE the button, and argued
+   *  against beside it at the same weight.
+   *
+   *  The recommendation is `all.advice`, served by `health` next to the
+   *  number it qualifies. It is rendered as a block with the same visual
+   *  weight as the cost block above the button and NOT as a tooltip,
+   *  because the brief was explicit and because a total this large reads as
+   *  a target unless something argues with it in the same glance.
+   */
+  function allClientsBlock(doc) {
+    const all = doc.allClients;
+    const box = mk('div', 'set-allclients');
+    if (!all || all.error) return box;
+    box.appendChild(mk('h4', 'set-sub', 'Every declared client'));
+
+    const cost = mk('div', 'set-cost');
+    cost.appendChild(mk('h4', null,
+      'What all ' + all.clients.length + ' clients would cost'));
+    // The total FIRST, and labelled for what it is. `totalMeasured` false
+    // means at least one client's mesh work list could not be counted, and
+    // then this is a lower bound with no duration attached -- the server
+    // sends no `estimate` key at all in that case, and this must not invent
+    // one or print a zero in its place.
+    cost.appendChild(mk('p', null,
+      (all.totalMeasured ? 'Total: ' : 'At least: ') +
+      all.images.toLocaleString() + ' images, ' + all.megabytes + ' MB' +
+      (all.estimate ? ', estimated ' + all.estimate : '') + '.'));
+    if (!all.totalMeasured) {
+      cost.appendChild(mk('p', 'set-measured',
+        'That is a LOWER BOUND, not the total: ' + all.unmeasured.length +
+        ' of ' + all.clients.length + ' clients have no mesh work list yet, ' +
+        'so their model half is not counted and contributes nothing to the ' +
+        'figures above. No time estimate is shown for the same reason — an ' +
+        'estimate over an uncounted job would be a guess wearing a number.'));
+    }
+    box.appendChild(cost);
+
+    // The recommendation, at the same weight as the cost block, above the
+    // button. The owner's answer, verbatim from the server.
+    const warn = mk('div', 'set-cost');
+    warn.appendChild(mk('h4', null, 'Recommended: don’t do this'));
+    warn.appendChild(mk('p', null, all.advice));
+    box.appendChild(warn);
+
+    const tbl = mk('div', 'set-clientlist');
+    for (const c of all.clients) {
+      const line = mk('div', 'set-clientrow');
+      line.appendChild(mk('span', 'set-groupname', c.root));
+      line.appendChild(mk('span', 'set-groupcount',
+        c.corpusMeasured
+          ? (c.meshes.toLocaleString() + ' meshes + ' +
+             c.textures.toLocaleString() + ' textures · ' + c.megabytes + ' MB')
+          // The refusal, per client and in its own words. No megabytes,
+          // because the server sent none -- an absent key, not a zero.
+          : (c.texturesCounted
+              ? c.textures.toLocaleString() + ' textures counted; ' +
+                'meshes not counted, so no size for this client'
+              : 'nothing counted for this client')));
+      if (!c.corpusMeasured && c.why) {
+        line.appendChild(mk('div', 'set-measured', c.why));
+      }
+      tbl.appendChild(line);
+    }
+    box.appendChild(tbl);
+
+    const row = mk('div', 'set-field');
+    const go = mk('button', 'ghost',
+      'Generate for all ' + all.clients.length + ' clients anyway');
+    go.id = 'thumb-all-clients';
+    go.disabled = !!(doc.run || {}).running || doc.enabled === false;
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      try {
+        const res = await jpost('/api/thumbs/start',
+                                { mode: 'meshes', allClients: true });
+        say(res.started
+          ? 'Queued — clients run one after another, not at once.'
+          : (res.reason || 'not started'));
+        startPoll();
+      } catch (e) { say(String(e.message || e), true); go.disabled = false; }
+    });
+    row.appendChild(go);
+    row.appendChild(mk('span', 'set-help',
+      'Each client keeps its own folder selection and its own cache, and ' +
+      'each is resumable on its own — so stopping part-way loses nothing.'));
+    box.appendChild(row);
+    return box;
+  }
+
   // ------------------------------------------------------------ thumbnails
   function thumbBlock(doc) {
     const box = mk('div');
@@ -534,6 +752,18 @@
         'Declining is fine: ' + plan.declining));
     }
     box.appendChild(cost);
+
+    // -- WHICH FOLDERS ----------------------------------------------------
+    // The substantive half of the owner's Q3: "allow the user to select
+    // which paths get thumbnails generated in the settings menu."
+    //
+    // A "path" here is the group `thumbs.logical_group` reads off a logical
+    // name -- its second path segment, which is the partition the archives
+    // already use and `thumbs.py --include` already takes. Not invented for
+    // this list: the same string names the folder, prices the row, and goes
+    // on the command line, so the number beside the checkbox and the number
+    // the run does cannot drift.
+    box.appendChild(pathBlock(doc));
 
     // -- the optional component -------------------------------------------
     const optRow = mk('div', 'set-field');
@@ -697,6 +927,7 @@
     host.textContent = '';
     host.appendChild(bootstrapBlock(boot));
     host.appendChild(thumbBlock(thumb));
+    host.appendChild(allClientsBlock(thumb));
     host.appendChild(indexBlock(index));
     host.appendChild(note);
 

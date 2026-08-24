@@ -748,6 +748,65 @@ def out_path(kind: str, logical: str) -> Path:
     return OUT_DIR / kind / (stem + ".png")
 
 
+#: The name for "no group could be read off this logical" -- a bare filename
+#: with no directory.  It is a real bucket rather than a discard: a logical
+#: that fell out of every group would be rendered by an unfiltered run and
+#: skipped by a filtered one, and the difference would show up as a corpus
+#: that does not add up.  `test_health_thumbs` pins the partition exhaustive.
+GROUP_UNROOTED = "(no folder)"
+
+
+def logical_group(logical: str) -> str:
+    r"""The selectable partition `logical` belongs to.
+
+    **This is not a new taxonomy.**  It is the second path segment of the
+    logical name -- the thing `load_worklist` and `texture_universe` already
+    hand back, spelled the way the archives already spell it.  The first
+    segment is only ever `c3` or `data` (the two archive roots), so it
+    separates nothing; the second is where the corpus actually divides, and
+    it divides *unevenly*, which is the whole reason a selection is worth
+    having.  MEASURED on Clients/5517, counting the WORK LIST -- the 4,250
+    meshes that have a texture match and would actually render, not the
+    5,042 entries in coverage.json, because the smaller number is the job:
+
+      * `c3/effect` is **2,508 of 4,250 meshes** -- 59% of the mesh job is
+        particle and spell effects, which render as coloured smears and are
+        the least useful thumbnails in the set.
+      * `data/map` is **13,191 of 36,119 textures** -- 37% of the texture job
+        is ground tiles nobody browses as a thumbnail grid.
+      * `c3/mesh` (1,350 meshes) is the character and item models the builder
+        actually shows, and `data/itemminicon` (3,666 textures) the item
+        icons.
+
+    So deselecting two groups removes about half the mesh work and over a
+    third of the texture work, and the split is the tool's own -- not one
+    invented for a checkbox list.
+
+    Deliberately case-folded and slash-normalised: coverage.json spells
+    logicals with forward slashes, the census can hand back either, and a
+    group that matched only one spelling would silently drop half a bucket.
+    """
+    parts = [p for p in logical.replace("\\", "/").lower().split("/") if p]
+    if len(parts) <= 1:
+        return GROUP_UNROOTED
+    return "/".join(parts[:2]) if len(parts) > 2 else parts[0]
+
+
+def filter_jobs(jobs: list["Job"], groups) -> list["Job"]:
+    """`jobs` restricted to `groups`, or unchanged when `groups` is falsy.
+
+    ``None``/empty means NO FILTER -- every group -- and not "no groups".
+    The two are the same value in Python and opposite jobs, so the caller
+    that means "render nothing" must not reach here at all; `main` refuses an
+    `--include` that selects nothing rather than quietly rendering all of it,
+    which is the failure mode where a selection is accepted and ignored.
+    """
+    if not groups:
+        return list(jobs)
+    want = {str(g).strip().lower() for g in groups if str(g).strip()}
+    return [j for j in jobs if logical_group(j.logical) in want]
+
+
 def load_worklist(idx_path: Optional[Path] = None,
                   root=None) -> tuple[list[Job], list[str]]:
     """Mesh work list, straight out of `out/meshtex/coverage.json` (a linked
@@ -1396,6 +1455,10 @@ def main(argv: list[str]) -> int:
                     help="render every mesh with a matched texture")
     ap.add_argument("--textures", action="store_true",
                     help="second pass: decode-and-downscale every .dds")
+    ap.add_argument("--include", default="", metavar="GROUP[,GROUP...]",
+                    help="restrict the run to these logical groups (the "
+                         "second path segment: c3/mesh, data/map, ...). "
+                         "Empty = every group. See thumbs.logical_group.")
     ap.add_argument("--only-unmatched-textures", action="store_true",
                     help="with --textures, skip textures already used by a mesh")
     ap.add_argument("--resume", action="store_true",
@@ -1486,11 +1549,27 @@ def main(argv: list[str]) -> int:
     })
 
     report: dict = {}
+    # The selection, parsed once. `None` (no flag) and a flag that named
+    # nothing usable are DIFFERENT: the first means every group, the second
+    # is a user who asked for a subset and would otherwise be handed the
+    # whole corpus -- an accepted-and-ignored selection, which is the exact
+    # failure this flag exists to be checkable against. Refuse it.
+    include = [g.strip().lower() for g in a.include.split(",") if g.strip()]
+    if a.include.strip() and not include:
+        ap.error("--include named no group; omit it to render every group")
     mesh_jobs: list[Job] = []
+    all_mesh_jobs: list[Job] = []
     unmatched: list[str] = []
     if a.all:
-        mesh_jobs, unmatched = (server_worklist(view) if view
-                                else load_worklist(root=a.root))
+        all_mesh_jobs, unmatched = (server_worklist(view) if view
+                                    else load_worklist(root=a.root))
+        mesh_jobs = filter_jobs(all_mesh_jobs, include)
+        # `unmatched` is meshes with no texture match -- reported, never
+        # rendered. It is filtered too so the dry-run's three counts stay
+        # about the same selection; an unfiltered one would report skips
+        # from groups the user did not ask for.
+        unmatched = [u for u in unmatched
+                     if not include or logical_group(u) in include]
         for j in mesh_jobs:
             j.old_key = (entries.get(j.logical) or {}).get("key", "")
         if a.limit:
@@ -1498,14 +1577,21 @@ def main(argv: list[str]) -> int:
 
     tex_jobs: list[Job] = []
     if a.textures:
-        used = {j.texture for j in mesh_jobs if j.texture}
-        if not used:
-            wl, _ = (server_worklist(view) if view
-                     else load_worklist(root=a.root))
-            used = {j.texture for j in wl if j.texture}
+        # NOT filtered: this is "which textures are a skin for some mesh",
+        # used only by `--only-unmatched-textures` and by the manifest's
+        # `used_by_mesh` flag. Restricting it to the selected groups would
+        # make a texture look unclaimed because the mesh that claims it sits
+        # in a group the user did not tick -- a fact about the selection
+        # printed as a fact about the art.
+        if not all_mesh_jobs:
+            all_mesh_jobs = (server_worklist(view) if view
+                             else load_worklist(root=a.root))[0]
+        used = {j.texture for j in all_mesh_jobs if j.texture}
         for t in (server_texture_universe(view) if view
                   else texture_universe(a.root)):
             if a.only_unmatched_textures and t in used:
+                continue
+            if include and logical_group(t) not in include:
                 continue
             tex_jobs.append(Job(t, "texture",
                                 old_key=(entries.get(t) or {}).get("key", "")))
@@ -1513,6 +1599,12 @@ def main(argv: list[str]) -> int:
             tex_jobs = tex_jobs[:a.limit]
 
     if a.dry_run:
+        # Printed FIRST, and printed even when there is no selection: the
+        # counts below are about a subset whenever `--include` is given, and
+        # a subset total that does not say so is the same class of mistake as
+        # one client's corpus quoted for another.
+        print(f"groups selected: "
+              f"{','.join(include) if include else '(every group)'}")
         print(f"mesh thumbnails to consider : {len(mesh_jobs)}")
         print(f"  of which already in manifest with a key: "
               f"{sum(1 for j in mesh_jobs if j.old_key)}")
@@ -1536,7 +1628,11 @@ def main(argv: list[str]) -> int:
         report["textures"] = run(tex_jobs, opts, a.root, jobs_n, manifest, "textures")
 
     by_logical = {j.logical: j for j in mesh_jobs}
-    used_textures = {j.texture for j in mesh_jobs if j.texture}
+    # `all_mesh_jobs`, not `mesh_jobs`: `used_by_mesh` is a fact about the
+    # art, and computing it from the SELECTION would mark a skin unclaimed
+    # because the model that wears it is in an unticked group.
+    used_textures = {j.texture for j in (all_mesh_jobs or mesh_jobs)
+                     if j.texture}
     for logical, e in entries.items():
         j = by_logical.get(logical)
         if j is not None:

@@ -545,6 +545,16 @@ class ThumbRunner:
         #: Set whenever the runner is not in flight; see `BootstrapRunner`.
         self.done = threading.Event()
         self.done.set()
+        #: Clients still to render, for the "all clients" offer. A QUEUE,
+        #: and `active` stays True across the whole of it -- a poll landing
+        #: between two clients must not read "finished", which is the same
+        #: window `active` was introduced for at the end of a single run.
+        self.queue: list[str] = []
+        self.queue_total: int = 0
+        self.queue_done: int = 0
+        self.current_root: str = str(root)
+        #: The arguments the chain re-uses for each queued client.
+        self._opts: dict = {}
 
     # -- lifecycle ---------------------------------------------------------
     def running(self) -> bool:
@@ -552,8 +562,61 @@ class ThumbRunner:
             return True
         return self.proc is not None and self.proc.poll() is None
 
+    def _spawn(self, root, mode: str, jobs: int, limit: int,
+               server: str, library: str, paths) -> list[str]:
+        """Build the argv for one client and start it.  Returns the argv."""
+        argv = [sys.executable, str(HERE / "thumbs.py"),
+                "--root", str(root), *self.MODES[mode]]
+        # `paths` is a per-CLIENT selection, so it is resolved per client
+        # inside the chain rather than once at the top: a queue of eight
+        # installs does not share a folder list, and reusing the first
+        # client's would render folders another client does not have (and
+        # `thumbs.py` would then refuse the whole run) or silently skip ones
+        # it does. `None` here means "read what is saved for THIS root".
+        sel = coroot.thumbnail_paths(root) if paths is None else paths
+        if sel is not None and not isinstance(sel, str):
+            sel = [g for g in sel if str(g).strip()]
+            # An empty selection is "render nothing", and the honest response
+            # is to skip this client rather than to drop the flag -- which is
+            # what would happen if this fell through, and would start a full
+            # run for someone who had ticked nothing.
+            if sel:
+                argv += ["--include", ",".join(sel)]
+            else:
+                return []
+        if server:
+            argv += ["--library", str(library), "--server", server]
+        if jobs:
+            argv += ["--jobs", str(int(jobs))]
+        if limit:
+            argv += ["--limit", str(int(limit))]
+        creation = 0
+        if os.name == "nt":
+            # Own process group: lets us kill the whole worker pool, not
+            # just the parent, when someone hits Stop.
+            creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        self.proc = subprocess.Popen(
+            argv, cwd=str(self.project), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            errors="replace", creationflags=creation)
+        self.current_root = str(root)
+        return argv
+
     def start(self, mode: str, jobs: int = 0, limit: int = 0,
-              server: str = "", library: str = "") -> dict:
+              server: str = "", library: str = "", roots=None,
+              paths=None) -> dict:
+        r"""Render `mode` for one client, or for `roots` in sequence.
+
+        ``roots`` is the "all clients" offer.  It is a QUEUE and not a
+        parallel fan-out: eight `thumbs.py` processes each opening a worker
+        pool would oversubscribe the box and make every one of them slower
+        than running them in turn, and the estimate on the page is a
+        core-seconds figure that assumes one pool.
+
+        ``paths`` restricts each client to the logical groups the user
+        ticked; ``None`` means "read each client's own saved selection",
+        which is the only correct default for a queue -- see `_spawn`.
+        """
         if mode not in self.MODES:
             raise ValueError(f"unknown mode {mode!r}; "
                              f"expected one of {sorted(self.MODES)}")
@@ -561,38 +624,46 @@ class ThumbRunner:
             if self.running():
                 return {"started": False, "reason": "already running",
                         **self.status()}
-            argv = [sys.executable, str(HERE / "thumbs.py"),
-                    "--root", str(self.root), *self.MODES[mode]]
-            self.target_server = server
-            if server:
-                argv += ["--library", str(library), "--server", server]
-            if jobs:
-                argv += ["--jobs", str(int(jobs))]
-            if limit:
-                argv += ["--limit", str(int(limit))]
-            creation = 0
-            if os.name == "nt":
-                # Own process group: lets us kill the whole worker pool, not
-                # just the parent, when someone hits Stop.
-                creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            self.proc = subprocess.Popen(
-                argv, cwd=str(self.project), stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1,
-                errors="replace", creationflags=creation)
+            queue = [str(r) for r in (roots or [self.root])]
+            self.queue = list(queue)
+            self.queue_total = len(queue)
+            self.queue_done = 0
             self.mode = mode
+            self.target_server = server
+            self._opts = {"mode": mode, "jobs": jobs, "limit": limit,
+                          "server": server, "library": library,
+                          "paths": paths}
             self.started = time.time()
             self.finished = 0.0
             self.returncode = None
             self.cancelled = False
             self.progress = {"label": mode, "done": 0, "total": 0}
             self.tail = []
+            argv: list[str] = []
+            while self.queue and not argv:
+                nxt = self.queue.pop(0)
+                argv = self._spawn(nxt, mode, jobs, limit, server, library,
+                                   paths)
+                if not argv:
+                    # Selected nothing for this client: skipped, and SAID so.
+                    # A silent skip would look like a run that did nothing.
+                    self.queue_done += 1
+                    self.tail.append(f"(skipped {nxt}: no folders selected)")
+            if not argv:
+                self.returncode = 0
+                self.finished = time.time()
+                return {"started": False,
+                        "reason": "no folders are selected for any of the "
+                                  "chosen clients",
+                        **self.status()}
             # After the spawn (so a Popen that raises does not leave the
             # runner claiming to run) and before the reader exists (so the
             # first poll cannot land between the child's exit and the drain).
             self.active = True
             self.done.clear()
             threading.Thread(target=self._pump, daemon=True).start()
-            _log(f"thumbnails: started {' '.join(argv[1:])}")
+            _log(f"thumbnails: started {' '.join(argv[1:])}"
+                 + (f" (+{len(self.queue)} queued)" if self.queue else ""))
             return {"started": True, "cmd": " ".join(argv), **self.status()}
 
     def cancel(self) -> dict:
@@ -601,6 +672,11 @@ class ThumbRunner:
                 return {"cancelled": False, "reason": "not running",
                         **self.status()}
             self.cancelled = True
+            # Drop the queue too. `_pump` breaks on `cancelled` anyway, but
+            # Stop on client 2 of 8 must mean the other six are not starting,
+            # and a queue left in place would still be reported by `status`
+            # as work remaining.
+            self.queue = []
             pid = self.proc.pid                    # type: ignore[union-attr]
         if os.name == "nt":
             # terminate() only reaches the parent; the spawn Pool's children
@@ -613,6 +689,57 @@ class ThumbRunner:
         return {"cancelled": True, **self.status()}
 
     def _pump(self) -> None:
+        """Drain the child, then chain to the next queued client.
+
+        The loop is here rather than in `start` so that `active` spans the
+        WHOLE queue: it is cleared once, in the `finally` at the bottom, and
+        a status poll landing between two clients therefore reads "running"
+        rather than the `running: false, returncode: null` pair
+        `sethealth.js` treats as "nothing here".  That pair is the exact bug
+        `active` was added to close for a single run; a queue reopens the
+        same window seven more times.
+        """
+        try:
+            while True:
+                self._drain_one()
+                self.queue_done += 1
+                if self.cancelled or self.returncode != 0 or not self.queue:
+                    break
+                argv: list[str] = []
+                while self.queue and not argv:
+                    nxt = self.queue.pop(0)
+                    argv = self._spawn(nxt, self._opts["mode"],
+                                       self._opts["jobs"], self._opts["limit"],
+                                       self._opts["server"],
+                                       self._opts["library"],
+                                       self._opts["paths"])
+                    if not argv:
+                        self.queue_done += 1
+                        self.tail.append(
+                            f"(skipped {nxt}: no folders selected)")
+                if not argv:
+                    break
+                self.tail.append(f"--- {self.current_root} "
+                                 f"({self.queue_done + 1} of "
+                                 f"{self.queue_total}) ---")
+                # Reset, or the panel shows the PREVIOUS client's "4250/4250
+                # done" over the new one until its first progress line lands
+                # -- a finished bar above a job that has not started, which
+                # is the most confident-looking wrong number on the page.
+                self.progress = {"label": self._opts["mode"],
+                                 "done": 0, "total": 0}
+                self.returncode = None
+                _log(f"thumbnails: next {' '.join(argv[1:])}")
+        finally:
+            # In a `finally`, and last: a runner that cannot be woken out of
+            # "running" has no exit and no button, and the only cure would be
+            # restarting the viewer.
+            self.finished = time.time()
+            self.active = False
+            self.done.set()
+        _log(f"thumbnails: finished, exit {self.returncode}")
+
+    def _drain_one(self) -> None:
         """Read the child's output, keeping the last progress line and tail."""
         proc = self.proc
         assert proc is not None and proc.stdout is not None
@@ -645,16 +772,7 @@ class ThumbRunner:
                     buf += ch
         except Exception as e:                       # pragma: no cover
             self.tail.append(f"(reader stopped: {e})")
-        try:
-            self.returncode = proc.wait()
-            self.finished = time.time()
-        finally:
-            # In a `finally`, and last: a runner that cannot be woken out of
-            # "running" has no exit and no button, and the only cure would be
-            # restarting the viewer.
-            self.active = False
-            self.done.set()
-        _log(f"thumbnails: finished, exit {self.returncode}")
+        self.returncode = proc.wait()
 
     # -- reporting ---------------------------------------------------------
     def status(self) -> dict:
@@ -670,6 +788,14 @@ class ThumbRunner:
             "cancelled": self.cancelled,
             "progress": self.progress,
             "tail": self.tail[-12:],
+            # The queue, so a multi-client run can say which client it is on
+            # instead of showing eight indistinguishable progress bars in
+            # sequence. `queueTotal` is 1 for an ordinary single-client run,
+            # which is what it is.
+            "root": self.current_root,
+            "queueTotal": self.queue_total,
+            "queueDone": self.queue_done,
+            "queueRemaining": list(self.queue),
         }
 
 
@@ -3550,6 +3676,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/collect/stage": self.post_collect_stage,
                 "/api/setroot": self.post_setroot,
                 "/api/thumbs/start": self.post_thumbs_start,
+                "/api/thumbs/paths": self.post_thumbs_paths,
                 "/api/index/start": self.post_index_start,
                 "/api/index/cancel": self.post_index_cancel,
                 "/api/thumbs/cancel": self.post_thumbs_cancel,
@@ -6403,6 +6530,19 @@ class Handler(BaseHTTPRequestHandler):
                # whose content hash is unchanged.
                "rerun": state.get("status") not in ("none", None),
                }
+        # The "all clients" offer. Served with the panel rather than behind
+        # its own click, because the whole point of it is that the TOTAL is
+        # visible before the button -- a number you have to ask for is a
+        # number nobody sees until after they have decided.
+        #
+        # Only for the install view: a library view's cache is not per
+        # install and an aggregate over declared clients would be about a
+        # different thing than the panel it appears in.
+        if not getattr(self.server, "server_name", ""):
+            try:
+                out["allClients"] = health.thumbnail_all_clients()
+            except Exception as e:                     # pragma: no cover
+                out["allClients"] = {"error": f"{type(e).__name__}: {e}"}
         # Generation is incremental: re-read the manifests so a page left open
         # during a run picks up what has landed.
         if self.cat is not None and runner and runner.running():
@@ -6433,11 +6573,31 @@ class Handler(BaseHTTPRequestHandler):
         mode = str(doc.get("mode") or arg("mode", "meshes"))
         srv_name = getattr(self.server, "server_name", "")
         srv_lib = getattr(self.server, "library", None)
+        # "all clients" -- the owner's Q3 answer, offered and argued against
+        # on the page. The roots come from the DECLARATION MAP and are
+        # intersected with what the browser asked for, so a posted body
+        # cannot queue a render against a path this box never declared.
+        roots = None
+        if doc.get("allClients") or arg("allClients", ""):
+            declared = sorted(coroot.declared_kinds())
+            asked = doc.get("roots")
+            roots = ([r for r in declared if r in set(asked)] if asked
+                     else declared)
+            if not roots:
+                return self._error(400, "no declared client matched")
+            if srv_name:
+                # A library view has one cache and it is not per-install; a
+                # queue of installs under it would write eight clients'
+                # meshes into one server namespace.
+                return self._error(409, "an \"all clients\" run is about the "
+                                        "declared installs, not a library "
+                                        "view -- leave the library first")
         try:
             res = runner.start(mode, int(doc.get("jobs") or arg("jobs", 0) or 0),
                                int(doc.get("limit") or arg("limit", 0) or 0),
                                server=srv_name,
-                               library=str(srv_lib) if srv_lib else "")
+                               library=str(srv_lib) if srv_lib else "",
+                               roots=roots)
         except ValueError as e:
             return self._error(400, str(e))
         # Remember that they said yes, so the prompt does not come back.
@@ -6449,6 +6609,54 @@ class Handler(BaseHTTPRequestHandler):
         if runner is None:
             return self._error(503, "no install configured")
         return self._json(runner.cancel())
+
+    def post_thumbs_paths(self, body: bytes, arg):
+        """Save which logical groups a client should render.
+
+        Persisted through `core/coroot.py` beside every other setting --
+        there is no second store, and there must not be: a selection kept in
+        the viewer's own state would not survive a restart and would not be
+        visible to `tools/thumbs.py` run from a shell, which is the same
+        program doing the same job.
+
+        The body carries ``root`` (defaults to the client being browsed) and
+        either ``groups`` (a list) or ``all: true``.  ``groups: null`` forgets
+        the selection, which is NOT the same as an empty list -- forgotten
+        means "every group", empty means the user unticked everything, and
+        the JSON distinguishes them because `coroot.thumbnail_paths` does.
+        """
+        try:
+            doc = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            return self._error(400, "bad JSON")
+        root = doc.get("root") or getattr(self.server, "game_root", None)
+        if not root:
+            return self._error(503, "no install configured")
+        # Same rule as the "all clients" start: only a DECLARED root, so a
+        # posted body cannot write a settings entry for an arbitrary path.
+        declared = {str(Path(r).resolve()).lower(): r
+                    for r in coroot.declared_kinds()}
+        try:
+            key = str(Path(root).resolve()).lower()
+        except OSError:
+            key = str(root).lower()
+        if declared and key not in declared:
+            return self._error(400, f"{root} is not a declared client")
+        if doc.get("all"):
+            groups: object = health.SELECT_ALL
+        elif "groups" in doc and doc["groups"] is None:
+            groups = None
+        else:
+            groups = [str(g) for g in (doc.get("groups") or [])]
+        coroot.set_thumbnail_paths(root, groups)
+        # Answer with the RE-READ plan, not with what was posted: the point
+        # of the panel is the cost of the selection, and echoing the request
+        # would show a number nothing computed.
+        return self._json({
+            "saved": True, "root": str(root),
+            "selection": coroot.thumbnail_paths(root),
+            "state": health.thumbnail_state(root=root),
+        })
 
     def post_thumbs_decision(self, body: bytes, arg):
         """Record "not now" or "never ask again" without starting anything.
