@@ -107,8 +107,25 @@ html, body { height: auto; overflow: visible; display: block; }
                 border: 1px solid rgba(128,128,128,.3); border-radius: 4px;
                 padding: .5rem .7rem; margin: .6rem 0; }
 .set-empty { opacity: .7; font-style: italic; }
-.set-dev { opacity: .8; border: 1px dashed rgba(128,128,128,.5);
+.set-dev { border: 1px dashed rgba(128,128,128,.5);
            border-radius: 5px; padding: 1rem; }
+/* -- collapsible install groups ----------------------------------------- */
+/* A real <button>, styled to read as the heading it replaces: it has to be
+   focusable and operable from the keyboard, which a clickable <h4> is not. */
+.set-group { margin: 1.2rem 0; }
+.set-group-toggle { display: flex; align-items: baseline; gap: .5rem;
+                    width: 100%; text-align: left; background: none;
+                    border: 0; padding: .3rem 0; cursor: pointer;
+                    font: inherit; font-weight: 600; color: inherit; }
+.set-group-toggle:hover .set-group-title { text-decoration: underline; }
+.set-group-toggle:focus-visible { outline: 2px solid currentColor;
+                                  outline-offset: 2px; }
+.set-group-caret { opacity: .7; font-size: .9em; width: 1em; }
+/* The group body is hidden with the `hidden` attribute rather than a class,
+   so `elementFromPoint` genuinely cannot reach a collapsed row -- a rule that
+   only dimmed it would leave the control clickable and the hit-test passing
+   on something the user cannot see. */
+.set-list[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -154,17 +171,13 @@ html, body { height: auto; overflow: visible; display: block; }
   <!-- ================================================ 3. developer options -->
   <section class="set-section" id="sec-dev">
     <h3>Developer options</h3>
-    <div class="set-dev" id="dev-body">
-      <p><strong>Nothing here yet.</strong></p>
-      <p class="set-help">
-        This section is a placeholder: it is present and labelled so that the
-        developer-facing switches land somewhere already agreed, and it does
-        nothing today. It is shown rather than hidden for the same reason the
-        deferred settings at the bottom of this page are shown — a section
-        that appears when it gains its first control reads as new, when in
-        fact it was planned.
-      </p>
-    </div>
+    <p class="set-lede">
+      Switches for someone working on the tools rather than on a mod. These
+      are the same registry and the same store as Preferences — a setting is
+      listed here because it <em>declares</em> that it belongs here, not
+      because this page keeps a list of names.
+    </p>
+    <div class="set-dev" id="dev-body">loading…</div>
   </section>
 
   <!-- ========================================================= preferences -->

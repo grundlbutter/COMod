@@ -54,6 +54,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import coroot                                      # noqa: E402
+import cosettings                                  # noqa: E402
 import provenance                                  # noqa: E402
 
 REPORT_PATH = REPO / "out" / "health.json"
@@ -585,6 +586,106 @@ DERIVED = [
 ]
 
 WDF_RECOVER_REL = DERIVED[0][0]
+
+#: **Ticked by default in the Settings page's artefact list, when they are not
+#: already built.** Five of the six.
+#:
+#: `out/opcodes.json` is deliberately absent, and it is the interesting
+#: omission because it is also the CHEAPEST -- 0.2 s against wdf_recover's
+#: 302-2,167 s. It is left unticked because it is the one artefact that has
+#: nothing to do with the install being bootstrapped: it is built from `refs/`
+#: and opens no client at all, so it is the same bytes for every install on
+#: the box and rebuilding it once per selected client is five redundant runs
+#: of a table that cannot differ. The other five are derived FROM the install
+#: and are genuinely per-client work.
+#:
+#: Kept here rather than in `sethealth.js` so the list cannot drift from
+#: `DERIVED`: a rel renamed above and not below would silently stop being a
+#: default, and nothing would say so.
+DEFAULT_BOOTSTRAP = frozenset({
+    "out/wdf/c3_names.json",
+    "out/dll/wdf_name_recovery.json",
+    "out/meshtex/coverage.json",
+    "out/effects/linkage.json",
+    "out/skins/classic/manifest.json",
+})
+
+assert DEFAULT_BOOTSTRAP <= {rel for rel, _a, _c, _w in DERIVED}, (
+    "DEFAULT_BOOTSTRAP names an artefact that is not in DERIVED -- a default "
+    "that can never be ticked because no row carries it")
+
+#: **The one artefact anybody may supply without `show_advanced_options`.**
+#:
+#: `out/opcodes.json` is built from `refs/` and opens no install at all, so
+#: one machine's copy is legitimately byte-identical to another's -- supplying
+#: it makes no claim about anybody's client, which is exactly why it is safe.
+#: Every other entry in `DERIVED` is derived FROM an install, so a supplied
+#: copy IS a claim about archives the supplier had, and that is the case
+#: `coroot.override_verdict` exists to judge.
+SUPPLY_WITHOUT_ADVANCED = "out/opcodes.json"
+
+
+def supply_allowed(rel: str) -> bool:
+    """May `rel` be supplied with the current settings?
+
+    ENFORCED HERE RATHER THAN IN THE BROWSER, and that is the whole point: a
+    restriction that lives only in `sethealth.js` is a restriction that a
+    second surface -- the CLI, a hand-written POST, a page left open across a
+    settings change -- walks straight past. The page hides the fields; this
+    decides.
+    """
+    if str(rel) == SUPPLY_WITHOUT_ADVANCED:
+        return True
+    try:
+        return bool(cosettings.get("show_advanced_options"))
+    except Exception:                                     # pragma: no cover
+        # FAILS CLOSED. An unreadable settings store must not open the
+        # restricted fields; the safe direction for a control whose purpose is
+        # to withhold is to keep withholding.
+        return False
+
+
+def selected_roots(asked=None, browsing=None, *, fallback: bool = True):
+    """**The unified install selection**, resolved against what is declared.
+
+    Returns ``(roots, dropped)``.  `asked` overrides the stored setting, for
+    a caller that named installs explicitly.
+
+    Lives in `health` rather than in the viewer because it is not a browser
+    concern: `tools/thumbs.py` and this module's own `--bootstrap` are the
+    other readers, and a resolver that only existed inside an HTTP handler
+    would have to be reimplemented for them -- which is how two surfaces come
+    to disagree about which clients are selected.
+
+    See `cosettings.selected_installs`' declared effect for why an empty
+    selection means the browsed install rather than all of them or none.
+    """
+    declared = {}
+    try:
+        for r in coroot.declared_kinds():
+            declared[str(Path(r).resolve()).lower()] = str(r)
+    except Exception:                                     # pragma: no cover
+        declared = {}
+    if asked is None:
+        try:
+            asked = cosettings.get("selected_installs")
+        except Exception:                                 # pragma: no cover
+            asked = []
+    roots, dropped = [], []
+    for r in (asked or []):
+        try:
+            key = str(Path(str(r)).resolve()).lower()
+        except Exception:                                 # noqa: BLE001
+            dropped.append(str(r))
+            continue
+        real = declared.get(key)
+        if real is None:
+            dropped.append(str(r))
+        elif real not in roots:
+            roots.append(real)
+    if not roots and fallback and browsing:
+        roots = [str(browsing)]
+    return roots, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1322,6 +1423,7 @@ def check_derived(root=None) -> dict:
                 cost = est["text"]
         artefacts.append({
             "costEstimate": est,
+            "defaultChecked": rel in DEFAULT_BOOTSTRAP,
             "path": rel, "exists": found,
             "buildable": buildable,
             "applicable": applicable,
@@ -1335,7 +1437,18 @@ def check_derived(root=None) -> dict:
             # "checked and accepted" from "nothing here judges this kind" so
             # the page never implies a check it did not make.
             "refusedWhy": coroot.refused_derived_overrides().get(rel, ""),
-            "verified": bool(supplied) and coroot.is_verifiable(rel) and found,
+            # A REFUSED OVERRIDE IS NOT VERIFIED. This used to read
+            # `bool(supplied) and is_verifiable(rel) and found` with no
+            # reference to the refusal, so a declined name table reported
+            # `verified: True` -- `found` is satisfied by the tree's OWN copy,
+            # which is what gets used once the override is refused. The row
+            # then carried a refusal and a verified flag at the same time, and
+            # any consumer reading the flag alone would show a broken supply
+            # as a checked one. MEASURED against a decoy table that
+            # `profilecheck` refuses on both soundness and applicability.
+            "verified": (bool(supplied) and coroot.is_verifiable(rel)
+                         and found
+                         and not coroot.refused_derived_overrides().get(rel)),
             "supply": None if buildable else
                       f'py -3 tools/health.py --use "{rel}=<path>"',
             "inherited": found and not (

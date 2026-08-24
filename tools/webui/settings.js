@@ -119,9 +119,34 @@
     return wrap;
   }
 
+  // WHICH SECTION A SETTING BELONGS TO COMES FROM THE SERVER, not from a list
+  // of names here. `developer_notes` moved to Developer options by gaining
+  // `surface="developer"` in `core/cosettings.py` and nothing in this file
+  // knows its name -- which is the point: a name list in the browser is the
+  // copy that goes stale when a setting is renamed, and it goes stale
+  // silently, leaving the row rendering in the section it used to be in.
+  //
+  // `surface: "panel"` is rendered by NOBODY here. `selected_installs` is a
+  // list of install paths drawn by the health panel as a client checklist;
+  // falling through to the generic control would give it a text input, and a
+  // hand-typed path in that box would be pruned as undeclared the moment it
+  // was read back -- a control that appears to accept a value and discards it.
+  function surfaceOf(s) {
+    return s.surface || "preferences";
+  }
+
+  function fill(host, list, doc) {
+    host.textContent = "";
+    const note = el("div", "set-note");
+    list.forEach((s) => host.appendChild(row(s, note)));
+    host.appendChild(note);
+    return host;
+  }
+
   async function render() {
     const host = $("#settings-body");
     if (!host) return;
+    const devHost = $("#dev-body");
     host.textContent = "";
     let doc;
     try {
@@ -131,9 +156,20 @@
       return;
     }
 
-    const note = el("div", "set-note");
-    doc.settings.forEach((s) => host.appendChild(row(s, note)));
-    host.appendChild(note);
+    const prefs = doc.settings.filter((s) => surfaceOf(s) === "preferences");
+    const dev = doc.settings.filter((s) => surfaceOf(s) === "developer");
+    fill(host, prefs, doc);
+
+    if (devHost) {
+      fill(devHost, dev, doc);
+      if (!dev.length) {
+        // The section keeps saying so rather than vanishing: it was
+        // deliberately present before it had controls, and a section that
+        // disappears when its last control is removed reads as a bug.
+        devHost.appendChild(el("p", "set-help",
+          "No developer-facing switches are declared."));
+      }
+    }
 
     if (doc.deferred && doc.deferred.length) {
       host.appendChild(el("h4", "set-sub", "Declared in the brief, not wired yet"));

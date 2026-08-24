@@ -1008,6 +1008,16 @@ class BootstrapRunner:
         #: before. Served in `status()` so the page can never label a run with
         #: a client it was not given.
         self.root: str = ""
+        #: EVERY install this run is building for, in the order they run.
+        #: `root` is the first of them and is kept because the status line and
+        #: the page's label already read it; anything that needs to know a run
+        #: covers four clients has to read this, because a single string
+        #: cannot say so and a joined one would lie about being a path.
+        self.roots: list = []
+        #: Remembered installs that are no longer declared and so were NOT
+        #: built. Carried on the run rather than left to the page to work out,
+        #: so "I ticked four and three ran" has an answer on the status.
+        self.dropped: list = []
         self.no_tpi: bool = False
         self.only: list = []
         #: Did the BUILDERS succeed -- a different question from the exit
@@ -1058,14 +1068,29 @@ class BootstrapRunner:
 
     def start(self, rebuild_all: bool = False, uses: Optional[list] = None,
               root=None, *, no_tpi: bool = False,
-              only: Optional[list] = None) -> dict:
+              only: Optional[list] = None,
+              dropped: Optional[list] = None) -> dict:
         """`uses` is a list of `"REL=PATH"` strings, applied before building.
 
-        `root` is **which client to build for**, and it is the whole point of
-        this parameter existing: the page lists every declared install and
-        "Run bootstrap" next to a chosen one has to mean that one. Passing
-        None keeps the old behaviour -- the configured install -- for a
-        machine with a single client.
+        `root` is **which client or clients to build for**, and it is the
+        whole point of this parameter existing: the page lists every declared
+        install and "Run bootstrap" against a chosen set has to mean that
+        set. It takes a single path or a list of them; passing None keeps the
+        old behaviour -- the configured install -- for a machine with a
+        single client.
+
+        **ONE STEP PER INSTALL, sequenced, not one step for all of them.**
+        `health.py --bootstrap` builds for exactly one root, so N installs is
+        N invocations. They are appended to `steps`, which this runner
+        already executes in order and already reports progress through, so
+        multi-install is the existing sequencer being given a longer list
+        rather than a second execution path to keep in sync.
+
+        Every root is checked to be a directory BEFORE any of them starts.
+        Validating them one at a time as the run reaches each would mean a
+        typo in the fourth install is discovered forty minutes in, with three
+        clients already built and the run then failing -- so a bad path in
+        the set refuses the whole set and names it.
 
         `only` restricts the run to named `health.DERIVED` artefacts (the
         checklist's boxes) and `no_tpi` drops the DatPkg wordlist from
@@ -1073,12 +1098,19 @@ class BootstrapRunner:
         """
         uses = [str(u) for u in (uses or []) if str(u).strip()]
         only = [str(o) for o in (only or []) if str(o).strip()]
+        if root is None:
+            roots = []
+        elif isinstance(root, (list, tuple)):
+            roots = [str(r) for r in root if str(r).strip()]
+        else:
+            roots = [str(root)] if str(root).strip() else []
         with self.lock:
             if self.running():
                 return {"started": False, "reason": "already running",
                         **self.status()}
-            if root:
-                p = Path(str(root))
+            checked = []
+            for r in roots:
+                p = Path(r)
                 if not p.is_dir():
                     # Refused rather than silently falling back to the
                     # configured install. A fallback here is the defect this
@@ -1089,7 +1121,8 @@ class BootstrapRunner:
                                       f"no client there to build for. "
                                       f"Nothing was run.",
                             **self.status()}
-                root = str(p)
+                checked.append(str(p))
+            roots = checked
             health_py = str(HERE / "health.py")
             steps = []
             if uses:
@@ -1097,19 +1130,26 @@ class BootstrapRunner:
                 for u in uses:
                     argv += ["--use", u]
                 steps.append(argv)
-            build = [sys.executable, health_py,
-                     "--bootstrap-all" if rebuild_all else "--bootstrap",
-                     "--no-write"]
-            if root:
-                build += ["--root", str(root)]
-            if no_tpi:
-                build.append("--no-tpi")
-            for rel in only:
-                build += ["--only", rel]
-            steps.append(build)
+            for one in (roots or [None]):
+                build = [sys.executable, health_py,
+                         "--bootstrap-all" if rebuild_all else "--bootstrap",
+                         "--no-write"]
+                if one:
+                    build += ["--root", str(one)]
+                if no_tpi:
+                    build.append("--no-tpi")
+                for rel in only:
+                    build += ["--only", rel]
+                steps.append(build)
             self.all = bool(rebuild_all)
             self.uses = uses
-            self.root = str(root or "")
+            self.roots = list(roots)
+            # `self.root` stays a single string because `status()` and the
+            # page's "building for X" line already read it. It is the FIRST
+            # root, never a join: a caller that formats it into a path would
+            # otherwise get a string that looks like a path and is not.
+            self.root = roots[0] if roots else ""
+            self.dropped = [str(d) for d in (dropped or [])]
             self.no_tpi = bool(no_tpi)
             self.only = only
             self.built = None
@@ -1248,6 +1288,8 @@ class BootstrapRunner:
             # for "nobody said" is how the old panel came to claim a run was
             # about a client it had never been given.
             "root": self.root,
+            "roots": list(self.roots),
+            "dropped": list(self.dropped),
             "noTpi": self.no_tpi,
             "only": list(self.only),
             # None = it never said. True/False = the BUILD's own verdict,
@@ -3758,6 +3800,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/installs/copystatus": self.api_installs_copystatus,
             "/api/bootstrap/status": self.api_bootstrap_status,
             "/api/bootstrap/checklist": self.api_bootstrap_checklist,
+            "/api/selection": self.api_selection,
             "/api/files": self.api_files,
             "/api/provenance": self.api_provenance,
             "/api/mesh": self.api_mesh,
@@ -6103,6 +6146,80 @@ class Handler(BaseHTTPRequestHandler):
                 "--root <install>.",
         })
 
+    def selected_installs(self, asked=None, *, fallback: bool = True):
+        r"""**The one selection**, resolved against what is actually declared.
+
+        Returns ``(roots, dropped)``.  `roots` is what to act on; `dropped` is
+        every remembered path that is no longer a declared install, so the
+        page can SAY a selection shrank instead of quietly acting on fewer
+        clients than the user ticked.
+
+        Three rules, and each of them is load-bearing:
+
+        **Only declared installs.**  The stored set is intersected with
+        `coroot.declared_kinds()` exactly as `post_thumbs_start` already does
+        for its "all clients" run.  Without it a posted body -- or a config
+        file hand-edited months ago -- can aim a builder at any path on the
+        box.
+
+        **A forgotten install is dropped and REPORTED, not silently kept.**
+        The stored list is left alone rather than rewritten here: a user who
+        forgets a client and re-declares it tomorrow gets their selection
+        back, and a GET that quietly rewrites the config is a GET with a side
+        effect.  But it never counts toward what runs, and `dropped` is why
+        the page can explain the difference between "I ticked four" and
+        "three ran".
+
+        **Empty means the install being browsed.**  Not all of them: one
+        click on a fresh profile would otherwise start a nine-client
+        bootstrap whose `wdf_recover` step alone is MEASURED at 302-2,167 s
+        per client.  Not none: both buttons would be dead on first visit with
+        nothing on screen explaining why.  The browsed install is what this
+        page did before the set existed, so an untouched page behaves exactly
+        as it used to.
+        """
+        # DELEGATED, not reimplemented. `tools/thumbs.py` and `health.py`'s
+        # own CLI read the same selection, so the rule lives in `health` and
+        # this is the HTTP surface over it. A second copy here is how the
+        # page and the shell come to disagree about which clients are ticked.
+        #
+        # `fallback=False` IS FOR AN EXPLICIT REQUEST, and the distinction is
+        # not cosmetic. A stored selection whose installs have all been
+        # forgotten should still leave the page usable, with the dropped
+        # paths named on screen -- so a GET falls back. A POST that NAMED
+        # installs and had every one of them pruned is a different thing
+        # entirely: falling back there hands the caller a build of the
+        # browsed install while they believe they asked for two others, which
+        # is the `--root`-was-parsed-and-dropped defect exactly.
+        return health.selected_roots(
+            asked, getattr(self.server, "game_root", None), fallback=fallback)
+
+    def api_selection(self, arg):
+        """The unified selection, and what the health panel needs to draw it.
+
+        Served rather than computed in the browser because the pruning rule
+        above is the interesting part: the page must show which remembered
+        installs no longer resolve, and a browser that re-derived that from
+        `/api/dirs` would be a second implementation of the same rule.
+        """
+        stored = []
+        try:
+            stored = list(cosettings.get("selected_installs"))
+        except Exception:                                # pragma: no cover
+            pass
+        roots, dropped = self.selected_installs()
+        return self._json({
+            "stored": stored,
+            "roots": roots,
+            "dropped": dropped,
+            # `true` when nothing was ticked and the browsed install is
+            # standing in, so the page can say so rather than showing a row
+            # ticked that the user never ticked.
+            "fallback": not stored or not [d for d in stored
+                                           if d not in dropped],
+            "browsing": str(getattr(self.server, "game_root", "") or ""),
+        })
+
     def post_bootstrap_start(self, body: bytes, arg):
         try:
             doc = json.loads(body.decode("utf-8") or "{}")
@@ -6118,6 +6235,28 @@ class Handler(BaseHTTPRequestHandler):
                 spec = f"{rel}={path}" if rel else ""
             if spec:
                 uses.append(spec)
+        # THE UPLOAD RESTRICTION, ENFORCED HERE AND NOT ONLY IN THE PAGE.
+        # `sethealth.js` hides the fields; hiding a field is not a rule. A
+        # page left open across a settings change, or any hand-written POST,
+        # would otherwise record an override the user is not allowed to set.
+        # Refused with the reason rather than dropped, because a `--use` that
+        # is silently ignored leaves the user believing an artefact is
+        # supplied when nothing was stored.
+        blocked = [u.split("=", 1)[0] for u in uses
+                   if not health.supply_allowed(u.split("=", 1)[0])]
+        if blocked:
+            return self._json({
+                "started": False,
+                "reason": "supplying " + ", ".join(sorted(set(blocked))) +
+                          " needs Developer options -> show_advanced_options. "
+                          "Only " + health.SUPPLY_WITHOUT_ADVANCED + " may be "
+                          "supplied without it: it is built from refs/ rather "
+                          "than from an install, so one copy is legitimately "
+                          "the same as another. The rest are derived FROM a "
+                          "client, and supplying one is a claim about "
+                          "archives this machine does not have. Nothing was "
+                          "run and nothing was stored.",
+                **self._bootstrapper().status()})
         known = {rel for rel, _a, _c, _w in health.DERIVED}
         only = [str(r) for r in (doc.get("only") or []) if str(r) in known]
         # An `only` list that the filter emptied is NOT the same request as no
@@ -6131,11 +6270,31 @@ class Handler(BaseHTTPRequestHandler):
                           "health.DERIVED: " +
                           ", ".join(str(r) for r in doc["only"]),
                 **self._bootstrapper().status()})
+        # WHICH INSTALLS. `roots` is the unified selection; `root` is the old
+        # single-client body and still works, because a client that posts one
+        # root should not have to learn a new field to keep doing what it did.
+        one = str(doc.get("root") or "").strip().strip('"')
+        asked = doc.get("roots")
+        if asked is None and one:
+            asked = [one]
+        # A body that NAMED installs and had every one of them pruned is not
+        # the same request as a body that named none, so the fallback is
+        # switched OFF for an explicit list: the caller asked for specific
+        # clients, and handing them the browsed install instead is the
+        # `--root` defect wearing a different hat. Refused, with the paths.
+        roots, dropped = self.selected_installs(asked,
+                                                fallback=not asked)
+        if asked and not roots:
+            return self._json({
+                "started": False,
+                "reason": "none of those are declared installs, so there is "
+                          "nothing to build for: " + ", ".join(dropped) +
+                          ". Nothing was run.",
+                **self._bootstrapper().status()})
         run = self._bootstrapper()
         return self._json(run.start(
-            bool(doc.get("all")), uses,
-            str(doc.get("root") or "").strip().strip('"') or None,
-            no_tpi=bool(doc.get("noTpi")), only=only))
+            bool(doc.get("all")), uses, roots,
+            no_tpi=bool(doc.get("noTpi")), only=only, dropped=dropped))
 
     def api_bootstrap_checklist(self, arg):
         r"""THE CHECKLIST: every declared client x every derived artefact.
@@ -6252,6 +6411,13 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": n, "value": v, "default": d, "isDefault": is_d,
                  "help": h, "effect": e,
                  "kind": cosettings.SETTINGS[n].kind.__name__,
+                 # WHICH SECTION DRAWS IT, from the registry rather than from
+                 # a list of names in `settings.js`. The page has three
+                 # sections now; a name list in the browser is the copy that
+                 # goes stale when a setting is renamed here, and it goes
+                 # stale silently -- the row simply keeps rendering in the
+                 # section it used to be in.
+                 "surface": cosettings.SETTINGS[n].surface,
                  "choices": list(cosettings.SETTINGS[n].choices or ()),
                  "bounds": list(cosettings.SETTINGS[n].bounds or ())}
                 for n, v, d, is_d, h, e in cosettings.describe()],
@@ -6578,20 +6744,39 @@ class Handler(BaseHTTPRequestHandler):
         # intersected with what the browser asked for, so a posted body
         # cannot queue a render against a path this box never declared.
         roots = None
-        if doc.get("allClients") or arg("allClients", ""):
+        # THE UNIFIED SELECTION REACHES THUMBNAILS TOO, which is the owner's
+        # stated reason for merging the two pickers: both track "what you are
+        # working on", and two independent lists is how a user bootstraps
+        # 5517 and then renders thumbnails for 6609 without noticing.
+        #
+        # `useSelection` is what the Settings page posts. `allClients` is the
+        # older "every declared client" button and keeps its own meaning --
+        # the two are NOT collapsed, because "everything I have" and "the
+        # four I am working on" are different requests and a button that
+        # quietly became the other one is worse than two buttons.
+        if doc.get("useSelection"):
+            roots, _dropped = self.selected_installs(doc.get("roots"))
+            if not roots:
+                return self._error(400, "nothing selected, and no install is "
+                                        "being browsed to fall back to")
+        elif doc.get("allClients") or arg("allClients", ""):
             declared = sorted(coroot.declared_kinds())
             asked = doc.get("roots")
             roots = ([r for r in declared if r in set(asked)] if asked
                      else declared)
             if not roots:
                 return self._error(400, "no declared client matched")
-            if srv_name:
-                # A library view has one cache and it is not per-install; a
-                # queue of installs under it would write eight clients'
-                # meshes into one server namespace.
-                return self._error(409, "an \"all clients\" run is about the "
-                                        "declared installs, not a library "
-                                        "view -- leave the library first")
+        # HOISTED OUT OF THE `allClients` BRANCH, and it had to be. A library
+        # view has one cache and it is not per-install, so a queue of installs
+        # under it writes several clients' meshes into one server namespace.
+        # That is true of ANY multi-install run, and the guard used to sit
+        # inside the "all clients" arm alone -- so the unified selection
+        # posting `useSelection` would have walked straight past it and
+        # produced exactly the corruption the check exists to stop.
+        if roots and srv_name:
+            return self._error(409, "a multi-install thumbnail run is about "
+                                    "the declared installs, not a library "
+                                    "view -- leave the library first")
         try:
             res = runner.start(mode, int(doc.get("jobs") or arg("jobs", 0) or 0),
                                int(doc.get("limit") or arg("limit", 0) or 0),

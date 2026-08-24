@@ -94,6 +94,23 @@ class Setting:
     bounds: Optional[tuple] = None
     #: For str settings: the values permitted.
     choices: Optional[tuple] = None
+    #: WHICH PANEL OWNS THE CONTROL. The registry stays one registry -- this
+    #: does not split it -- but a settings page with three sections has to be
+    #: told where each row belongs, and the alternative is a list of names
+    #: hardcoded in `settings.js`. That list is the thing that goes stale: a
+    #: setting renamed here would keep rendering in the old section, or in
+    #: both. Declaring it beside the setting means the page cannot disagree
+    #: with the registry about where a control lives.
+    #:
+    #:   "preferences" -- the default; the Preferences section.
+    #:   "developer"   -- the Developer options section.
+    #:   "panel"       -- NOT rendered as a generic row at all: some other
+    #:                    panel draws its own control for it. `page_size` as
+    #:                    a number box is a fine generic row; a set of install
+    #:                    paths is not, and rendering one as a comma-joined
+    #:                    text field would invite a hand-edit that the health
+    #:                    panel then silently prunes.
+    surface: str = "preferences"
 
 
 SETTINGS = {s.name: s for s in (
@@ -142,6 +159,10 @@ SETTINGS = {s.name: s for s in (
         "wants the name, not the argument behind it; on, because when the "
         "name is wrong this is the only place that says a second candidate "
         "ever existed.",
+        # Moved out of Preferences on the owner's ask. It is a UI move and
+        # NOT a schema change: same entry, same registry, same effect, same
+        # stored key, so a value already set survives the move untouched.
+        surface="developer",
     ),
     Setting(
         "cache_derived", False, bool,
@@ -161,6 +182,50 @@ SETTINGS = {s.name: s for s in (
         "would make a control_kind depend on whether some earlier run "
         "happened to warm the entry. Strongest evidence is the right default; "
         "speed is the opt-in.",
+    ),
+    Setting(
+        "show_advanced_options", False, bool,
+        "Show the developer-facing controls that are hidden by default.",
+        "The Settings page's 'Supply an artefact' section offers a path field "
+        "for EVERY derived artefact. With this off it offers one field, for "
+        "`out/opcodes.json`, and says why the others are withheld. "
+        "The restriction is not decoration. `out/opcodes.json` is built from "
+        "`refs/` and opens no install at all, so one machine's copy is "
+        "legitimately byte-identical to another's and supplying it carries no "
+        "claim about anybody's client. Every other artefact in `DERIVED` is "
+        "derived FROM an install: a supplied `out/wdf/c3_names.json` is a "
+        "claim about archives the supplier had and the recipient does not, "
+        "which is the case `coroot.override_verdict` exists to judge and the "
+        "case a casual user should not be walked into by an open text field.",
+        surface="developer",
+    ),
+    Setting(
+        # THE UNIFIED SELECTION. One set of installs, read by bootstrap AND by
+        # thumbnail generation, because the owner's reason for merging them is
+        # that both track "what you are working on" -- and two independent
+        # pickers for one intent is how a user bootstraps 5517 and then
+        # generates thumbnails for 6609 without noticing.
+        #
+        # It lives HERE and not in a third store: `coroot` already owns the
+        # per-user document and `cosettings` already namespaces into it, so
+        # this is the same file and the same write path as every other
+        # preference. `surface="panel"` because the health panel draws it as
+        # a client checklist; a generic text row would be unusable.
+        "selected_installs", [], list,
+        "Which declared installs the health panel acts on -- bootstrap and "
+        "thumbnail generation both read this one set.",
+        "`POST /api/bootstrap/start` and `POST /api/thumbs/start` run once "
+        "per install named here instead of once for the configured install, "
+        "and the Settings page ticks these rows on load. "
+        "EMPTY MEANS THE INSTALL BEING BROWSED -- not all of them and not "
+        "none. All-of-them would let one click on a fresh profile start a "
+        "nine-client bootstrap whose `wdf_recover` step alone is MEASURED at "
+        "302-2,167 s PER CLIENT; none-of-them would leave both buttons dead "
+        "on first visit with nothing on screen explaining it. Falling back to "
+        "the browsed install reproduces exactly the single-client behaviour "
+        "this page had before the set existed, so a user who never touches "
+        "the checklist sees no change at all.",
+        surface="panel",
     ),
 )}
 
@@ -260,6 +325,32 @@ def _coerce(spec: Setting, value: Any) -> Any:
             raise BadValue(f"{spec.name} must be between {spec.bounds[0]} and "
                            f"{spec.bounds[1]}, got {n}")
         return n
+    if spec.kind is list:
+        # CHECKED BEFORE THE `str()` FALLBACK, and that ordering is the whole
+        # reason this branch is written out rather than left to the tail of
+        # the function. Without it a list falls through to `str(value)` and
+        # is stored as its own repr -- `"['C:/a', 'C:/b']"` -- which reads
+        # back through `get()` as a 20-character string that is not a path,
+        # is not a list, and type-checks forever. No error is raised at any
+        # point. That is the exact shape of the silent-corruption bug this
+        # module's docstring says `set_value` raises to avoid.
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list,
+                                                                     tuple)):
+            raise BadValue(f"{spec.name} is a list of strings, got "
+                           f"{type(value).__name__}")
+        out = []
+        for item in value:
+            if not isinstance(item, str):
+                raise BadValue(f"{spec.name} takes strings, got a "
+                               f"{type(item).__name__}: {item!r}")
+            item = item.strip()
+            # De-duplicated and order-preserved. A set would be the natural
+            # type and is deliberately not used: this is serialised to JSON,
+            # which has no set, and a stored order that changes on every
+            # write makes the config file's diff noise rather than history.
+            if item and item not in out:
+                out.append(item)
+        return out
     s = str(value)
     if spec.choices and s not in spec.choices:
         raise BadValue(f"{spec.name} must be one of "
@@ -274,6 +365,14 @@ def get(name: str) -> Any:
         raise UnknownSetting(name)
     stored = _read_doc().get(NAMESPACE, {})
     if not isinstance(stored, dict) or name not in stored:
+        # COPIED, for the list kind. `Setting` is a frozen dataclass, which
+        # freezes the ATTRIBUTE and not the list it points at: handing the
+        # registry's own `[]` to every caller means one caller doing
+        # `get("selected_installs").append(root)` silently edits the DEFAULT,
+        # and from then on a fresh profile starts with somebody else's
+        # install already selected. Frozen buys nothing here.
+        if isinstance(spec.default, list):
+            return list(spec.default)
         return spec.default
     try:
         return _coerce(spec, stored[name])
@@ -282,7 +381,8 @@ def get(name: str) -> Any:
         # setting whose type changed between versions. The default is the
         # honest answer; refusing to run because a PREFERENCE is malformed
         # would make the politeness layer load-bearing.
-        return spec.default
+        return list(spec.default) if isinstance(spec.default, list) \
+            else spec.default
 
 
 def set_value(name: str, value: Any) -> Path:

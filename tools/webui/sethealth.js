@@ -105,10 +105,51 @@
   // the user did not pick. That is the same class of bug as the one this
   // section exists to close, so the selection lives here.
   let book = null;          // /api/bootstrap/checklist, cheap version
-  let pickedRoot = null;    // which client. null = not chosen yet.
+  // ONE SELECTION, SHARED BY BOOTSTRAP AND THUMBNAILS. It used to be a single
+  // `pickedRoot` behind a radio button, and thumbnails had a separate "all
+  // clients" list -- so bootstrapping 5517 and then generating thumbnails for
+  // 6609 was two clicks apart and looked identical. The owner's reason for
+  // merging them is that both track "what you are working on", so there is
+  // one set and both readers take it from here.
+  //
+  // It is persisted through `cosettings.selected_installs` -- the config
+  // `coroot` already owns -- and NOT in localStorage, because `tools/thumbs.py`
+  // and `tools/health.py` run from a shell have to see the same answer. A
+  // browser-only selection would be invisible to them.
+  let picked = null;        // Set of roots. null = not loaded from the server yet.
+  let selection = null;     // /api/selection: stored, roots, dropped, fallback
+  let advanced = false;     // cosettings.show_advanced_options
   let pickedArts = null;    // Set of rels, or null = "the missing ones"
   let noTpi = false;
   let estimating = false;
+  let saving = false;
+
+  /** The installs to act on: what is ticked, or the browsed one standing in.
+   *
+   *  The fallback is the server's rule (`selected_installs`' declared effect)
+   *  reproduced for the label only -- `/api/selection` computes the real one,
+   *  and every POST re-resolves it server-side. The page never gets to decide
+   *  which installs a builder runs against.
+   */
+  function pickedRoots() {
+    if (picked && picked.size) return Array.from(picked);
+    return (selection && selection.roots) || [];
+  }
+
+  async function saveSelection() {
+    saving = true;
+    try {
+      await jpost('/api/settings',
+                  { name: 'selected_installs', value: Array.from(picked) });
+      // Re-read rather than trusting what we sent: the server prunes to
+      // declared installs, so the set that came back is the set that will
+      // actually be built and is what the rows must show.
+      selection = await jget('/api/selection');
+    } catch (e) {
+      say(String(e.message || e), true);
+    }
+    saving = false;
+  }
 
   function mb(n) { return (n || 0).toFixed(0) + ' MB'; }
 
@@ -119,12 +160,130 @@
     return null;
   }
 
-  function chosenArts(row) {
+  /** Every checklist row for the currently selected installs. */
+  function pickedRows() {
+    const out = [];
+    for (const r of pickedRoots()) {
+      const row = clientRow(r);
+      if (row) out.push(row);
+    }
+    return out;
+  }
+
+  /** ONE ARTEFACT, ACROSS EVERY SELECTED INSTALL.
+   *
+   *  The owner's ask is that ticking an artefact builds it "of both" when an
+   *  offline client and a private server are selected, which means a single
+   *  checkbox now stands for N cells rather than one. The aggregation rules
+   *  below are the whole design, and each is chosen so the SAFE reading wins:
+   *
+   *    * `refused` if ANY selected install refused a supplied copy. Not "most"
+   *      and not "the first" -- a refusal is a broken state on that install
+   *      and hiding it behind three healthy ones is how it stays broken.
+   *    * `resolved` only if EVERY selected install has it built, inherited or
+   *      supplied-and-accepted. One install short is work to do, so the box
+   *      stays live.
+   *    * `blocked` if the artefact cannot be built here at all.
+   *
+   *  `missing` is a count rather than a flag because the header says "built
+   *  for 2 of 3 selected", and a flag cannot.
+   */
+  function aggregate(rel, rows) {
+    const out = { rel: rel, total: rows.length, built: 0, missing: 0,
+                  supplied: 0, refused: [], notApplicable: [], blocked: false,
+                  unverified: 0, inherited: 0, sample: null,
+                  defaultChecked: false, cost: '', why: '', scope: '' };
+    for (const row of rows) {
+      const a = (row.artefacts || []).find(x => x.path === rel);
+      if (!a) continue;
+      if (!out.sample) {
+        out.sample = a;
+        out.defaultChecked = !!a.defaultChecked;
+        out.cost = a.cost || '?';
+        out.why = a.why || '';
+        out.scope = a.perClient ? 'per client'
+          : (a.rootAware ? 'shared, built from one install'
+                         : 'shared, no --root');
+      }
+      if (!a.buildable) out.blocked = true;
+      if (!a.applicable) { out.notApplicable.push(row.name); continue; }
+      // ORDER MATTERS AND MATCHES THE ROW LABEL BELOW: a refusal outranks
+      // "supplied", because the override gate can decline a supplied copy and
+      // the artefact is then NOT in force. Counting it as supplied would gray
+      // the box on the strength of a file the tool has rejected.
+      if (a.refusedWhy) { out.refused.push({ name: row.name, why: a.refusedWhy }); continue; }
+      if (a.suppliedFrom) {
+        out.supplied += 1;
+        if (!a.verified) out.unverified += 1;
+        if (a.exists) { out.built += 1; continue; }
+        // Supplied, not refused, and still not readable. Rare, and it is
+        // WORK rather than a settled state, so it counts as missing.
+        out.missing += 1;
+        continue;
+      }
+      if (a.exists) { out.built += 1; if (a.inherited) out.inherited += 1; }
+      else out.missing += 1;
+    }
+    out.resolved = out.total > 0 && out.missing === 0 &&
+                   out.refused.length === 0 &&
+                   out.built + out.notApplicable.length >= out.total;
+    return out;
+  }
+
+  /** WHY a box is grayed, in the page's own words -- or '' when it is live.
+   *
+   *  Every disabled control on this page returns a sentence from here. A
+   *  disabled checkbox with no reason beside it is indistinguishable from a
+   *  broken one, and this page has six of them in a column.
+   */
+  function grayReason(ag) {
+    if (ag.notApplicable.length === ag.total && ag.total > 0) {
+      const a = ag.sample || {};
+      return a.notApplicableWhy ||
+             'not applicable in this checkout';
+    }
+    // A REFUSAL NEVER GRAYS THE BOX. This is the case the brief singles out:
+    // a supplied copy that `coroot.override_verdict` declined is not
+    // "supplied", and disabling the row because a setting exists would hide a
+    // broken state behind a dead control -- the user would see the artefact
+    // listed as handled and have no way to act on it.
+    if (ag.refused.length) return '';
+    if (ag.blocked && !ag.resolved) {
+      return 'no builder for this artefact in this checkout — supply a copy ' +
+             'built elsewhere below';
+    }
+    if (ag.resolved) {
+      if (ag.supplied) {
+        return ag.unverified
+          ? 'already supplied from a copy built elsewhere, and accepted — ' +
+            'though NOT verified: no check exists for this artefact'
+          : 'already supplied from a copy built elsewhere, and verified ' +
+            'against your own archives';
+      }
+      if (ag.inherited === ag.total) {
+        return 'already built — inherited from the primary checkout';
+      }
+      return ag.total === 1
+        ? 'already built for the selected install'
+        : 'already built for all ' + ag.total + ' selected installs';
+    }
+    return '';
+  }
+
+  function chosenArts(rows) {
     if (pickedArts) return pickedArts;
-    // Default: exactly what is missing FOR THIS CLIENT. `row.missing` comes
-    // from check_derived(root), so it is that client's gaps and not the
-    // configured install's.
-    return new Set((row && row.missing) || []);
+    // THE DEFAULT TICKS, and they are a property of the artefact rather than
+    // of this page: `health.DEFAULT_BOOTSTRAP` names the five, and
+    // `out/opcodes.json` is deliberately not among them. A rel is ticked when
+    // it is one of those five AND there is still work to do for at least one
+    // selected install -- ticking something already built everywhere would
+    // ask for a rebuild nobody requested.
+    const s = new Set();
+    for (const rel of ((book && book.artefacts) || [])) {
+      const ag = aggregate(rel, rows);
+      if (ag.defaultChecked && !ag.resolved && !grayReason(ag)) s.add(rel);
+    }
+    return s;
   }
 
   // ------------------------------------------------- the client checklist
@@ -133,10 +292,45 @@
   function checklistBlock() {
     const wrap = mk('div');
     wrap.id = 'boot-checklist';
-    wrap.appendChild(mk('h4', null, 'Which client'));
+    wrap.appendChild(mk('h4', null, 'Which installs'));
     if (!book) {
       wrap.appendChild(mk('div', 'set-help', 'loading the client list…'));
       return wrap;
+    }
+    wrap.appendChild(mk('div', 'set-help',
+      'One selection, used by BOTH the bootstrap below and thumbnail ' +
+      'generation — they track the same thing, which is whichever clients ' +
+      'you are working on. It is stored in the config beside every other ' +
+      'setting, so tools/health.py and tools/thumbs.py run from a shell see ' +
+      'the same answer.'));
+    // WHAT AN EMPTY SELECTION MEANS, SAID ON THE PAGE rather than left for
+    // the user to discover by pressing a button. Nothing ticked falls back to
+    // the install being browsed -- not all of them, because one click would
+    // otherwise start a nine-client bootstrap.
+    if (selection && selection.fallback) {
+      wrap.appendChild(mk('div', 'set-effect',
+        'Nothing is ticked, so both buttons act on the install you are ' +
+        'browsing — ' + (selection.browsing || '(none)') + '. Ticking rows ' +
+        'below replaces that. An empty selection never means "all of them": ' +
+        'wdf_recover alone is MEASURED at 302-2,167 s per client.'));
+    }
+    // A REMEMBERED INSTALL THAT IS NO LONGER DECLARED. Reported rather than
+    // dropped in silence, because "I ticked four and three ran" is otherwise
+    // invisible. The stored entry is deliberately left alone server-side, so
+    // re-declaring the client brings the tick back.
+    if (selection && (selection.dropped || []).length) {
+      const d = mk('div', 'set-bad');
+      d.id = 'boot-dropped';
+      d.textContent =
+        (selection.dropped.length === 1
+          ? 'One remembered install is no longer declared and will NOT be ' +
+            'built: '
+          : selection.dropped.length + ' remembered installs are no longer ' +
+            'declared and will NOT be built: ') +
+        selection.dropped.join(', ') +
+        '. They are still remembered — re-declare one in Directory ' +
+        'management and it returns to the selection.';
+      wrap.appendChild(d);
     }
     // THE COST DRIVER, AND IT IS NOT INSTALL SIZE. Printed above the rows,
     // not under them, because a per-client table implies per-client
@@ -167,19 +361,34 @@
     for (const c of (book.clients || [])) {
       const tr = mk('tr');
       const cell = mk('td');
+      // A CHECKBOX, NOT A RADIO. The owner asked for a multi-select shared by
+      // bootstrapping and thumbnail generation; a radio can express neither
+      // half of that. `name` is dropped with the type -- a group name on
+      // checkboxes does nothing but suggest they are still exclusive.
       const rb = mk('input');
-      rb.type = 'radio';
-      rb.name = 'boot-client';
+      rb.type = 'checkbox';
       rb.id = 'boot-client-' + (i++);
       rb.className = 'boot-client';
       rb.setAttribute('data-root', c.root);
-      rb.checked = (c.root === pickedRoot);
-      rb.disabled = !c.exists;
-      rb.addEventListener('change', () => {
-        pickedRoot = c.root;
-        // A new client means new gaps. Keeping the previous client's ticks
-        // would tick artefacts this one already has and untick ones it needs.
+      rb.checked = !!(picked && picked.has(c.root));
+      // An install whose folder is gone cannot be built for. It is shown --
+      // removing the row would make a selection silently shrink with nothing
+      // on screen saying why -- but it cannot be ticked.
+      rb.disabled = !c.exists || saving;
+      if (!c.exists) {
+        rb.title = 'this folder is not there any more, so nothing can be ' +
+                   'built from it';
+      }
+      rb.addEventListener('change', async () => {
+        if (!picked) picked = new Set();
+        if (rb.checked) picked.add(c.root); else picked.delete(c.root);
+        // The ticked artefacts were defaulted from the PREVIOUS set of
+        // installs' gaps. A changed set means different gaps, so they are
+        // dropped back to the default rather than carried over: keeping them
+        // would tick artefacts the newly-added client already has and leave
+        // unticked ones it is missing.
         pickedArts = null;
+        await saveSelection();
         render();
       });
       cell.appendChild(rb);
@@ -266,27 +475,28 @@
   function bootstrapBlock(doc) {
     const box = mk('div');
     box.appendChild(mk('h4', 'set-sub', 'Bootstrap the derived data'));
-    if (pickedRoot === null) {
-      pickedRoot = doc.browsing || doc.buildsFor || '';
-    }
     box.appendChild(mk('div', 'set-help',
       'Six generated artefacts the viewer reads. Built once, in dependency ' +
-      'order, for the client you pick below — tools/health.py --bootstrap ' +
-      'takes a --root and this page passes it. Browsing ' +
+      'order, for EVERY install ticked below — tools/health.py --bootstrap ' +
+      'takes one --root, so this page runs it once per selected install and ' +
+      'reports them in order. Browsing ' +
       (doc.browsing || '?') + '; configured install ' +
       (doc.buildsFor || '(none)') + '.'));
 
     box.appendChild(checklistBlock());
 
-    const row = clientRow(pickedRoot);
-    const arts = row ? row.artefacts : ((doc.derived || {}).artefacts || []);
-    const want = chosenArts(row);
+    const rows = pickedRows();
+    const rels = (book && book.artefacts) ||
+                 ((doc.derived || {}).artefacts || []).map(a => a.path);
+    const want = chosenArts(rows);
 
     // -- THE COST, ABOVE THE BUTTON ---------------------------------------
     const cost = mk('div', 'set-cost');
     cost.appendChild(mk('h4', null,
       'What this will cost, before you start it' +
-      (pickedRoot ? ' — for ' + pickedRoot : '')));
+      (rows.length === 1 ? ' — for ' + rows[0].name
+        : rows.length ? ' — for ' + rows.length + ' selected installs'
+        : '')));
     const tbl = mk('table');
     tbl.style.width = '100%';
     tbl.style.borderCollapse = 'collapse';
@@ -301,47 +511,81 @@
     tbl.appendChild(thead);
     let todo = 0;
     let n = 0;
-    for (const a of arts) {
+    for (const rel of rels) {
+      const ag = aggregate(rel, rows);
+      const gray = grayReason(ag);
       const tr = mk('tr');
-      // `refusedWhy` outranks `suppliedFrom`, and the order is the whole
-      // point: the override gate can decline a supplied artefact, and a row
-      // that then read "supplied" while the artefact reads as MISSING is the
-      // most confusing state this page can show -- the setting is there, the
-      // file is there, and nothing says why it is not being used.
-      const state = !a.applicable ? 'n/a here'
-        : a.refusedWhy ? 'REFUSED'
-        : a.suppliedFrom ? 'supplied'
-        : a.exists ? (a.inherited ? 'inherited' : 'built')
-        : a.buildable ? 'MISSING' : 'not buildable here';
-      if (state === 'MISSING') todo += 1;
-      // THE CHECKLIST'S OTHER AXIS: which artefacts, not only which client.
+      // THE STATE COLUMN, AGGREGATED. With one install selected it reads
+      // exactly as it did before. With several it has to say how many, or a
+      // row built for three clients and missing on the fourth reads as
+      // "built" and the fourth never gets one.
+      let state;
+      if (ag.refused.length) {
+        state = 'REFUSED on ' + ag.refused.map(r => r.name).join(', ');
+      } else if (ag.notApplicable.length === ag.total && ag.total) {
+        state = 'n/a here';
+      } else if (ag.total === 0) {
+        state = 'no install selected';
+      } else if (ag.missing === 0) {
+        state = ag.supplied ? 'supplied' :
+                (ag.inherited === ag.total ? 'inherited' : 'built');
+      } else if (ag.blocked) {
+        state = 'not buildable here';
+      } else {
+        state = 'MISSING for ' + ag.missing + ' of ' + ag.total;
+        todo += ag.missing;
+      }
       const cell = mk('td');
       const cb = mk('input');
       cb.type = 'checkbox';
       cb.id = 'boot-art-' + (n++);
-      cb.className = 'boot-art';
-      cb.setAttribute('data-rel', a.path);
-      cb.checked = want.has(a.path);
-      cb.disabled = !a.buildable;
+      // `artefact-check` is the class the anti-duplicate-work gate greps for,
+      // named here so the gate and the implementation cannot drift apart.
+      // `boot-art` is kept beside it because the existing browser tests
+      // select on it.
+      cb.className = 'boot-art artefact-check';
+      cb.setAttribute('data-rel', rel);
+      cb.checked = want.has(rel) && !gray;
+      cb.disabled = !!gray;
+      // A DISABLED BOX ALWAYS CARRIES ITS REASON, in the tooltip and in the
+      // cell beside it. A grayed control with nothing saying why is
+      // indistinguishable from one that is simply broken, and this column has
+      // six of them.
+      if (gray) cb.title = gray;
       cb.addEventListener('change', () => {
-        const s = new Set(chosenArts(row));
-        if (cb.checked) s.add(a.path); else s.delete(a.path);
+        const s = new Set(want);
+        if (cb.checked) s.add(rel); else s.delete(rel);
         pickedArts = s;
         render();
       });
       cell.appendChild(cb);
       tr.appendChild(cell);
-      // "shared" rows are labelled as shared rather than duplicated per
-      // client: out/opcodes.json is built from refs/ and opens no install at
-      // all, so a per-client copy of it would be the same bytes twice.
-      const scope = a.perClient ? 'per client'
-        : (a.rootAware ? 'shared, built from one install' : 'shared, no --root');
-      [a.path, state, a.cost || '?', scope, a.why || ''].forEach((v, i) => {
+      const nameCell = mk('td');
+      const nameText = mk('div', null, rel);
+      nameText.style.fontFamily = 'var(--mono, monospace)';
+      nameCell.appendChild(nameText);
+      if (gray) {
+        const g = mk('div', 'set-help', gray);
+        g.className = 'set-help artefact-why';
+        g.setAttribute('data-rel', rel);
+        nameCell.appendChild(g);
+      }
+      // The refusal's own sentences, whole, on the row itself rather than
+      // only in the supply section below -- this is the row the user is
+      // looking at when they wonder why a supplied artefact is not in force.
+      for (const r of ag.refused) {
+        const w = mk('div', 'set-bad', r.name + ': ' + r.why);
+        w.style.whiteSpace = 'pre-wrap';
+        nameCell.appendChild(w);
+      }
+      nameCell.style.paddingRight = '.8rem';
+      nameCell.style.verticalAlign = 'top';
+      tr.appendChild(nameCell);
+      [state, ag.cost || '?', ag.scope, ag.why].forEach((v, i) => {
         const td = mk('td', null, v);
         td.style.paddingRight = '.8rem';
         td.style.verticalAlign = 'top';
-        if (i === 0) td.style.fontFamily = 'var(--mono, monospace)';
-        if (i === 4) td.style.opacity = '.85';
+        if (i === 3) td.style.opacity = '.85';
         tr.appendChild(td);
       });
       tbl.appendChild(tr);
@@ -349,7 +593,9 @@
     cost.appendChild(tbl);
     cost.appendChild(mk('p', null,
       want.size + ' artefact' + (want.size === 1 ? '' : 's') + ' ticked; ' +
-      todo + ' missing for this client.'));
+      todo + ' artefact-install pair' + (todo === 1 ? '' : 's') +
+      ' still to build across ' + rows.length + ' selected install' +
+      (rows.length === 1 ? '' : 's') + '.'));
     if (book && book.sharedNote) {
       cost.appendChild(mk('p', 'set-measured', book.sharedNote));
     }
@@ -359,12 +605,37 @@
     box.appendChild(cost);
 
     // -- --use: supply what this tree cannot build ------------------------
-    const cannot = arts.filter(a => !a.buildable && a.applicable);
+    //
+    // WHICH ARTEFACTS MAY BE SUPPLIED, AND WHY THE LIST IS NORMALLY ONE.
+    //
+    // With `show_advanced_options` off, the only field offered is
+    // `out/opcodes.json`. That is not an arbitrary safety rail, it follows
+    // from where the artefact comes from: opcodes is built from `refs/` and
+    // opens no install at all, so one machine's copy is legitimately
+    // byte-identical to another's and handing one over carries no claim about
+    // anybody's client.
+    //
+    // Every other artefact in DERIVED is derived FROM an install. A supplied
+    // `out/wdf/c3_names.json` is a claim about archives the supplier had and
+    // the recipient does not, which is precisely the case
+    // `coroot.override_verdict` exists to judge -- and the case that produces
+    // a REFUSED row further up when the claim does not hold. Offering those
+    // fields to everyone invites a user to paste a stranger's name table and
+    // then wonder why the page says REFUSED. Advanced users who know what
+    // they are supplying still get all six.
+    const SUPPLY_ALWAYS = 'out/opcodes.json';
+    const supplyRels = advanced ? rels : rels.filter(r => r === SUPPLY_ALWAYS);
+    const withheld = rels.length - supplyRels.length;
+    const cannot = rels.filter(rel => {
+      const ag = aggregate(rel, rows);
+      return ag.blocked && ag.notApplicable.length < ag.total;
+    });
     const sup = mk('details');
+    sup.id = 'boot-supply';
     sup.open = cannot.length > 0;
     sup.appendChild(mk('summary', null,
-      'Supply an artefact this tree cannot build (' + cannot.length +
-      ' candidate' + (cannot.length === 1 ? '' : 's') + ')'));
+      'Supply an artefact this tree cannot build (' + supplyRels.length +
+      ' offered' + (withheld ? ', ' + withheld + ' hidden' : '') + ')'));
     sup.appendChild(mk('div', 'set-help',
       'Some builders are not shipped in every checkout — COMod ships the ' +
       'asset subset. Point at a copy built elsewhere and it is recorded in ' +
@@ -372,37 +643,55 @@
       'py -3 tools/health.py --use "REL=PATH" would. A path that does not ' +
       'exist is refused rather than stored, and the bootstrap that follows ' +
       'is not run.'));
-    for (const a of arts) {
+    if (withheld) {
+      // THE WITHHELD ROWS SAY THEY ARE WITHHELD. A section that silently
+      // shows one field where six exist reads as a tool that only supports
+      // one, and the user has no way to find the switch.
+      const w = mk('div', 'set-effect');
+      w.id = 'boot-supply-withheld';
+      w.textContent =
+        withheld + ' more can be supplied, and are hidden because they are ' +
+        'derived from an install rather than from refs/: supplying one is a ' +
+        'claim about archives you have and this machine does not, which is ' +
+        'what the verification gate then judges. Turn on ' +
+        '"show_advanced_options" under Developer options to offer them.';
+      sup.appendChild(w);
+    }
+    for (const rel of supplyRels) {
+      const ag = aggregate(rel, rows);
+      const a = ag.sample || { path: rel };
       const row = mk('div', 'set-field');
-      const lab = mk('label', null, a.path);
+      const lab = mk('label', null, rel);
       lab.style.fontFamily = 'var(--mono, monospace)';
       lab.style.flex = '0 0 16rem';
       row.appendChild(lab);
-      let inp = useFields[a.path];
+      let inp = useFields[rel];
       if (!inp) {
         inp = mk('input');
         inp.type = 'text';
-        inp.placeholder = a.buildable
-          ? 'buildable here — leave blank'
-          : 'path to a copy built elsewhere';
+        inp.placeholder = ag.blocked
+          ? 'path to a copy built elsewhere'
+          : 'buildable here — leave blank';
         inp.value = a.suppliedFrom || '';
-        inp.setAttribute('data-use-rel', a.path);
-        useFields[a.path] = inp;
+        inp.setAttribute('data-use-rel', rel);
+        useFields[rel] = inp;
       }
       row.appendChild(inp);
-      if (a.refusedWhy) {
+      if (ag.refused.length) {
         // The server's own sentences, whole. A shortened refusal is a refusal
         // the user cannot act on, and the reason it was refused is the only
         // thing that tells them whether to fix the file or clear the setting.
-        const w = mk('div', 'set-help', a.refusedWhy);
-        w.style.whiteSpace = 'pre-wrap';
-        row.appendChild(w);
+        for (const r of ag.refused) {
+          const w = mk('div', 'set-help', r.name + ': ' + r.why);
+          w.style.whiteSpace = 'pre-wrap';
+          row.appendChild(w);
+        }
       } else if (a.suppliedFrom) {
         row.appendChild(mk('span', 'set-help',
           a.verified ? 'currently supplied — verified'
                      : 'currently supplied — NOT verified, no check exists ' +
                        'for this artefact'));
-      } else if (!a.buildable) {
+      } else if (ag.blocked) {
         row.appendChild(mk('span', 'set-help', 'not buildable here'));
       }
       sup.appendChild(row);
@@ -424,9 +713,15 @@
     // -- the buttons ------------------------------------------------------
     const run = (doc.run || {});
     const btnRow = mk('div', 'set-field');
-    const label = pickedRoot
-      ? 'Run bootstrap for ' + (row ? row.name : pickedRoot)
-      : 'Run bootstrap';
+    // The button NAMES what it will act on, and names all of it. "Run
+    // bootstrap" beside a four-install selection is the button that gets
+    // pressed by someone expecting one client's worth of work.
+    const label = rows.length === 1
+      ? 'Run bootstrap for ' + rows[0].name
+      : rows.length > 1
+        ? 'Run bootstrap for ' + rows.length + ' installs (' +
+          rows.map(r => r.name).join(', ') + ')'
+        : 'Run bootstrap';
     const go = mk('button', 'primary',
                   run.running ? 'Bootstrap running…' : label);
     go.id = 'boot-start';
@@ -435,18 +730,25 @@
       const uses = [];
       for (const rel of Object.keys(useFields)) {
         const v = (useFields[rel].value || '').trim();
-        const was = (arts.find(a => a.path === rel) || {}).suppliedFrom || '';
+        // Only fields the user actually CHANGED are posted. `suppliedFrom`
+        // comes off the aggregate's sample row rather than a per-client
+        // artefact list, because an override is recorded once in the config
+        // and is not per install.
+        const was = ((aggregate(rel, rows).sample) || {}).suppliedFrom || '';
         if (v !== was) uses.push({ rel: rel, path: v });
       }
       go.disabled = true;
       say('starting…');
       try {
-        // `root` is the whole point: the run is for the client ticked above,
-        // not for whichever install happens to be configured.
+        // `roots` is the whole point: the run is for the clients ticked
+        // above, not for whichever install happens to be configured.
         const res = await jpost('/api/bootstrap/start', {
           all: allBox.checked,
           uses: uses,
-          root: pickedRoot || '',
+          // THE SET, NOT A ROOT. The server re-resolves it against the
+          // declared installs and refuses if none survive, so what is posted
+          // here is a request and never the last word on what gets built.
+          roots: pickedRoots(),
           noTpi: noTpi,
           only: Array.from(want),
         });
@@ -651,11 +953,39 @@
     const all = doc.allClients;
     const box = mk('div', 'set-allclients');
     if (!all || all.error) return box;
-    box.appendChild(mk('h4', 'set-sub', 'Every declared client'));
+    box.appendChild(mk('h4', 'set-sub', 'Thumbnails for the selected installs'));
 
     const cost = mk('div', 'set-cost');
     cost.appendChild(mk('h4', null,
       'What all ' + all.clients.length + ' clients would cost'));
+    // THE BUTTON RUNS THE SELECTION; THE TABLE BELOW COSTS EVERY DECLARED
+    // CLIENT. Those are different sets, and saying so is not a footnote: a
+    // total for nine clients sitting directly above a button that renders two
+    // is a number the user will read as the price of pressing it. The
+    // subtotal is computed from the same per-client rows, so the two cannot
+    // disagree, and it ABSTAINS rather than printing a wrong number when any
+    // selected client's corpus could not be counted -- `thumbnail_corpus`
+    // declines to guess for exactly the same reason.
+    (function () {
+      const sel = new Set(pickedRoots());
+      const mine = all.clients.filter(c => sel.has(c.root));
+      if (!mine.length) return;
+      const measured = mine.every(c => c.corpusMeasured);
+      const imgs = mine.reduce(
+        (n, c) => n + (c.meshes || 0) + (c.textures || 0), 0);
+      const mbs = mine.reduce((n, c) => n + (c.megabytes || 0), 0);
+      const p = mk('p', 'set-effect');
+      p.id = 'thumb-selected-subtotal';
+      p.textContent = measured
+        ? 'Ticked right now: ' + mine.length + ' of ' + all.clients.length +
+          ' — ' + imgs.toLocaleString() + ' images, ' + mbs.toFixed(0) +
+          ' MB. That is what the button below will render.'
+        : 'Ticked right now: ' + mine.length + ' of ' + all.clients.length +
+          '. At least one has no mesh work list yet, so their cost is NOT ' +
+          'totalled here rather than guessed at — build ' +
+          'out/meshtex/coverage.json for it first.';
+      cost.appendChild(p);
+    })();
     // The total FIRST, and labelled for what it is. `totalMeasured` false
     // means at least one client's mesh work list could not be counted, and
     // then this is a lower bound with no duration attached -- the server
@@ -704,15 +1034,26 @@
     box.appendChild(tbl);
 
     const row = mk('div', 'set-field');
+    // The button NAMES the set it acts on, and that set is the selection --
+    // not "all N clients", which is what it used to say and used to do.
+    const picks = pickedRoots();
     const go = mk('button', 'ghost',
-      'Generate for all ' + all.clients.length + ' clients anyway');
+      picks.length === 1
+        ? 'Generate thumbnails for the selected install'
+        : 'Generate thumbnails for the ' + picks.length + ' selected installs');
     go.id = 'thumb-all-clients';
     go.disabled = !!(doc.run || {}).running || doc.enabled === false;
     go.addEventListener('click', async () => {
       go.disabled = true;
       try {
+        // THE SAME SELECTION THE BOOTSTRAP USES -- `useSelection`, not
+        // `allClients`. This is the half of the owner's ask that makes the
+        // setting unified: before this, "all clients" meant every declared
+        // install while the bootstrap meant one picked client, so the two
+        // controls on this page acted on different sets by design.
         const res = await jpost('/api/thumbs/start',
-                                { mode: 'meshes', allClients: true });
+                                { mode: 'meshes', useSelection: true,
+                                  roots: pickedRoots() });
         say(res.started
           ? 'Queued — clients run one after another, not at once.'
           : (res.reason || 'not started'));
@@ -721,8 +1062,12 @@
     });
     row.appendChild(go);
     row.appendChild(mk('span', 'set-help',
-      'Each client keeps its own folder selection and its own cache, and ' +
-      'each is resumable on its own — so stopping part-way loses nothing.'));
+      'Runs for the installs ticked under "Which installs" above — the same ' +
+      'selection the bootstrap uses. Each client keeps its OWN folder ' +
+      'selection and its own cache, and each is resumable on its own, so ' +
+      'stopping part-way loses nothing. The two selections compose: this one ' +
+      'says which clients, and each client’s own folder list says which ' +
+      'groups within it.'));
     box.appendChild(row);
     return box;
   }
@@ -932,6 +1277,22 @@
       // 2 s poll: it walks each install and benchmarks the CPU, MEASURED at
       // 1-14 s per client.
       if (!book) book = await jget('/api/bootstrap/checklist');
+      // THE SELECTION AND THE ADVANCED FLAG, from the server, once. Both are
+      // stored settings, so a page opened in a second window shows the same
+      // ticks -- which a `localStorage` selection could not.
+      if (!selection) selection = await jget('/api/selection');
+      if (picked === null) picked = new Set(selection.stored || []);
+      try {
+        const st = await jget('/api/settings');
+        const adv = (st.settings || []).find(
+          s => s.name === 'show_advanced_options');
+        advanced = !!(adv && adv.value);
+      } catch (e) {
+        // The supply section falls back to its RESTRICTED form, never its
+        // open one: failing closed is the only safe direction for a control
+        // whose whole purpose is to withhold fields by default.
+        advanced = false;
+      }
       thumb = await jget('/api/thumbs/status');
       index = await jget('/api/index/status');
     } catch (e) {

@@ -736,15 +736,100 @@
     return box;
   }
 
-  function group(title, rows, emptyText) {
-    const box = mk('div');
-    box.appendChild(mk('h4', 'set-sub', title));
-    if (!rows.length) {
+  // ------------------------------------------------------ collapsible groups
+  //
+  // WHICH GROUPS FOLD, AND WHY NOT ALL OF THEM THE SAME WAY.
+  //
+  // Offline Clients starts COLLAPSED, because it is the wall: seven declared
+  // patch clients push the private-server group and the two add-a-folder
+  // forms below the fold, and those forms are what someone opens this page to
+  // use. Private servers and Unclassified start OPEN. They are short, and
+  // they are short for different reasons worth keeping visible -- a private
+  // server is usually the thing the user just added and wants to confirm, and
+  // Unclassified is an anomaly list. Folding an anomaly list by default is how
+  // an anomaly stops being noticed.
+  //
+  // A REOPENED GROUP STAYS OPEN. The state is per group and remembered, so
+  // the default above is a starting position and not a preference the page
+  // re-imposes on every render.
+  //
+  // AN EMPTY GROUP IS NOT GIVEN A TOGGLE. Two reasons. There is nothing to
+  // hide, so a control that folds nothing is a control that does nothing; and
+  // a collapsed group and an empty group are otherwise the same picture -- a
+  // title with no rows under it. The count in the header is the other half of
+  // that: `Offline Clients (7)` collapsed cannot be read as "none declared",
+  // which is exactly what a bare collapsed title would say.
+  //
+  // NOT `localStorage` FOR THE INSTALL SELECTION -- that lives in the config
+  // through `cosettings`, because a builder run from a shell has to see it.
+  // This is different: which sections a browser has folded is about this
+  // browser, `cards.js` and `builder.js` already keep panel state here under
+  // the same convention, and putting it in the config would mean a viewer
+  // open in two windows fighting over one value.
+  const GROUP_KEY = 'cosetdirs.groups';
+
+  function groupState() {
+    try {
+      const raw = localStorage.getItem(GROUP_KEY);
+      const doc = raw ? JSON.parse(raw) : {};
+      return (doc && typeof doc === 'object') ? doc : {};
+    } catch (e) {
+      // A corrupt or unavailable store must not take the directory list with
+      // it: the groups fall back to their defaults, which is a cosmetic loss.
+      return {};
+    }
+  }
+
+  function groupOpen(key, dflt) {
+    const st = groupState();
+    return Object.prototype.hasOwnProperty.call(st, key) ? !!st[key] : dflt;
+  }
+
+  function setGroupOpen(key, open) {
+    try {
+      const st = groupState();
+      st[key] = !!open;
+      localStorage.setItem(GROUP_KEY, JSON.stringify(st));
+    } catch (e) { /* remembering is a convenience, not a requirement */ }
+  }
+
+  function group(title, rows, emptyText, key, openByDefault) {
+    const box = mk('div', 'set-group');
+    const n = rows.length;
+    // THE COUNT IS PART OF THE TITLE, not a badge that a collapsed header
+    // might drop. It is rendered for every group including the empty one.
+    const heading = title + ' (' + n + ')';
+    if (!n) {
+      const h = mk('h4', 'set-sub', heading);
+      h.setAttribute('data-group', key);
+      box.appendChild(h);
       box.appendChild(mk('div', 'set-empty', emptyText));
       return box;
     }
+    const open = groupOpen(key, openByDefault !== false);
+    const btn = mk('button', 'set-group-toggle');
+    btn.type = 'button';
+    btn.id = 'set-group-' + key;
+    btn.setAttribute('data-group', key);
+    // `aria-expanded` is the state a screen reader reads AND the state the
+    // browser test asserts on, so the two cannot drift: there is no separate
+    // "is it open" flag for a test to check that the control does not set.
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    btn.appendChild(mk('span', 'set-group-caret', open ? '▾' : '▸'));
+    btn.appendChild(mk('span', 'set-group-title', heading));
     const ul = mk('ul', 'set-list');
+    ul.id = 'set-group-body-' + key;
     rows.forEach(r => ul.appendChild(installCard(r)));
+    ul.hidden = !open;
+    btn.setAttribute('aria-controls', ul.id);
+    btn.addEventListener('click', () => {
+      const now = btn.getAttribute('aria-expanded') !== 'true';
+      btn.setAttribute('aria-expanded', now ? 'true' : 'false');
+      ul.hidden = !now;
+      btn.firstChild.textContent = now ? '▾' : '▸';
+      setGroupOpen(key, now);
+    });
+    box.appendChild(btn);
     box.appendChild(ul);
     return box;
   }
@@ -1036,13 +1121,20 @@
       pendingOffer = null;
     }
 
+    // THE OTHER "Offline Clients" IS NOT THIS ONE. `basepicker.js` renders a
+    // group with the same label, but it is an <optgroup> inside a <select>
+    // -- an optgroup cannot be collapsed, has no header to click, and is a
+    // different surface entirely. Anyone who finds the collapsing feature by
+    // grepping for the label will land there first; this is the section the
+    // owner meant.
     host.appendChild(group('Offline Clients', dirs.offlineClients,
-      'None declared.'));
+      'None declared.', 'offline', false));
     host.appendChild(group('Private servers', dirs.privateServers,
-      'None declared. Add one below — there is no default location.'));
+      'None declared. Add one below — there is no default location.',
+      'servers', true));
     if (dirs.unclassified.length) {
       host.appendChild(group('Unclassified', dirs.unclassified,
-        'None.'));
+        'None.', 'unclassified', true));
     }
 
     host.appendChild(scanBlock());
