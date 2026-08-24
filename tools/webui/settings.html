@@ -7,6 +7,21 @@
 <style>
 /* Local to this page. The shared style.css is built around the browser's
    three-pane layout, and a settings window is one column of prose. */
+
+/* Opt OUT of the viewer's fixed-viewport shell, or this page cannot scroll.
+   style.css sets `html, body { height: 100% }` and `body { display: flex;
+   flex-direction: column; overflow: hidden }` so the viewer's panes can each
+   scroll INSIDE a body that never does. This page has no such inner scroller
+   -- it is one long document -- so the inherited `overflow: hidden` clipped it
+   at the viewport and everything below the fold was unreachable. The comment
+   above already said this page is prose rather than panes; it just did not
+   carry that through to the layout it inherits.
+
+   Scoped to this file rather than relaxed in style.css: the viewer NEEDS
+   `overflow: hidden` on body, and loosening it there to fix a page that is
+   not the viewer would trade this bug for a worse one. */
+html, body { height: auto; overflow: visible; display: block; }
+
 .set-wrap { max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
 .set-row { padding: .9rem 0; border-bottom: 1px solid rgba(128,128,128,.25); }
 .set-head { display: flex; align-items: center; gap: .6rem; }
