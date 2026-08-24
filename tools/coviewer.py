@@ -32,6 +32,7 @@ Layers:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import io
 import json
@@ -3435,9 +3436,255 @@ def c3_to_json(data: bytes, logical: str, *, bake_motion: bool = False,
 # HTTP
 # ---------------------------------------------------------------------------
 
+#: Distinguishes "this `__file__` has not been looked at" from "looked at, and
+#: it is not one of ours" in `SourceWatch._resolved`. A plain `None` would
+#: conflate the two and re-resolve every foreign module on every check.
+_UNRESOLVED = object()
+
+
+class SourceWatch:
+    r"""What this process IMPORTED, against what is on disk right now.
+
+    THE BUG THIS EXISTS FOR
+    -----------------------
+    The viewer is a long-running process, and `tools/webui/*` is served **from
+    disk on every request** (`_static` reads the file each time). So a browser
+    that reloads the settings page after an edit gets today's HTML and today's
+    JavaScript talking to handlers that were imported hours ago. The page
+    renders perfectly and its buttons answer ``no route /api/...``, with
+    nothing on screen saying why. Measured, not hypothetical: it has landed
+    three times, as ``no route /api/installs/dirs``, ``no route
+    /api/bootstrap/status`` and ``no route /api/selection``.
+
+    The condition is exactly "a source file this process imported has changed
+    on disk since it was imported", so that is what is measured -- not a build
+    number, not a version string somebody has to remember to bump.
+
+    HOW IT AVOIDS CRYING WOLF, which is the whole design constraint
+    --------------------------------------------------------------
+    A false "restart me" is worse than the bug it warns about, because the
+    next real one gets ignored. Five separate narrowings:
+
+    1. **Content, not timestamps.** ``mtime`` alone is wrong here: ``git
+       checkout``, ``git stash pop``, a worktree switch and an editor's
+       save-with-no-edit all restamp a file whose bytes are identical, and the
+       running process is not stale in any of those cases. The stamp is used
+       only as a cheap *prefilter* -- unchanged ``(size, mtime_ns)`` skips the
+       read; a changed stamp costs one ``sha256`` and is dismissed when the
+       digest matches. The refreshed stamp is then stored, so a restamped file
+       is hashed once and not on every check thereafter.
+    2. **Only modules this process actually imported.** The set comes from
+       ``sys.modules``, not from globbing the tree. Editing a test, a document,
+       a plugin nothing has loaded, or a tool the viewer never imports cannot
+       fire this.
+    3. **Only files inside the checkout.** ``site-packages`` and the stdlib are
+       out of scope; a ``pip install`` in another window is not the viewer's
+       problem to report.
+    4. **A file that cannot be read is not "changed".** Atomic writes
+       (``write tmp`` + ``replace``) and antivirus locks can make a file
+       briefly unopenable. Those land in ``unreadable`` and are reported, but
+       they do not raise the flag.
+    5. **A module imported *after* startup is baselined at first sight, not
+       flagged.** Several modules here are imported lazily inside handlers
+       (``plugins``, ``colibrary``). Such a module executed the bytes that were
+       on disk when it was imported, so those bytes are its baseline. Adding it
+       to the snapshot with its current content is correct and, incidentally,
+       is why coverage *grows* while the process runs instead of silently
+       missing the lazily-loaded half.
+
+    WHAT IT IS BLIND TO, stated positively
+    --------------------------------------
+    * **A module that was never imported and never will be.** If a route moved
+      into a file this process does not import, nothing here notices; the
+      no-route symptom still does, and the page treats an unroutable
+      ``/api/viewer/build`` as proof of staleness for exactly that reason.
+    * **In-memory state that is stale for other reasons** -- a catalogue built
+      over assets that have since changed. Different problem, different check
+      (`/api/health`).
+    * **Semantics.** A changed file whose change is a comment reads as stale.
+      That is deliberate: this answers "is the code running the code on disk",
+      which has a yes/no answer, rather than "does the difference matter",
+      which does not.
+
+    COST -- measured on this checkout, 38 modules / 2.03 MB at startup
+    -----------------------------------------------------------------
+    A full **uncached** check -- scan ``sys.modules``, ``stat`` all 38, hash
+    nothing -- is **0.78 ms** (100 forced checks, cache defeated between each).
+    ``sha256`` over the whole set, which only happens when every stamp has
+    moved at once, adds **3.2 ms**. The first draft cost **98 ms** because it
+    called ``Path.resolve()`` on all ~1,000 entries of ``sys.modules`` each
+    time; ``_resolved`` is the memo that fixes it, and the two figures are why
+    it is not an optimisation to remove.
+
+    It is cached anyway, for :attr:`CACHE_SECONDS`, because a page that
+    re-checks on every failed button would otherwise walk the set once per
+    click.
+    """
+
+    #: How long one answer is reused. Two seconds: long enough that a burst of
+    #: failing requests costs one pass, short enough that the banner appears
+    #: while the user is still looking at the button that failed.
+    CACHE_SECONDS = 2.0
+    #: The floor a caller cannot get under, even with ``force=1``.
+    FORCE_FLOOR = 0.25
+
+    def __init__(self, project: Path):
+        self.project = Path(project).resolve()
+        self.started_at = time.time()
+        self._lock = threading.Lock()
+        #: rel path -> (size, mtime_ns, sha256).  Grows as modules are
+        #: imported lazily; see narrowing 5.
+        self._base: dict = {}
+        #: `__file__` string -> (rel, Path) for ours, None for everything else.
+        self._resolved: dict = {}
+        self._answer: Optional[dict] = None
+        self._answer_at = 0.0
+        first = self.check(force=True)
+        #: A digest over the baseline, fixed at startup. Not recomputed as the
+        #: snapshot grows -- it identifies *this run's* code, which is the only
+        #: thing a token is useful for.
+        self.token = first["token"]
+
+    # -- the snapshot -------------------------------------------------------
+    def _project_modules(self) -> dict:
+        """``{relative posix path: absolute Path}`` for every imported module
+        whose source lives in this checkout.
+
+        Keyed by path rather than by module name on purpose: ``coroot`` and
+        ``core.coroot`` are two names for one file, and a name-keyed map would
+        count that file twice and report it twice.
+        """
+        out = {}
+        for _name, mod in list(sys.modules.items()):
+            f = getattr(mod, "__file__", None)
+            if not f:
+                continue
+            # MEMOISED, and the memo is the difference between this check
+            # costing 0.9 ms and costing 98 ms -- measured, both ways, on this
+            # checkout. `sys.modules` holds ~1,000 entries and only ~40 are
+            # ours; `Path.resolve()` touches the filesystem, so resolving all
+            # thousand on every request is the whole cost of the feature. A
+            # module's `__file__` never changes for the life of the process, so
+            # the answer for a given string is a constant.
+            hit = self._resolved.get(f, _UNRESOLVED)
+            if hit is _UNRESOLVED:
+                try:
+                    p = Path(f).resolve()
+                    hit = ((p.relative_to(self.project).as_posix(), p)
+                           if p.suffix == ".py" else None)
+                except (OSError, ValueError):
+                    hit = None
+                self._resolved[f] = hit
+            if hit:
+                out[hit[0]] = hit[1]
+        return out
+
+    @staticmethod
+    def _digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def check(self, force: bool = False) -> dict:
+        now = time.time()
+        with self._lock:
+            age = now - self._answer_at
+            if self._answer is not None:
+                if age < (self.FORCE_FLOOR if force else self.CACHE_SECONDS):
+                    out = dict(self._answer)
+                    out["cached"] = True
+                    out["answerAgeSeconds"] = round(age, 3)
+                    return out
+            mods = self._project_modules()
+            changed, unreadable, added = [], [], []
+            restamped = 0
+            for rel, p in sorted(mods.items()):
+                try:
+                    st = p.stat()
+                    stamp = (st.st_size, st.st_mtime_ns)
+                except OSError:
+                    unreadable.append(rel)
+                    continue
+                have = self._base.get(rel)
+                if have is None:
+                    try:
+                        self._base[rel] = (stamp[0], stamp[1], self._digest(p))
+                    except OSError:                   # pragma: no cover
+                        unreadable.append(rel)
+                        continue
+                    added.append(rel)
+                    continue
+                if stamp == (have[0], have[1]):
+                    continue
+                try:
+                    digest = self._digest(p)
+                except OSError:                       # pragma: no cover
+                    unreadable.append(rel)
+                    continue
+                if digest == have[2]:
+                    # Narrowing 1: same bytes, new stamp. Not stale. Take the
+                    # new stamp so this file is not re-hashed forever.
+                    self._base[rel] = (stamp[0], stamp[1], have[2])
+                    restamped += 1
+                    continue
+                changed.append(rel)
+            token = hashlib.sha256("\n".join(
+                f"{k} {v[2]}" for k, v in sorted(self._base.items())
+            ).encode("utf-8")).hexdigest()[:16]
+            ans = {
+                "ok": True,
+                "watched": True,
+                # The one field the page keys on.
+                "stale": bool(changed),
+                "changed": changed,
+                "changedCount": len(changed),
+                "tracked": len(self._base),
+                # Reported rather than counted as staleness -- narrowing 4.
+                "unreadable": unreadable,
+                # Reported so a reader can tell "nothing moved" from "moved and
+                # was dismissed", which is the difference between this check
+                # being right and being asleep.
+                "restamped": restamped,
+                "newlyTracked": added,
+                "token": token,
+                "startedAt": self.started_at,
+                "uptimeSeconds": round(now - self.started_at, 1),
+                "checkedAt": now,
+                "cacheSeconds": self.CACHE_SECONDS,
+                "cached": False,
+                "answerAgeSeconds": 0.0,
+            }
+            self._answer = ans
+            self._answer_at = now
+            return dict(ans)
+
+
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    #: The install being served.  A PROPERTY, not a plain attribute, because
+    #: the socket test has to follow it and used to do so only by accident:
+    #: `ACTIVE_ROOT` was set from `Catalog.__init__`, so it moved when a
+    #: catalogue was BUILT rather than when an install was SERVED.  Those are
+    #: not the same event -- `base_views` caches one Catalog per declared
+    #: install so switching back is instant, and on a cache hit the
+    #: constructor does not run.  Serving cco, switching to an install whose
+    #: `[Dumy]` list is short, and switching back left the socket test on the
+    #: install just left: the header said cco, the renderer classified with
+    #: 5065's eight names, and nine attachment points came back as textured
+    #: boxes with `v_zero` sitting on the ground at the model's feet.  Nothing
+    #: reported a fault, because a short `[Dumy]` list does not fail to parse
+    #: -- it just stops hiding attachment points.
+    #:
+    #: Setting it here means the two cannot drift: there is one assignment
+    #: that means "this is the install on screen", and it is this one.
+    @property
+    def game_root(self) -> Optional[Path]:
+        return self._game_root
+
+    @game_root.setter
+    def game_root(self, root: Optional[Path]) -> None:
+        self._game_root = root
+        set_active_root(root)
 
     def __init__(self, addr, handler, catalog: Optional[Catalog],
                  root: Optional[Path]):
@@ -3478,6 +3725,10 @@ class ViewerServer(ThreadingHTTPServer):
         #: written to disk -- a token in a file is a token that outlives the
         #: run it authorised. See `Handler._csrf_reason`.
         self.csrf_token = secrets.token_urlsafe(32)
+        #: The imported-source snapshot behind `/api/viewer/build`. Taken here
+        #: rather than in `serve()` so a server built directly -- which the
+        #: tests do -- carries one too.
+        self.source_watch = SourceWatch(PROJECT)
 
 
 def _json_bytes(obj) -> bytes:
@@ -3751,6 +4002,11 @@ class Handler(BaseHTTPRequestHandler):
             # before an install exists.
             if path == "/api/token":
                 return self.api_token(arg)
+            # A stale process is exactly as confusing in setup mode -- more so,
+            # because setup is the only screen the user can reach -- so the
+            # staleness answer is served here too.
+            if path == "/api/viewer/build":
+                return self.api_viewer_build(arg)
             return self._error(503, "no game install configured yet -- "
                                     "open http://" + self.headers.get("Host", "")
                                     + "/setup")
@@ -3861,6 +4117,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/thumbs/status": self.api_thumbs_status,
             "/api/index/status": self.api_index_status,
             "/api/token": self.api_token,
+            "/api/viewer/build": self.api_viewer_build,
             "/api/plugins": self.api_plugins,
         }
         fn = routes.get(path)
@@ -3886,6 +4143,31 @@ class Handler(BaseHTTPRequestHandler):
                            "header": "X-CO-Token",
                            "note": "send this as the X-CO-Token header on POSTs; "
                                    "it changes every time the server restarts"})
+
+    def api_viewer_build(self, arg):
+        """Is this process running the code that is on disk?
+
+        See :class:`SourceWatch` for the measurement and for the five
+        narrowings that keep it from crying wolf. This handler is the whole
+        API surface: one GET, no side effects, cached server-side.
+
+        `force=1` skips the cache down to :attr:`SourceWatch.FORCE_FLOOR`. It
+        exists so the page can re-check *immediately* after a button answered
+        `no route` rather than showing the user a two-second-old "all fine".
+        The floor is what stops a loop in the page from turning into a hash of
+        the tree per frame.
+
+        **A 404 from this route is itself the answer.** A viewer old enough not
+        to have this handler cannot report its own staleness -- and a page
+        asking for it is by construction newer than that handler. `settings.js`
+        treats `no route /api/viewer/build` as stale for that reason, so the
+        feature works against the servers that predate it.
+        """
+        w = getattr(self.server, "source_watch", None)
+        if w is None:                                # pragma: no cover
+            return self._json({"ok": True, "watched": False, "stale": False,
+                               "why": "this server has no source watch"})
+        return self._json(w.check(force=str(arg("force", "")) in ("1", "true")))
 
     # -- static ------------------------------------------------------------
     def _static(self, rel: str):
@@ -5468,8 +5750,61 @@ class Handler(BaseHTTPRequestHandler):
         servers, plus where `Scan` will look."""
         root, why = clients_root()
         rows = self._install_rows()
+        # HOW the configured root was resolved, not just what it is.
+        #
+        # "Set as root" writes the per-user config, and the per-user config is
+        # the FOURTH thing `coroot.search_report` consults: an explicit path,
+        # then `CO_ROOT`, then the repo's `.co-root`, then this. When one of
+        # the two that outrank it is in play, a write here changes the file and
+        # changes nothing the user can see -- the badge does not move, because
+        # the badge reports what actually resolved. That is precisely the
+        # "button that does nothing" defect, so the page is given what it needs
+        # to refuse instead of pretending.
+        try:
+            got = coroot.find()
+        except Exception:                            # RootNotHonoured, or none
+            got = None
+        source = getattr(got, "source", "") if got else ""
+        detail = getattr(got, "detail", "") if got else ""
+        shadowed = source in ("env", "explicit", "repo-config")
+        if got is None:
+            # A REFUSED `CO_ROOT` -- set, and naming something that is not an
+            # install -- resolves to nothing at all, so `source` is empty and
+            # the test above misses it. It shadows all the same, and worse:
+            # `env_refusal` makes resolution *stop*, so the per-user config is
+            # never even consulted. Saving a root would write the file, leave
+            # no card badged, and look exactly like a button that did nothing.
+            # `last_report` is the diagnostic that never raises, which is why
+            # it is asked here rather than catching the exception's fields.
+            #
+            # HOW THIS IS REACHED, stated because it is NOT the obvious way.
+            # A viewer cannot be STARTED under a refused `CO_ROOT`: the
+            # import-time `DEFAULT_ROOT = coroot.default_root()` in
+            # `coassets` re-raises, and the process dies before it serves
+            # anything (verified). The reachable case is the folder going
+            # away *under a running process* -- `CO_ROOT` valid at startup,
+            # renamed or unmounted afterwards -- at which point this handler's
+            # `find()` starts raising while the viewer keeps serving from the
+            # catalogue it already opened. Covered by test rather than by a
+            # drive, for that reason.
+            try:
+                rep = coroot.last_report()
+            except Exception:                        # pragma: no cover
+                rep = {}
+            ref = (rep or {}).get("refused")
+            if ref:
+                shadowed = True
+                source = "env-refused"
+                detail = (f"{ref.get('var', coroot.ENV_VAR)} is set to "
+                          f"{ref.get('value')!r}, which is not an install")
         return self._json({
             "installs": rows,
+            "rootPath": str(getattr(got, "path", "")) if got else "",
+            "rootSource": source,
+            "rootSourceDetail": detail,
+            # `env` / `explicit` / `.co-root` all outrank the file that
+            # `save_root(scope="user")` writes, and so does a refused CO_ROOT.
+            "rootShadowed": shadowed,
             "offlineClients": [r for r in rows
                                if r["category"] == "offline-client"],
             "privateServers": [r for r in rows

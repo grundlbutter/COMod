@@ -22,6 +22,39 @@
    not the viewer would trade this bug for a worse one. */
 html, body { height: auto; overflow: visible; display: block; }
 
+/* The "this process is running old code" banner (settings.js, #viewer-stale).
+   STICKY, not a line in the flow, and that is the whole point: the thing it
+   explains is a button somewhere down the page answering "no route", and a
+   warning parked at the top of a document the reader has scrolled away from
+   is a warning that was never shown. Same lesson as b5393a8f, where a
+   confirmation was written to a shared note at the top of Directory
+   Management while the page scrolled to Health, and the button read as having
+   done nothing.
+
+   `hidden` (the attribute, set by the JS) is what keeps it off a healthy
+   viewer -- so `elementFromPoint` genuinely cannot reach it, rather than it
+   sitting there transparent. */
+.viewer-stale { position: sticky; top: 0; z-index: 40;
+                border: 1px solid rgba(192,57,43,.75);
+                background: #fdecea; color: #641e16;
+                border-radius: 0 0 6px 6px; padding: .8rem 1rem;
+                margin: 0 auto; max-width: 52rem;
+                box-shadow: 0 2px 10px rgba(0,0,0,.18); }
+.viewer-stale[hidden] { display: none; }
+.viewer-stale-head { display: block; margin-bottom: .35rem; }
+.viewer-stale-files { font-family: var(--mono, monospace); font-size: .88em;
+                      margin: .4rem 0; padding-left: 1.2rem; }
+.viewer-stale-symptom { font-family: var(--mono, monospace); font-size: .88em;
+                        margin: .4rem 0; }
+.viewer-stale-fix { margin-top: .45rem; }
+.viewer-stale-x { margin-top: .55rem; }
+
+/* "Make this the configured root" (setdirs.js). */
+.set-rootctl { margin-top: .2rem; }
+.set-rootnow { color: #2e8b57; }
+.set-rootdone { border-left: 3px solid #2e8b57; padding-left: .7rem;
+                margin: .5rem 0; }
+
 .set-wrap { max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
 .set-row { padding: .9rem 0; border-bottom: 1px solid rgba(128,128,128,.25); }
 .set-head { display: flex; align-items: center; gap: .6rem; }

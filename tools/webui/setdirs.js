@@ -64,6 +64,10 @@
 
   let plugins = [];      // every parser plugin, for the manual picker
   let dirs = null;       // last /api/installs/dirs response
+  // The root switch that just happened, held across the re-render that moves
+  // the badge. Same reason `pendingOffer` is held: `render()` clears the host,
+  // so a confirmation appended to a card is gone before it is read.
+  let rooted = null;     // { root, from, savedTo, at }
   // The build offer that follows a declaration. Held across the re-render
   // rather than appended to a node `render()` is about to clear.
   let pendingOffer = null;
@@ -580,6 +584,223 @@
     return box;
   }
 
+  /* ==================================================================
+   * MAKE A DECLARED INSTALL THE CONFIGURED ROOT
+   * ==================================================================
+   *
+   * WHAT THE BADGE MEANS, because the control has to mean the same thing.
+   * `configured root` is not "the client you are currently looking at". It is
+   * `coroot.game_root()` -- the folder every tool in this repo opens when it
+   * is not handed one: `comod`, `colibrary`, and this viewer on its NEXT
+   * start. It is persisted. The base picker inside the viewer deliberately is
+   * not: `post_base` says so in as many words, because flipping between
+   * installs to answer "regression, or difference between the clients?" is
+   * something you do several times a minute and is not a change of settings.
+   *
+   * So these are two different acts, and conflating them is the obvious way
+   * to build a button that appears to lie. The panel states both halves --
+   * what changes and what does not -- BEFORE the click, and confirms on the
+   * card afterwards.
+   *
+   * WHY IT IS OFFERED ON OFFLINE CLIENTS AS WELL AS PRIVATE SERVERS.
+   * Stated rather than done quietly, because the copy button one block up is
+   * private-servers-only and the asymmetry would otherwise look accidental.
+   *
+   *   - "Configured root" is a property of a DECLARATION, not of a category.
+   *     `_install_rows` computes `current` for every row from one comparison
+   *     against `coroot.game_root()`; the badge can therefore already appear
+   *     on any card. Offering the control on only some of them would leave a
+   *     state the page can display and cannot reach -- worse than either
+   *     answer, because the user can see where they want to be.
+   *   - The frozen Offline Client is the thing you are meant to work against.
+   *     The whole argument for the copy feature is that a private server
+   *     patches and rewrites itself underneath you; a mod is built against the
+   *     copy that does not move. Making that copy the default for `comod` is
+   *     the natural next step, and refusing it here would send the user to the
+   *     setup page to type the path by hand.
+   *   - Seven of the owner's nine declarations are patch clients, which is to
+   *     say Offline Clients. A root control that skipped them would skip most
+   *     of the list.
+   *
+   * The copy button is private-servers-only for a reason that does not apply
+   * here: copying a frozen copy is meaningless. Rooting one is not.
+   *
+   * WHERE THE CONTROL IS *NOT*. Three cases, and none of them is a disabled
+   * button. This file already records why, on the copy control: "A disabled
+   * button still reads as 'this is the thing you would click'; an absent one
+   * cannot be clicked by a script, a keyboard, or a stale hit-test." The
+   * owner has reported a button that does nothing when pressed twice this
+   * week, so each case renders as a SENTENCE that says why instead.
+   *
+   *   1. The card that already holds the badge. Nothing to do, and a control
+   *      that re-sets the current value is a no-op wearing a button.
+   *   2. A declaration that is not usable -- folder gone, incomplete, or no
+   *      parser plugin. `post_setroot` would refuse all three, so offering
+   *      the click would be offering a failure.
+   *   3. The resolved root did not come from the file this control writes.
+   *      `coroot` consults an explicit path, then `CO_ROOT`, then the repo's
+   *      `.co-root`, then the per-user config -- and `save_root(scope="user")`
+   *      writes the last of those. Under `CO_ROOT` the write would succeed,
+   *      the badge would not move, and the button would be exactly the defect
+   *      it is meant to avoid. `/api/installs/dirs` reports `rootShadowed` so
+   *      this page can say that out loud instead of finding out by pressing.
+   */
+
+  const slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-')
+                             .replace(/^-+|-+$/g, '');
+
+  /* The sentence a just-completed switch leaves on the card it moved to.
+   * On the CARD, not in the shared note at the top of the section: that note
+   * is off-screen for anyone who scrolled to the ninth declaration, and a
+   * confirmation the user cannot see is the b5393a8f defect. */
+  function rootedNote(r) {
+    const when = new Date(rooted.at);
+    const box = mk('div', 'set-note set-rootdone');
+    box.id = 'set-as-root-done';
+    box.textContent =
+      'Made the configured root at ' +
+      (isNaN(when.getTime()) ? 'just now' : when.toLocaleTimeString()) +
+      (rooted.from && rooted.from !== r.root
+        ? ' — it was ' + rooted.from + '.' : '.') +
+      ' Written to ' + (rooted.savedTo || 'the per-user config') +
+      '. comod and colibrary use it from now on, and this viewer will open ' +
+      'here next time it starts. What is on screen right now did not change.';
+    return box;
+  }
+
+  function rootControl(r, host, li) {
+    host.textContent = '';
+
+    if (r.current) {
+      // Case 1. No button at all.
+      const now = mk('div', 'set-help set-rootnow');
+      now.id = 'set-as-root-current';
+      now.textContent =
+        'This is the configured root: every tool that is not given a path ' +
+        'opens this folder. There is nothing to set.';
+      host.appendChild(now);
+      if (rooted && rooted.root === r.root) host.appendChild(rootedNote(r));
+      return;
+    }
+
+    if (!r.usable || !r.pluginKnown) {
+      // Case 2. The card already prints WHICH fault it is, in `set-bad`
+      // above; this line only says what the fault costs you here.
+      const no = mk('div', 'set-help');
+      no.id = 'set-as-root-unavailable-' + slug(r.root);
+      no.className = 'set-help set-as-root-unavailable';
+      no.textContent =
+        'It cannot be made the configured root while it is in this state — ' +
+        'the server checks the folder and the plugin before saving, and ' +
+        'would refuse.';
+      host.appendChild(no);
+      return;
+    }
+
+    if (dirs && dirs.rootShadowed) {
+      // Case 3.
+      const no = mk('div', 'set-help set-as-root-shadowed');
+      no.id = 'set-as-root-shadowed-' + slug(r.root);
+      no.textContent =
+        'Not offered: the root in force came from ' +
+        (dirs.rootSourceDetail || dirs.rootSource) + ', which outranks the ' +
+        'saved setting this control writes. Saving one here would change the ' +
+        'file and change nothing you can see. Clear it and restart the ' +
+        'viewer first.';
+      host.appendChild(no);
+      return;
+    }
+
+    const row = mk('div', 'set-field');
+    const btn = mk('button', 'ghost', 'Make this the configured root…');
+    btn.className = 'ghost set-as-root';
+    btn.id = 'set-as-root-' + slug(r.root);
+    btn.dataset.setAsRoot = r.root;
+    btn.title = 'Says exactly what changes before anything is saved.';
+    btn.addEventListener('click', () => rootPanel(r, host, li));
+    row.appendChild(btn);
+    host.appendChild(row);
+  }
+
+  /* The panel. States the change first and the click second -- the same shape
+   * as `copyPanel`, and for the same reason: a warning under the button is a
+   * warning read after the click. */
+  function rootPanel(r, host, li) {
+    host.textContent = '';
+    const box = mk('div', 'set-cost');
+    box.id = 'set-as-root-panel';
+    // The same expression the card's own heading uses. Naming it `zephyr1057`
+    // here while the card says `Zephyr Conquer` would make the panel read as
+    // being about something else; and appending the plugin as well gave
+    // `Zephyr Conquer (private server) (zephyr1057)`, which is the label
+    // already carrying it. The plugin is on the card two lines up.
+    const who = r.serverName || r.label || r.kind;
+    box.appendChild(mk('h4', null, 'Make ' + who + ' the configured root?'));
+    box.appendChild(mk('p', null,
+      'Saves ' + r.root + ' as the install root in ' +
+      (dirs && dirs.storePath ? dirs.storePath : 'the per-user config') + '.'));
+    box.appendChild(mk('p', null,
+      'WHAT CHANGES: every tool that is not given a path opens this folder ' +
+      'instead of ' + (dirs && dirs.rootPath ? dirs.rootPath : 'the current ' +
+      'root') + ' — comod, colibrary, and this viewer the next time it ' +
+      'starts. The badge on this list moves here.'));
+    box.appendChild(mk('p', null,
+      'WHAT DOES NOT CHANGE: the client this viewer is showing right now, and ' +
+      'nothing on disk. No files are copied, moved or deleted, in either ' +
+      'folder. Set a different one whenever you like — this is one line in a ' +
+      'config file, not a migration.'));
+    if (!r.indexed) {
+      box.appendChild(mk('p', 'set-measured',
+        'Note: this client has no asset index yet. Rooting it does not build ' +
+        'one — the Health section still offers that, separately.'));
+    }
+
+    const row = mk('div', 'set-field');
+    const yes = mk('button', 'primary', 'Yes — make this the configured root');
+    yes.className = 'primary set-as-root-confirm';
+    yes.id = 'set-as-root-confirm';
+    yes.addEventListener('click', async () => {
+      yes.disabled = true;
+      const before = (dirs && dirs.rootPath) || '';
+      // Confirm HERE, next to the pointer, from the first frame. The shared
+      // note at the top of the section is set as well, but it is the echo and
+      // not the confirmation.
+      const working = mk('div', 'set-note');
+      working.textContent = 'saving…';
+      box.appendChild(working);
+      say('saving the configured root…');
+      try {
+        const res = await jpost('/api/setroot',
+                                { path: r.root, kind: r.kind, scope: 'user' });
+        if (res && res.ok === false) throw new Error(res.error || 'refused');
+        rooted = { root: r.root, from: before, savedTo: res.savedTo || '',
+                   at: Date.now() };
+        say('');
+        await render();
+        // The badge has moved; put the reader on the card that now holds it.
+        // `nearest` so a card already in view does not jump.
+        const moved = document.querySelector('#set-as-root-done');
+        if (moved && moved.scrollIntoView) {
+          moved.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      } catch (e) {
+        working.remove();
+        const bad = mk('div', 'set-note set-bad');
+        bad.id = 'set-as-root-failed';
+        bad.textContent = 'Not saved: ' + String(e.message || e);
+        box.appendChild(bad);
+        say(String(e.message || e), true);
+        yes.disabled = false;
+      }
+    });
+    row.appendChild(yes);
+    const no = mk('button', 'ghost', 'Cancel');
+    no.addEventListener('click', () => rootControl(r, host, li));
+    row.appendChild(no);
+    box.appendChild(row);
+    host.appendChild(box);
+  }
+
   /* An already-declared install. */
   function installCard(r) {
     const li = mk('li', 'set-item');
@@ -644,6 +865,10 @@
       li.appendChild(crow);
     }
     li.appendChild(copyHost);
+
+    const rootHost = mk('div', 'set-rootctl');
+    li.appendChild(rootHost);
+    rootControl(r, rootHost, li);
 
     const row = mk('div', 'set-field');
     const forget = mk('button', 'ghost', 'Forget this declaration');

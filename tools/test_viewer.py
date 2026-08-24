@@ -46,6 +46,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -1009,6 +1010,68 @@ class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
         self.assertTrue(coviewer.is_socket_chunk("v_head"))
         coviewer.set_active_root(self.short_root)
         self.assertFalse(coviewer.is_socket_chunk("v_head"))
+
+    # -- the second half of the same bug: SERVING is not BUILDING ------------
+
+    def _server(self, root):
+        """A bound-but-not-serving ViewerServer on an ephemeral port."""
+        import coviewer
+        prev = coviewer.ACTIVE_ROOT
+        self.addCleanup(coviewer.set_active_root, prev)
+        srv = coviewer.ViewerServer(("127.0.0.1", 0), _NullHandler, None, root)
+        self.addCleanup(srv.server_close)
+        return coviewer, srv
+
+    def test_serving_an_install_repoints_the_socket_test(self):
+        """`game_root` is the one assignment that means "this is on screen",
+        so the socket test must move with it and not with `Catalog.__init__`.
+
+        Falsifier: make `game_root` a plain attribute again and this fails on
+        the first switch.
+        """
+        coviewer, srv = self._server(self.long_root)
+        self.assertTrue(coviewer.is_socket_chunk("v_head"))
+        srv.game_root = self.short_root
+        self.assertFalse(coviewer.is_socket_chunk("v_head"))
+
+    def test_switching_back_to_a_CACHED_install_restores_the_socket_test(self):
+        """The regression guard proper, and the shape the bug actually took.
+
+        `base_views` keeps one Catalog per declared install so switching back
+        is instant. `ACTIVE_ROOT` used to move only from `Catalog.__init__`, so
+        on a cache HIT the constructor did not run and the socket test stayed
+        on the install just LEFT. Serving cco, visiting an install with a short
+        `[Dumy]`, and coming back therefore drew nine attachment points as
+        geometry -- `v_zero` among them, a textured box on the ground at the
+        model's feet -- while every label in the UI still said cco.
+
+        The switch back is simulated exactly as the cache makes it happen: no
+        Catalog is constructed, only `game_root` is assigned. Asking twice is
+        the test; a one-shot switch passed even with the old code because the
+        first visit to an install always builds its Catalog.
+        """
+        coviewer, srv = self._server(self.long_root)
+        seen = []
+        for _ in range(2):
+            srv.game_root = self.short_root          # a cached foreign install
+            seen.append(coviewer.is_socket_chunk("v_head"))
+            srv.game_root = self.long_root           # cached: no Catalog built
+            seen.append(coviewer.is_socket_chunk("v_head"))
+        self.assertEqual(seen, [False, True, False, True])
+
+    def test_the_stale_root_is_wrong_in_both_directions(self):
+        """Drift that leaves the PERMISSIVE list in place is the dangerous
+        half: it looks correct, so a check that only watches for boxes reports
+        clean while the served install is being classified with someone
+        else's vocabulary."""
+        coviewer, srv = self._server(self.short_root)
+        self.assertFalse(coviewer.is_socket_chunk("v_head"))
+        srv.game_root = self.long_root
+        self.assertTrue(coviewer.is_socket_chunk("v_head"))
+
+
+class _NullHandler(BaseHTTPRequestHandler):
+    """Never instantiated -- ViewerServer only stores the class."""
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
