@@ -2,9 +2,24 @@
 
 HUMAN NOTE - This is 100% vibe coded. I know a little bit about computers,
 programming, troubleshooting, etc... but I am not a software developer, or a
-game developer, or a 3d artist or animator. Maybe thats a bad thing, maybe its
-not. The world is weird right now. Lets learn as much as we can, and see how
-far we can get, no matter what tools we use.
+game developer, or a 3d artist or animator. But I do like learning about these
+things, and jumping in as a human in a few of them as well. Yes, this uses AI
+as a major shortcut, maybe that's a bad thing, maybe its not. The world is
+weird right now. I want to learn as much as I can, and see how far I can get.
+
+There's an active group of people who have done incredible things for the
+preservation of this game, 100% by human brainpower. And they're still doing
+amazing things to this day. Recently they've clarified their stance on AI made
+projects, so I have deliberately not posted in their community. But, I want to
+attribute them and thank them, because without their effort, the AI couldn't
+do any of this. I'm not sure I agree/understand with their stance completely
+though, which is why this still exists. A lead figure in this community did
+clarify that its to prevent slop that provides no value, or false hopes. This
+project was held from release until it provided actual value without false
+hopes, so I think I am with you there. It's got a purpose for my own
+exploratory use, it has a usable tool with a simplified version for a private
+server I play on in hopes that others can more easily mod their local client,
+and it gives the curious a window into a game I love.
 
 Tools for reading, viewing and modding the assets of **classic-era Conquer
 Online clients** — any client built on TQ Digital's classic formats: `.wdf` archives,
