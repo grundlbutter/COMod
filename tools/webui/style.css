@@ -46,7 +46,11 @@ body {
   flex: 0 0 auto;
 }
 .co-gap { flex: 1 1 auto; }
-.co-tablist { display: flex; flex-wrap: wrap; gap: 4px; margin-left: auto; }
+/* No `margin-left: auto` here. That was what pushed the tabs to the right when
+   they were on the right; with them leading the bar it would push them right
+   again and undo the order. Spacing is `.co-gap`'s job alone -- one thing
+   decides where the space goes, so the two cannot disagree. */
+.co-tablist { display: flex; flex-wrap: wrap; gap: 4px; }
 
 .co-tab {
   display: inline-block;

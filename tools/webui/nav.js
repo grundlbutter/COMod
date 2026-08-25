@@ -53,18 +53,24 @@ const CoNav = (() => {
     { id: 'builder',  href: '/builder',  label: 'Character Builder' },
     { id: 'models',   href: '/models',   label: 'Model Viewer' },
     { id: 'mapedit',  href: '/mapedit',  label: 'Map Editor' },
+    { id: 'swap',     href: '/swap',     label: 'Swap' },
     { id: 'settings', href: '/settings', label: 'Settings' },
   ];
 
   /** Pages that are not themselves tabs, and the tab they belong under.
    *
-   *  `/swap` is a real route and deliberately not a sixth tab: it is the
-   *  Asset Viewer's swap flow with the window to itself, reached from the
-   *  viewer, and its own <h2> says so. Mapping it here is what keeps "exactly
-   *  one tab is current" true on a page that is not a tab, rather than
-   *  leaving the bar with nothing lit and the reader with no idea which
-   *  section they are in. */
-  const UNDER = { swap: 'viewer' };
+   *  EMPTY, and that is the current state rather than a stub. `/swap` used to
+   *  live here, mapped under `viewer`, so the bar would light SOMETHING on a
+   *  page that was not a tab. That was the honest-but-uncomfortable answer to
+   *  "which tab is current on /swap": Asset Viewer, a page you are not on.
+   *  Swap is its own tab now, so the question is gone.
+   *
+   *  The mechanism stays because the situation will recur -- the next route
+   *  that is a flow rather than a section needs somewhere to point, and
+   *  rediscovering that is worse than keeping eight lines. A page listed here
+   *  lights its parent; a page listed nowhere lights nothing, which reads as
+   *  broken and is why the map exists at all. */
+  const UNDER = {};
 
   const TITLE = {};
   for (const t of TABS) TITLE[t.id] = t.label;
@@ -153,13 +159,13 @@ const CoNav = (() => {
     mods.textContent = 'Mod staging';
     mods.title = 'What is staged to replace an asset, and the install that ' +
                  'applies it. Nothing reaches the game until you press Install.';
-    bar.appendChild(mods);
+    // Built first, appended LAST. The destinations lead the bar and the
+    // staging control sits at the far end -- reading order matches the two
+    // kinds of thing: where you can go, then what you can do here.
+    // Assembling the button before the tabs keeps its wiring where it was,
+    // so only the order in the DOM changed and nothing had to be re-bound.
 
-    const gap = document.createElement('span');
-    gap.className = 'co-gap';
-    bar.appendChild(gap);
-
-    // RIGHT: the destinations.
+    // LEFT: the destinations.
     const list = document.createElement('div');
     list.className = 'co-tablist';
     for (const t of TABS) {
@@ -178,6 +184,15 @@ const CoNav = (() => {
       list.appendChild(a);
     }
     bar.appendChild(list);
+
+    const gap = document.createElement('span');
+    gap.className = 'co-gap';
+    bar.appendChild(gap);
+
+    // RIGHT: the one control in the bar. It is not a destination and never
+    // takes `aria-current`; the gap is what says so without decoration.
+    bar.appendChild(mods);
+
     host.appendChild(bar);
 
     return { page: pageId(), current: cur, tabs: TABS.length };

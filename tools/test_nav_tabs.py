@@ -58,6 +58,7 @@ WANT_TABS = [
     ("builder",  "/builder",  "Character Builder"),
     ("models",   "/models",   "Model Viewer"),
     ("mapedit",  "/mapedit",  "Map Editor"),
+    ("swap",     "/swap",     "Swap"),
     ("settings", "/settings", "Settings"),
 ]
 
@@ -377,10 +378,22 @@ class SwapIsNotOrphaned(unittest.TestCase):
     def test_it_is_reachable_from_the_viewer(self):
         self.assertRegex(read("index.html"), r'href="/swap"')
 
-    def test_it_still_lights_a_tab(self):
-        """Being off the bar must not mean the bar goes blank while you are
-        there -- that is a reader with no idea which section they are in."""
-        self.assertEqual(parse_under(read("nav.js")).get("swap"), "viewer")
+    def test_it_lights_its_own_tab(self):
+        r"""Swap is a tab in its own right now, so it lights ITSELF.
+
+        This used to assert `UNDER['swap'] == 'viewer'` -- the mapping that
+        lit Asset Viewer while you were on /swap. That was the least-bad
+        answer while swap was off the bar: something lit beats nothing lit,
+        because a blank bar reads as broken. It was still the bar naming a
+        page you were not on, and the owner resolved it by giving swap a tab.
+
+        So the assertion inverts. Swap must NOT be in the parent map, because
+        being there would light a second section as well as its own.
+        """
+        under = parse_under(read("nav.js"))
+        self.assertNotIn("swap", under,
+                         "swap is a tab now; mapping it under another tab "
+                         "would light two sections for one page")
         self.assertIn('data-co-page="swap"', read("swap.html"))
 
     def test_the_page_no_longer_claims_the_whole_viewport(self):
