@@ -8,6 +8,59 @@
 
 const $ = s => document.querySelector(s);
 
+/* CCO MODE -- one prefilled field, no parser-plugin picker, no detection log.
+ *
+ * This is a MODE OF THIS PAGE, not a second page. setup.html stays one
+ * document and CCO hides the parts it does not need, rather than gaining a
+ * setup-cco.html that would drift from this one the first time the
+ * required-files list or the save flow changed. Same argument nav.js makes
+ * for the tab bar, and the same defect shape behind it.
+ *
+ * WHAT IT REMOVES IS A CHOICE, NEVER A CHECK. `/api/setroot` still validates
+ * the folder against the named plugin's own `confidence` hook before saving
+ * it -- hiding the picker means the answer is SUPPLIED, not that it stops
+ * being verified. A path that is not a CCO install is still refused, with its
+ * reason, in the same `#msg`.
+ *
+ * The mode and the default root both come from `/api/mode`. This page does
+ * not carry the path: `coroot.CONVENTIONAL_ROOT` is where it is written down,
+ * and a copy here is the one that keeps naming the old folder after a rename.
+ */
+let MODE = { mode: 'full', defaultRoot: '', kind: '' };
+
+/* ONE fetch, awaited by BOTH consumers -- `load()` and the plugin-picker IIFE
+ * at the bottom of this file. They are independent async entry points that
+ * both start at parse time, so a plain `await` inside `load()` would leave the
+ * picker racing it: the IIFE would test a block that `applyMode` had not
+ * hidden yet, enumerate the plugins anyway, and CCO mode would show a picker
+ * on a fast machine and hide it on a slow one. A shared promise makes the
+ * ordering a fact rather than a timing accident. */
+const MODE_READY = fetch('/api/mode')
+  .then(r => r.json())
+  .then(d => { MODE = d; return d; })
+  .catch(() => MODE);        // an older viewer with no /api/mode: stay full
+
+function applyMode() {
+  if (MODE.mode !== 'cco') return;
+  document.body.classList.add('setup-cco');
+  for (const id of ['#kinds-block', '#searched-block']) {
+    const b = $(id);
+    // Whole blocks, by id. Hiding only the inner control would leave its
+    // heading and its explanatory paragraph behind, describing a picker that
+    // is not on the page.
+    if (b) b.hidden = true;
+  }
+  const h = document.querySelector('header .mut');
+  if (h) h.textContent = 'first run — CCO Swap';
+  const path = $('#path');
+  if (path && !path.value && MODE.defaultRoot) path.value = MODE.defaultRoot;
+  const note = $('#msg');
+  if (note && !note.textContent) {
+    note.textContent = 'CCO Swap expects Classic Conquer 2.0 at the path ' +
+                       'above. Change it if yours is elsewhere.';
+  }
+}
+
 function say(text, cls) {
   const m = $('#msg');
   m.textContent = text;
@@ -15,6 +68,12 @@ function say(text, cls) {
 }
 
 async function load() {
+  // The mode FIRST, and awaited: everything below either fills in a block
+  // CCO hides or prefills the field CCO owns, so learning the mode after
+  // painting would show the full detection flow and then snatch it away.
+  await MODE_READY;
+  applyMode();
+
   let rep;
   try {
     rep = await (await fetch('/api/health')).json();
@@ -39,6 +98,10 @@ async function load() {
     : 'no candidates were produced — auto-detection found nothing to check.';
 
   // Prefill with the most likely candidate so the common case is one click.
+  // Prefill with the most likely candidate so the common case is one click.
+  // `!value` is what keeps CCO mode's own prefill: `applyMode` ran above and
+  // has already put `defaultRoot` there, and detection's guess must not
+  // overwrite the path the mode exists to assume.
   const guess = tried.find(t => t.source === 'default-path');
   if (guess && !$('#path').value) $('#path').value = guess.path;
 
@@ -64,7 +127,12 @@ $('#save').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         path,
-        kind: (document.querySelector('input[name="kind"]:checked') || {}).value || '',
+        // The picked plugin, or -- in CCO mode, where there is no picker --
+        // the kind the mode declares. Still only a SUPPLIED answer: the
+        // server puts it to that plugin's own `confidence` hook and refuses
+        // a folder that is not one.
+        kind: (document.querySelector('input[name="kind"]:checked') || {}).value
+              || MODE.kind || '',
         scope: $('#scope-repo').checked ? 'repo' : 'user',
       }),
     });
@@ -95,6 +163,10 @@ load();
 (async () => {
   const host = document.getElementById('kinds');
   if (!host) return;
+  // No picker in CCO mode, so no reason to enumerate plugins for it. The
+  // shared promise is what makes this deterministic -- see MODE_READY.
+  await MODE_READY;
+  if (MODE.mode === 'cco') return;
   let d;
   try { d = await (await fetch('/api/plugins')).json(); }
   catch (e) { host.textContent = 'could not list parser plugins: ' + e.message; return; }

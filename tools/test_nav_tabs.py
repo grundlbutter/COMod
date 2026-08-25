@@ -54,7 +54,10 @@ PAGES = ("index.html", "builder.html", "models.html", "mapedit.html",
 #: derived from nav.js -- a test that reads the list it is checking cannot
 #: notice the list changing.
 WANT_TABS = [
-    ("viewer",   "/",         "Asset Viewer"),
+    # "/index.html", not "/". CCO mode redirects bare "/" to the Swap page,
+    # and the Asset Viewer is STILL a tab in that mode -- so pointing its tab
+    # at the shared route would make the one tab bounce to another.
+    ("viewer",   "/index.html", "Asset Viewer"),
     ("builder",  "/builder",  "Character Builder"),
     ("models",   "/models",   "Model Viewer"),
     ("mapedit",  "/mapedit",  "Map Editor"),
@@ -144,7 +147,7 @@ class OneNav(unittest.TestCase):
         button: it looks like a destination and is not."""
         src = (PROJECT / "tools" / "coviewer.py").read_text("utf-8")
         for _id, href, label in parse_tabs(self.nav):
-            if href == "/":
+            if href == "/index.html":
                 self.assertIn('if path == "/" or path == "/index.html":', src)
                 continue
             self.assertIn(f'if path in ("{href}", "{href}/", "{href}.html")',

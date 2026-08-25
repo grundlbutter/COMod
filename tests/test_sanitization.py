@@ -100,9 +100,11 @@ from __future__ import annotations
 import ast
 import base64
 import hashlib
+import json
 import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -765,6 +767,128 @@ def decoded_views(text: str, budget: int = DECODE_BUDGET) -> list[tuple[str, str
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Check 4 -- no recovered name table is publishable.
+#
+# COMod is MIT licensed and its safety story is one sentence: *the tool ships
+# no game data; every path it reads points into an install the user already
+# has*.  A pre-bootstrap name profile (`tools/profilepack.py`) is the first
+# artefact that would put an asterisk on that, so it ships as a SEPARATE,
+# opt-in file and never as part of this repository.
+#
+# `.gitignore` already ignores `out/` whole, which is where a profile is
+# written -- and that stops the accident.  It does not stop `git add -f`,
+# which overrides an ignore rule silently.  That is the identical reasoning
+# `local_list_is_tracked` above was written for, and this is the same guard
+# pointed at the other file that must never be committed.
+#
+# Detected by CONTENT and not by filename, because a rename defeats a name
+# check and the thing being guarded is a compilation, not a path.
+
+#: A recovered table is `{u32 hash hex: asset path}`.  The threshold is high
+#: on purpose: a handful of hash-keyed pairs is a fixture, tens of thousands
+#: are a harvest.  Measured, the real tables are 10,160 and 14,266 pairs.
+NAME_TABLE_MIN_PAIRS = 200
+
+_HASH_KEY_RE = re.compile(r"^[0-9a-fA-F]{1,8}$")
+_ASSET_PATH_RE = re.compile(
+    r"\.(c3|dds|jpg|jpeg|png|bmp|cur|ico|wav|mp3|ini|dat|ani|3ds|phy)$",
+    re.IGNORECASE)
+
+
+def _looks_like_name_table(doc) -> int:
+    """How many `{hash: asset path}` pairs a parsed document holds."""
+    if not isinstance(doc, dict):
+        return 0
+    n = 0
+    for k, v in doc.items():
+        if (isinstance(k, str) and isinstance(v, str)
+                and _HASH_KEY_RE.match(k) and _ASSET_PATH_RE.search(v)):
+            n += 1
+    return n
+
+
+def name_table_findings(path: Path) -> list:
+    """Sentences naming a recovered name table, or `[]`.
+
+    Looks inside `.zip` too: a packed profile is the distributable shape, and
+    a check that only read loose JSON would miss the exact artefact this
+    guard exists for.
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix not in (".json", ".zip"):
+        return []
+    try:
+        if suffix == ".json":
+            pairs = _looks_like_name_table(json.loads(p.read_text("utf-8")))
+            if pairs >= NAME_TABLE_MIN_PAIRS:
+                return [f"holds {pairs:,} recovered {{hash -> asset path}} "
+                        f"pairs -- this is game-derived DATA and must not be "
+                        f"in this repository. Profiles ship separately; see "
+                        f"tools/profilepack.py."]
+            return []
+        with zipfile.ZipFile(p) as z:
+            names = z.namelist()
+            for n in names:
+                if not n.lower().endswith(".json"):
+                    continue
+                try:
+                    pairs = _looks_like_name_table(json.loads(z.read(n)))
+                except (ValueError, OSError):
+                    continue
+                if pairs >= NAME_TABLE_MIN_PAIRS:
+                    return [f"is an archive whose member {n!r} holds "
+                            f"{pairs:,} recovered {{hash -> asset path}} "
+                            f"pairs -- a packed name profile. It must not be "
+                            f"in this repository."]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return []
+    return []
+
+
+#: `(description, document, must_be_a_finding)` -- the check must bite in
+#: BOTH directions before it is allowed to report a clean tree.  A guard that
+#: cannot fire reports every tree clean, which is the failure this whole file
+#: was written about.
+CHECK4_CONTROLS = (
+    ("a real recovered name table",
+     {f"{i:08x}": f"c3/effect/thing-{i}/2.c3" for i in range(NAME_TABLE_MIN_PAIRS)},
+     True),
+    ("a table one pair short of the threshold",
+     {f"{i:08x}": f"c3/effect/thing-{i}/2.c3"
+      for i in range(NAME_TABLE_MIN_PAIRS - 1)}, False),
+    ("hash-keyed values that are not asset paths",
+     {f"{i:08x}": f"some prose {i}" for i in range(NAME_TABLE_MIN_PAIRS * 2)},
+     False),
+    ("an ordinary config document", {"game_root": "somewhere", "kinds": {}},
+     False),
+)
+
+
+def prove_check4_bites(tmp_dir=None) -> list:
+    """Run `CHECK4_CONTROLS`; return the ones that behaved wrongly."""
+    import tempfile                                       # noqa: PLC0415
+    broken = []
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
+        for desc, doc, want in CHECK4_CONTROLS:
+            f = Path(td) / "probe.json"
+            f.write_text(json.dumps(doc), "utf-8")
+            got = bool(name_table_findings(f))
+            if got != want:
+                broken.append(f"{desc}: expected "
+                              f"{'a finding' if want else 'no finding'}, "
+                              f"got {'a finding' if got else 'none'}")
+        # ...and the same document inside a zip, which is the shipping shape.
+        z = Path(td) / "probe.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("c3_names.json",
+                        json.dumps(dict(CHECK4_CONTROLS[0][1])))
+        if not name_table_findings(z):
+            broken.append("a packed profile zip: expected a finding, got none")
+    return broken
+
+
 def publishable_files() -> list[Path]:
     """Every file `git push` would carry: tracked, plus untracked and not
     ignored.  Falls back to a filesystem walk outside a git checkout."""
@@ -1056,9 +1180,30 @@ def main(argv: list[str]) -> int:
               f"check-3 control(s) failed; {len(files)} file(s) NOT scanned")
         return 2
 
+    # Check 4's controls, on the same rule as check 3's: a guard that cannot
+    # fire reports every tree clean, so it proves it bites before it is
+    # believed.
+    broken4 = prove_check4_bites()
+    if broken4:
+        print("\n*** CHECK 4'S OWN CONTROLS FAILED ***\n"
+              "    The recovered-name-table check no longer behaves as "
+              "specified, so it cannot be believed.\n    Refusing to scan.\n")
+        for b in broken4:
+            print(f"    {b}")
+        print(f"\nRESULT: FAIL -- {len(broken4)} of "
+              f"{len(CHECK4_CONTROLS) + 1} check-4 control(s) failed; "
+              f"{len(files)} file(s) NOT scanned")
+        return 2
+
     # A tracked `.sanitize-local` is the one failure this whole mechanism
     # exists to prevent, so it is fatal on its own and reported first.
     tracked = local_list_is_tracked()
+
+    # Check 4 itself: a recovered name table anywhere `git push` would carry.
+    table_findings = []
+    for p in files:
+        for b in name_table_findings(p):
+            table_findings.append((p.relative_to(REPO).as_posix(), b))
 
     view_bytes: dict[str, int] = {}
     path_stats: dict[str, int] = {}
@@ -1131,6 +1276,25 @@ def main(argv: list[str]) -> int:
     # two readouts of one run disagree". Scanning zero files and finding
     # nothing is not a pass, and only the count can say which happened.
     ident = len(BANNED_TOKENS) + len(BANNED_SQUASHED) + len(local[0]) + len(local[1])
+
+    # Stated with its count, on the same rule as every other verdict line
+    # here: a check that scanned nothing and found nothing is not a pass.
+    print(f"recovered name tables: {len(table_findings)} finding(s) over "
+          f"{len(files)} publishable file(s); check 4's controls bit in both "
+          f"directions this run ({len(CHECK4_CONTROLS) + 1} of them)")
+    if table_findings:
+        print("\n*** GAME-DERIVED DATA IS PUBLISHABLE FROM THIS TREE ***\n"
+              "    This repository ships no game data -- that is what makes "
+              "its MIT licence\n    unqualified. A name profile is a separate, "
+              "opt-in artefact built by\n    tools/profilepack.py and written "
+              "under out/, which .gitignore ignores whole.\n"
+              "    A file here can only have arrived via `git add -f`.\n")
+        for rel, b in table_findings:
+            print(f"    {rel}\n        {b}")
+        print(f"\nRESULT: FAIL -- {len(table_findings)} recovered name "
+              f"table(s) publishable; {len(files)} file(s) scanned")
+        return 1
+
     if findings:
         print(f"\n{len(findings)} FILE(S) WITH FINDINGS:\n")
         for rel, bad in findings:

@@ -110,7 +110,15 @@ try:                                                     # speed only
 except Exception:                                        # pragma: no cover
     _np = None
 
-STAGE = _REPO / "mods" / "stage"
+#: comod's stage tree, imported. A local copy here is how the Map Editor
+#: would come to write where `comod install` does not read -- the same defect
+#: that made Mod staging report "Nothing is staged" over a real stage tree.
+def _stage_dir():
+    import comod                                          # noqa: PLC0415
+    return comod.STAGE
+
+
+STAGE = _stage_dir()
 
 #: Output edge of one map tile, in pixels. 256 keeps a full-zoom screen at a
 #: few dozen requests and a whole-map view at a handful.

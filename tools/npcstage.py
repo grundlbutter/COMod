@@ -47,7 +47,21 @@ import coassets                                            # noqa: E402
 import coroot                                              # noqa: E402
 import safepath                                            # noqa: E402
 
-STAGE = PROJECT / "mods" / "stage"
+#: THE STAGE TREE, IMPORTED -- NEVER RE-DERIVED.
+#:
+#: `comod.py` is what installs and reverts, so its `STAGE` is the only
+#: definition that decides where a staged file has to be to exist. When the
+#: layout moved from `mods/` to `Installed/`, comod changed and the local
+#: copies here did not: files staged by this module landed in a directory the
+#: installer never reads, so Mod staging reported "Nothing is staged" over a
+#: real stage tree. `coviewer.py` was corrected at the time; this module was
+#: not, which is why the same bug came back through a different door.
+def _stage_dir():
+    import comod                                          # noqa: PLC0415
+    return comod.STAGE
+
+
+STAGE = _stage_dir()
 
 
 class Refused(Exception):

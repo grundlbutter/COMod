@@ -49,13 +49,38 @@ const CoNav = (() => {
    *  coviewer.py -- nowhere else. `id` is what a page puts in
    *  `data-co-page`. */
   const TABS = [
-    { id: 'viewer',   href: '/',         label: 'Asset Viewer' },
+    { id: 'viewer',   href: '/index.html', label: 'Asset Viewer' },
     { id: 'builder',  href: '/builder',  label: 'Character Builder' },
     { id: 'models',   href: '/models',   label: 'Model Viewer' },
     { id: 'mapedit',  href: '/mapedit',  label: 'Map Editor' },
     { id: 'swap',     href: '/swap',     label: 'Swap' },
     { id: 'settings', href: '/settings', label: 'Settings' },
   ];
+
+  /** WHICH DESTINATIONS A MODE ADVERTISES -- ids only.
+   *
+   *  `TABS` above stays the ONE definition of what a tab IS: its route and
+   *  its label. This says only which of them a mode puts in the bar, so a
+   *  mode cannot invent a destination, cannot relabel one, and cannot point
+   *  one somewhere else. That split is why CCO Swap is a filter here rather
+   *  than a second bar in a second file -- the fork shape this project has
+   *  paid for seven times, which this file's own header describes.
+   *
+   *  `null` means "every tab", and it is null rather than a written-out copy
+   *  of all six ids on purpose: a spelled-out full list is `TABS` duplicated,
+   *  and it goes stale the day a seventh tab is added -- SILENTLY, and in the
+   *  mode whose entire job is to show everything.
+   *
+   *  `cco` is the CCO Swap product: browse an asset, swap it, set your
+   *  preferences. The three it drops -- Character Builder, Model Viewer, Map
+   *  Editor -- are sections of the toolkit, not steps in that flow. Asset
+   *  Viewer STAYS because `/swap`'s entry point is a link on it; dropping it
+   *  would leave the mode's headline feature reachable only by typing a URL.
+   */
+  const MODES = {
+    full: null,
+    cco: ['viewer', 'swap', 'settings'],
+  };
 
   /** Pages that are not themselves tabs, and the tab they belong under.
    *
@@ -69,8 +94,67 @@ const CoNav = (() => {
    *  that is a flow rather than a section needs somewhere to point, and
    *  rediscovering that is worse than keeping eight lines. A page listed here
    *  lights its parent; a page listed nowhere lights nothing, which reads as
-   *  broken and is why the map exists at all. */
+   *  broken and is why the map exists at all.
+   *
+   *  THIS MAP IS MODE-INDEPENDENT. The tabs a MODE hides are handled by
+   *  `under()` below, which derives them -- see there for why they are not
+   *  written out as a second map beside `MODES`. */
   const UNDER = {};
+
+  /** Which mode the server says this page is in.
+   *
+   *  Read from a `<meta>` the server injects at serve time, exactly like
+   *  `co-csrf`, and read SYNCHRONOUSLY because the bar renders where this
+   *  script sits. It cannot be a fetch: the bar would draw in full mode and
+   *  then redraw narrower a moment later, which is a flicker in the one
+   *  component whose job is to be identical on every page.
+   *
+   *  An unknown or missing value is `full`, and the direction of that
+   *  fallback is deliberate: a garbled mode string that HIDES real
+   *  destinations is a broken tool, while one that shows a tab a CCO user
+   *  does not need is a tab they do not click. */
+  function mode() {
+    const m = document.querySelector('meta[name="co-mode"]');
+    const v = ((m && m.content) || '').trim();
+    return Object.prototype.hasOwnProperty.call(MODES, v) ? v : 'full';
+  }
+
+  /** The bar's destinations for this mode. */
+  function tabs() {
+    const keep = MODES[mode()];
+    if (!keep) return TABS.slice();
+    return TABS.filter(t => keep.indexOf(t.id) >= 0);
+  }
+
+  /** The parent map in force, DERIVED for the tabs this mode drops.
+   *
+   *  A mode that hides `builder` does not make `/builder` stop existing --
+   *  the route is still served and still reachable by URL or bookmark. If
+   *  nothing claimed those pages they would render a bar with nothing lit,
+   *  which is the exact "reads as broken" failure `UNDER` exists for.
+   *
+   *  COMPUTED from `MODES` rather than written out as a second map beside it,
+   *  because a hand-written one must be edited every time `TABS` grows: add a
+   *  seventh tab, forget the parallel entry, and that page silently lights
+   *  nothing in CCO mode -- while every test that reads either list on its
+   *  own still passes. Deriving it keeps the keep-list the single place a
+   *  mode is described.
+   *
+   *  The parent is the mode's FIRST kept tab: its landing page, the one a
+   *  user in that mode gets by opening the tool. There is no truer answer --
+   *  the Map Editor is not "part of" the Asset Viewer -- and the bar's job
+   *  here is to say "you are outside this mode's sections", not to invent a
+   *  hierarchy it does not have. */
+  function under() {
+    const keep = MODES[mode()];
+    const map = Object.assign({}, UNDER);
+    if (!keep || !keep.length) return map;
+    const home = keep[0];
+    for (const t of TABS) {
+      if (keep.indexOf(t.id) < 0 && !(t.id in map)) map[t.id] = home;
+    }
+    return map;
+  }
 
   const TITLE = {};
   for (const t of TABS) TITLE[t.id] = t.label;
@@ -84,7 +168,7 @@ const CoNav = (() => {
 
   function currentTab() {
     const p = pageId();
-    return UNDER[p] || p;
+    return under()[p] || p;
   }
 
   /** The staging drawer, for a page that has none of its own.
@@ -168,7 +252,8 @@ const CoNav = (() => {
     // LEFT: the destinations.
     const list = document.createElement('div');
     list.className = 'co-tablist';
-    for (const t of TABS) {
+    const drawn = tabs();
+    for (const t of drawn) {
       const a = document.createElement('a');
       a.className = 'co-tab';
       a.id = 'co-tab-' + t.id;
@@ -195,7 +280,11 @@ const CoNav = (() => {
 
     host.appendChild(bar);
 
-    return { page: pageId(), current: cur, tabs: TABS.length };
+    // `tabs` is what was DRAWN, not how many exist: in CCO mode those differ,
+    // and a driven test asking "did the mode take effect" needs the drawn
+    // count. `mode` rides along so the answer names its own cause.
+    return { page: pageId(), current: cur, mode: mode(),
+             tabs: drawn.length, of: TABS.length };
   }
 
   /** Make the injected drawer work.
@@ -242,7 +331,8 @@ const CoNav = (() => {
     return true;
   }
 
-  return { TABS, UNDER, TITLE, render, pageId, currentTab, ensureDrawer,
+  return { TABS, MODES, UNDER, TITLE, mode, tabs, under,
+           render, pageId, currentTab, ensureDrawer,
            wireStaging };
 })();
 

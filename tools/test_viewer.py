@@ -11221,11 +11221,20 @@ class MapEditorRoutes(unittest.TestCase):
         thing that touches the install is `_run_comod`."""
         import mapedit
         src = (Path(__file__).resolve().parent / "mapedit.py").read_text("utf-8")
-        self.assertIn("STAGE = _REPO", src)
         for bad in ("shutil.copy", "os.remove"):
             self.assertNotIn(bad, src)
-        self.assertIs(mapedit.STAGE.parent.name, mapedit.STAGE.parent.name)
-        self.assertEqual(mapedit.STAGE.parts[-2:], ("mods", "stage"))
+        # THE INVARIANT IS AGREEMENT WITH THE INSTALLER, not a literal path.
+        # This used to assert the last two parts were ("mods", "stage"), which
+        # PINNED THE DEFECT: comod's stage had moved to Installed/, so the
+        # test kept passing while the editor wrote where nothing installs
+        # from. It also carried `assertIs(x.name, x.name)` -- a comparison of
+        # a value with itself, true whatever the code does.
+        import comod
+        self.assertEqual(mapedit.STAGE, comod.STAGE,
+                         "the Map Editor stages somewhere comod does not read")
+        self.assertNotIn('STAGE = _REPO / "mods"', src,
+                         "mapedit re-derives the stage path instead of "
+                         "importing comod's")
 
 
 class SafePath(unittest.TestCase):

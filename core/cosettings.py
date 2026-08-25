@@ -115,6 +115,37 @@ class Setting:
 
 SETTINGS = {s.name: s for s in (
     Setting(
+        # THE CCO SWAP MODE. It is a MODE and not a stripped branch, and that
+        # is the load-bearing decision rather than a preference about layout:
+        # a fork means the swap UI defined twice, which is the shape this
+        # project logged seven defects from in three days. One `coviewer`,
+        # one `nav.js`, one registry -- and this string is the switch.
+        #
+        # It is also the ONLY switch. No environment variable, no `--mode`
+        # flag, no query parameter. A mode settable two ways is a mode two
+        # parts of the tool can disagree about, and the symptom would be a
+        # tab bar that does not match the page it is drawn on.
+        "ui_mode", "full", str,
+        "Which surface the web UI presents: the full toolkit, or CCO swap "
+        "only.",
+        "Every page the viewer serves carries `<meta name=\"co-mode\">` with "
+        "this value, and `nav.js` draws the tab list that mode names: `full` "
+        "draws all six destinations, `cco` draws three -- Asset Viewer, Swap, "
+        "Settings -- and files the Character Builder, Model Viewer and Map "
+        "Editor under a derived parent so those routes still light a tab "
+        "instead of a blank bar. `GET /api/mode` reports the same value plus "
+        "the `defaultRoot` the mode assumes. "
+        "**Mod staging is unaffected either way**: it is a button in the bar "
+        "on every page, not a destination, and no mode may drop it. "
+        "`cco` also changes the FIRST-RUN page -- it offers one prefilled "
+        "field at `coroot.CONVENTIONAL_ROOT` instead of the parser-plugin "
+        "picker and the detection log. That removes a CHOICE and not a "
+        "CHECK: `/api/setroot` still puts the folder to the plugin's own "
+        "`confidence` hook, so a path that is not a CCO install is still "
+        "refused with its reason.",
+        choices=("full", "cco"),
+    ),
+    Setting(
         "ui_recommendations", True, bool,
         "Show the trailing Note:/recommendation blocks after a listing.",
         "`comod catalogs` and `comod browse` stop printing their trailing "

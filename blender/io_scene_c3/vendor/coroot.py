@@ -800,6 +800,23 @@ GLOBAL: tuple[str, ...] = (
     # `out/thumbs/servers/`.
     "out/viewer/texcache-",
 
+    # `tools/profilepack.py` -- packed pre-bootstrap name profiles, and the
+    # tables unpacked from an applied one. GLOBAL, and the reason is the
+    # rule this list states: **the sharing boundary is whatever the artefact
+    # is about.** A profile is *about* the `out/wdf/` name tables, which are
+    # themselves GLOBAL a few lines above, for the same reason -- the TQ hash
+    # is a pure function of the filename string, so a recovered pair is true
+    # in any install.
+    #
+    # It is also the directory where profiles for SEVERAL clients coexist:
+    # each carries its base id in its own filename
+    # (`patch5517-<fingerprint>-<producer>.zip`) and in its manifest, so the
+    # base keying is inside the artefact rather than in the path above it.
+    # Keying the directory as well would bury one client's profile under
+    # another client's index and defeat the one thing a profile is for --
+    # being handed to somebody who does not have that client yet.
+    "out/profiles/",
+
     # The keyed tree itself. Without this, resolving an already-keyed path
     # would raise, and a caller that round-trips one would key it twice.
     "out/indexes/",

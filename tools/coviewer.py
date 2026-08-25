@@ -3994,6 +3994,22 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code: int = 200):
         self._send(code, _json_bytes(obj), "application/json; charset=utf-8")
 
+    def _redirect(self, location: str):
+        """302 to another route on this server.
+
+        A redirect rather than serving the other page's bytes at this URL, so
+        the address bar tells the truth about which page is open and a reload
+        or a bookmark lands in the same place.
+        """
+        body = ("<!doctype html><meta http-equiv=refresh content=\"0;url="
+                + html.escape(location, quote=True) + "\">").encode("utf-8")
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _error(self, code: int, msg: str):
         self._json({"error": msg}, code)
 
@@ -4192,6 +4208,13 @@ class Handler(BaseHTTPRequestHandler):
             # before an install exists.
             if path == "/api/token":
                 return self.api_token(arg)
+            # SETUP IS THE PAGE THAT NEEDS THE MODE MOST. In CCO mode it
+            # offers one prefilled field instead of the plugin picker and the
+            # detection log, and `defaultRoot` comes from here -- so without
+            # this route the mode would apply to every page EXCEPT the first
+            # one a CCO user ever sees.
+            if path == "/api/mode":
+                return self.api_mode(arg)
             # A stale process is exactly as confusing in setup mode -- more so,
             # because setup is the only screen the user can reach -- so the
             # staleness answer is served here too.
@@ -4201,6 +4224,15 @@ class Handler(BaseHTTPRequestHandler):
                                     "open http://" + self.headers.get("Host", "")
                                     + "/setup")
 
+        # "/" means "the landing page for my mode"; "/index.html" means the
+        # Asset Viewer specifically. They were the same route until CCO mode
+        # needed a different landing, and separating them is what keeps the
+        # Asset Viewer REACHABLE in that mode -- its tab is still in `MODES`,
+        # so a redirect on the shared route would have made the one tab bounce
+        # to another. nav.js points the viewer tab at "/index.html" for this
+        # reason; do not point it back at "/".
+        if path == "/" and self._ui_mode() == "cco":
+            return self._redirect("/swap")
         if path == "/" or path == "/index.html":
             return self._static("index.html")
         # The character builder is its own page, not a panel on the browser.
@@ -4235,6 +4267,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {
             "/api/status": self.api_status,
             "/api/settings": self.api_settings,
+            "/api/mode": self.api_mode,
             "/api/servers": self.api_servers,
             "/api/bases": self.api_bases,
             "/api/library": self.api_library,
@@ -4383,7 +4416,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         body = p.read_bytes()
         if ctype.startswith("text/html"):
-            body = self._inject_csrf(body)
+            body = self._inject_mode(self._inject_csrf(body))
         self._send(200, body, ctype)
 
     def _inject_csrf(self, page: bytes) -> bytes:
@@ -4413,6 +4446,86 @@ class Handler(BaseHTTPRequestHandler):
         if at >= 0:
             return page[:at] + tag + page[at:]
         return tag + page
+
+    # -- the UI mode -------------------------------------------------------
+    #
+    # ONE SWITCH. The mode is `cosettings.get("ui_mode")` and nothing else --
+    # no environment variable, no `--mode` flag, no query parameter. A mode
+    # settable two ways is a mode two parts of the tool can disagree about,
+    # and the visible symptom would be a bar that does not match the page it
+    # is drawn on. `cosettings` already owns per-user preferences, already
+    # writes them where `coroot` keeps everything else, and already has
+    # `CO_SETTINGS_FILE` for running against a throwaway store -- which is
+    # what the tests use instead of a second switch built for them.
+
+    #: The kind CCO mode supplies to `/api/setroot` so the first-run page can
+    #: skip the parser-plugin PICKER. A removed CHOICE, not a removed CHECK:
+    #: the named plugin's own `confidence` hook still has to accept the
+    #: folder. `tools/test_ccomode.py` asserts a plugin answers to this name
+    #: -- a mode supplying a kind nobody has would fail the save on a string
+    #: the user never typed.
+    CCO_KIND = "cco"
+
+    def _ui_mode(self) -> str:
+        """`full` or `cco`, from the settings registry."""
+        try:
+            return cosettings.get("ui_mode")
+        except cosettings.UnknownSetting:                # pragma: no cover
+            return "full"
+
+    def _inject_mode(self, page: bytes) -> bytes:
+        """Tell the page which mode it is in, before any script runs.
+
+        Same mechanism and the same reason as `_inject_csrf`: a `<meta>`
+        written at serve time rather than into the six `.html` files. It has
+        to be a meta and not a fetch because `nav.js` renders the bar
+        SYNCHRONOUSLY where its script tag sits -- a fetch would draw the
+        full bar and then redraw it narrower, so the one component whose job
+        is to look identical on every page would flicker on all of them.
+
+        Injected on every HTML response, `setup.html` included. That page is
+        the first thing a CCO user ever sees and is the one that has to offer
+        a single prefilled field instead of the detection flow, so it needs
+        the answer as much as the tabbed pages do.
+        """
+        tag = (f'<meta name="co-mode" content="'
+               f'{html.escape(self._ui_mode(), quote=True)}">').encode("utf-8")
+        low = page.lower()
+        at = low.find(b"<head>")
+        if at >= 0:
+            return page[:at + 6] + tag + page[at + 6:]
+        # No <head>: before the first script, for the same reason csrf.js is.
+        at = low.find(b"<script")
+        if at >= 0:
+            return page[:at] + tag + page[at:]
+        return tag + page
+
+    def api_mode(self, arg):
+        """Which surface this server presents, and what that mode assumes.
+
+        The mode ALSO travels as `<meta name="co-mode">` on every page, and
+        that is what `nav.js` reads -- see `_inject_mode` for why the bar
+        cannot wait for a fetch. This endpoint is for the callers that CAN
+        wait: `setup.js` asks it for `defaultRoot` so the first-run field is
+        prefilled without the page carrying a path of its own, and
+        `settings.js` asks it after a save to notice that the chrome this
+        document was served with has gone out of date.
+
+        `modes` comes from the registry's own `choices`, and `defaultRoot`
+        from `coroot.CONVENTIONAL_ROOT`, rather than either being spelled out
+        again here. Both are the second-definition shape this repo keeps
+        paying for: the copy is the one still naming the old folder after
+        somebody renames it.
+        """
+        m = self._ui_mode()
+        spec = cosettings.SETTINGS.get("ui_mode")
+        return self._json({
+            "mode": m,
+            "modes": list(spec.choices or ()) if spec else [m],
+            "defaultRoot": coroot.CONVENTIONAL_ROOT,
+            "kind": self.CCO_KIND if m == "cco" else "",
+            "root": str(self.cat.root) if self.cat is not None else "",
+        })
 
     # -- API: status / catalogue -------------------------------------------
     def api_status(self, arg):

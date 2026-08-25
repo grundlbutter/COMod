@@ -566,7 +566,11 @@ def occupancy_sources(view: coassets.AssetRoot, root: Path) -> dict:
     # overwritten the staged art and pointed both NPCs at one group. That is
     # not a partial split; it is the sharing the split exists to undo,
     # recreated silently and one step later.
-    stage_root = PROJECT / "mods" / "stage"
+    # comod's, not a local copy -- see npcstage.STAGE for what a local copy
+    # cost. This function REPORTS what is staged; pointing it at the wrong
+    # tree makes it report an empty stage that is not empty.
+    import comod                                          # noqa: PLC0415
+    stage_root = comod.STAGE
     sdir = stage_root / "c3" / "npc"
     srcs["mods/stage/c3/npc/"] = (
         [p.stem for p in sdir.rglob("*") if p.is_file()]
@@ -653,7 +657,11 @@ def run(args) -> int:
     print(f"encoding             {note}")
 
     before_install = tree_state(root)
-    before_mods = tree_state(PROJECT / "mods")
+    # The tree staging actually writes to. This watched PROJECT/"mods" until
+    # the stage moved to Installed/ -- a "wrote nothing" guard pointed at a
+    # directory nothing writes to any more, which passes whatever happens.
+    import comod                                          # noqa: PLC0415
+    before_mods = tree_state(comod.STAGE.parent)
     print(f"install fingerprint  {len(before_install)} files, "
           f"blake2b {tree_fingerprint(root)['digest']}")
 
@@ -1123,7 +1131,7 @@ def run(args) -> int:
     # -- this command wrote nothing ---------------------------------------
     rule("this command wrote nothing")
     after_install = tree_state(root)
-    after_mods = tree_state(PROJECT / "mods")
+    after_mods = tree_state(comod.STAGE.parent)
     d = tree_delta(before_install, after_install)
     moved = d["changed"] + d["added"] + d["removed"]
     game_owned = [k for k in moved if is_volatile(k)]

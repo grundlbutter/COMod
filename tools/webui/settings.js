@@ -276,6 +276,35 @@
     return doc;
   }
 
+  /* IS THE CHROME AROUND THIS PAGE STILL THE RIGHT CHROME?
+   *
+   * `ui_mode` decides which tabs nav.js draws, and nav.js reads it from a
+   * `<meta>` the server injects when the page is SERVED -- it cannot be a
+   * fetch, because the bar renders synchronously before any fetch could
+   * return (nav.js says why at length). So changing the mode from this page
+   * writes the setting and leaves the bar around it showing the old mode's
+   * tabs: the row says "saved" and the visible effect is missing, which
+   * core/cosettings.py's own docstring calls worse than having no toggle.
+   *
+   * This asks the SERVER what it is serving now and compares it with what
+   * this document was served with. It names no setting at all -- deliberately.
+   * A list of "settings that need a reload" here would be the name list in
+   * the browser that `surfaceOf` above exists to avoid, and it would go stale
+   * silently the day a setting is renamed. This keeps working if the mode is
+   * renamed, moved, or joined by a second piece of serve-time chrome.
+   */
+  async function chromeIsCurrent() {
+    const meta = document.querySelector('meta[name="co-mode"]');
+    if (!meta) return true;            // older viewer: nothing to compare
+    let doc;
+    try {
+      doc = await (await fetch("/api/mode")).json();
+    } catch (e) {
+      return true;                     // unreachable is not the same as stale
+    }
+    return String(doc.mode || "") === String(meta.content || "");
+  }
+
   const save = (name, value) => post({ name: name, value: value });
   const resetAll = () => post({ reset: true });
 
@@ -421,6 +450,13 @@
     });
     foot.appendChild(rst);
     host.appendChild(foot);
+
+    // LAST, and after the page is painted: if the mode this document was
+    // served with is no longer the mode the server serves, the bar is stale
+    // and only a reload can fix it. `render()` runs on boot and after every
+    // save, so this one call site covers both without a hook per control.
+    // It cannot loop -- after the reload the meta matches.
+    if (!(await chromeIsCurrent())) location.reload();
   }
 
   window.coSettings = { render: render, load: load, save: save };

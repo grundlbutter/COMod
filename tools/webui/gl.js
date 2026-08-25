@@ -305,6 +305,28 @@ class Viewer {
     if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   }
 
+  /** Ask for a redraw; at most one per animation frame.
+   *
+   * `draw()` is synchronous WebGL work. Calling it straight from an input
+   * handler ties the number of redraws to the number of EVENTS, and a
+   * high-resolution wheel emits many events per notch -- so a single flick
+   * could queue dozens of full redraws on the main thread. The wheel
+   * listener is `passive: false` (it must be, to preventDefault and zoom),
+   * which means the compositor cannot scroll ANYTHING until that handler
+   * returns. Slow redraws there do not just make the canvas late; they hold
+   * up the browser's whole input pipeline.
+   *
+   * `mapedit.js` already had this right with its `schedule()`. This is the
+   * same idea, and the two should stay the same idea.
+   */
+  _drawSoon() {
+    if (this._drawPending) return;
+    this._drawPending = requestAnimationFrame(() => {
+      this._drawPending = 0;
+      this.draw();
+    });
+  }
+
   // ------------------------------------------------------------ input
   _bindInput() {
     const c = this.canvas;
@@ -340,7 +362,7 @@ class Viewer {
         this.cam.yaw -= dx * 0.008;
         this.cam.pitch = Math.max(-1.54, Math.min(1.54, this.cam.pitch + dy * 0.008));
       }
-      this.draw();
+      this._drawSoon();
     });
     c.addEventListener('contextmenu', e => e.preventDefault());
     c.addEventListener('wheel', e => {
@@ -351,7 +373,7 @@ class Viewer {
       this.cam.dist = Math.max(this.zoomMin || this.radius * 0.05,
                                Math.min(this.zoomMax || this.radius * 40,
                                         this.cam.dist));
-      this.draw();
+      this._drawSoon();
       clearTimeout(this._wheelSave);
       this._wheelSave = setTimeout(() => this._saveCam(), 400);
     }, { passive: false });
