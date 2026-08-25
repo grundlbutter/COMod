@@ -397,9 +397,20 @@ Every format spec states what is **verified** against real files and what is
 
 ## License
 
-Not chosen yet — until a `LICENSE` file lands, this code is source-available
-for reading and personal use, and that is all anybody can safely assume.
-Picking one is the first open issue.
+**MIT.** See [`LICENSE`](LICENSE). Use it, fork it, ship it, sell it — the
+only obligation is to keep the copyright notice with the copy.
+
+MIT rather than a copyleft licence because this is a library other people's
+modding tools are meant to build on, and the point is to be easy to build on.
+
+**What that covers and what it does not.** The licence covers the code in this
+repository and nothing else. It grants you no rights whatsoever in Conquer
+Online's assets, tables or client binaries — those belong to their owners, and
+this tool ships none of them. Every path it reads points into an install you
+already have. The separation is not a promise, it is mechanical: `TOOLS`,
+`CORE` and `DOCS` in `tools/extract_comod.py` name what may be published, and
+`tests/test_sanitization.py` refuses a build that carries a personal
+identifier or a hardcoded install path.
 
 ## Not for use against live servers, and not for cheating
 
