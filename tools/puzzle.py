@@ -84,7 +84,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import coroot                                            # noqa: E402
-from coassets import AssetRoot, DMap, Pul, PUL_EMPTY      # noqa: E402
+from coassets import AssetRoot, DMap, Pul                 # noqa: E402
 import dds                                               # noqa: E402
 
 try:                                    # speed only -- see dds.py's docstring
@@ -96,12 +96,8 @@ except Exception:                                        # pragma: no cover
 CELL_PX_W = 64
 #: Pixels per cell along the image's y axis. Half of CELL_PX_W: 2:1 isometric.
 CELL_PX_H = 32
-#: An empty slot in a .pul -- no tile painted there.  Re-exported, not
-#: redeclared: the constant is a property of the `.pul` format and now lives
-#: with the reader (`coassets.PUL_EMPTY`), because a second consumer that did
-#: not know it treated 0xFFFF as a reference to tile 65535.  The name stays
-#: here so `puzzle.EMPTY` keeps meaning what it always did.
-EMPTY = PUL_EMPTY
+#: An empty slot in a .pul -- no tile painted there.
+EMPTY = 0xFFFF
 #: What an unpainted pixel becomes when the art is flattened to RGB. Deliberately
 #: near-black rather than a grass green: off-art is *void*, not ground.
 VOID = (12, 12, 14)
@@ -128,7 +124,16 @@ class PuzzleMap:
     ani: str = ""
     pul_path: str = ""
     #: idx -> logical .dds path, resolved through the .ani. Filled lazily.
+    #: FRAME 0 of an animated tile -- every existing caller reads this and
+    #: gets exactly the byte it got before `frame_list` was added.
     frames: dict = field(repr=False, default_factory=dict)
+    #: idx -> EVERY frame the .ani names for that tile, in `Frame<N>` order.
+    #: `frames[idx] == frame_list[idx][0]` wherever both are set. Separate
+    #: from `frames` deliberately: the still renderers (`terrain.py`, the
+    #: `/api/game/*` PNG endpoints) must keep taking frame 0 with no change,
+    #: so animation is an ADDITIVE fact rather than a different value in an
+    #: existing field. See `docs/ground_animation.md`.
+    frame_list: dict = field(repr=False, default_factory=dict)
     assets: Optional[AssetRoot] = field(repr=False, default=None)
     _tile_rgb: dict = field(repr=False, default_factory=dict)
 
@@ -198,10 +203,35 @@ class PuzzleMap:
         return self.tiles[j * self.pul_w + i]
 
     def tile_path(self, idx: int) -> str:
-        """The .dds behind a tile index, via the .ani. Frame 0 of an animated
-        tile -- a few water tiles have several and we do not animate the
-        ground."""
+        """The .dds behind a tile index, via the .ani. **Frame 0** of an
+        animated tile, always -- the still renderers depend on that and
+        `tile_frames` is where the rest live."""
         return self.frames.get(idx, "")
+
+    def tile_frames(self, idx: int) -> list:
+        """Every .dds the .ani names for a tile index, `Frame<N>` order.
+
+        Always at least as long as ``[tile_path(idx)]`` when the tile
+        resolves at all, so a caller can loop over this instead of
+        special-casing the single-frame case.
+
+        MEASURED (2026-08-26) over the nine corpus installs under
+        ``CO_CLIENTS`` **and** the conventional install `core/coroot.py`
+        resolves: **no GROUND puzzle on any of them has a tile whose key
+        names more than one frame.** Every multi-frame key in the corpus
+        belongs to a BACKDROP plane. See `docs/ground_animation.md` 1.
+        """
+        v = self.frame_list.get(idx)
+        if v:
+            return list(v)
+        p = self.frames.get(idx, "")
+        return [p] if p else []
+
+    @property
+    def animated_tiles(self) -> dict:
+        """``{idx: frame count}`` for tiles the .ani gives more than one
+        frame. Empty on every ground puzzle in the corpus."""
+        return {i: len(v) for i, v in self.frame_list.items() if len(v) > 1}
 
     def _tile_pixels(self, idx: int) -> Optional[bytes]:
         """One tile as ``grid*grid*3`` RGB bytes, alpha flattened onto VOID.
@@ -619,7 +649,9 @@ class PuzzleLibrary:
             if isinstance(v, str):
                 v = [v]
             if v:
-                pm.frames[idx] = str(v[0]).replace("\\", "/").lstrip("/").lower()
+                seq = [str(x).replace("\\", "/").lstrip("/").lower() for x in v]
+                pm.frames[idx] = seq[0]
+                pm.frame_list[idx] = seq
         self.reason = ""
         return pm
 
@@ -629,22 +661,53 @@ class PuzzleLibrary:
     def backdrops(self, name: str) -> list["Backdrop"]:
         """The map's background puzzle layers, furthest first.
 
-        WHERE THEY COME FROM -- VERIFIED. A `.DMap`'s trailing section (the
-        `extra` array `core/dmap.py` decodes: six `u32` then a `char[260]`
-        path) is the background list. 57 of the 136 shipped maps carry 109 such
-        records between them and every well-formed one names a
-        `map/puzzle/*.pul`. `newbie` names `newbiebg.pul`, which nothing in the
-        header references -- which is why the ground pipeline never loaded it.
+        FURTHEST FIRST IS ASCENDING `values[0]`, and the list really is
+        sorted that way -- it used to be sorted `-values[0]`, contradicting
+        this line. `docs/ground_animation.md` 6.
 
-        WHAT THE SIX INTEGERS ARE. values[0] is VERIFIED as a draw index:
-        `2009-7x` and `beach` each carry two, numbered 0 and 1, and 0 is the
-        further one in both. values[2..3] are INFERRED to be a parallax
-        percentage -- over the 57 well-formed records they are 30/30 (42x),
-        50/50, 100/100, 40/40, 20/20, 10/10, and five mismatched pairs; the
-        range is 10..100 and never above it, which is what a percentage looks
-        like and what a pixel or tile count does not. values[1] is 4 on every
-        record and values[5] is 8 on every record; values[4] is 1 on 47 of 57
-        and 7..16 on the rest. None of those three is named here.
+        WHERE THEY COME FROM -- VERIFIED. A `.DMap`'s trailing section is the
+        background list. `core/dmap.parse_trailer` decodes it as GROUPS of
+        planes (a one-plane group is byte-for-byte the 284-byte record an
+        earlier flat model read), and `extra` flattens the groups into one
+        row per plane: six `u32` then a `char[260]` path. Every well-formed
+        one names a `map/puzzle/*.pul`. `newbie` names `newbiebg.pul`, which
+        nothing in the header references -- which is why the ground pipeline
+        never loaded it.
+
+        THE OLD FIGURE HERE -- "57 of the 136 shipped maps carry 109 such
+        records" -- WAS WRONG TWICE, and 57 is the number that misled.
+        Re-measured 2026-08-26 over `PuzzleLibrary.names()` on the install
+        `core/coroot.py` resolves: **137 maps, of which 55 carry a
+        resolvable plane, holding 57 GROUPS and 162 PLANES**, and 0 records
+        name a `.pul` that is not shipped. 57 is the GROUP count, not a map
+        count. `docs/map_scenery.md` 5 publishes 80/187, 84/193 and 87/196
+        for 5517/6090/6609 and flags the 57/109 pair as CCO's; it does not
+        reproduce on CCO either.
+
+        WHAT THE SIX INTEGERS ARE. values[0] is VERIFIED as a draw index,
+        furthest first: `2009-7x` and `beach` each carry two, numbered 0 and
+        1, and 0 is the further one in both -- confirmed independently from
+        the raw binary trailer by the Route B survey
+        (`docs/routeb_backdrop_planes_2026-08-26.md` on
+        `claude/vibeco-dx-backdrop`), which never calls this method.
+        values[4] is the PLANE COUNT OF THE GROUP (VERIFIED 2026-08-10;
+        re-measured here 162/162 records agree), which is why `star01`..
+        `star10` carry 7..16 planes ALL AT values[0] == 0 -- one group, one
+        draw index -- and why the sort below must be STABLE: within a group
+        the trailer's own order is the only order there is.
+        values[2..3] are a parallax PERCENTAGE -- 30/30 (42x), 50/50,
+        100/100, 40/40, 20/20, 10/10, and five mismatched pairs; the range is
+        10..100 and never above it, which is what a percentage looks like and
+        what a pixel or tile count does not. **MEASURED 2026-08-26, no longer
+        inferred**: 5017 `Conquer.exe` reads exactly these two dwords out of
+        the map file at VA 0x474019 (`MSVCRT!fread`, 4 bytes each) into the
+        plane object's +4/+8, then forms `camera * [esi+4] / 100` at VA
+        0x473F0A -- a division by 100, so a percentage by construction. The
+        `values[4]` plane count read by the same loop is the control that the
+        field indices line up. The same two integers are also the roll
+        `rate`; see `Backdrop.roll` and `docs/ground_animation.md` 10.10.
+        values[1] is 4 on every record and values[5] is 8 on every record;
+        neither is named here.
         """
         out: list[Backdrop] = []
         if self._root is None:
@@ -688,13 +751,27 @@ class PuzzleLibrary:
                 if isinstance(t, str):
                     t = [t]
                 if t:
-                    pm.frames[idx] = str(t[0]).replace("\\", "/").lstrip("/").lower()
+                    seq = [str(x).replace("\\", "/").lstrip("/").lower()
+                           for x in t]
+                    pm.frames[idx] = seq[0]
+                    pm.frame_list[idx] = seq
             out.append(Backdrop(art=pm, index=v[0] if v else 0,
                                 parallax=(v[2] if len(v) > 2 else 100,
                                           v[3] if len(v) > 3 else 100),
                                 roll=tuple(z.roll_speed or (0, 0)),
                                 values=v, path=rel.lower()))
-        out.sort(key=lambda b: -b.index)
+        # FURTHEST FIRST -- ascending, so the NEAREST plane is last and a
+        # last-wins compositor puts it on top. This used to be `-b.index`,
+        # which contradicted this method's own docstring and put the far
+        # plane over the near one in every server-rendered PNG.
+        # `tilebake.js:load()` has always sorted ascending and draws in list
+        # order with blending off, so this is the server agreeing with the
+        # client rather than a new convention. Only `beach` and `2009-7x`
+        # move: they are the only two maps in the corpus with more than one
+        # plane AND distinct indices -- `star01`..`star10` carry 7..16 planes
+        # all at index 0, where a STABLE sort returns them in .DMap trailer
+        # order either way. `docs/ground_animation.md` 6.
+        out.sort(key=lambda b: b.index)
         return out
 
 
@@ -704,9 +781,16 @@ class Backdrop:
 
     art: PuzzleMap
     index: int = 0
-    #: Percent of the ground's own scroll this plane follows. INFERRED.
+    #: Percent of the ground's own scroll this plane follows. MEASURED --
+    #: see `PuzzleLibrary.backdrops` for the two disassembly sites.
     parallax: tuple[int, int] = (100, 100)
-    #: `rollSpeedX/Y` from the .pul -- a scrolling backdrop. Not animated here.
+    #: `rollSpeedX/Y` from the .pul -- a scrolling backdrop. Not animated
+    #: here (a still PNG cannot show a scroll) but animated in the GL
+    #: client, whose `tilebake.js` scrolls the plane at
+    #: **`roll * parallax / 100` PIXELS PER SECOND**. Sign and magnitude from
+    #: `coassets.Pul` (int32 over 2,724 files); the time base and the
+    #: parallax factor are both recovered from the client --
+    #: `docs/ground_animation.md` 10 and 10.10.
     roll: tuple[int, int] = (0, 0)
     values: list = field(default_factory=list)
     path: str = ""
@@ -716,7 +800,8 @@ class Backdrop:
 
         The plane is smaller than the map (12x40 tiles against a 132-cell map is
         typical), so it tiles; `render_tiled` does the wrapping and this only
-        applies the parallax shift. INFERRED -- see `backdrops()`.
+        applies the parallax shift. The `/ 100` is the client's own -- see
+        `backdrops()` for the disassembly site.
         """
         px, py = self.parallax
         x0, y0, x1, y1 = rect

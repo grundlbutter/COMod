@@ -12,6 +12,41 @@ repeat them:
 * **`docs/effects.md`** — `MOTI`/`SHAP`/`SMOT` binary layouts, `C3Key` channels,
   the effect tables, and the effect playback loop (§8).
 
+> ## SUBJECT BINARY, added 2026-08-26 by RE New Functionality. The RVAs below are **x86-64** and belong to **one** DLL.
+>
+> This document cites `graphic.dll` RVAs and never says which `graphic.dll`. The
+> corpus holds **eleven**, from 180 KB to 5.0 MB, and **every retail one is 32-bit**:
+>
+>     Clients/CCO-snapshot-2026-08-24/bin/64/graphic.dll   2,728,960 B
+>       machine 0x8664 (x86-64), PE32+, SizeOfImage 0x2c8000
+>       sha256 1e6cf71ff3f1871a4cb9f861e02c7c9686db4ee9a1b39d5912380bc95cc3534a
+>       ALL TEN RVAs cited across this document and docs/attachment.md land in
+>       its .text: 0x266d0 0x26880 0x27610 0x277c0 0x27b30 0x28360 0x56040
+>       0x5a735 0x5b44c 0x5bbc0
+>
+>     every retail graphic.dll: machine 0x14c (i386, 32-bit)
+>       5017 5065 180,224 B · 5165 286,720 · 5517 323,584 · 6090 327,680
+>       6609 339,968 · 6609/Env_DX9 830,464
+>       7878/Env_DX8 3,222,680 · 7878/Env_DX9 5,000,728 · 7878/graphicDX9.dll 1,744,144
+>       and the HIGH RVAs (0x56040, 0x5a735, 0x5b44c, 0x5bbc0) are OUTSIDE THE
+>       WHOLE IMAGE of 5017, 5065, 5165, 5517, 6090 and 6609.
+>
+> **So these addresses must never be tried against a retail client.** It is not a
+> build difference, it is a different ARCHITECTURE -- `py -3 tools/disfn.py` on a
+> 32-bit DLL at `0x5b44c` will decode something, and it will be unrelated code.
+>
+> **The identification is positive, not circumstantial:** this document's own
+> content claim -- *"`graphic.dll` divides the STEP1/STEP2 UV-scroll rates by the
+> literal 33.0"* -- is verifiable there and nowhere else. The IEEE float and double
+> encodings of 33.0 each appear **once** in the CCO binary and **zero times in all
+> ten retail `graphic.dll` files**, against a working control (1.0f appears 306
+> times in the CCO binary, 219 in 5065).
+>
+> *Method note, because the negative nearly misled its own author: "33.0 absent from
+> every retail graphic.dll" was read as "the claim may be unverifiable" before the
+> subject was found. A zero is only informative once you have seen the instrument
+> return a one.*
+
 Every claim is marked **VERIFIED** (read out of `graphic.dll` / `Role3D.dll`
 with the RVA cited, stated by an ini file's own header, or proven across the
 whole shipped corpus) or **INFERRED** (a rule that reproduces the data, whose

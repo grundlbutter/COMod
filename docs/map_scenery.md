@@ -236,6 +236,17 @@ Every well-formed record names a `map/puzzle/*.pul`.
 that never had 136 maps; the counts rose here because the corpus did, not
 because the reading changed.
 
+**And 57 was never a map count — re-measured 2026-08-26 on CCO itself.**
+`PuzzleLibrary.names()` enumerates **137** maps there, **55** carry a
+resolvable plane, and those 55 hold **57 GROUPS / 162 PLANES**, with **0**
+records naming a `.pul` that is not shipped. 57 is the number of trailer
+GROUPS, which is what the pre-`C-2026-08-10-dmap-plane-groups` flat model
+counted as "records" before `core/dmap.parse_trailer` learned that a group can
+hold more than one plane. The `star01`..`star10` family is the whole
+difference: 10 groups holding 115 planes between them. So the row for CCO in
+the table above would read **55 / 162**, on the same basis as the three rows
+that are there.
+
 | field | reading | status |
 |---|---|---|
 | values[0] | draw index, furthest first | VERIFIED — `2009-7x` and `beach` each carry two, numbered 0 and 1, and 0 is the further one in both |

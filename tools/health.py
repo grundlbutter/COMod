@@ -1680,6 +1680,35 @@ def _mmss(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _quiet_mark(last: str, quiet: float, threshold: float) -> str:
+    r"""The quiet decision, with every source of time removed from it.
+
+    Returns the "[+M:SS with no new output]" suffix, or "" when there is
+    nothing to accuse. `quiet` is seconds since the builder last spoke and
+    `threshold` is the patience; NEITHER is read from a clock here.
+
+    WHY THIS IS A FUNCTION. `test_a_flowing_builder_is_never_called_quiet`
+    used to assert this returns "" while driving a REAL child process: emit,
+    sleep 0.3, emit, against a 1.0 s threshold. Under load a 0.3 s sleep
+    really does stretch past 1.0 s, so the relay marked a flowing builder
+    quiet and WAS RIGHT to. Measured intermittent at 2-in-12 by the Director
+    of COMod, reproduced under process churn by Quick Fix.
+
+    An injected clock did not fix it: the poll loop calls the clock once per
+    0.1 s of real time, so a per-poll clock is still proportional to wall
+    time. That tree still failed 1-in-8 under churn. The coupling was not in
+    the clock, it was in asserting a NEGATIVE about a gap that a real process
+    on a real box does not promise.
+
+    So the assertion moved here, where the inputs are given rather than
+    produced. The subprocess tests keep what they can control -- that output
+    is relayed, in order -- and assert nothing about gap SIZE.
+    """
+    if not last or quiet < threshold:
+        return ""
+    return f"   [+{_mmss(quiet)} with no new output]"
+
+
 def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
     r"""Run `cmd` and show that it is alive, without inventing a number.
 
@@ -1775,9 +1804,7 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
             # the moment someone reaches for Ctrl-C, and a frozen line beside
             # a moving clock reads as "stuck at dictionary". Say which it is:
             # the clock is the run, this is the silence inside it.
-            quiet = now - last_at
-            mark = (f"   [+{_mmss(quiet)} with no new output]"
-                    if last and quiet >= _QUIET_SECONDS else "")
+            mark = _quiet_mark(last, now - last_at, _QUIET_SECONDS)
             status = (f"{indent}{_mmss(now - t0):>6}  {spin}"
                       + (last or "(working; no output from it yet)") + mark)
             if tty:

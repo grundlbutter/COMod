@@ -714,8 +714,38 @@ class Pul:
     VERIFIED on all 381 .pul files in map/puzzle/: ``char[8] version``,
     ``char[256] ani path``, ``uint32 width``, ``uint32 height``, then
     height*width ``uint16`` indices into the named .ani file. Version
-    ``PUZZLE2`` (350 files) appends two uint32 roll-speed fields; version
+    ``PUZZLE2`` (350 files) appends two roll-speed fields; version
     ``PUZZLE`` (31 files) does not. Every file's length matched exactly.
+
+    **The roll-speed pair is int32, not uint32.**  It was read ``<II`` here
+    until 2026-08-26, which is not a cosmetic difference: a backdrop that
+    scrolls the other way came back as ~4.29 billion.
+
+    MEASURED over **2,724** ``.pul`` files carrying the field, across nine
+    independent corpora (the resolved install plus
+    ``Clients/{5017,5065,5165,5517,6090,6609,7878,Zephyr,CCO-snapshot}``) --
+    141 of them non-zero:
+
+    ==========  =========================  ==============================
+    read as     component range            files with a component > 2**20
+    ==========  =========================  ==============================
+    ``<ii``     ``[-35, 60]``              **0**
+    ``<II``     ``[0, 4294967286]``        **37**
+    ==========  =========================  ==============================
+
+    Signed, the whole corpus is ten distinct pairs and every component is a
+    multiple of 5 -- ``(-35,35) (10,-10) (10,0) (10,10) (15,15) (20,0)
+    (20,20) (40,-30) (40,40) (60,40)``.  Unsigned, 37 of the 141 sit eight
+    orders of magnitude from the other 104, and the two axes of a plane that
+    scrolls diagonally (``shipbg`` at ``(-35, 35)``) disagree by 4e9.  A
+    one-family reading and a bimodal one is the whole test; nothing else in
+    the format is signed, so this is the field's own evidence.
+
+    On the resolved install the defect reaches **2 of the 35** backdrop-plane
+    instances that carry a roll (``l-arena`` and ``p-arena``, both
+    ``newplainbg-move.pul`` at ``(40, -30)``).  It is latent today only
+    because no renderer consumes ``roll_speed`` yet -- see
+    ``docs/ground_animation.md`` 10.
     """
     version: str
     ani_path: str
@@ -737,7 +767,9 @@ class Pul:
         tiles = list(struct.unpack_from(f"<{n}H", d, 272))
         roll = None
         if len(d) >= 272 + n * 2 + 8:
-            roll = struct.unpack_from("<II", d, 272 + n * 2)
+            # `<ii`, NOT `<II` -- a leftward/upward scroll is negative. See
+            # the class docstring for the 2,724-file measurement.
+            roll = struct.unpack_from("<ii", d, 272 + n * 2)
         return cls(version, ani, width, height, tiles, roll)
 
 

@@ -61,6 +61,30 @@ Blender addon by ``tools/build_addon.py``: ``core/verdict.py`` for the
 three-state answer the override gate returns, and -- reached lazily, and only
 when a user-named artefact is actually read -- ``tools/profilecheck.py``, the
 verifier that gate consults.  See *the override gate*, below.
+
+
+WHICH RESOLVER ANSWERS WHICH QUESTION -- added 2026-08-27
+=========================================================
+"Resolve it through coroot" is NOT sufficient guidance and this table is why.
+These are DIFFERENT QUESTIONS and picking the wrong one returns a real,
+existing, wrong path -- which then SKIPS rather than fails.
+
+    game_root() / find()   the ONE PLAYABLE install this machine is
+                           configured for            -> C:/Program Files/...
+    clients_dir()          the folder of SHIPPED BUILDS (5017..7878, Zephyr)
+                           -> <collection>/Clients
+    assets_dir()           the COLLECTION: Clients/ + derived/ + _variants/
+    installs_root()        where COMod records what it INSTALLED
+    community_library()    the user-curated library
+
+MEASURED COST, 2026-08-26: a test helper called `find()` -- a real resolver,
+no literal anywhere, passing every hardcoded-path audit -- and still SKIPPED
+15 METHODS on a box where the 7878 install was present, because it asked for
+the playable install and the suite wanted the 7878 build in the collection.
+
+A suite that wants a specific BUILD wants `clients_dir() / "<build>"`.
+It does not want `find()`. The audit that says "no literal" cannot tell them
+apart, so the audit passing is not evidence the caller is correct.
 """
 
 from __future__ import annotations
@@ -1452,6 +1476,37 @@ def assets_dir() -> Path:
     a parent and its child is two ways to disagree.
     """
     return clients_dir().parent
+
+
+#: Corpus locations this project has used, OLDEST-ONLY -- the current one comes
+#: from `clients_dir()` and is never repeated here.  `d294e1c4` moved the asset
+#: tree out of `C:\Claude`; receipts and figures recorded before that move still
+#: name the old place.
+#:
+#: This file is the one place install-path literals are allowed to live
+#: (`tests/test_sanitization.INSTALL_PATH_ALLOWED`), which is exactly why a
+#: historical path belongs HERE rather than inlined at each caller that has to
+#: cope with it.
+_HISTORICAL_CLIENTS_DIRS = (
+    r"C:\Claude\ConquerAssets\Clients",
+)
+
+
+def clients_search_dirs() -> list:
+    """Every place a `Clients/` tree has lived, current first.
+
+    **A SEARCH LIST, NEVER AN IDENTITY.**  The caller decides which entry (if
+    any) is really the corpus -- by fingerprint, not by position -- so a stale
+    entry costs one `is_dir()` and cannot produce a wrong answer.  Callers that
+    want *the* corpus want `clients_dir()`; this is for readers of records
+    written before a move.
+    """
+    out = [clients_dir()]
+    for h in _HISTORICAL_CLIENTS_DIRS:
+        q = Path(h)
+        if q not in out:
+            out.append(q)
+    return out
 
 
 def community_library() -> Optional[Path]:

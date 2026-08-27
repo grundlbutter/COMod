@@ -168,8 +168,20 @@ def unwrap(doc: Any) -> tuple[Optional[dict], Any]:
     reader can migrate gradually instead of failing on everything built
     before this existed.
     """
-    if isinstance(doc, dict) and isinstance(doc.get(KEY), dict):
-        return doc[KEY], doc.get("data")
+    cand = doc.get(KEY) if isinstance(doc, dict) else None
+    # `schema` is what separates a stamp from a payload SECTION that happens
+    # to be called "provenance".  `out/health.json` has one -- it holds the
+    # audit's own result, and its `base_id` field names whichever install the
+    # LAST health run was pointed at.  Without this check `read_stamp` handed
+    # that section back as health.json's stamp, so `audit` reported its own
+    # report as FOREIGN to every other install: a permanent false positive
+    # wearing the exact word this audit reserves for a real fault, which is
+    # the failure mode the keyed-artefact comment in `audit` already warns
+    # about.  `wrap` refuses to shadow a payload key on the write side; that
+    # guard cannot fire for a file written with a plain `json.dump`, so the
+    # read side has to be able to tell the two apart on its own.
+    if isinstance(cand, dict) and "schema" in cand:
+        return cand, doc.get("data")
     return None, doc
 
 

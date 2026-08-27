@@ -398,19 +398,57 @@ def art_texture(puzzle, patch: dict, *, scale: int = 1, backdrops=None,
     return puzzlemod.encode_png(w, h, rgb)
 
 
-def _ground_over_backdrops(puzzle, rect, backdrops, scale: int):
-    """Backdrop planes first, then the ground painted over them wherever the
-    ground has art. The ground's own VOID is what lets a backdrop show."""
+def backdrop_layer(rect, backdrops, scale: int):
+    """The backdrop planes flattened into one RGB buffer, nearest LAST.
+
+    Returns ``(w, h, rgb)``, or ``(0, 0, None)`` when there is no plane --
+    "no planes" is not the same picture as "one VOID plane" and the caller
+    decides what an absent layer looks like.
+
+    VOID IS A HOLE, NOT PAINT. A plane's EMPTY slots and unresolved tiles come
+    back from `render_tiled` as VOID, and the plane BENEATH must show through
+    them -- that is what `tilebake.js:_drawPlane` does, by `continue`-ing on an
+    empty slot so those pixels are never written. This used to be a flat
+    `base[:n] = brgb[:n]`, which copies the near plane's VOID over the far one
+    instead. Measured, that is not a corner case: `beach-bg02` is 1,221/1,376
+    EMPTY and `2009-7x-bg1` is 2,392/2,400, so once the planes are in the
+    client's near-last order the flat copy erases 613,011 of `2009-7x`'s
+    614,400 backdrop pixels. `mapedit.MapEditor.render_background` has always
+    masked; this is the two server paths catching up to it.
+    Evidence: `docs/backdrop_plane_order_2026-08-26.md`. That is a RESTATEMENT
+    of section 6 of `docs/ground_animation.md`, which is where the originating
+    team wrote it and which arrives with `d1b83863` -- deliberately NOT part of
+    this integration, because its other sections document animation code that
+    is not on master.
+    """
     import puzzle as puzzlemod                              # noqa: PLC0415
+    void = bytes(puzzlemod.VOID)
     w = h = 0
     base = None
     for b in backdrops:
         bw, bh, brgb = b.render_tiled(rect, scale=scale)
         if base is None:
             w, h, base = bw, bh, bytearray(brgb)
-        else:
+        elif void not in brgb:
+            # FAST PATH, and exact rather than approximate: if the three VOID
+            # bytes do not occur anywhere in the buffer -- aligned or not --
+            # then no pixel of this plane is VOID and masking cannot skip
+            # anything, so the slice copy is the same answer. This is what
+            # keeps `star10`'s 16 fully-painted planes off the per-pixel loop.
             n = min(len(base), len(brgb))
             base[:n] = brgb[:n]
+        else:
+            for i in range(0, min(len(base), len(brgb)), 3):
+                if brgb[i:i + 3] != void:
+                    base[i:i + 3] = brgb[i:i + 3]
+    return w, h, (bytes(base) if base is not None else None)
+
+
+def _ground_over_backdrops(puzzle, rect, backdrops, scale: int):
+    """Backdrop planes first, then the ground painted over them wherever the
+    ground has art. The ground's own VOID is what lets a backdrop show."""
+    import puzzle as puzzlemod                              # noqa: PLC0415
+    w, h, base = backdrop_layer(rect, backdrops, scale)
     gw, gh, grgb = puzzle.render(rect, scale=scale)
     if base is None:
         return gw, gh, grgb

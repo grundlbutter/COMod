@@ -109,7 +109,23 @@ def build(pm) -> tuple[dict, bytes]:
         "k": pm.k,
         "pixels": [pm.px_w, pm.px_h],
         "consistent": pm.consistent,
-        "rollSpeed": list(pm.roll_speed) if getattr(pm, "roll_speed", None) else None,
+        # NO `rollSpeed` HERE. There was one until 2026-08-26, spelled
+        # `list(pm.roll_speed) if getattr(pm, "roll_speed", None) else None`,
+        # and it emitted `null` on every map ever built -- twice over:
+        # `PuzzleMap` has no `roll_speed` attribute at all (so the `getattr`
+        # default was the only branch that could run), and **0 of the 132
+        # resolvable GROUND .pul files carry a non-zero roll** anyway. A
+        # scrolling walkable surface is not a thing; roll is a backdrop-plane
+        # property, and it rides `build_full`'s per-plane `roll` key below,
+        # which is live.
+        #
+        # It is removed rather than fixed because a key that has never
+        # carried a value and structurally cannot is worse than no key: this
+        # one was read as evidence that the roll pipeline was already
+        # complete, and the plane-side work was scoped off that reading.
+        # Nothing consumes it (`grep -rn rollSpeed` over tools/ and
+        # tools/webui/ finds only its own definition), and it is not among
+        # the ground keys `tests/test_ground_animation.py` pins.
         "empty": pz.EMPTY,
         "slots": base64.b64encode(
             struct.pack(f"<{len(slots)}H", *slots)).decode("ascii"),
@@ -217,11 +233,41 @@ def build_full(pm, scenery=None, sprites=None, backdrops=None) -> tuple[dict, by
         rec.update(index=b.index, parallax=list(b.parallax),
                    roll=list(b.roll), tiles={})
         used = sorted({t for t in art.tiles if t != pz.EMPTY})
+        # `tiles` stays FRAME 0 for every tile -- a client that knows nothing
+        # about `anim` renders exactly the manifest it rendered before, byte
+        # for byte. `anim` is added only for tiles that really have several
+        # frames, so a plane with none carries no new key at all and the
+        # whole manifest is unchanged. (docs/ground_animation.md 3)
+        anim: dict[str, list[int]] = {}
         for t in used:
-            path = art.tile_path(t)
+            path = art.tile_path(t)                    # frame 0, exactly as before
             idx = w.add_dds(pm.assets, path) if path else None
-            if idx is not None:
-                rec["tiles"][str(t)] = idx
+            if idx is None:
+                continue
+            rec["tiles"][str(t)] = idx
+            seq = art.tile_frames(t)
+            if len(seq) < 2:
+                continue
+            ents = [w.add_dds(pm.assets, p) for p in seq]
+            # ALL-OR-NOTHING. A tile whose frame 3 will not decode falls back
+            # to the still frame 0 rather than animating over a gap-shortened
+            # cycle -- a cycle that silently drops frames is a WRONG
+            # animation, and it would be indistinguishable from a right one
+            # in every measurement below. Corpus-wide today no frame fails
+            # (measured: 0 missing over beach-bg02's 45 and icecrypt-lev5/6's
+            # 24x17), so this branch costs nothing and only bounds the damage
+            # if a future install ships a broken frame.
+            if any(e is None for e in ents) or ents[0] != idx:
+                continue
+            anim[str(t)] = ents
+        if anim:
+            rec["anim"] = anim
+            #: Cycle length in FRAMES -- the property of the content. The
+            #: .ani format carries FrameAmount and Frame<N> and NO interval
+            #: (verified on 5017/5065/5165/5517/6090/6609/7878/Zephyr's raw
+            #: .ani and on CCO's .json), so the rate is the client's to pick
+            #: and only the LENGTH is authored. docs/ground_animation.md 4.
+            rec["animFrames"] = max(len(v) for v in anim.values())
         bds.append(rec)
 
     # Scene + cover sprites: distinct frames, placements in painted-image px.

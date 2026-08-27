@@ -1387,8 +1387,18 @@ class BootstrapRunner:
 
     def _run(self, steps: list) -> None:
         rc = 0
+        verdicts: list = []
         try:
             for argv in steps:
+                # A `--use` step and a per-root build step fail for different
+                # reasons and must be treated differently below.
+                is_build = "--bootstrap" in argv or "--bootstrap-all" in argv
+                if is_build:
+                    # Per STEP, not per run: `start` clears this once, which
+                    # is enough for one install and not for N. Left sticky, a
+                    # second root whose builders died would inherit the first
+                    # root's `True` and be waved through.
+                    self.built = None
                 creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
                     if os.name == "nt" else 0
                 try:
@@ -1401,12 +1411,44 @@ class BootstrapRunner:
                     rc = 1
                     break
                 self._pump(self.proc)
-                rc = self.proc.wait()
-                if rc != 0 or self.cancelled:
+                step_rc = self.proc.wait()
+                if is_build:
+                    verdicts.append(self.built)
+                # The run's exit code stays the LAST non-zero one, so nothing
+                # downstream starts reading success where there was none.
+                if step_rc:
+                    rc = step_rc
+                if self.cancelled:
+                    break
+                if step_rc and not (is_build and self.built):
                     # A refused `--use` must not be followed by a build
-                    # against the override it refused.
+                    # against the override it refused, and a build whose
+                    # BUILDERS failed is a real stop.
+                    #
+                    # But `health.py --bootstrap` does not return after
+                    # building: it goes on to the health report and ends on
+                    # `0 if rep["ok"] else 1`, so it exits 1 for an install
+                    # that merely has problems -- a missing artefact for some
+                    # other client, a foreign-provenance one -- which on a box
+                    # with nine declared clients is the normal state. Breaking
+                    # there abandoned every install after the first, and the
+                    # installs in this list are INDEPENDENT of one another:
+                    # 6609's build has no relationship to 5017's exit code.
+                    #
+                    # `_BOOTSTRAP_OK_RE` already exists because the exit code
+                    # cannot answer "did the build work". It was taught to the
+                    # page's label and not to this loop, so the run was
+                    # correctly described and still truncated.
                     break
         finally:
+            if verdicts:
+                # An aggregate, because `built` is now per-step and a caller
+                # asking a multi-install run "did the builders work" means all
+                # of them. Unchanged for a single install: one verdict in,
+                # the same value out.
+                self.built = (False if any(v is False for v in verdicts)
+                              else True if all(v is True for v in verdicts)
+                              else None)
             # In a `finally` so a crash in here cannot leave the runner
             # claiming to be running forever -- that state has no exit and no
             # button, and the only cure would be restarting the viewer.
@@ -4148,6 +4190,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/preview": self.post_preview,
                 "/api/stage": self.post_stage,
                 "/api/swap/stage": self.post_swap_stage,
+                "/api/swap/lookstage": self.post_swap_lookstage,
                 "/api/unstage": self.post_unstage,
                 "/api/install": self.post_install,
                 "/api/uninstall": self.post_uninstall,
@@ -4306,6 +4349,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/swap/targets": self.api_swap_targets,
             "/api/swap/npcset": self.api_swap_npcset,
             "/api/swap/instructions": self.api_swap_instructions,
+            "/api/swap/lookplan": self.api_swap_lookplan,
             "/api/swap/libmesh": self.api_swap_libmesh,
             "/api/swap/libtex": self.api_swap_libtex,
             "/api/swap/kinds": self.api_swap_kinds,
@@ -5262,6 +5306,68 @@ class Handler(BaseHTTPRequestHandler):
                                 if elevated is False else
                                 "Check the permissions on that folder.")))})
 
+    def _lookswap(self, arg, dry: bool):
+        """Plan or stage a straight replacement, via `tools/lookswap.py`.
+
+        ONE planner, the way the NPC path uses one: "show me what to change"
+        is this same command with `--dry-run`, so the preview and the action
+        cannot describe different changes. The page does not compute the
+        paths itself.
+
+        This exists because the non-NPC branch used to call the NPC planner.
+        Measured 2026-08-26: every monster and every weapon row came back
+        `exit 2, npc '103' matches 0 rows in ini/npc.json`. The kinds that do
+        not split had no planner at all.
+        """
+        import subprocess, sys as _sys                     # noqa: PLC0415
+        kind = str(arg("kind", "") or "").strip()
+        target = str(arg("target", "") or "").strip()
+        donor = str(arg("donor", "") or "").strip()
+        missing = [n for n, v in (("kind", kind), ("target", target),
+                                  ("donor", donor)) if not v]
+        if missing:
+            return self._error(400, "missing: " + ", ".join(missing))
+        root = str(arg("root", "") or "") or str(self.cat.root)
+        tool = Path(__file__).resolve().parent / "lookswap.py"
+        cmd = [_sys.executable, str(tool), "--root", root, "--kind", kind,
+               "--target", target, "--donor", donor, "--json"]
+        if dry:
+            cmd.append("--dry-run")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=900)
+        except Exception as e:
+            return self._json({"ok": False, "staged": False,
+                               "headline": "Could not run lookswap.",
+                               "detail": "%s: %s" % (type(e).__name__, e)})
+        try:
+            doc = json.loads((r.stdout or "").strip() or "{}")
+        except ValueError:
+            doc = {"ok": False,
+                   "refused": (r.stdout or "") + (r.stderr or "")}
+        doc.setdefault("ok", r.returncode == 0)
+        doc["dry"] = dry
+        doc["exit"] = r.returncode
+        doc["staged"] = bool(doc.get("ok")) and not dry
+        if not doc.get("ok"):
+            # A refusal is an ANSWER. lookswap declines rather than staging
+            # half a replacement, and the reason belongs on screen.
+            doc.setdefault("headline", "lookswap refused rather than guessing.")
+            doc["detail"] = doc.get("refused") or r.stderr or ""
+        doc["command"] = ("py -3 tools/lookswap.py --root \"%s\" --kind %s "
+                          "--target %s --donor %s%s"
+                          % (root, kind, target, donor,
+                             " --dry-run" if dry else ""))
+        return self._json(doc)
+
+    def api_swap_lookplan(self, arg):
+        """What a straight replacement would change. Writes nothing."""
+        return self._lookswap(arg, dry=True)
+
+    def post_swap_lookstage(self, body: bytes, arg):
+        """Stage a straight replacement into comod's stage tree."""
+        return self._lookswap(arg, dry=False)
+
     def post_swap_stage(self, body: bytes, arg):
         """Stage a split into mods/stage. Writes nothing outside the stage tree.
 
@@ -5755,6 +5861,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(415, "cannot decode %s: %s" % (rel, e))
         return self._send(200, png, "image/png")
 
+    def _monster_morph_rows(self, base_rows, q: str) -> list:
+        r"""Monster recolours, from `lookswap.monster_morph_rows`.
+
+        DELEGATED, never re-derived. This method had its own copy of the rule
+        for about ten minutes, and in that time the panel offered 148 monster
+        looks while `lookswap` -- which does the actual staging -- still knew
+        only 66, so 82 of the new rows would have been refused at the moment
+        of the swap. Same second-definition shape as the mods/stage split.
+        """
+        try:
+            import lookswap                                # noqa: PLC0415
+        except Exception:
+            return []
+        by_id = {str(r.get("id")): r for r in base_rows}
+        morphs = lookswap.monster_morph_rows(self.cat, by_id)
+        out = []
+        for ident, row in sorted(morphs.items()):
+            usable = bool(row.get("mesh"))
+            out.append({
+                "id": ident, "key": "monster:%s" % ident,
+                "label": row["label"], "mesh": row.get("mesh", ""),
+                "texture": row.get("texture", ""), "kind": "monster",
+                "usable": usable, "reason": "" if usable else row.get("why", ""),
+                "recolourOf": row.get("recolourOf", ""),
+                "sharedNote": ("borrows %s's geometry and wears its own skin"
+                               % row["recolourOf"]) if (usable and row.get("recolourOf"))
+                              else ""})
+        if q:
+            ql = q.lower()
+            out = [r for r in out if ql in (r["label"] + " " + r["id"]).lower()]
+        return out
+
     def api_swap_browse(self, arg):
         """Pickable assets of one kind. `?kind=npc&q=store`"""
         import swapplan
@@ -5764,6 +5902,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, f"unknown kind {key!r}")
         q = str(arg("q", "") or "")
         limit = min(int(arg("limit", "300") or 300), 1000)
+        #: One row per distinct (mesh, texture) instead of one per item id.
+        #: Opt-in, because `browse` feeds BOTH the donor library and the
+        #: target list, and silently changing the row shape under both is how
+        #: one caller starts reading a field the other never sends.
+        group_looks = str(arg("group", "") or "") == "look"
+        if group_looks:
+            # The 1,000 ceiling exists to bound a response of ITEM rows --
+            # 5,214 weapons on CCO, and no upper bound in principle. Grouped
+            # rows are bounded by DISTINCT LOOKS instead, measured at 1,068
+            # here, so the same ceiling would hide 68 looks for no reason.
+            # Still a ceiling, not "unlimited": a pathological install must
+            # not be able to ask for an unbounded response.
+            limit = min(int(arg("limit", "2000") or 2000), 4000)
         rows = []
         total = 0
         if k.source == "models":
@@ -5787,18 +5938,69 @@ class Handler(BaseHTTPRequestHandler):
                                         "this install")})
         else:
             idx = self.cat.builder
-            for o in ((idx.options.get(k.ref) or []) if idx else []):
-                if q and q.lower() not in (o.name + " " + o.ident).lower():
-                    continue
-                total += 1
-                if len(rows) >= limit:
-                    continue
-                # A builder Option is only constructed when both its mesh and
-                # its texture resolve, so these are usable by construction.
-                rows.append({"id": o.ident, "key": f"{k.key}:{o.ident}",
-                             "label": o.name or o.ident, "mesh": o.mesh,
-                             "texture": o.texture, "kind": k.key,
-                             "usable": True, "reason": ""})
+            matched = [o for o in ((idx.options.get(k.ref) or []) if idx else [])
+                       if not q or q.lower() in (o.name + " " + o.ident).lower()]
+            if group_looks:
+                # GROUP BEFORE THE SLICE. Measured on CCO: r_weapon holds
+                # 5,214 options over 1,068 distinct (mesh, texture) pairs --
+                # 4.9 rows per real look, and one mesh shared by 63 rows all
+                # named "Bronze Club". The 1,000 cap was therefore hiding
+                # DUPLICATION, not content, and raising it to 5,214 would have
+                # made the list worse rather than better. Grouping first is
+                # also why this cannot be done client-side: the page only ever
+                # receives the capped slice.
+                by_look: "dict[tuple, list]" = {}
+                for o in matched:
+                    by_look.setdefault((o.mesh, o.texture), []).append(o)
+                total = len(by_look)
+                for (mesh, tex), members in by_look.items():
+                    if len(rows) >= limit:
+                        continue
+                    members.sort(key=lambda m: str(m.ident))
+                    head = members[0]
+                    names = sorted({m.name for m in members if m.name})
+                    rows.append({
+                        "id": head.ident, "key": f"{k.key}:{head.ident}",
+                        "label": head.name or head.ident,
+                        "mesh": mesh, "texture": tex, "kind": k.key,
+                        "usable": True, "reason": "",
+                        "count": len(members),
+                        "members": [{"id": m.ident, "label": m.name or m.ident}
+                                    for m in members[:60]],
+                        # STATED, because a group of 63 that lists 60 is a lie
+                        # by omission otherwise.
+                        "membersShown": min(len(members), 60),
+                        "names": names[:8],
+                        "sharedNote": (
+                            "" if len(members) == 1 else
+                            "%d item%s share this exact look%s"
+                            % (len(members), "" if len(members) == 1 else "s",
+                               (" -- " + ", ".join(names[:3])
+                                + ("..." if len(names) > 3 else ""))
+                               if names else ""))})
+            else:
+                for o in matched:
+                    total += 1
+                    if len(rows) >= limit:
+                        continue
+                    # A builder Option is only constructed when both its mesh
+                    # and its texture resolve, so these are usable by
+                    # construction.
+                    rows.append({"id": o.ident, "key": f"{k.key}:{o.ident}",
+                                 "label": o.name or o.ident, "mesh": o.mesh,
+                                 "texture": o.texture, "kind": k.key,
+                                 "usable": True, "reason": ""})
+        # Monster recolours, which the catalogue cannot see because it
+        # enumerates directories and a morph ships only a texture. Appended
+        # AFTER the directory rows so `_monster_morph_rows` can borrow their
+        # mesh paths, and counted into `total` so the shortfall note stays
+        # honest.
+        if k.source == "models" and k.key == "monster":
+            extra = self._monster_morph_rows(rows, q)
+            total += len(extra)
+            room = max(0, limit - len(rows))
+            rows.extend(extra[:room])
+
         # Drawable first, but the rest are still listed. Measured on
         # Clients/7878: 29 of 300 catalogued NPC rows resolve a mesh, so
         # withholding the other 271 silently would make most of the client

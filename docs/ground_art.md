@@ -319,9 +319,20 @@ per window; `?scale=2` quarters it.
   is no audio path in this client at all** (`client/settings.py`). This was the
   **third** copy of the same claim in this file and it outlived the first two
   because they were corrected in the OPEN list while this one sits in §5.
-* **Animated tiles are frozen.** A handful of `Puzzle<n>` keys name several
-  frames; frame 0 is used. Four `.pul` files carry a non-zero `rollSpeedX/Y`
-  (`market-sky`, `skybg-move` and friends) — a scrolling backdrop, not modelled.
+* ~~**Animated tiles are frozen.** A handful of `Puzzle<n>` keys name several
+  frames; frame 0 is used.~~ **Drawn, and the subject was wrong** (corrected
+  2026-08-26, `docs/ground_animation.md`). It is **not the ground**: measured
+  over ten installs, **no ground puzzle anywhere has a multi-frame tile**.
+  Every multi-frame `Puzzle<n>` key in the corpus belongs to a **backdrop
+  plane**, and exactly 3 of the 22 such `.pul` are referenced by a shipped map
+  — `beach` (a 45-frame sea), `icecrypt-lev5` and `icecrypt-lev6` (17-frame
+  ping-pong). "A handful" was 22 files of which 19 are unreferenced. Because
+  plane tiles are already drawn from resident per-tile textures on
+  frame-independent quads, animating them is a texture-handle swap and not the
+  per-frame re-bake this entry's phrasing implied. Four `.pul` files carry a
+  non-zero `rollSpeedX/Y` (`market-sky`, `skybg-move` and friends) — a
+  scrolling backdrop, still not modelled, and `docs/ground_animation.md` §7
+  says why it is cheap and what actually blocks it.
 * **The art is not integrity-checked.** `integrity.json` covers the 155 `.DMap`
   files, not the `.pul` or the `.dds`. Repainting a map's ground is a texture
   edit outside the manifest (`docs/modding.md` §6).

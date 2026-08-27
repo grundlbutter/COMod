@@ -163,11 +163,13 @@
 .sw-step { margin: .5rem 0; }
 </style>
 </head>
-<!-- /swap is a real route and deliberately NOT a sixth tab: it is the Asset
-     Viewer's swap flow given the whole window, not a section of the tool.
-     nav.js maps it back under Asset Viewer (CoNav.UNDER), so the bar still
-     lights exactly one tab here, and the Collection card on the viewer is
-     where you come in from. -->
+<!-- /swap is a tab of its own -- nav.js lists it in TABS -- and a document of
+     its own. It is not a section of the Asset Viewer rendered elsewhere: two
+     model viewers side by side need the whole window, which is the same
+     reason coviewer.py serves this route as a static page rather than a
+     panel. The Collection card on the Asset Viewer is still the usual way
+     in; it is now a link to a sibling tab rather than a way out of the tool.
+     -->
 <body data-co-page="swap">
 
 <div id="co-nav"></div>

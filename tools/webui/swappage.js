@@ -392,16 +392,29 @@
       if (targetKind === 'npc') {
         NPCSET = await api('/api/swap/npcset?kind=npc&root=' + root);
       } else {
-        // Monsters and Weapons are not table-keyed, so they come from browse
-        // one look at a time, shaped into the rows this list already draws
-        // with `count: 1` -- there is no group, so there is nothing to split.
+        // Monsters and Weapons are not table-keyed, so they come from browse.
+        //
+        // `group=look` asks for one row per distinct (mesh, texture) instead
+        // of one per item id. Measured on CCO: weapons are 5,214 item rows
+        // over 1,068 real looks -- 4.9 rows per look, one mesh shared by 63
+        // rows all called "Bronze Club". Ungrouped, the 1,000 cap left 4,214
+        // unreachable AND the visible 1,000 were mostly repeats; grouped, all
+        // 1,068 fit with nothing truncated. Raising the cap alone would have
+        // made this list worse, not better.
         const d = await api('/api/swap/browse?kind=' +
-                            encodeURIComponent(targetKind) + '&limit=1000');
+                            encodeURIComponent(targetKind) + '&group=look');
         const src = d.rows || d.assets || [];
         const rows = src.map(r => ({
           group: r.label || r.key || r.id,
-          groupKey: r.id, count: 1,
-          members: [{ name: r.label || r.key || r.id }],
+          groupKey: r.id,
+          // The tiers that share this look, so "N others move with it" means
+          // the same thing here as it does for NPCs.
+          count: r.count || 1,
+          members: (r.members && r.members.length)
+            ? r.members.map(m => ({ name: m.label || m.id }))
+            : [{ name: r.label || r.key || r.id }],
+          membersShown: r.membersShown,
+          sharedNote: r.sharedNote || '',
           paths: { standby_motion: r.mesh || '' },
           texture: r.texture || '',
           art: r.usable ? 'ok' : 'unresolved',
@@ -426,9 +439,18 @@
           groups: rows, kind: targetKind, totalRows: rows.length,
           droppedRows: 0,
           headline: rows.length ? '' : ('No ' + targetKind + ' is listed here.'),
+          // SAY WHAT WAS COUNTED. With group=look a row is a LOOK, not an
+          // item, and weapons collapse 5,214 items into 1,068 looks -- so
+          // "1,068 weapons in this install" would be false, and "1,068 items"
+          // falser still. Only claim items when a row really is one.
           detail: rows.length
-            ? (rows.length + ' ' + targetKind + '(s) in this install; each has '
-               + 'its own art, so there is no group to split.'
+            ? ((rows.some(r => r.count > 1)
+                 ? (rows.length + ' distinct ' + targetKind + ' look(s), '
+                    + 'covering ' + rows.reduce((n, r) => n + (r.count || 1), 0)
+                    + ' item(s). Items that share a look are listed together, '
+                    + 'because changing the art changes it for all of them.')
+                 : (rows.length + ' ' + targetKind + '(s) in this install; '
+                    + 'each has its own art, so there is no group to split.'))
                + (d.truncNote ? '  ' + d.truncNote : '') + gap)
             : (d.detail || 'The catalogue returned no rows for this kind.')
         };
@@ -857,14 +879,24 @@
     if (targetKind !== 'npc') {
       // Measured, not assumed: only NPC rows share motion ids. Offering a
       // split here would invent a problem this family does not have.
+      //
+      // These kinds go through `tools/lookswap.py`, NOT the NPC planner.
+      // Until 2026-08-26 this branch called showInstructions(), which asks
+      // npcsplit about an ini/npc.json row -- so every monster and every
+      // weapon came back `exit 2, matches 0 rows`. The single action offered
+      // here failed for 100% of rows.
       host.appendChild(el('div', 'sw-note',
         'Each ' + targetKind + ' has its own art, so there is nothing to '
         + 'split -- this is a straight replacement.'));
       const go2 = el('button', 'sw-go', 'Show me what to change');
-      go2.onclick = () => showInstructions(D, T);
+      go2.onclick = () => lookSwap(D, T, true);
       host.appendChild(go2);
+      const doit = el('button', 'sw-go', 'Stage this replacement');
+      doit.onclick = () => lookSwap(D, T, false);
+      host.appendChild(doit);
       host.appendChild(el('div', 'sw-note',
-        'COMod describes the change; it does not apply it.'));
+        'Staging writes into COMod’s staging area only. Nothing reaches '
+        + 'the game until you press Install in Mod staging.'));
       return;
     }
     if (T.count > 1) {
@@ -927,6 +959,67 @@
     // different NPC than the one on screen -- silently.
     const m = (T.members || [])[0] || {};
     return { type: m.type, name: m.name || '' };
+  }
+
+  /* A straight replacement, for the kinds that do not split.
+   *
+   * `dry` chooses between the preview and the act, and BOTH run the same
+   * command -- tools/lookswap.py, with and without --dry-run. The page never
+   * computes the paths itself, so what it shows and what it stages cannot
+   * describe different changes.
+   */
+  async function lookSwap(D, T, dry) {
+    const host = $('#mid-body');
+    host.textContent = '';
+    host.appendChild(el('div', null, dry ? 'working out what to change…'
+                                         : 'staging…'));
+    const q = 'kind=' + encodeURIComponent(targetKind) +
+              '&target=' + encodeURIComponent(T.groupKey || T.group) +
+              '&donor=' + encodeURIComponent(D.id) +
+              '&root=' + encodeURIComponent(targetPath || '');
+    let res;
+    try {
+      res = dry ? await api('/api/swap/lookplan?' + q)
+                : await api('/api/swap/lookstage?' + q, { method: 'POST' });
+    } catch (e) {
+      host.textContent = '';
+      const b = el('div', 'sw-note');
+      b.appendChild(el('strong', null, dry ? 'Could not work out the change.'
+                                           : 'Could not stage.'));
+      b.appendChild(el('div', null, e.message));
+      host.appendChild(b);
+      return;
+    }
+    host.textContent = '';
+    if (!res.ok) {
+      const b = el('div', 'sw-note');
+      b.appendChild(el('strong', null, res.headline || 'Refused.'));
+      b.appendChild(el('div', null, res.detail || res.refused || ''));
+      host.appendChild(b);
+      return;
+    }
+    host.appendChild(el('div', null,
+      (res.donorLabel || D.id) + '  →  ' + (res.targetLabel || '')));
+    host.appendChild(el('div', 'sw-note', res.note || ''));
+    for (const s of (res.steps || [])) {
+      host.appendChild(el('div', 'sw-detail',
+        s.slot + ':  ' + s.write + '   ←  ' + s.from));
+    }
+    if (dry) {
+      host.appendChild(el('div', 'sw-note',
+        'Nothing was written. Press “Stage this replacement” to put '
+        + 'these files into staging.'));
+      const doit = el('button', 'sw-go', 'Stage this replacement');
+      doit.onclick = () => lookSwap(D, T, false);
+      host.appendChild(doit);
+    } else {
+      LASTSTAGE = res;
+      host.appendChild(el('div', 'sw-note',
+        'Staged. Open Mod staging to review and install, or to revert.'));
+      const go = el('button', 'sw-go', 'Open Mod staging');
+      go.onclick = () => { const b = $('#btn-mods'); if (b) b.click(); };
+      host.appendChild(go);
+    }
   }
 
   async function stageSplit(D, T) {

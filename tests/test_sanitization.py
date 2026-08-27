@@ -132,7 +132,11 @@ BANNED_TOKENS = {
     "68892dda0232282bc2a574a131c113c4",
     "adc5b3ec3cf30a23c675da5a43a4c0f9",
     "3ed1f621d7a2b5e2f1772c7f5324cbea",
-    "7b8bd6c0abf53d22888beafc48830e11",
+    # OWNER RULING 2026-08-26: the owner's FIRST NAME is acceptable PII and
+    # its entry is removed here.  RELAXED EXACTLY ONE TOKEN.  The squashed
+    # email entry in BANNED_SQUASHED is NOT covered by this ruling and stays
+    # -- it is the control that proves this relaxation did not over-apply to
+    # the adjacent forbidden thing.  Do not widen without a fresh ruling.
     "a1fce31d9b8cd02f4fa150c81ee0e705",
     "9c7cf46e652a7e7d650e78f9f8ae6176",
     "3e21b5457152fe8520fb999f2ed252c9",

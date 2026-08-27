@@ -10394,14 +10394,22 @@ class MapBackdrops(unittest.TestCase):
     @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_a_two_plane_map_orders_them_furthest_first(self):
         """`2009-7x` and `beach` each carry two backdrops, numbered 0 and 1 in
-        the record's first integer. They are returned back to front."""
+        the record's first integer. They are returned back to front.
+
+        THIS USED TO ASSERT `[1, 0]` -- nearest first -- which contradicted its
+        own name, its own docstring, and `backdrops()`'s docstring, and was the
+        third place the inverted sort had been written down. `[0, 1]` is
+        furthest first: index 0 is "the further one", so a last-wins compositor
+        puts index 1 on top, which is what `tilebake.js:load()` has always done.
+        Evidence: `docs/backdrop_plane_order_2026-08-26.md`.
+        """
         import puzzle
         lib = puzzle.PuzzleLibrary()
         for name in ("2009-7x", "beach"):
             with self.subTest(map=name):
                 bd = lib.backdrops(name)
                 self.assertEqual(len(bd), 2)
-                self.assertEqual([b.index for b in bd], [1, 0])
+                self.assertEqual([b.index for b in bd], [0, 1])
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_a_desynchronised_trailer_yields_no_backdrop_rather_than_debris(self):
@@ -17842,6 +17850,29 @@ class TwoInstalls(unittest.TestCase):
         self.assertIn("ini/", r["missing"])
 
 
+#: The `MAX_ACTIONS` margin (`smallest cut - largest kept`), COUNTED on all
+#: eight declared installs 2026-08-16 at `de648c8` with `MAX_ACTIONS = 40`,
+#: each from one run of `_loose_census`:
+#:
+#:     5517 1 | 6090 1 | 6609 1 | 7878 3 | cco 5 | 5017 5 | 5065 5 | 5165 5
+#:
+#: Written once because two tests and a CORRECTIONS entry rest on it, and
+#: three copies is how two of them go stale.  **The zero margin is a fact
+#: about three trees, not about the rule** -- it was measured on 5517 and
+#: filed as a shape, and it is not one.  What survives on all eight is the
+#: other half: the smallest discarded count is `MAX_ACTIONS + 1` exactly.
+#: -- CORRECTIONS `C-2026-08-10-asstdir-action-classifier`
+_MARGIN_CENSUS = (
+    "the ZERO MARGIN is per-base, not a shape. COUNTED on all eight declared "
+    "installs 2026-08-16 at de648c8: margin 1 on 5517 (where the finding was "
+    "measured), 6090 and 6609; 3 on 7878; 5 on cco, 5017, 5065 and 5165. "
+    "Every base cuts first at 41 -- what moves is the largest SURVIVING "
+    "count (40 / 38 / 36), so the kept class recedes from the boundary while "
+    "the cut class never does. The portable half is asserted by "
+    "test_the_tripping_set_on_this_install, which runs everywhere "
+    "-- CORRECTIONS C-2026-08-10-asstdir-action-classifier")
+
+
 class ContentFolderJudgementIsAudible(unittest.TestCase):
     r"""`MAX_ACTIONS` discards the whole unanchored set, and says so now.
 
@@ -17886,6 +17917,15 @@ class ContentFolderJudgementIsAudible(unittest.TestCase):
     docstring describes; the gap between **47 and 117** is where a boundary
     would sit if that model were right.
 
+    **The zero margin is a fact about that tree and was filed as a shape.**
+    Re-measured 2026-08-16 on all eight declared installs (`_MARGIN_CENSUS`):
+    it is 1 on 5517, 6090 and 6609, **3** on 7878 and **5** on CCO. So the
+    census test below could not assert it and run everywhere, and the two
+    halves are now separate tests. What is portable is that the smallest
+    discarded count is `MAX_ACTIONS + 1` on every one of the eight -- the cut
+    class begins at the first count past the threshold, with nothing between.
+    What moves is how close the *kept* class gets: 40, 38, 36.
+
     **And the margin is not even the worst of it** — see
     `test_the_verdict_depends_on_WHICH_MESH_you_ask_about`. The count is a
     property of *(directory, querying mesh)*, not of the directory, so
@@ -17927,8 +17967,10 @@ class ContentFolderJudgementIsAudible(unittest.TestCase):
         self.assertEqual(len(got), collection.MAX_ACTIONS - 1)
 
     def test_at_the_threshold_exactly_it_still_does_not_fire(self):
-        """`> MAX_ACTIONS`, not `>=`. The measured margin is zero, so which
-        side of the boundary 40 sits on is load-bearing for 15 directories."""
+        """`> MAX_ACTIONS`, not `>=`. Every declared install cuts first at
+        exactly 41 (`_MARGIN_CENSUS`), so which side of the boundary 40 sits
+        on is load-bearing on all eight -- for 15 directories on 5517, 11 on
+        CCO, 28 on 7878."""
         import collection
         rec = {}
         got = self._call(self._rows(collection.MAX_ACTIONS), rec)
@@ -18012,43 +18054,100 @@ class ContentFolderJudgementIsAudible(unittest.TestCase):
         # Same folder, same instant, opposite verdicts.
         self.assertNotEqual(bool(got_plain), bool(got_hyphen))
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
-    def test_the_tripping_set_on_this_install(self):
-        r"""The census, as a within-tree delta.
-
-        Not "15" — *"15 of 1,398 on this base"*, both measured in the same
-        run. An absolute inherits the lifetime of the tree it was taken on; a
-        ratio measured here inherits nothing.
-
-        This asserts the SHAPE that made the OPEN worth filing — that the
-        margin is zero — rather than pinning the membership.
-
-        **That choice was made to protect against the name tables moving,
-        and it turns out to guard something worse, which its author had not
-        identified**: per the test above, membership is not stable *within a
-        single run of a single tree*, because the count depends on which mesh
-        is asking. Pinning membership would have made this test a hostage to
-        which representative the census happened to pick — which is exactly
-        how two honest censuses of this tree disagreed about `c3/mount/803`.
-        Recorded as such rather than claimed as foresight.
-        """
+    def _census(self) -> tuple:
+        """`(counts, trip, keep)` for the configured install, or a skip."""
         import collection
-        import coroot
         counts = _loose_census()
         if not counts:
             self.skipTest("no .c3 universe on this base")
         trip = {d: n for d, n in counts.items() if n > collection.MAX_ACTIONS}
         keep = [n for n in counts.values() if n <= collection.MAX_ACTIONS]
+        return counts, trip, keep
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_tripping_set_on_this_install(self):
+        r"""The census, as a within-tree delta — the half that is portable.
+
+        Not "15" — *"15 of 1,398 on this base"*, both measured in the same
+        run. An absolute inherits the lifetime of the tree it was taken on; a
+        ratio measured here inherits nothing.
+
+        **This asserted `smallest_cut - largest_kept == 1` until 2026-08-16,
+        and that was wrong in a way its own docstring had claimed immunity
+        to.** It was written to assert the SHAPE rather than pin the
+        membership, on the reasoning that a shape survives what a membership
+        does not. The margin is not a shape. Re-measured on all eight
+        declared installs (`_MARGIN_CENSUS`) it is 1 on three of them, 3 on
+        7878 and **5 on CCO** — so the assertion was a hostage to *which
+        base* the suite happened to run on, which is the same defect as
+        pinning membership, one level up. It went unseen because the base it
+        was authored on is one of the three.
+
+        What is left here is the half that holds on all eight: **the cut
+        class begins at `MAX_ACTIONS + 1` exactly.** That is the load-bearing
+        content of "the two classes are separated by nothing" — a threshold
+        with a real gap under it would show its smallest discard well clear
+        of the boundary, and none of the eight does. How close the *kept*
+        class comes (40 on 5517, 38 on 7878, 36 on CCO) is a property of how
+        much content the tree ships, and is recorded, not asserted.
+
+        Membership is still not pinned, and that choice **turns out to guard
+        something worse than the name tables moving, which its author had
+        not identified**: per the test above, membership is not stable
+        *within a single run of a single tree*, because the count depends on
+        which mesh is asking. Pinning it would have made this a hostage to
+        which representative the census picked — exactly how two honest
+        censuses of one tree disagreed about `c3/mount/803`. Recorded as such
+        rather than claimed as foresight.
+        """
+        import collection
+        import coroot
+        counts, trip, keep = self._census()
         self.assertTrue(trip, f"nothing trips the cap on {coroot.base_id()}")
         largest_kept, smallest_cut = max(keep), min(trip.values())
-        # The finding: the two classes are separated by nothing at all.
-        self.assertEqual(smallest_cut - largest_kept, 1,
-                         f"the margin moved: {largest_kept} kept, "
-                         f"{smallest_cut} cut, on {coroot.base_id()}")
+        # The portable finding: nothing sits between the threshold and the
+        # first thing it discards.  `largest_kept` is in the message because
+        # it is the number that moves, and a failure here should hand over
+        # the whole band rather than half of it.
+        self.assertEqual(
+            smallest_cut, collection.MAX_ACTIONS + 1,
+            f"the cut class no longer begins at the boundary: "
+            f"{largest_kept} kept, {smallest_cut} cut, "
+            f"MAX_ACTIONS={collection.MAX_ACTIONS}, on {coroot.base_id()} "
+            f"-- a gap here would be the first evidence that the count "
+            f"separates anything")
         # And the discard is genuinely reaching real directories, not one
         # pathological archive.
         self.assertGreater(len(trip), 1,
                            f"{len(trip)} of {len(counts)} directories")
+
+    @requires_base("patch5517", "patch6090", "patch6609", why=_MARGIN_CENSUS)
+    def test_the_zero_margin_is_a_fact_about_three_trees(self):
+        r"""The half that is pinned to an install's content, gated as such.
+
+        `requires_base`' own rule: use it where a test asserts a fact about
+        *particular* game data. The margin is that — 5517's largest surviving
+        directory holds 40 and its smallest discarded holds 41, and CCO
+        shipping less content puts those at 36 and 41 without anything in
+        `collection.py` changing.
+
+        **Gated to three bases rather than to the one it was measured on**,
+        because narrowing a gate to the authoring install is the failure
+        `C-2026-08-09-comod-base-gate-audit` was called to find — it silently
+        skips clients that carry the fact. 6090 and 6609 carry it.
+
+        A red here means one of those three trees moved. That is worth
+        knowing and is not a code regression. The red this used to produce on
+        CCO was not even that: it was the record failing to say which trees
+        it had been measured on.
+        """
+        import coroot
+        _, trip, keep = self._census()
+        self.assertTrue(trip, f"nothing trips the cap on {coroot.base_id()}")
+        largest_kept, smallest_cut = max(keep), min(trip.values())
+        self.assertEqual(smallest_cut - largest_kept, 1,
+                         f"the margin moved: {largest_kept} kept, "
+                         f"{smallest_cut} cut, on {coroot.base_id()}")
 
 
 def collection_MAX():
