@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Swap an asset -- CO Asset Viewer</title>
+<title>Apply your library -- CO Asset Viewer</title>
 <link rel="stylesheet" href="/ui/style.css">
 <style>
 /* Local to this page. The shared style.css is built around the browser's
@@ -97,6 +97,26 @@
                       white-space: pre-wrap; word-break: break-all; }
 .sw-fault { background: rgba(200,60,50,.16);
             border-left: 3px solid rgba(200,60,50,.9); }
+/* The library's four states get four appearances, not two. `invite` is
+   deliberately NOT `none`: an empty library is the owner's own deliberate
+   state and reads as an opening, while `setup` is a step not yet taken and
+   is neither a fault nor a statement about any library's contents. */
+.sw-invite { background: rgba(90,140,220,.12);
+             border-left: 3px solid rgba(90,140,220,.7); }
+.sw-setup  { background: rgba(128,128,128,.10);
+             border-left: 3px dashed rgba(128,128,128,.8); }
+/* `served, not offered` is a normal answer about a real install, so it is
+   informative rather than alarming -- but it is never quiet, because the
+   pane it heads is refusing to do the thing the page is for. */
+.sw-served { background: rgba(160,90,200,.14);
+             border-left: 3px solid rgba(160,90,200,.9); }
+.sw-install { font-family: ui-monospace, monospace; font-size: .82em;
+              opacity: .85; word-break: break-all; }
+.sw-basis { font-size: .8em; opacity: .7; margin-top: .35rem;
+            font-style: italic; }
+.sw-pane.sw-refused .sw-kinds,
+.sw-pane.sw-refused .sw-pick { opacity: .4; pointer-events: none; }
+.sw-cat-count { opacity: .6; font-size: .85em; margin-left: .25rem; }
 .sw-unknown { background: rgba(220,150,40,.16);
               border-left: 3px solid rgba(220,150,40,.9); }
 .sw-none { background: rgba(128,128,128,.14);
@@ -184,12 +204,21 @@
   <div id="sw-writable"></div>
   <div class="sw-body">
 
+    <!-- LEFT: the COmmunity Library. Read from anywhere, filtered by
+         CATEGORY rather than by install, because the library is the owner's
+         own set of decisions and it outlives any one client. -->
     <div class="sw-pane" id="pane-donor">
       <div class="sw-head">
         <span class="sw-role">Your library
           <small>collect something first &mdash; this pane is never an install</small></span>
       </div>
-      <div class="sw-kinds" id="donor-kinds"></div>
+      <!-- The library's state is rendered BEFORE the list, and when the
+           state has no list it is rendered INSTEAD of one. Four states
+           (stocked / empty / unreadable / unconfigured) with four
+           sentences: an empty shelf and an unreadable folder are not the
+           same news, and the second must never wear the first's copy. -->
+      <div id="library-state"></div>
+      <div class="sw-kinds" id="library-cats"></div>
       <div class="sw-stage"><canvas id="gl-donor"></canvas>
         <div class="sw-msg" id="msg-donor">pick a kind</div></div>
       <!-- WHICH INSTALL this entry's art came from, and therefore whose
@@ -214,14 +243,20 @@
 
     <div class="sw-mid" id="sw-mid">
       <div class="sw-arrow">&rarr;</div>
-      <div id="mid-body">Pick a donor and a target.</div>
+      <div id="mid-body">Pick something from your library on the left, and what it replaces on the right.</div>
     </div>
 
+    <!-- RIGHT: the install being applied TO. Exactly one is offered.
+         `#target-install` is drawn in EVERY verdict, including both
+         refusals: three installs are live on this box and a pane that will
+         not say which one it is showing cannot be checked by the person
+         looking at it. -->
     <div class="sw-pane" id="pane-target">
       <div class="sw-head">
         <span class="sw-role">The private server
           <small>CCO &mdash; the NPC set from its own npc.json</small></span>
       </div>
+      <div id="target-state"></div>
       <div class="sw-kinds" id="target-kinds"></div>
       <div class="sw-stage"><canvas id="gl-target"></canvas>
         <div class="sw-msg" id="msg-target">pick a kind</div></div>

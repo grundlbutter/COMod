@@ -468,7 +468,9 @@ def _directory_anchored(logical: str) -> bool:
 
 
 def gather_parts(read, list_under, mesh: str,
-                 effects: Iterable[str] = ()) -> list[tuple[str, str, str, bytes]]:
+                 effects: Iterable[str] = (), *,
+                 motions: "Optional[Iterable[str]]" = None,
+                 ) -> list[tuple[str, str, str, bytes]]:
     """Everything that belongs with ``mesh`` beyond its own skin.
 
     ``motion``  MOTI-only ``.c3`` siblings in the same directory -- the old
@@ -481,8 +483,44 @@ def gather_parts(read, list_under, mesh: str,
 
     ``read``/``list_under`` come from the active view, so this works for
     assets that exist only inside an imported client.
+
+    ``motions`` REPLACES the directory sweep with an explicit list, for
+    families whose actions are named by a TABLE rather than found beside the
+    mesh.  It is keyword-only and defaults to None, so **every existing
+    caller gets exactly the behaviour it got before**; `None` means "sweep",
+    and an empty list means "the caller looked and there are none", which are
+    different instructions and are kept different here.
+
+    Weapons need it.  Measured on 6609, 2026-08-17: `c3/weapon/` is 633 files
+    holding 331 single-file `.c3` meshes with no per-action siblings, so
+    `actions_beside` returns `[]` for **every weapon on the install** and the
+    `MAX_ACTIONS` content-folder classifier never fires.  The sweep does not
+    over-collect here, which is the failure that would be noticed -- it
+    under-collects to exactly zero and reports success.  See
+    `core/weaponcollect.plan_files`, which reads the motion rows out of
+    `weaponmotion.dbc`/`.ini` and passes them here.
     """
     out: list[tuple[str, str, str, bytes]] = []
+    if motions is not None:
+        for p in motions:
+            try:
+                blob = read(p)
+            except Exception:
+                continue
+            # No MOTI test and no geometry test: the table NAMED this file as
+            # this weapon's motion. Re-deriving that judgement from the bytes
+            # would let a layout check overrule the only authority that
+            # actually knows, which is what the directory rule does and why
+            # it is not used here.
+            out.append(("motion", p.rsplit("/", 1)[-1], p, blob))
+        for e in effects:
+            role = ("sound" if e.rsplit(".", 1)[-1].lower()
+                    in ("wav", "mp3", "ogg") else "effect")
+            try:
+                out.append((role, e.rsplit("/", 1)[-1], e, read(e)))
+            except Exception:
+                continue
+        return out
     for _code, p, anchored in actions_beside(list_under, mesh):
         try:
             blob = read(p)

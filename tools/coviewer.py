@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import html
 import io
@@ -42,6 +43,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import struct
 import subprocess
 import sys
@@ -2348,6 +2350,7 @@ class Catalog:
 
         self.all_paths: list[str] = sorted(set(self.loose) | set(self.archived))
         self._path_set = set(self.all_paths)
+        self._garment_map = None
 
         # Assets this server does not share with the baseline get its tag
         # ("Zephyr"), derived from the filemap rather than stored per file:
@@ -2390,6 +2393,12 @@ class Catalog:
                      f"DMaps extracted, {stats['failed']} failed "
                      f"({time.time()-t0:.0f}s) -> {dest}")
             self._map_root = dest
+        # "What goes with this MAP" walks the same map root the rest of the
+        # map stack does, not the install: on a server view they are different
+        # directories and the layer walk would otherwise describe the wrong
+        # client's maps. Assigned here rather than passed to the constructor
+        # because `_map_root` is not known until materialization has run.
+        self.assetcat.map_root = self._map_root
         self.maps = mapindex.MapIndex(self._map_root, exists=self.exists)
         self._cat_summary: Optional[dict] = None
         self._cat_index: Optional[dict] = None
@@ -3242,8 +3251,22 @@ class Catalog:
     #: Same rule as coassets.AssetRoot.resolve_asset (INFERRED: reproduces 94%
     #: of armor.ini, 98% of weapon.ini, 79% of armet.ini) but answered from
     #: memory -- `ships()` below -- instead of hitting the filesystem 21 times.
-    MESH_DIRS = ("mesh", "weapon", "body", "hair", "mount", "npc", "monster")
-    TEX_DIRS = ("texture", "weapon", "body", "hair", "mount", "npc", "monster")
+    #: TAKEN FROM `AssetRoot`, not restated. These were a verbatim copy of
+    #: that tuple and they went stale the moment it moved: `armet`, `head`,
+    #: `cape`, `pelvis`, `spirit` and `misc` were added there on 2026-08-27
+    #: because 7878 splits art per kind and ships NEITHER `c3/mesh` NOR
+    #: `c3/texture`. This copy kept the old seven, so the viewer resolved
+    #: no headgear on that client while `comod show` resolved it fine --
+    #: the same id answering differently depending on which reader you
+    #: asked. The file already warns that a third copy is how one of them
+    #: stays wrong; this is the second copy proving it.
+    #:
+    #: The EXTRA directories are gated on an enumerable namespace in
+    #: `AssetRoot` because there every probe is a filesystem stat. Here
+    #: resolution is a set lookup against names already in memory, so they
+    #: cost nothing and are always included.
+    MESH_DIRS = AssetRoot.MESH_DIRS + AssetRoot.MESH_DIRS_EXTRA
+    TEX_DIRS = AssetRoot.TEX_DIRS + AssetRoot.TEX_DIRS_EXTRA
 
     @property
     def arc_by_hash(self) -> dict:
@@ -3326,6 +3349,52 @@ class Catalog:
         for sub in dirs:
             for i in ids:
                 p = f"c3/{sub}/{i}{ext}"
+                if self.ships(p):
+                    return p
+        # Last resort, after every exact probe: the GARMENT rule, so this
+        # reader and `AssetRoot.resolve_asset` answer the same id the same
+        # way. Without it `comod show 1130000` resolved and the viewer's
+        # resolve_id("1130000") returned None on the same install -- one id,
+        # two answers, decided by which reader you happened to ask.
+        return self._resolve_garment(asset_id, dirs, ext)
+
+    def _garment_index(self) -> dict:
+        """`{(kind, last6): [stem, ...]}` over the names already in memory.
+
+        The same discovered mapping `AssetRoot._art_by_garment` builds, but
+        answered from `all_paths` rather than by walking the install again --
+        this class exists precisely so resolution does not hit the disk.
+        Stems that also ship a `.dds` sort first: a mesh you can texture is a
+        better answer than one you cannot, and on 7878 the 10-digit armet
+        variants have no texture at all.
+        """
+        if self._garment_map is None:
+            idx: dict = {}
+            textured: set = set()
+            for n in self.all_paths:
+                parts = n.split("/")
+                if len(parts) < 3 or parts[0] != "c3":
+                    continue
+                stem, _, x = parts[-1].rpartition(".")
+                if x not in ("c3", "dds") or len(stem) < 6:
+                    continue
+                if x == "dds":
+                    textured.add((parts[1], stem))
+                idx.setdefault((parts[1], stem[-6:]), [])
+                if stem not in idx[(parts[1], stem[-6:])]:
+                    idx[(parts[1], stem[-6:])].append(stem)
+            for (kind, _g), v in idx.items():
+                v.sort(key=lambda t: ((kind, t) not in textured, t))
+            self._garment_map = idx
+        return self._garment_map
+
+    def _resolve_garment(self, asset_id: str, dirs, ext: str):
+        if len(asset_id) < 6:
+            return None
+        idx = self._garment_index()
+        for sub in dirs:
+            for stem in idx.get((sub, asset_id[-6:]), ()):
+                p = f"c3/{sub}/{stem}{ext}"
                 if self.ships(p):
                     return p
         return None
@@ -3889,9 +3958,129 @@ class SourceWatch:
             return dict(ans)
 
 
+class PortInUse(OSError):
+    """Refusal: the port asked for belongs to somebody else.
+
+    Its own type so `serve()` can print a sentence instead of a traceback,
+    and so a caller can tell *this port is taken* from any other bind
+    failure. See `ViewerServer.allow_reuse_address` for why this is a
+    refusal and not a warning.
+    """
+
+
+def _port_is_listening(host: str, port: int, timeout: float = 0.2) -> bool:
+    """Is something accepting connections on `(host, port)` right now?
+
+    A plain TCP connect, not an HTTP request: whatever holds the port may
+    not speak HTTP, and the only question here is whether it is occupied.
+    Port 0 means *any free port* and has nothing to ask about.
+
+    Racy by nature -- the holder can appear or vanish between this and the
+    bind -- which is why it is the FIRST of two guards, not the only one.
+    `server_bind` below still converts a losing bind into the same refusal.
+    """
+    if not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _taken_msg(host: str, port: int, why: str) -> str:
+    return (
+        f"port {port} is not free -- {why}.\n"
+        f"    Start with --port <other>, or stop whatever holds "
+        f"{host}:{port} first.\n"
+        f"    Refusing on purpose: on Windows two processes CAN listen on "
+        f"one port, neither errors, and requests go to whichever socket "
+        f"wins -- so a viewer answers for an install you are not serving "
+        f"and the reply looks exactly like a correct one. Not starting is "
+        f"better than starting beside it.")
+
+
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+
+    #: **Off on Windows**, and that is the fix rather than a tidy-up.
+    #:
+    #: `SO_REUSEADDR` on POSIX means *rebind a port whose old socket is in
+    #: TIME_WAIT* -- what a tool restarted every few minutes wants, so
+    #: POSIX keeps it. On Windows it means something else entirely: it lets
+    #: a second process bind a port another process is ALREADY LISTENING
+    #: on. Neither process errors, connections go to whichever socket wins,
+    #: and `Get-NetTCPConnection -LocalPort N -State Listen` names one
+    #: owner.
+    #:
+    #: MEASURED 2026-08-24, and it cost a measurement: two
+    #: `coviewer.py --port 8763` processes existed at once, started by
+    #: different sessions. `curl 127.0.0.1:8763` was answered by the one
+    #: the asker had NOT started -- a different install root, a different
+    #: COmmunity Library -- while their own process's log stayed empty, and
+    #: a collect POST was written into a library nobody meant to touch. The
+    #: only reason it was caught is that `/api/status` disagreed with the
+    #: startup banner.
+    #:
+    #: **A wrong-process answer looks exactly like a right one**, which is
+    #: what makes this a measurement hazard on a box where a dozen sessions
+    #: run viewers at once, rather than an inconvenience. Same family as
+    #: the socket-root drift below: nothing fails, the answer is just
+    #: someone else's.
+    #:
+    #: With the flag off the second bind fails with WSAEADDRINUSE (10048)
+    #: -- measured directly, both with and without the flag.
+    allow_reuse_address = os.name != "nt"
+
+    #: Bind errors that mean *somebody else has this port*, on both
+    #: platforms and **under both numbering schemes**: WSAEADDRINUSE surfaces
+    #: as `errno == winerror == 10048`, but WSAEACCES -- what Windows returns
+    #: when the holder claimed the port with `SO_EXCLUSIVEADDRUSE`, i.e. when
+    #: the other end is a viewer carrying this same fix -- surfaces as
+    #: `winerror 10013` with `errno 13`. MEASURED; reading only `errno` lets
+    #: the second case through, which is the half that fires between two
+    #: FIXED viewers. Anything else is not this problem and keeps its
+    #: traceback.
+    _TAKEN = {errno.EADDRINUSE, errno.EACCES, 10048, 10013}
+
+    def server_bind(self):
+        """Refuse a busy port, then claim ours exclusively.
+
+        Two guards, because they stop opposite directions of the same
+        collision:
+
+        * the probe stops **us** binding beside a viewer already serving;
+        * `SO_EXCLUSIVEADDRUSE` stops **them** binding beside us -- a
+          process that still sets `SO_REUSEADDR`, which every checkout of
+          this file older than 2026-08-24 does, and there are a dozen live
+          worktrees. MEASURED: a `SO_REUSEADDR` bind against a port held
+          this way fails with WSAEACCES (10013) instead of succeeding.
+
+        The obvious objection to the exclusive claim is restart latency, so
+        it was measured rather than argued: rebinding immediately after a
+        served-and-closed connection took 0.3 ms with the option and 0.2 ms
+        without. It costs nothing here.
+        """
+        host, port = self.server_address[0], self.server_address[1]
+        if _port_is_listening(host, port):
+            raise PortInUse(
+                _taken_msg(host, port, "something is already listening there"))
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET,
+                                       socket.SO_EXCLUSIVEADDRUSE, 1)
+            # An odd stack that rejects the option is not a reason not to
+            # start: the probe above still stands on its own.
+            except OSError:                          # pragma: no cover
+                pass
+        try:
+            super().server_bind()
+        except OSError as e:
+            # The race the probe cannot close: free when asked, taken by
+            # the time we bind. Same refusal, arrived at the other way.
+            if {e.errno, getattr(e, "winerror", None)} & self._TAKEN:
+                raise PortInUse(_taken_msg(host, port, str(e))) from e
+            raise
 
     #: The install being served.  A PROPERTY, not a plain attribute, because
     #: the socket test has to follow it and used to do so only by accident:
@@ -4356,6 +4545,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/swap/browse": self.api_swap_browse,
             "/api/swap/parts": self.api_swap_parts,
             "/api/swap/plan": self.api_swap_plan,
+            # "keep" rather than "collect": ad blockers eat `/collect` as the
+            # Google Analytics Measurement Protocol path. Same reason the
+            # collect routes above are aliased.
+            "/api/keep/weapon": self.api_weapon_parts,
             "/api/diff": self.api_diff,
             "/api/bodyfacets": self.api_bodyfacets,
             "/api/categories": self.api_categories,
@@ -4578,6 +4771,11 @@ class Handler(BaseHTTPRequestHandler):
                 for name, a in c.assets._archives.items()}
         return self._json({
             "root": str(c.root),
+            # WHICH PROCESS ANSWERED. Cheap, and the one field that makes a
+            # reply attributable: a `curl` answer used to be
+            # indistinguishable from another session's viewer holding the
+            # same port. See `ViewerServer.allow_reuse_address`.
+            "pid": os.getpid(),
             "server": getattr(self.server, "server_name", ""),
             "serverTag": c.server_tag,
             "serverUnique": len(c.unique_paths),
@@ -5126,7 +5324,16 @@ class Handler(BaseHTTPRequestHandler):
             fx = [str(x) for x in (doc.get("effects") or [])]
             if not fx:
                 fx = self._effects_for_asset(mesh)
-            parts = gather_parts(c.read, c.list_under, mesh, effects=fx)
+            # `motions` present (even as []) means the caller resolved this
+            # family's actions from a TABLE and the directory sweep must not
+            # run. Absent means sweep, exactly as before. Weapons send it:
+            # c3/weapon/ has no per-action siblings at all, so the sweep
+            # returns [] for all 331 meshes and would file a motionless entry
+            # while reporting success. See core/weaponcollect.py.
+            mo = doc.get("motions")
+            parts = gather_parts(
+                c.read, c.list_under, mesh, effects=fx,
+                motions=None if mo is None else [str(x) for x in mo])
         if dry:
             # Everything the real path does except the writing, so a failing
             # Collect can be told apart from a failing *request*.
@@ -5218,6 +5425,83 @@ class Handler(BaseHTTPRequestHandler):
     #
     # The Replace panel asks for a target *path*; these back the page that
     # asks for a target *asset* instead and derives the path from it.
+
+    def api_swap_sides(self, arg):
+        r"""What the two panes ARE: the library on the left, the install on
+        the right.
+
+        The owner's model, which this endpoint exists to serve:
+
+            "you would always build your library how you want it, and apply
+             it to individual private servers."
+
+        LEFT is the COmmunity Library -- read from anywhere, filtered by
+        category, and reported in one of four states that are never
+        collapsed into each other.  `api_collection` above answers a
+        *different* question (what is on the shelves) and answers it with
+        one sentence for two worlds: `_collection()` returns None only for
+        "not configured", while a corrupt index raises `CollectionError` out
+        of `Collection.__init__` and is never caught.  `swapsides.read_library`
+        separates them, so this endpoint is the one the swap page reads.
+
+        RIGHT is pinned by IDENTITY, not by "the root we happen to be on".
+        Three installs are live on this box and `coassets.DEFAULT_ROOT` is
+        `coroot.default_root()` frozen at import, so it moves.  A pane built
+        as "whatever the viewer is pointed at" renders 7878 and labels it
+        CCO.  `swapsides.offering_for` is given the catalogue's OWN root --
+        explicitly, never defaulted, for the reason
+        `tests/test_kind_agreement.py` records -- and refuses anything that
+        is not CCO.  **The install is named in every verdict**, including
+        both refusals: a pane that will not say what it is looking at cannot
+        be checked by the person looking at it.
+
+        Nothing here writes.  `describable` is a statement that a swap
+        against this install may be DESCRIBED, and there is no other verb.
+        """
+        import swapsides
+
+        # **The library THIS SERVER is using, and nothing else.**
+        # `srv.library` is already the fully resolved value -- `main` sets it
+        # from `--library`, then the saved `community_library`, then
+        # discovery -- so `None` here means genuinely unconfigured, and
+        # `post_setlibrary` sets it to None when the owner clears it.
+        #
+        # An earlier draft fell back to reading `community_library` out of
+        # the settings when this was None. That was the same
+        # configured-vs-actual divergence the right pane exists to refuse,
+        # reintroduced on the left: `--library DIR` sets `srv.library`
+        # WITHOUT saving it, so the fallback described a different folder
+        # than every other route on this process uses, and it turned "the
+        # owner cleared their library" into "here are the 32 entries in the
+        # library they cleared". Read one value, from one place.
+        view = swapsides.read_library(getattr(self.server, "library", None))
+
+        cat = self.cat
+        if cat is None or getattr(cat, "root", None) is None:
+            # Setup mode: no install located yet. Not a refusal of CCO -- a
+            # statement that there is nothing to refuse, kept distinct so the
+            # page does not tell the owner their install is "not CCO" when it
+            # simply has not been found.
+            right = {"verdict": "no_install", "install": "", "kind": "",
+                     "label": "no install configured",
+                     "note": "COMod has not located a game install yet. "
+                             "Point it at one on the setup page.",
+                     "basis": swapsides.DECLARATION_BASIS,
+                     "offeredKind": swapsides.OFFERED_KIND,
+                     "describable": None}
+        else:
+            right = swapsides.offering_for(cat.root).to_json()
+
+        return self._json({
+            "left": view.to_json(),
+            "right": right,
+            # The gap, carried on the payload rather than left for the page
+            # to remember: no displacement check runs for NPC roles.
+            "displacement": swapsides.displacement_note("npc"),
+            "model": ("Build your library how you want it, then apply it to "
+                      "one install. The library reads from anywhere; only "
+                      "CCO is offered as a target."),
+        })
 
     def api_swap_kinds(self, arg):
         """The six kinds the left pane offers, with what each can draw.
@@ -6071,6 +6355,205 @@ class Handler(BaseHTTPRequestHandler):
         out = plan.to_json()
         out["donorParts"] = rep.to_json()
         return self._json(out)
+    # ------------------------------------------------------------------ weapons
+
+    #: Directories that hold one `.dds` per ITEM ID and none per model. They
+    #: match a weapon's stem exactly, which is what makes them dangerous to a
+    #: stem-keyed lookup, and they are never a model's skin.
+    WEAPON_TEXTURE_NEVER = ("data/itemminicon/", "data/mapitemicon/")
+
+    def _weapon_provider(self):
+        """COMod Parser's `weapon_parts`, or None when it has not landed.
+
+        The ONLY place this module is imported. Everything else goes through
+        `weaponcollect`, which raises `WeaponPartsUnavailable` when this
+        returns None -- so the page renders "the resolver is not wired in"
+        rather than four `unavailable` facets that would be indistinguishable
+        from an install shipping no weapon tables.
+        """
+        try:
+            import weaponparts
+        except Exception:
+            return None
+        return lambda root, wid: weaponparts.weapon_parts(root, wid)
+
+    def _displacement_provider(self):
+        """COMod Parser's `displacement`, or None when it has not landed.
+
+        Byte-identity of a resolved mesh across two installs. Deliberately a
+        separate provider from `_weapon_provider`: the tables can be readable
+        while this is not, and the page must be able to show the parts of a
+        weapon while saying it cannot tell what writing it would destroy.
+
+        There is NO fallback. The obvious cheap stand-in -- comparing the mesh
+        ids the two appearance tables name -- is already computable from the
+        two reports this handler holds, and it is the exact predicate this
+        replaces: it agrees while the bytes differ on 3,763 of 4,710 shared
+        ids, so it renders the common overwrite as safe. See
+        core/weaponcollect.py.
+
+        The contract is agreed but is not on a ref yet, so where it will live
+        is not known. Both plausible homes are tried -- beside `weapon_parts`
+        in `weaponparts`, and a module of its own -- and if neither answers
+        the page says NOT WIRED IN. Guessing the module wrong costs a stub
+        message; guessing a *predicate* wrong is what this change is undoing.
+        """
+        for mod, attr in (("weaponswap", "displacement"),
+                          ("weaponparts", "displacement"),
+                          ("weapondisplace", "displacement")):
+            try:
+                m = __import__(mod)
+            except Exception:
+                continue
+            fn = getattr(m, attr, None)
+            if callable(fn):
+                return fn
+        return None
+
+    def _weapon_locator(self, cat):
+        """`(kind, name) -> logical path or ""` for one catalogue.
+
+        Weapon meshes, textures, motions and effects are named by the tables
+        as bare stems; this turns a stem into a path that view can read. It
+        looks the stem up in the catalogue's own index and NEVER lists a
+        directory to guess neighbours -- see `weaponcollect`'s docstring.
+        """
+        exts = {"mesh": (".c3",), "motion": (".c3",),
+                "texture": (".dds", ".tga", ".bmp"),
+                "effect": (".ini", ".c3", ".dds", ".wav")}
+        # `c3/mesh/` first and `c3/weapon/` second, measured on 6609
+        # 2026-08-17: c3/weapon/ holds only 331 of the 13,292 appearances and
+        # the rest live in c3/mesh/ (410230 -> c3/mesh/410230.c3). Leaving it
+        # out resolved the owner's own 800915 -- which happens to ship in
+        # BOTH -- and silently failed to resolve a mesh for most other
+        # weapons, which is the shape of bug a single hand-checked example
+        # hides.
+        #
+        # The order is a preference, not a fallback chain to be reordered
+        # casually: `data/itemminicon/` and `data/mapitemicon/` hold a .dds
+        # per item id too, and they are ICONS. A texture lookup that reached
+        # them would return a 64px inventory picture as a weapon's skin, so
+        # they are absent from every list here on purpose.
+        dirs = {"mesh": ("c3/mesh/", "c3/weapon/", "c3/effect/"),
+                "motion": ("c3/mesh/", "c3/weapon/", "c3/motion/",
+                           "c3/effect/"),
+                "texture": ("c3/texture/", "c3/weapon/", "c3/mesh/"),
+                "effect": ("c3/effect/", "c3/mesh/", "ani/", "sound/")}
+
+        def effect_folder(name: str) -> list:
+            """Every file under the folder an effect name refers to.
+
+            `weaponeffect.ini` names an effect `m-b02`; on disk that is
+            `c3/effect/monster-bomb/m-b02/{1,2,3}.{c3,dds}` -- a folder, one
+            category level below `c3/effect/`, holding the frames. Collecting
+            only the first file gives a weapon whose aura is one frame.
+
+            The TABLE named this folder, so listing it follows a reference
+            rather than guessing from adjacency -- unlike `actions_beside`,
+            which is why weapons do not use that. The segment match is exact
+            (`/m-b02/`), so a sibling effect whose name merely starts the same
+            is not swept in.
+            """
+            seg = f"/{name}/"
+            return sorted(p for p in cat.list_under("c3/effect/") if seg in p)
+
+        def locate(kind: str, name: str):
+            name = (name or "").strip().replace("\\", "/").lower()
+            if not name:
+                return ""
+            if "/" in name and cat.exists(name):
+                return name
+            for d in dirs.get(kind, ()):
+                for ext in exts.get(kind, (".c3",)):
+                    p = f"{d}{name}{ext}"
+                    if cat.exists(p):
+                        return p
+            if kind == "effect":
+                return effect_folder(name)
+            return ""
+        return locate
+
+    def api_weapon_parts(self, arg):
+        """Everything the builder needs to decide about one weapon id.
+
+        Answers with FOUR blocks, and the page reads them in this order:
+
+          ``resolver``  whether Parser's resolver is wired in at all. When it
+                        is not there are no facets -- not four empty ones.
+          ``donor``     the parts on the view being browsed.
+          ``target``    the same id on the install being modded.
+          ``verdict``   what writing it to the target would DO: absent /
+                        present-same-art / present-different-art. There is no
+                        bare "present": that reading is the one that destroys
+                        a weapon the owner never looked at.
+        """
+        import weaponcollect
+        wid = str(arg("id", "") or "").strip()
+        if not wid:
+            return self._error(400, "id required")
+        provider = self._weapon_provider()
+        donor_cat = self.cat
+        target_cat = self._base_cat()
+
+        def report(cat, tag):
+            if cat is None:
+                return weaponcollect.parts_report(None, wid, provider=None,
+                                                  install=tag)
+            return weaponcollect.parts_report(
+                cat.assets, wid, provider=provider,
+                install=(coroot.base_id(cat.root) if cat.root else tag))
+
+        donor = report(donor_cat, self.server.server_name or "donor")  # type: ignore[attr-defined]
+        target = report(target_cat, "target")
+        verdict = weaponcollect.displacement_report(
+            getattr(donor_cat, "root", None), getattr(target_cat, "root", None),
+            wid, provider=self._displacement_provider(),
+            donor_report=donor, target_report=target,
+            target_install=target.get("install", ""))
+        plan = weaponcollect.plan_files(
+            donor, self._weapon_locator(donor_cat) if donor_cat else
+            (lambda kind, name: ""))
+        # The appearance table names a texture STEM, and it does not always
+        # exist under that stem: weapon 1050000's row says `1050000` and the
+        # file on 6609 is `c3/texture/105000000.dds`. Rather than invent a
+        # padding rule here, fall back to the viewer's own resolver -- the
+        # same one `post_collect` uses. `tools/collect.py`'s docstring records
+        # what the alternative costs: a second implementation of this lookup
+        # gave a different answer than the viewer, which is a bug you only
+        # find in the rendered model.
+        #
+        # The fallback is FILTERED, and this is not hypothetical: asked for
+        # weapon 1050000 it returns `data/itemminicon/1050000.dds`, the 64px
+        # inventory icon, because that file really is named after the mesh.
+        # A generic asset browser showing an icon is harmless; a weapon
+        # collected with one has an icon stretched over its blade. An honest
+        # "could not resolve" beats a confident wrong file, so a rejected
+        # answer is recorded in `skipped` rather than quietly dropped.
+        if donor_cat is not None and plan["mesh"] and not plan["texture"]:
+            cand = donor_cat.texture_for_mesh(plan["mesh"]) or ""
+            if cand and not cand.startswith(self.WEAPON_TEXTURE_NEVER):
+                plan["texture"] = cand
+            elif cand:
+                plan["skipped"].append(
+                    {"surface": "appearance", "role": "texture",
+                     "name": cand,
+                     "reason": "the only match is an inventory icon, not a "
+                               "model skin -- left unresolved on purpose"})
+        return self._json({
+            "weaponId": wid,
+            "resolver": {
+                "available": donor.get("resolverAvailable"),
+                "stub": donor.get("stub"),
+                "owner": donor.get("owner"),
+                "module": donor.get("module"),
+                "contract": donor.get("contract"),
+                "headline": donor.get("headline") if donor.get("stub") else "",
+                "detail": donor.get("detail") if donor.get("stub") else "",
+                "reason": donor.get("reason"),
+            },
+            "donor": donor, "target": target, "verdict": verdict,
+            "plan": plan,
+        })
 
     def post_collect_stage(self, body: bytes, arg):
         """Stage a collected entry over the asset it replaces.
@@ -10936,7 +11419,12 @@ def serve(root: Optional[Path], port: int, host: str = "127.0.0.1",
              + (f"   (found via {found.source}: {found.detail})" if found else ""))
         cat = build_catalog(root, server_view)
 
-    httpd = ViewerServer((host, port), Handler, cat, root)
+    try:
+        httpd = ViewerServer((host, port), Handler, cat, root)
+    except PortInUse as e:
+        # A sentence, not a traceback: the reader's next action is to pick
+        # another port, and a stack does not help them choose one.
+        raise SystemExit(f"[coviewer] {e}") from None
     httpd.library = Path(library) if library else None
     httpd.server_name = server_name if (server_name and cat) else ""
     if cat is not None:
@@ -10945,7 +11433,12 @@ def serve(root: Optional[Path], port: int, host: str = "127.0.0.1",
     #: "CO_ROOT" rather than re-deriving it and possibly disagreeing.
     httpd.root_found = found                       # type: ignore[attr-defined]
     url = f"http://{host}:{port}/"
-    _log(f"serving {url}   (Ctrl-C to stop)")
+    # The pid is here so a log can be tied to a process. When two viewers
+    # were live on one port, the tell was that `/api/status` disagreed with
+    # this banner -- and the follow-up question, "then WHICH process
+    # answered", had nothing to answer it with. `/api/status` reports the
+    # same number, so the two can be compared instead of trusted.
+    _log(f"serving {url}   (Ctrl-C to stop)   pid {os.getpid()}")
     if not dds.HAVE_NUMPY:
         why = "CO_DDS_SCALAR is set" if dds.SCALAR_ONLY else "numpy not installed"
         _log(f"{why} -- block textures decode through the scalar reference "

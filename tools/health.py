@@ -2632,6 +2632,48 @@ def _base_id_safe(root=None) -> str:
         return "unkeyed"
 
 
+def _derived_suppression():
+    """The suppression reason, or None. Isolated so tests can inject one."""
+    try:
+        import catalog as _catalog                       # noqa: E402
+        return _catalog.derived_channel_suppressed()
+    except Exception:
+        return None
+
+
+def derived_problem(der, suppressed):
+    """One problem dict for the derived channel -- SUPPRESSED vs NOT-YET-BUILT.
+
+    Only the first is a fault. `out/` is gitignored and BUILT, never cloned, so
+    every fresh checkout legitimately has no derived data; promoting this
+    warning unconditionally would exit non-zero on a healthy clone and teach
+    everyone to ignore the tool. `catalog.derived_channel_suppressed()` already
+    draws the line -- it fires only when the fallback is switched OFF *and* a
+    primary checkout exists to have been read -- so this reuses it rather than
+    inventing a second rule that could disagree with the first.
+
+    Pure and argument-driven on purpose: both arms are then testable without
+    running a full `collect()`.
+    """
+    if suppressed:
+        return {
+            "severity": "error",
+            "what": "the derived-artefact channel is SUPPRESSED, not unbuilt "
+                    "-- a channel that exists and is being refused is a fault, "
+                    "and every count below is a lower bound: " + str(suppressed),
+            "fix": "unset %s (or set it to 1) and re-run"
+                   % coroot.DERIVED_FALLBACK_VAR,
+        }
+    return {
+        "severity": "warning",
+        "what": "%d generated artefact(s) have not been built yet, so the "
+                "catalogue can only see loose files — the .wdf archives "
+                "store a hash of each filename, not the name, and the recovery "
+                "has not run." % len(der["missing"]),
+        "fix": der["fix"],
+    }
+
+
 def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
     inst = check_install(explicit)
     # Ask about the install that was actually RESOLVED, not the one that was
@@ -2691,13 +2733,7 @@ def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
                 "fix": p["fix"]})
     der = rep["derived"]
     if not der["ok"]:
-        problems.append({
-            "severity": "warning",
-            "what": f"{len(der['missing'])} generated artefact(s) have not "
-                    "been built yet, so the catalogue can only see loose "
-                    "files — the .wdf archives store a hash of each "
-                    "filename, not the name, and the recovery has not run.",
-            "fix": der["fix"]})
+        problems.append(derived_problem(der, _derived_suppression()))
     # Called out separately from the count above, because this one has a
     # symptom the user will otherwise blame on the viewer: without it the
     # mesh<->texture relation is rebuilt in-process on every open of this

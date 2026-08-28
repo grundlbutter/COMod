@@ -38,6 +38,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -1069,9 +1070,334 @@ class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
         srv.game_root = self.long_root
         self.assertTrue(coviewer.is_socket_chunk("v_head"))
 
+    def _mesh(self, *chunks) -> bytes:
+        """A minimal MAXFILE container: one PHY4 per name, then one MOTI each.
 
+        All PHY chunks first and all MOTI chunks after, which is the layout
+        `attach.PartMesh.parse` pairs by ordinal rather than by adjacency.
+        """
+        import c3write
+        out = bytearray(c3phy.C3_MAGIC)
+        for name, at in chunks:
+            m = c3phy.PhyMesh(tag=b"PHY4", name=name)
+            for x, y, z in ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 10.0, 0.0)):
+                v = c3phy.Vertex()
+                v.px, v.py, v.pz = x + at, y, z + at
+                m.vertices.append(v)
+            m.vertex_count_a = len(m.vertices)
+            m.faces = [(0, 1, 2)]
+            m.face_count_a = 1
+            m.matrix = (1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0)
+            body = c3write.serialize_phy(m)
+            out += b"PHY4" + struct.pack("<I", len(body)) + body
+        moti = c3write.synth_moti(1, 1)
+        for _ in chunks:
+            out += b"MOTI" + struct.pack("<I", len(moti)) + moti
+        return bytes(out)
+
+    def _asset(self) -> bytes:
+        """A body whose one attachment point is 500 units off the geometry."""
+        return self._mesh(("v_body", 0.0), ("v_head", 500.0))
+
+    def test_parts_moti_sockets_reads_the_bytes_own_install(self):
+        """`moti_sockets` keeps a chunk only if the socket test accepts it, so
+        a miss here **drops** an anchor: the mesh carries it, it has a matrix,
+        and the resolver never sees it."""
+        import parts
+        raw = self._asset()
+        self.assertIn("v_head", parts.moti_sockets(raw, root=self.long_root))
+        self.assertNotIn("v_head", parts.moti_sockets(raw, root=self.short_root))
+
+    def test_parts_body_bounds_reads_the_bytes_own_install(self):
+        """The same miss the other way round: an unrecognised socket is counted
+        as geometry and the camera frames on 500 units of empty air."""
+        import parts
+        raw = self._asset()
+        near = parts.body_bounds(raw, root=self.long_root)
+        far = parts.body_bounds(raw, root=self.short_root)
+        self.assertLess(near["max"][0], 100.0, "v_head must not be in the box")
+        self.assertGreater(far["max"][0], 400.0,
+                           "the short vocabulary should have swallowed it -- "
+                           "if this fails the fixture stopped discriminating")
+
+    def test_superfx_bbox_reads_the_meshs_own_install(self):
+        """`_bbox` takes a loaded `PartMesh`, so the install is already on it;
+        the bug was asking `DEFAULT_ROOT` anyway. Every span superfx prints is
+        a measurement, so this one is a wrong *number*, not just a wrong pixel.
+        """
+        import superfx
+        raw = self._asset()
+        near = superfx._bbox(self.attach.PartMesh.parse(raw, root=self.long_root))
+        far = superfx._bbox(self.attach.PartMesh.parse(raw, root=self.short_root))
+        self.assertLess(near[1][0], 100.0)
+        self.assertGreater(far[1][0], 400.0)
+
+    def test_thumbs_mesh_geometry_reads_the_bytes_own_install(self):
+        """The one with lasting consequences: this answer is rasterised and
+        written to a PNG, so a run under the wrong root outlives the run."""
+        import thumbs
+        raw = self._asset()
+        long_g, _ = thumbs.mesh_geometry(raw, root=self.long_root)
+        short_g, _ = thumbs.mesh_geometry(raw, root=self.short_root)
+        self.assertEqual([g.name for g in long_g], ["v_body"])
+        self.assertEqual([g.name for g in short_g], ["v_body", "v_head"],
+                         "under a short vocabulary the socket is drawn as art")
+
+    def test_thumbs_hands_its_worker_root_to_the_socket_test(self):
+        """The wiring, not the classifier.
+
+        `mesh_geometry` taking a root is useless if `render_job` never passes
+        the one its worker was initialised with -- which is exactly the shape
+        the bug had. `mesh_geometry` is replaced by a recorder here, so this
+        asserts the argument and nothing about rasterising.
+        """
+        import thumbs
+        seen = []
+
+        def recorder(data, **kw):
+            seen.append(kw.get("root"))
+            return [], {"chunks": 0, "sockets": 0, "empty": 0, "other_tags": []}
+
+        class _Assets:
+            def read(self, logical):
+                return b"never parsed -- the recorder stands in for the parser"
+
+        prev_w = dict(thumbs._W)
+        prev_out = thumbs.OUT_DIR
+
+        def _restore():
+            thumbs._W.clear()
+            thumbs._W.update(prev_w)
+            thumbs.OUT_DIR = prev_out
+
+        self.addCleanup(_restore)
+        thumbs.OUT_DIR = Path(tempfile.mkdtemp(prefix="thumbout-"))
+        self.addCleanup(shutil.rmtree, thumbs.OUT_DIR, True)
+        thumbs._W.clear()
+        thumbs._W.update({"assets": _Assets(), "tex_cache": {},
+                          "root": self.long_root,
+                          "opts": {"size": 64, "ss": 1, "shade": "flat",
+                                   "frame": 0, "bg": (0, 0, 0, 0),
+                                   "tex_size": 64, "tex_quantize": False}})
+        with unittest.mock.patch.object(thumbs, "mesh_geometry", recorder):
+            thumbs.render_job(thumbs.Job("c3/mesh/1.c3", "mesh"))
+        self.assertTrue(seen, "render_job never reached mesh_geometry")
+        self.assertEqual(set(seen), {self.long_root},
+                         "the renderer must classify under the install it was "
+                         "pointed at, not CO_ROOT's")
+
+    def test_the_module_default_is_only_what_a_missing_root_falls_back_to(self):
+        """The falsifier, stated as a test.
+
+        Point the module default at the SHORT install -- what
+        `CO_ROOT=.../Clients/5517` does on this rig -- and hand each caller a
+        LONG asset. Passing the root must classify all of it as sockets;
+        omitting it must not. The second half is the bug reproduced on demand,
+        and it is also why leaving `root` None is documented as a fallback
+        rather than quietly made an error: a caller that genuinely does not
+        know which install its bytes came from still gets the old behaviour.
+        """
+        import parts
+        import thumbs
+        raw = self._asset()
+        prev = self.attach.DEFAULT_ROOT
+        self.addCleanup(setattr, self.attach, "DEFAULT_ROOT", prev)
+        self.attach.DEFAULT_ROOT = self.short_root
+
+        self.assertIn("v_head", parts.moti_sockets(raw, root=self.long_root))
+        self.assertNotIn("v_head", parts.moti_sockets(raw))
+
+        self.assertEqual([g.name for g in thumbs.mesh_geometry(
+            raw, root=self.long_root)[0]], ["v_body"])
+        self.assertEqual([g.name for g in thumbs.mesh_geometry(raw)[0]],
+                         ["v_body", "v_head"])
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
 class _NullHandler(BaseHTTPRequestHandler):
     """Never instantiated -- ViewerServer only stores the class."""
+
+
+class TwoViewersMustNotShareOnePort(unittest.TestCase):
+    r"""A busy port is REFUSED. Binding beside a live viewer is the fault.
+
+    `ViewerServer` set `allow_reuse_address = True`, which on POSIX means
+    *rebind past TIME_WAIT* and on Windows means something else: a second
+    process may bind a port another process is **already listening on**.
+    Neither errors, connections go to whichever socket wins, and
+    `Get-NetTCPConnection -LocalPort N -State Listen` names one owner.
+
+    MEASURED 2026-08-24, and it cost a measurement rather than a startup:
+    two `coviewer.py --port 8763` processes were live at once, started by
+    different sessions. `curl 127.0.0.1:8763` was answered by the one the
+    asker had not started -- a different install root and a different
+    COmmunity Library -- while their own process's log stayed empty, and a
+    collect POST was written into a library nobody meant to touch. It was
+    caught only because `/api/status` disagreed with the startup banner.
+
+    **A wrong-process answer looks exactly like a right one.** That is the
+    whole cost, and it is why this is a refusal rather than a warning: a
+    viewer that starts and then answers for someone else's install is worse
+    than a viewer that does not start. Same family as
+    `TheSocketTestFollowsTheInstallBeingDrawn` above -- nothing fails, the
+    answer is just somebody else's.
+
+    Hermetic: every port here is ephemeral and every listener is created and
+    closed by the test, so it neither needs an install nor collides with a
+    viewer a colleague is running on this box.
+    """
+
+    def _listener(self, reuse: bool = False):
+        """A plain listening socket on an ephemeral port, plus its port."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if reuse:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        s.listen(5)
+        self.addCleanup(s.close)
+        return s, s.getsockname()[1]
+
+    def _viewer(self, port: int):
+        import coviewer
+        srv = coviewer.ViewerServer(("127.0.0.1", port), _NullHandler,
+                                    None, None)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    # -- the refusal ---------------------------------------------------------
+
+    def test_a_busy_port_is_refused_rather_than_bound_beside(self):
+        """A plain listener holds the port; the viewer must not start.
+
+        **This test does not, on its own, exercise the fix** -- see the next
+        one. Windows already refuses a `SO_REUSEADDR` bind against a holder
+        that did NOT set the flag, so the old code passed this too. It is
+        here for the message and the exception type, and because the refusal
+        must hold for any holder, not only for another viewer.
+        """
+        import coviewer
+        _sock, port = self._listener()
+        with self.assertRaises(coviewer.PortInUse):
+            self._viewer(port)
+
+    def test_the_holder_that_actually_bit_is_ANOTHER_VIEWER(self):
+        """The guard proper, and the only test here that the bug fails.
+
+        MEASURED while writing this class, by mutation: restore
+        `allow_reuse_address = True`, delete the probe and the exclusive
+        claim, and the test above still PASSES -- because its holder is a
+        plain socket and Windows refuses that pairing by itself. The hijack
+        needs **both** ends carrying `SO_REUSEADDR`, which is exactly the
+        live case: the other process is another `coviewer.py`. Mutated, this
+        one binds beside the holder and fails.
+
+        Worth stating plainly because the near-miss is the expensive kind: a
+        guard that passes for a reason unrelated to the defect reads as
+        coverage right up until the defect comes back.
+        """
+        import coviewer
+        _sock, port = self._listener(reuse=True)     # an older viewer, serving
+        with self.assertRaises(coviewer.PortInUse):
+            self._viewer(port)
+
+    def test_the_refusal_names_the_port_and_what_to_do_about_it(self):
+        """The message is the whole user interface of this refusal -- it is
+        read by someone whose viewer just did not start, whose next action is
+        to choose a different port."""
+        import coviewer
+        _sock, port = self._listener(reuse=True)
+        with self.assertRaises(coviewer.PortInUse) as cm:
+            self._viewer(port)
+        msg = str(cm.exception)
+        self.assertIn(str(port), msg)
+        self.assertIn("--port", msg)
+
+    def test_the_refusal_is_its_own_type_and_still_an_oserror(self):
+        """`serve()` catches `PortInUse` to print a sentence instead of a
+        traceback; anything holding the older, broader `except OSError` must
+        keep catching it."""
+        import coviewer
+        self.assertTrue(issubclass(coviewer.PortInUse, OSError))
+
+    # -- the permit direction ------------------------------------------------
+    #
+    # A guard that refused too much would be caught here rather than by every
+    # other server harness in the repo failing to start. Port 0 in particular:
+    # nine harnesses bind ephemeral, and a probe that treated 0 as a port to
+    # ask about would refuse all of them.
+
+    def test_an_ephemeral_port_still_binds(self):
+        srv = self._viewer(0)
+        self.assertGreater(srv.server_address[1], 0)
+
+    def test_a_free_port_binds(self):
+        sock, port = self._listener()
+        sock.close()
+        self._viewer(port)                    # no raise
+
+    def test_the_port_is_free_again_the_instant_the_holder_closes(self):
+        """The cost the exclusive claim could have imposed, pinned.
+
+        `SO_EXCLUSIVEADDRUSE` is the half that stops OTHER processes binding
+        beside us, and the standing objection to it is restart latency: a tool
+        restarted every few minutes must not meet a two-minute TIME_WAIT wall.
+        MEASURED on this rig at 0.3 ms with the option against 0.2 ms without
+        -- so this asserts the behaviour rather than the timing.
+        """
+        srv = self._viewer(0)
+        port = srv.server_address[1]
+        srv.server_close()
+        self._viewer(port)                    # immediately, no raise
+
+    # -- the mechanism, and the premise it rests on --------------------------
+
+    def test_the_flag_is_off_where_it_means_the_wrong_thing(self):
+        """The probe is racy on purpose (see `_port_is_listening`), so the
+        flag being off is a SEPARATE guard and needs its own assertion. With
+        only the behaviour test above, re-adding the flag would still pass."""
+        import coviewer
+        self.assertEqual(coviewer.ViewerServer.allow_reuse_address,
+                         os.name != "nt")
+
+    @unittest.skipUnless(os.name == "nt", "the hijack is a Windows behaviour")
+    def test_windows_really_does_let_a_second_listener_in(self):
+        """The premise of this whole class, asserted rather than believed.
+
+        If Windows ever stops doing this, the reader meets a failing test
+        naming the assumption instead of a comment nobody can check. Two RAW
+        sockets -- `ViewerServer` is deliberately not involved.
+        """
+        first, port = self._listener(reuse=True)
+        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(second.close)
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.bind(("127.0.0.1", port))      # the bug, in three lines
+        second.listen(5)
+        self.assertEqual(second.getsockname()[1], first.getsockname()[1])
+
+    @unittest.skipUnless(os.name == "nt", "SO_EXCLUSIVEADDRUSE is Windows-only")
+    def test_a_serving_viewer_cannot_be_bound_beside(self):
+        """The other direction, and the one that matters during rollout.
+
+        Turning the flag off stops *this* process stealing someone else's
+        port. It does nothing about the reverse: every checkout of
+        `coviewer.py` older than 2026-08-24 still sets `SO_REUSEADDR`, and a
+        dozen worktrees are live on this box. `SO_EXCLUSIVEADDRUSE` is what
+        refuses them -- WSAEACCES (10013), measured.
+        """
+        srv = self._viewer(0)
+        port = srv.server_address[1]
+        thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(thief.close)
+        thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        with self.assertRaises(OSError) as cm:
+            thief.bind(("127.0.0.1", port))
+        # `winerror`, not `errno`: this refusal arrives as WSAEACCES, which
+        # Python maps to `errno 13` while `winerror` keeps 10013. MEASURED --
+        # the first version of this assertion read `errno` and failed on the
+        # very behaviour it was written to prove.
+        self.assertIn(getattr(cm.exception, "winerror", cm.exception.errno),
+                      (10013, 10048), f"unexpected refusal: {cm.exception}")
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
@@ -2785,6 +3111,259 @@ class RelatedAssets(unittest.TestCase):
         self.assertIn(catalog.meshtex, (None, catalog.meshtex))
         app = self._appearance("410005", "r_weapon")
         self.ac.related_groups(appearance=app)          # must not raise
+
+
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
+class WhatGoesWithAMap(unittest.TestCase):
+    """"...and what goes with a MAP" -- four layer kinds, four groups.
+
+    Base-agnostic on purpose. Every count in `docs/viewer.md`'s map subsection
+    is measured on 7878, and pinning an assertion to one of them would make
+    this class red on the seven other installs -- which is `requires_base`'s
+    whole subject. What is asserted here is the SHAPE: four groups, sound
+    among them, `range`/`volume` on the row, unfilled editor rows skipped,
+    and the narrow routing test.
+
+    The fixture is DISCOVERED, not named. A map hardcoded here would expire as
+    a failure the moment the configured install changed, and `skipTest` when
+    nothing suitable ships is the honest outcome -- not a pass.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coviewer
+        cls.cat = coviewer.Catalog(ROOT)
+        cls.cat.wait_tables()
+        cls.ac = cls.cat.assetcat
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cat.close()
+
+    # -- synthetic layer fixtures.
+    #
+    # `decode_layer`'s output shape, built by hand. The aggregation is asked
+    # about a table it could not otherwise be shown: an install ships what it
+    # ships, and three of the assertions below have no shipped example on the
+    # configured client. Two of them were written against a shipped map first
+    # and went green with the code broken -- see `map_groups_for_layers`.
+    @staticmethod
+    def _cover(path, key, size, origin=(0, 0), interval=100):
+        return {"index": 0, "type": 4, "shape": "cover", "type_name": "COVER",
+                "path": path, "key": key, "origin": list(origin),
+                "size": list(size), "offset": [0, 0],
+                "frame_interval": interval}
+
+    @staticmethod
+    def _sounds(rows):
+        return [{"index": i, "type": 15, "shape": "sound",
+                 "type_name": "SOUND", "path": p, "origin": [0, 0],
+                 "range": rng, "volume": vol}
+                for i, (p, rng, vol) in enumerate(rows)]
+
+    def _group(self, layers, title):
+        groups = self.ac.map_groups_for_layers(layers)
+        hit = [g for g in groups if g["title"] == title]
+        self.assertTrue(hit, f"{title} not among {[g['title'] for g in groups]}")
+        return hit[0]
+
+    def _a_map_with(self, shape: str, limit: int = 40):
+        """(name, groups) for the first map carrying a layer of `shape`."""
+        import catalog
+        import dmap
+        title = {"scene": "Terrain scenes", "cover": "Cover sheets",
+                 "effect": "Effects", "sound": "Sounds"}[shape]
+        for name in dmap.map_names(ROOT)[:limit]:
+            groups = self.ac.map_layer_groups(name)
+            if not groups:
+                continue
+            hit = [g for g in groups if g["title"] == title]
+            if hit and hit[0]["items"]:
+                return name, groups, hit[0]
+        self.skipTest(f"no map in the first {limit} on this install carries a "
+                      f"{shape} layer -- {catalog.__name__} has nothing to "
+                      f"assert against here, which is not a pass")
+
+    def test_a_map_selection_is_routed_and_only_a_world_grid_is(self):
+        import catalog
+        self.assertEqual(catalog.map_name_of("map/map/island.DMap"), "island")
+        self.assertEqual(catalog.map_name_of("map/map/hq.7z"), "hq")
+        self.assertEqual(catalog.map_name_of(r"map\map\hq.7z"), "hq")
+        # Map ART is not a world grid. These are already classified under
+        # `map` and must NOT be walked as layer containers.
+        for p in ("map/puzzle/island.pul", "data/map/mapobj/hq/hq01.dds",
+                  "map/Scene/stand05.scene", "map/map/x/y.DMap", ""):
+            self.assertEqual(catalog.map_name_of(p), "", p)
+
+    def test_all_four_layer_kinds_get_their_own_group(self):
+        _name, groups, _hit = self._a_map_with("cover")
+        titles = [g["title"] for g in groups]
+        for want in ("Terrain scenes", "Cover sheets", "Effects", "Sounds"):
+            self.assertIn(want, titles)
+
+    def test_an_absent_map_is_not_an_empty_map(self):
+        """Two different facts, and `[]` is only one of them."""
+        self.assertEqual(self.ac.map_layer_groups("no-such-map-anywhere"), [])
+
+    def test_a_sound_row_carries_range_and_volume(self):
+        """The fields a naive design drops. They ride the RECORD, not the file.
+
+        7878 has 20 distinct `.wav` under 32 distinct `(range, volume)` pairs,
+        so a group keyed on the filename alone would collapse rows the engine
+        plays differently.
+
+        **Fed synthetic layers, not a shipped map.** Written against whichever
+        map the install happens to ship, this assertion PASSED with the volume
+        deliberately dropped from the dedupe key -- the fixture map placed
+        every file at one volume, so the test could not reach its own subject.
+        One file at two volumes is the whole hypothesis, so the fixture states
+        it.
+        """
+        snd = self._group(self._sounds([
+            ("sound/water.wav", 800, 80), ("sound/water.wav", 800, 80),
+            ("sound/water.wav", 800, 100),      # same file, LOUDER
+            ("sound/water.wav", 3000, 80),      # same file, further
+            ("sound/linn.wav", 800, 80),
+        ]), "Sounds")
+        self.assertEqual(len(snd["items"]), 4, snd["items"])
+        for row in snd["items"]:
+            self.assertIsNotNone(row["range"])
+            self.assertIsNotNone(row["volume"])
+            self.assertIn(str(row["range"]), row["label"])
+            self.assertIn(str(row["volume"]), row["label"])
+        water = sorted((r["range"], r["volume"], r["count"])
+                       for r in snd["items"] if "water" in r["path"])
+        self.assertEqual(water, [(800, 80, 2), (800, 100, 1), (3000, 80, 1)])
+
+    def test_a_sound_row_carries_range_and_volume_on_this_install_too(self):
+        """The synthetic case above, re-asked of whatever this client ships.
+
+        The fixture proves the aggregation; this proves the aggregation is
+        what a real map goes through. It asserts only what is true of every
+        install, so it is a shape check and never a content one.
+        """
+        _name, _groups, snd = self._a_map_with("sound")
+        for row in snd["items"]:
+            self.assertIn("range", row)
+            self.assertIn("volume", row)
+            self.assertIn(str(row["range"]), row["label"])
+            self.assertIn(str(row["volume"]), row["label"])
+
+    def test_an_empty_group_says_what_the_emptiness_means(self):
+        """Most maps carry no sound and no effects; the panel must say so."""
+        _name, groups, _hit = self._a_map_with("cover")
+        for g in groups:
+            self.assertTrue(g["note"].strip(), g["title"])
+            if not g["items"]:
+                self.assertTrue(g["pending"], g["title"])
+
+    def test_never_filled_editor_rows_are_skipped_by_both_tests(self):
+        r"""`"=" in path` and `size == [0,0]` are NOT the same test.
+
+        On 7878 they catch 2 and 917; on 6609, 636 and 1,819 -- so a check for
+        one of them is not a check for the other. **Fed synthetic layers**:
+        against a shipped map this PASSED with the `size == [0,0]` half of the
+        condition deleted, because the fixture map carried none of that kind.
+        The fixture carries one of each, so removing either half goes red.
+        """
+        cov = self._group([
+            self._cover("ani/MapScene.ani", "island15.tga", [64, 64]),
+            # the `=` form: the editor wrote the ini FIELD NAMES
+            self._cover("AniTitle=", "PosCell=[0,0]", [0, 0]),
+            # ...and the all-zero form, which the `=` test cannot see
+            self._cover("", "", [0, 0]),
+        ], "Cover sheets")
+        self.assertEqual(len(cov["items"]), 1, cov["items"])
+        self.assertEqual(cov["items"][0]["key"], "island15.tga")
+        self.assertIn("2 never-filled editor row(s) skipped", cov["note"])
+        for row in cov["items"]:
+            self.assertNotIn("=", row["path"], row)
+            self.assertTrue(row["key"], row)
+
+    def test_one_sheet_written_two_ways_is_one_sheet(self):
+        r"""Fold `\`->`/` AND case, or one file counts as two.
+
+        `ani\mapscene-new.ani` and `ani/MapScene-new.ani` are the same sheet.
+        Folding only the separator is the double-count that turned a 6609
+        cover figure into 1,272 / 1,266 from the true 636 / 633.
+        """
+        cov = self._group([
+            self._cover(r"ani\mapscene-new.ani", "ac-bamboo01.tga", [64, 64]),
+            self._cover("ani/MapScene-new.ani", "ac-bamboo01.tga", [64, 64]),
+        ], "Cover sheets")
+        self.assertEqual(len(cov["items"]), 1, cov["items"])
+        self.assertEqual(cov["items"][0]["count"], 2)
+        self.assertIn("1 sheet(s) here", cov["note"])
+
+    def test_a_cover_row_separates_a_missing_key_from_missing_art(self):
+        """Two faults, two flags -- 99.90% and 99.69% are different numbers."""
+        _name, _groups, cov = self._a_map_with("cover")
+        for row in cov["items"]:
+            self.assertIn("found", row)
+            self.assertIn("framesMissing", row)
+            # A key that is not in the sheet has no frames to be missing, so
+            # a row claiming both would be incoherent.
+            if not row["found"]:
+                self.assertEqual(row["framesMissing"], 0, row)
+
+    def test_resolution_asks_the_archives_and_the_note_admits_when_it_cannot(self):
+        r"""The 56.4% trap, as a property of the object rather than a number.
+
+        `AssetCatalog`'s fallback `exists` is a loose-file stat and cannot see
+        inside `c3.tpd`; on 7878 it calls 1,659 of 2,941 map effect meshes
+        absent where `AssetRoot.exists` calls 0. The viewer injects the real
+        one -- assert that, and assert that a catalogue WITHOUT one says so on
+        the group instead of presenting the artefact as the data.
+        """
+        import catalog
+        self.assertFalse(self.ac._exists_is_loose_only)
+        bare = catalog.AssetCatalog(ROOT)
+        self.assertTrue(bare._exists_is_loose_only)
+        name, _groups, _hit = self._a_map_with("cover")
+        for g in bare.map_layer_groups(name):
+            if g["title"] in ("Terrain scenes", "Cover sheets", "Sounds"):
+                self.assertIn("LOOSE-FILE", g["note"], g["title"])
+
+    def test_the_map_root_is_separable_from_the_install_root(self):
+        """A server view reads maps from a materialized root, not the install."""
+        import catalog
+        ac = catalog.AssetCatalog(ROOT)
+        self.assertEqual(ac.map_root, ac.root)
+        ac.map_root = Path(ROOT) / "no-maps-under-here"
+        self.assertEqual(ac.map_layer_groups("island"), [])
+
+    def test_an_effect_name_gap_is_a_missing_TWIN_not_a_different_ini(self):
+        r"""Pins the fact that made a published recoverability claim false.
+
+        `docs/viewer.md` gap 2 says twelve of the 18 undefined map effect names
+        are recoverable from 6609's **compiled `ini/3DEffect.dbc`**. The
+        earlier wording said "defined on 6609", which reads as a statement
+        about its `3DEffect.ini` -- and that is false, because 6609 and 7878
+        ship the BYTE-IDENTICAL ini. The difference is entirely that 6609 has
+        a `.dbc` twin and 7878 has none.
+
+        Asserted here rather than left in prose because prose is what got it
+        wrong: the two measurements were both right and only the sentence was
+        false, so nothing in the suite could have caught it. This can.
+        """
+        import hashlib
+        # Through coroot, like every other client-reading test here (see
+        # line ~11239). A literal works on exactly one box, and the
+        # sanitization gate refuses it for that reason.
+        clients = coroot.clients_dir()
+        old, new = clients / "6609", clients / "7878"
+        inis = [old / "ini" / "3DEffect.ini", new / "ini" / "3DEffect.ini"]
+        if not all(p.is_file() for p in inis):
+            self.skipTest("needs both 6609 and 7878 on this box; absent is "
+                          "not a pass")
+        a, b = (p.read_bytes() for p in inis)
+        self.assertEqual(hashlib.sha256(a).hexdigest(),
+                         hashlib.sha256(b).hexdigest(),
+                         "6609 and 7878 no longer ship the same 3DEffect.ini "
+                         "-- gap 2's reasoning needs re-deriving, not editing")
+        # ...and the asymmetry that DOES explain the gap.
+        self.assertTrue((old / "ini" / "3DEffect.dbc").is_file())
+        self.assertFalse((new / "ini" / "3DEffect.dbc").is_file())
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
@@ -8851,7 +9430,7 @@ class MapsOpenFromTheArchive(unittest.TestCase):
     **The registry decides, and that is measured rather than chosen.**
     `GameMap.dat`'s `FileName` names `.7z` on every install that ships
     archives and `.DMap` on every install that does not — 100% of rows on
-    seven installs, private-server repack included. `docs/map_twin_precedence.md`
+    nine installs, private-server repack included. `docs/map_twin_precedence.md`
     records why that makes the rule `core`'s rather than a parser plugin's,
     and refutes two proposals for a hook along the way.
 
@@ -10759,12 +11338,34 @@ class MapEditorModel(unittest.TestCase):
                         "largest first")
 
     @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
-    def test_a_pux_map_reports_rather_than_raises(self):
+    def test_a_pux_map_now_BUILDS_rather_than_reporting(self):
+        """SUPERSEDES `test_a_pux_map_reports_rather_than_raises`.
+
+        That test asserted a `.pux` map came back `ok: False` with `.pux` named
+        in `why` -- a graceful-degradation guard, correct while TqTerrain was
+        undecoded. `.pux` decodes now, so the guard was asserting the absence of
+        a feature that exists: it expired AS A FAILURE the moment its subject
+        was fixed, which is the same shape as a must-fire arm pinned to a
+        current defect.
+
+        The replacement asserts the thing that is now true, and can still fail:
+        a regression to the refusal path drops `ok: False` back in, and a decode
+        that returns an empty shell paints no tiles.
+        """
         art = self.lib.get("2020love01_new")
         j = art.to_json()
-        self.assertFalse(j["ok"])
-        self.assertIn(".pux", j["why"])
-        self.assertGreater(j["mapSize"][0], 0, "the grid still parses")
+        self.assertTrue(j["ok"], "regressed to the refusal path: %r" % (j["why"],))
+        self.assertNotIn(".pux", j["why"] or "")
+        # 40 x 33 tiles at 256 px -> 424 cells, and the file agrees with itself.
+        self.assertEqual(list(j["pul"]), [40, 33])
+        self.assertEqual(j["mapSize"], [424, 424])
+        self.assertEqual(int(j["impliedSize"]), j["mapSize"][0],
+                         "implied geometry disagrees with the declared grid")
+        self.assertTrue(j["consistent"])
+        # A decode that returned an empty shell would satisfy every geometry
+        # check above, because the grid is read from the header. Only the tile
+        # payload distinguishes "decoded" from "measured the box it came in".
+        self.assertGreater(j["layerCount"], 0, "decoded but carries no layers")
 
     def test_every_layer_renders_a_tile_of_the_right_size(self):
         for layer in self.m.LAYERS:
@@ -19598,7 +20199,12 @@ class CoreBoundary(unittest.TestCase):
                # The tri-state safety answer -- "I could not look" that cannot
                # be read as "nothing to worry about". Arrived with
                # claude/integrate-final.
-               "verdict"}
+               "splitoffer", "verdict",
+               # Arrived with the swap-page and weapon-collect rescue merges.
+               # Each was registered in ONE of the three lists that must
+               # agree -- pyproject for two, none for the third -- and in
+               # this one, none of them.
+               "npcaltskin", "swapsides", "weaponcollect"}
 
     def test_the_directory_holds_exactly_the_declared_modules(self):
         on_disk = {p.stem for p in self.CORE.glob("*.py")}

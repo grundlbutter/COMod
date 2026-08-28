@@ -952,6 +952,14 @@ class AssetRoot:
                   "`py -3 core/coroot.py --set DIR`, CO_ROOT, or --root.")
         self.overlay = Path(overlay) if overlay else None
         self._archives: dict = {}
+        #: Built on first use by `_art_by_garment`, never in __init__ -- it
+        #: walks every archive entry and every loose file under c3/, which is
+        #: ~150,000 names on 7878, and most callers never resolve a garment
+        #: at all. None means "not built yet", not "empty".
+        self._garment_index: Optional[dict] = None
+        #: False = not built; None = this root cannot be enumerated
+        #: (a hash-indexed .wdf); otherwise the set of c3/ names.
+        self._c3_name_set = False
         for p in self._discover_archives(self.root):
             reader = self._reader_for(p)
             if reader is None:                      # pragma: no cover
@@ -1169,8 +1177,178 @@ class AssetRoot:
     # digits, and stripped of leading zeros. This reproduces 94% of armor.ini,
     # 98% of weapon.ini and 79% of armet.ini references. The client's real rule
     # lives inside the Themida-packed exe and has not been read directly.
+    # 7878 ships NEITHER `c3/mesh` NOR `c3/texture` -- it splits art into
+    # per-kind directories instead, and adds kinds that did not exist in
+    # 5065/6090/6609 (armet, head, cape, pelvis, spirit).  Headgear was
+    # therefore unresolvable BY CONSTRUCTION on that client: `armet` was
+    # not in either list, so no probe ever looked where the files are.
+    #
+    # The new names are APPENDED, never inserted.  Resolution is
+    # first-hit-wins, so appending cannot change what an older client
+    # resolves to -- verified by re-measuring 5065/5517/6090/6609 against
+    # these lists before and after.
     MESH_DIRS = ("mesh", "weapon", "body", "hair", "mount", "npc", "monster")
     TEX_DIRS = ("texture", "weapon", "body", "hair", "mount", "npc", "monster")
+
+    #: Tried ONLY where the namespace is enumerable -- see `_c3_names`. Every
+    #: probe is a filesystem stat, so appending these unconditionally taxed
+    #: the clients that never had them: measured, 6609 went from 14s to 53s
+    #: over 360 appearances for six directories it does not ship. Where the
+    #: name set IS known the probe is a set lookup and costs nothing, and
+    #: that is exactly the case where these directories exist.
+    MESH_DIRS_EXTRA = ("armet", "head", "cape", "pelvis", "spirit", "misc")
+    TEX_DIRS_EXTRA = ("armet", "head", "cape", "pelvis", "spirit", "misc")
+
+    def _c3_names(self):
+        """Every `c3/...` logical path this root can serve, or None.
+
+        **None means "cannot be enumerated" and is NOT an empty set** -- the
+        distinction is the whole safety of this index.  A `.wdf` is
+        hash-indexed: you can ask it whether a name is present but you cannot
+        list what it holds.  So on a WDF root this returns None and every
+        caller falls back to probing, exactly as before.
+
+        Used only as a NECESSARY CONDITION: a name absent from here cannot be
+        found by `locate` either, so the probe can be skipped.  A name
+        present here still goes through `locate`, which keeps the real
+        precedence (overlay, then loose, then archives) in one place.
+        """
+        if self._c3_name_set is not False:
+            return self._c3_name_set
+        names: set = set()
+        for arc in self._archives.values():
+            entries = getattr(arc, "entries", None)
+            if not entries:
+                self._c3_name_set = None       # nothing to enumerate
+                return None
+            for e in entries:
+                n = getattr(e, "name", None)
+                if not n:
+                    # A NAMELESS entry makes the whole set unknowable. This
+                    # is not hypothetical and it is not rare: 6609's c3.wdf
+                    # has 10,274 entries and ALL 10,274 are nameless -- a WDF
+                    # stores only tq_hash(name), so a name is RECOVERED, not
+                    # read. An earlier version of this guard tested `entries`
+                    # for emptiness, which is true of no WDF, so the set was
+                    # built from the loose tree alone and every archived mesh
+                    # looked absent. Measured: 6609 body meshes fell from
+                    # 120/120 to 91/120. The skip is only sound when the set
+                    # is COMPLETE, so anything less than complete is None.
+                    self._c3_name_set = None
+                    return None
+                names.add(n.replace(chr(92), "/").lower())
+        root = Path(self.root)
+        for base in (root, self.overlay):
+            if base is None:
+                continue
+            c3 = Path(base) / "c3"
+            if not c3.is_dir():
+                continue
+            for f in c3.rglob("*"):
+                if f.is_file():
+                    names.add(("c3/" + str(f.relative_to(c3))
+                               ).replace(chr(92), "/").lower())
+        self._c3_name_set = names
+        return names
+
+    def _art_by_garment(self) -> dict:
+        """`{(kind, last6): [stem, ...]}` over every art file this install has.
+
+        WHY THIS EXISTS.  From 7878 the appearance tables and the art use
+        DIFFERENT id widths for the same garment.  `armor.ini` says mesh
+        ``1130000``; the files are ``c3/body/7130000.c3`` and
+        ``c3/body/8130000.c3``.  The trailing six digits -- the garment --
+        agree; the leading digits are the BODY TYPE, and the table's leading
+        `1` is a placeholder the client substitutes for whoever is wearing it.
+
+        DISCOVERED, NOT GUESSED.  The body types are read off the install
+        (7 and 8 for bodies, plus 1995/1996 for armets on this one) rather
+        than hardcoded.  That matters both ways: an install with other body
+        types still resolves, and -- more important -- a garment this install
+        does NOT ship cannot be resolved to a plausible neighbour, because
+        the only candidates are stems that exist.
+
+        Name-indexed containers only.  A `.wdf` is hash-indexed and cannot be
+        enumerated, but those clients keep everything in `c3/mesh` and
+        `c3/texture` and already resolve directly, so they never need this.
+        """
+        if self._garment_index is not None:
+            return self._garment_index
+        idx: dict = {}
+        textured: set = set()
+
+        def add(kind: str, base: str) -> None:
+            stem, _, ext = base.rpartition(".")
+            ext = ext.lower()
+            if ext not in ("c3", "dds") or len(stem) < 6:
+                return
+            if ext == "dds":
+                textured.add((kind, stem))
+            idx.setdefault((kind, stem[-6:]), [])
+            if stem not in idx[(kind, stem[-6:])]:
+                idx[(kind, stem[-6:])].append(stem)
+
+        for arc in self._archives.values():
+            entries = getattr(arc, "entries", None)
+            if not entries:
+                continue                      # hash-indexed: nothing to walk
+            for e in entries:
+                n = getattr(e, "name", None)
+                if not n:
+                    continue
+                n = n.replace(chr(92), "/").lower()
+                parts = n.split("/")
+                if len(parts) < 3 or parts[0] != "c3":
+                    continue
+                add(parts[1], parts[-1])
+        if self.root is not None:
+            c3 = Path(self.root) / "c3"
+            if c3.is_dir():
+                for d in c3.iterdir():
+                    if not d.is_dir():
+                        continue
+                    for f in d.rglob("*"):
+                        if f.is_file():
+                            add(d.name.lower(), f.name.lower())
+        # A stem that HAS a sibling .dds sorts first. One garment can ship
+        # under several body types and they are not interchangeable: 37 of
+        # 7878's 90 armet meshes are the 10-digit 1995xxxxxx/1996xxxxxx form
+        # and NONE of those has a texture, while all 53 of the 7xxxxxx and
+        # 8xxxxxx do. A plain sort puts "1995111000" ahead of "7111000"
+        # because '1' < '7', so every headgear resolved to the one variant
+        # that cannot be textured -- armet meshes came back 10 of 120 and
+        # armet textures 0 of 120. Preferring a mesh you can texture is not
+        # a tie-break, it is the difference between a model and a model with
+        # no skin.
+        for (kind, _g), v in idx.items():
+            v.sort(key=lambda s: ((kind, s) not in textured, s))
+        self._garment_index = idx
+        return idx
+
+    def resolve_garment(self, asset_id: str, kind_dirs, ext: str):
+        """Resolve `asset_id` by GARMENT (its last six digits) + body type.
+
+        Returns `(Located, stem)` or None.  The stem is returned because the
+        texture that goes with a mesh is the mesh's OWN name with a `.dds`
+        extension on these clients -- see `resolve_appearance`.
+        """
+        if not asset_id or len(asset_id) < 6:
+            return None
+        # Only where the namespace is ENUMERABLE. On a WDF root the archive
+        # entries are nameless, so this index would be built from the loose
+        # tree alone -- it could not find an archived garment, which is the
+        # only thing it exists to do, and it would cost a full walk of the
+        # install to answer nothing. `_c3_names` is the same knowability
+        # test the probe skip uses, so the two agree by construction.
+        if self._c3_names() is None:
+            return None
+        idx = self._art_by_garment()
+        for sub in kind_dirs:
+            for stem in idx.get((sub, asset_id[-6:]), ()):
+                loc = self.locate("c3/%s/%s%s" % (sub, stem, ext))
+                if loc:
+                    return loc, stem
+        return None
 
     def resolve_asset(self, asset_id: str, kind: str = "texture") -> Optional[Located]:
         if not asset_id or asset_id == "0":
@@ -1180,18 +1358,35 @@ class AssetRoot:
         # slash) resolves directly, no directory probing.
         if "/" in asset_id or "\\" in asset_id:
             return self.locate(asset_id)
-        dirs = self.TEX_DIRS if kind == "texture" else self.MESH_DIRS
+        tex = kind == "texture"
+        dirs = self.TEX_DIRS if tex else self.MESH_DIRS
+        if self._c3_names() is not None:
+            dirs = dirs + (self.TEX_DIRS_EXTRA if tex else self.MESH_DIRS_EXTRA)
         ext = ".dds" if kind == "texture" else ".c3"
         ids = []
         for cand in (asset_id, asset_id.zfill(9), asset_id.lstrip("0")):
             if cand and cand not in ids:
                 ids.append(cand)
+        # `locate` stats the filesystem, and this probes len(dirs)*len(ids)
+        # candidates -- 39 on a modern client. Where the name set IS knowable,
+        # a candidate that is in neither the archives nor the loose tree
+        # cannot be found by `locate` either, so the stat is skipped. This is
+        # a NECESSARY condition only: a candidate that survives it still goes
+        # through `locate`, so precedence is unchanged and a WDF root (where
+        # the set is None) probes exactly as it always did.
+        known = self._c3_names()
         for sub in dirs:
             for i in ids:
-                loc = self.locate(f"c3/{sub}/{i}{ext}")
+                logical = f"c3/{sub}/{i}{ext}"
+                if known is not None and logical not in known:
+                    continue
+                loc = self.locate(logical)
                 if loc:
                     return loc
-        return None
+        # LAST resort, after every exact probe above has missed, so a
+        # client that resolves exactly keeps resolving to the same file.
+        hit = self.resolve_garment(asset_id, dirs, ext)
+        return hit[0] if hit else None
 
     def resolve_appearance(self, ident: str, table: Optional[str] = None):
         """Find an appearance ID across the part tables and resolve its files.
@@ -1208,12 +1403,27 @@ class AssetRoot:
                 continue
             parts = []
             for pr in app.parts:
+                mesh = self.resolve_asset(pr.mesh, "mesh")
+                tex = self.resolve_asset(pr.texture, "texture")
+                tex_id = pr.texture
+                if tex is None and mesh is not None:
+                    # From 7878 the texture is the MESH's own name with a
+                    # .dds extension; the table's separate Texture0 id is
+                    # legacy and resolves NOWHERE on that client -- 0 of
+                    # 955 body and 0 of 1168 armet references exist under
+                    # it, while the beside-the-mesh file exists for every
+                    # body mesh that resolves at all (73 of 73).
+                    stem = mesh.logical.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    sub = mesh.logical.split("/")[1]
+                    tex = self.locate("c3/%s/%s.dds" % (sub, stem))
+                    if tex is not None:
+                        tex_id = stem
                 parts.append({
                     "index": pr.index,
                     "mesh_id": pr.mesh,
-                    "mesh": self.resolve_asset(pr.mesh, "mesh"),
-                    "texture_id": pr.texture,
-                    "texture": self.resolve_asset(pr.texture, "texture"),
+                    "mesh": mesh,
+                    "texture_id": tex_id,
+                    "texture": tex,
                     "material": pr.material,
                 })
             results.append({"part": part_name, "ini": ini.name,

@@ -52,6 +52,16 @@ py -3 tools/coviewer.py --health --json
 
 It refuses to bind to anything except loopback. Press Ctrl-C to stop it.
 
+**It also refuses a port somebody else is already listening on**, and prints
+the port plus what to do instead. That is not politeness: on Windows two
+processes could listen on one port with no error from either, and requests then
+went to whichever socket won — so a `curl` answer could come from a viewer
+serving a *different install*, with your own process's log staying empty. The
+startup banner and `/api/status` both report the pid so a reply can be tied to a
+process. See `ViewerServer.allow_reuse_address` in `tools/coviewer.py` for the
+measurement.
+
+
 **Start-up cost:** ~1 second. It walks the 53,675 loose files (0.2 s), maps the
 two `.wdf` archives, loads the 24,426 recovered archive filenames, and parses
 the appearance tables on a background thread.
@@ -620,6 +630,293 @@ distinguished:
   on the character. It is keyed by the 3-digit weapon *type*, so a quality-5
   blade with no trail still has one — the panel shows that combination rather
   than looking empty.
+
+### When the selection is a MAP
+
+A map is not one asset with satellites; it is a **container of four
+independent layer kinds**, and each kind has its own resolution chain. So the
+card shows **four groups, not one list** — and the fourth is **sound**, which
+is the one a visual browser drops. A map goes with its sounds.
+
+MEASURED on 7878, 2026-08-27, over **all 470 maps**: they ship as 470 `.7z`
+under `map/map/` and **not one loose `.DMap`**, so the sweep reads each with
+`core.dmap.read_archive(path)` and parses the bytes in place with
+`dmap.parse(path, data=raw, want_cells=False, verify=False)`. 470 of 470
+parsed, no failures. (`dmap.parse` refusing a `.7z` handed to it directly with
+*"implausible dimensions"* is the parser working, not a bug to route around.)
+
+| tag | shape | group in the card | records | resolve | how |
+|---:|---|---|---:|---:|---|
+| 1 | `scene` | **Terrain** | 2,294 | **100.00%** | `path` is a file: `map\Scene\stand05.scene` |
+| 4 + 24 | `cover` | **Cover sheets** | 244,086 → 243,169 filled | **99.90%** | `path` → an `.ani` sheet, `key` → a frame section in it |
+| 10 | `effect` | **Effects** | 2,941 | **94.15%** | `name` → `3DEffect.ini` → `3DEffectObj.ini` / `3dtexture.ini` (3 hops) |
+| 15 | `sound` | **Sounds** | 1,412 | **85.62%** | `path` is a file: `sound\linn.wav` |
+
+**Tag 5 has zero records in all 470 maps.** It is in the payload table and no
+shipped map uses it; the card has nothing to show for it and that is the data.
+
+**The card must aggregate, not enumerate.** 244,086 cover records over 470 maps
+resolve through only **7 distinct `.ani` sheets**, so the group lists sheets and
+frame keys, never one row per placement. Normalise the sheet path on **both**
+`\`→`/` *and* case or `ani\mapscene-new.ani` and `ani/mapscene-new.ani` count as
+two sheets:
+
+    ani/mapscene-new.ani     134,324 records
+    ani/mapscene.ani          65,201
+    ani/mapscene-snow.ani     35,800
+    ani/mapscene-snail.ani     3,188
+    ani/mapscene02.ani         2,553
+    ani/mapscene-saya.ani      2,078
+    ani/mapscene-task.ani         25
+
+**Sound: `range` and `volume` are per RECORD, and the card shows them.** They
+are not properties of the `.wav`, so a design that lists twenty filenames has
+thrown the layer away. Over 7878's 1,412 sound records there are **12 distinct
+`range` values, 12 distinct `volume` values and 32 distinct `(range, volume)`
+pairs** across only **20 distinct `.wav` files** — `sound/water.wav` alone is
+placed under **12 different combinations**, `sound/des01.wav` under 6,
+`sound/linn.wav` under 8. The commonest pair is `(800, 80)` on 713 records.
+Each row is therefore *file · range · volume · origin*, and the group is titled
+for the audible thing rather than the file.
+
+**An empty group is usually the data.** Only 404 of 470 maps carry cover, **69
+carry terrain, 59 carry effects and 27 carry sound** — and **48 of 470 declare
+no layers at all**. So "this map has no sound" is the overwhelmingly common
+answer (443 of 470) and the panel says so, the same way "no attack trail on
+most weapons is the data, not a bug" does above. The maps that *do* carry sound
+carry a lot of it: `Dgate` 388 records, `Dcloister` 381, `fight01` 381.
+
+**Unfilled cover records are skipped, and there are two distinct kinds.** They
+are map-editor rows that were never filled in, and listing them would put blank
+cells in the panel:
+
+* **`=`-marked** — `path` is literally `AniTitle=` and `key` is `PosCell=[0,0]`,
+  i.e. the editor wrote the ini *field names* where the values go. **2 records
+  on 7878** (`desert-m`, `newcanyon`); 636 on 6609, 633 of them in
+  `horserate-s`.
+* **all-zero** — `path` and `key` empty, `origin`, `size`, `offset` and
+  `frame_interval` all 0. **915 records on 7878**, 911 of them in `horserate`,
+  which declares 912 cover layers and fills exactly one (index 0).
+
+**These two are NOT the same test, and the second STRICTLY CONTAINS the
+first.** Stated as two rules with their own counts, because writing them as
+one — "`path` contains `=`, equivalently `size == [0,0]`" — is false and was
+believed for a while:
+
+| skip condition | 7878 | 6609 | 6090 |
+|---|---:|---:|---:|
+| `"=" in path` | 2 | 636 | 636 |
+| `size == [0,0]` | **917** | **1,819** | **1,818** |
+| `=`-rows that are *not* also `size == [0,0]` | 0 | 0 | 0 |
+
+The last row is the containment, MEASURED rather than assumed: every `=`-marked
+record also has `size == [0,0]`, on all three installs, with no exceptions. So
+`size == [0,0]` alone is sufficient to skip **both** kinds — but it is *not*
+sufficient to tell them apart, and the `=` form is the one that shows a human
+ran the editor and left the fields unfilled. Test both, skip on either.
+
+Excluding all 917 leaves **243,169** real cover records on 7878, of which
+242,406 (99.69%) resolve all the way to a frame file that exists.
+
+#### The gaps, so the panel never looks broken
+
+Five, and they differ in whether a sibling install could supply the missing
+byte. Tested against the nine client directories `AssetRoot` will open —
+4274, 5017, 5065, 5165, 5517, 6090, 6609, 7878, Zephyr. **6271 and CCO are
+refused as incomplete installs**, so "absent everywhere" below is a claim about
+nine, not eleven.
+
+1. **`sound/dfire031.wav` — 203 records, 3 maps, non-recoverable.**
+   `Dcloister` 100, `fight01` 100, `Dsigil` 3. Absent from all nine. The family
+   `dfire01`/`dfire02`/`dfire032`/`dfire033` all ship; only the `031` member
+   never did. **And the maps also name `sound/dfirie031.wav` — 216 records —
+   which *does* ship**, a typo'd sibling that resolves. So the panel shows one
+   sound missing and a nearly identically-named one present, which is the data
+   and not a lookup that half-worked.
+2. **18 map-sourced effect names are undefined on 7878 — 172 records. Twelve
+   are recoverable, but from the COMPILED TWIN, not from any `.ini`.**
+
+   This is stated carefully because the obvious phrasing is false. **Not one
+   of the 18 appears in any plaintext `3DEffect.ini` on this box** — scanned
+   all nine that ship, 0 hits — and `3DEffect.ini` is **byte-identical**
+   across 5165, 5517, 6090, 6609 and 7878 (`599,875 B`, sha256
+   `aa059fc7a8fc…`, 2,595 sections, dated 2009). So "defined on 6609 and not
+   on 7878" cannot be true *of the ini*, and any recoverability claim written
+   against the ini is wrong.
+
+   What differs is **whether a compiled `ini/3DEffect.dbc` ships at all.**
+   `GraphicData.dll` names both files and the client reads the twin where one
+   exists, so `effects.EffectDB` does too — and only three installs have one:
+
+   ```
+   install  3DEffect table EffectDB actually read      names
+   5165     ini/3DEffect.ini                            2,595
+   5517     ini/3DEffect.dbc   (363,958 B, 2011)        3,391
+   6090     ini/3DEffect.dbc   (508,446 B, 2015)        4,472
+   6609     ini/3DEffect.dbc   (627,162 B, 2017)        5,290
+   7878     ini/3DEffect.ini   -- no .dbc ships         2,595
+   ```
+
+   **7878 reads the 2009 plaintext table and 6609 reads a 2017 compiled one
+   with 2,695 more names.** That is the whole gap. Of the 18: **eleven are in
+   6090's and 6609's `.dbc`** (`earthbags_00`…`earthbags_09`, `batt_fl_3`),
+   **`cloudmist1` is in 6609's only**, and 5517's older `.dbc` has none of
+   them. So twelve names / 158 records are recoverable — by transplanting a
+   **compiled table**, which is a materially different operation from editing
+   an ini, and the panel should not imply otherwise.
+
+   **Six are in no table of either form, anywhere:** `paozhangdui9`,
+   `pho_bea_ani`, `pho_fir_fly`, `pho_ins_ect`, `pho_ray_lig`, `pho_sto_bir`
+   — 14 records, in `newbie` and `woods`. The 172 records together are exactly
+   the 5.85% that keeps tag 10 off 100%.
+
+   The same shape holds for the id→path tables: `ini/3dtexture.ini` is also
+   byte-identical across those five installs (`312,407 B`, sha256
+   `6be2fece83fd…`), and 7878 reads 8,793 rows from it where 6609 reads 22,420
+   from its twin. **When two installs disagree about a name, check whether a
+   compiled twin ships before concluding the registries differ** — here they
+   are the same bytes.
+3. **254 cover records name a frame key with no `[section]` in their sheet** —
+   16 keys over 14 maps; `do-li33.png` in `mapscene-new.ani` is 93 of them,
+   `nhouse-obj02.tga` in `MapScene.ani` 58. **15 of the 16 are defined in no
+   install's copy of the same sheet**, so this is the ini, not the lookup.
+4. **509 cover records reference at least one frame file that does not exist**
+   — 121 distinct files over 8 maps, and **all 121 are absent from all nine
+   installs**. `hq` accounts for 338 records (`data/map/mapobj/hq/hq40..hq62`),
+   then `n-newplain07` 96 and `street07` 64; the rest are
+   `data/map/cartoon/fish/fish01|fish02` and `data/map/mapobj/love/obj`.
+5. **10 effect *textures* are absent on 7878 and present on all eight other
+   installs** — 962 record-references. This is a claim about **shipped files**,
+   not about a table, and unlike gap 2 it survives that distinction: the
+   id→path table `3dtexture.ini` is the *same bytes* on all of them, so every
+   install is being asked for the identical path string.
+
+   ```
+   path                        4274   5017..6609        7878   Zephyr
+   c3/effect/zf2-e218/2.dds    loose  c3.wdf            --     c3.tpi
+   c3/effect/zf2-e222/2.dds    loose  c3.wdf            --     c3.tpi
+   c3/effect/zf2-e223/2.dds    loose  c3.wdf            --     c3.tpi
+   c3/effect/zf2-e223/3.dds    loose  c3.wdf            --     c3.tpi
+   c3/effect/zf2-e227/2.dds    loose  c3.wdf            --     c3.tpi
+   c3/effect/zf2-e228/2.dds    loose  c3.wdf            --     c3.tpi
+   C3/Effect/star/2.dds        c3.wdf c3.wdf            --     c3.tpi
+   C3/Effect/star/3.dds        c3.wdf c3.wdf            --     c3.tpi
+   c3/effect/light01/1.dds     loose  c3.wdf            --     c3.tpi
+   c3/effect/light01/2.dds     loose  c3.wdf            --     c3.tpi
+   ```
+
+   **Two controls, because "absent from a hash-indexed container" is exactly
+   the kind of negative that is usually an instrument fault:**
+
+   * **Zephyr resolves all ten from a `c3.tpi`** — the same DatPkg container
+     format 7878 uses. So a TPD root *can* answer for these paths, and 7878's
+     misses are not the container type, the name-hash table, or the path
+     spelling. (`AssetRoot` also resolves them case-insensitively; the
+     `C3/Effect/star` rows prove the mixed-case spelling is not the issue.)
+   * **The siblings in each folder are present on 7878.** `1.c3`, `2.c3` and
+     `1.dds` resolve in every one of these directories, and `3.dds`/`4.dds`
+     resolve in several — so the lookup reaches the folder and the absence is
+     per-file:
+
+     ```
+     c3/effect/zf2-e228/  1.c3=Y 2.c3=Y 1.dds=Y 2.dds=n 3.dds=Y
+     C3/Effect/star/      1.c3=Y 2.c3=Y 1.dds=Y 2.dds=n 3.dds=n 4.dds=Y
+     c3/effect/light01/   1.c3=Y 2.c3=Y 1.dds=n 2.dds=n
+     ```
+
+   The effect still resolves — its **mesh** is present — so the layer draws
+   untextured rather than not at all. This is the only one of the five gaps
+   that a straight file copy fixes.
+
+**Zero effect meshes are missing**, which is worth stating because the naive
+measurement says the opposite. See the trap below.
+
+#### The resolution check must ask the archives, not walk the filesystem
+
+**A file-existence check that only walks loose files calls an archived game
+absent.** The `.c3` effect meshes live inside `c3.tpd` (1.08 GB) and 7878 ships
+no `c3.wdf` at all. Measured both ways over the same 2,941 tag-10 records:
+
+    mesh absent, loose-file walk only :  1,659  (56.4%)  over 44 files
+    mesh absent, AssetRoot (loose+tpd):      0
+
+The 56.4% is an instrument artefact, top to bottom. `core.coassets.AssetRoot`
+is the only correct instrument here: `exists()`/`locate()` try the overlay, then
+the loose file, then **every** discovered container, which is the client's own
+`TqFOpen` order. `core.tpd.TpdArchive` — which `coassets._TpdContainer` wraps —
+is **hash-indexed and cannot be enumerated**: its whole public surface is
+`read`, `read_by_name`, `read_compressed`, `close`, and no listing, so a member
+can only be *asked for*, never found by scanning. Probing
+`read_by_name('c3/effect/zf2-e225/1.c3')` on `c3.tpd` returns **3,475 bytes**;
+nothing that lists directories will ever see it.
+
+For the same reason the effects group uses `effects.EffectDB.resolve(name)`
+rather than a re-implemented chain: it walks `3DEffect.ini` →
+`EffectId`/`TextureId` → `3DEffectObj.ini`/`3dtexture.ini`, reads the compiled
+`.dbc` twin where one ships, folds the ini's padded keys onto the twin's
+spelling, and reports `mesh_found` / `texture_found` through `AssetRoot`. Every
+figure above for tag 10 comes from it.
+
+#### These effect names are a different population from §4.5's
+
+§4.5 above reports **`effect names 2255, resolve 2255`** and `docs/effects.md`
+§9 reports **4 undefined names**. Those numbers stand and are not contradicted
+here: that population is the **weapon and item** effect names reached through
+`Action3DEffect.ini` / `ActionMap3DEffect.ini` / `WeaponMotion.ini`.
+**Map-sourced effect names are a new population** — 58 distinct names over
+2,941 tag-10 records — and **18 of those 58 are undefined**. Two populations,
+two denominators; the card should not present either count as the other.
+
+#### Where it lives
+
+`AssetCatalog.map_layer_groups(name)` in `tools/catalog.py` returns the four
+groups; `catalog.map_name_of(path)` is the test that routes a selection to it
+and is **deliberately narrow** — only a world grid, `map/map/<stem>.DMap` or
+`.7z`. `map/puzzle/island.pul` and `data/map/mapobj/**` are map *art*, already
+classified under `map`, and must not be treated as grids.
+`related_groups(path=…)` calls it, so `/api/related` needed no new route.
+
+The map is opened through `dmap.open_map`, which lets `GameMap.dat` pick which
+twin the client actually reads, and against `AssetCatalog.map_root` rather than
+`root` — a **server view** reads maps from a materialized root under
+`out/serverviews/` while every other lookup goes to the install.
+
+**Cost, measured rather than assumed** — the first draft of this section called
+it a new cost class and that was wrong. Unzip **2–6 ms**, parse **1–4 ms**,
+`load_ani` 35 ms once per sheet (and only 7 sheets exist across all 470 maps),
+`EffectDB` 104 ms once and lazily, on the first map selected. Warm mean over
+eight maps is **69 ms** — 22 ms of that is the layer walk and the rest is the
+per-frame existence check that separates "the key is missing" from "the art is
+missing"; the first call is 578 ms.
+
+One guard worth knowing about: `AssetCatalog`'s fallback `exists` is a loose
+file stat, which is the 56.4% trap above. The viewer always injects
+`AssetRoot.exists`, so it never fires there — but when nobody injects one the
+group's `note` now says the resolution is loose-only, rather than showing the
+artefact as if it were the data.
+
+**Why the aggregation is a separate method.** `map_groups_for_layers(layers)`
+is split out of `map_layer_groups(name)` for one reason: without it, the tests
+could not fail. Two of them were written against whichever map the configured
+install ships, and both stayed **green** with the code they were named for
+deliberately broken — CCO's fixture map carries no all-zero cover rows and
+places no file at two volumes, so neither assertion could reach its subject.
+`test_viewer.py::WhatGoesWithAMap` now feeds the aggregation a **synthetic
+layer table** that states each case (one `AniTitle=` row, one all-zero row,
+one file at three `(range, volume)` combinations, one sheet written both
+`ani\mapscene-new.ani` and `ani/MapScene-new.ani`), and each break goes red on
+every install. The shipped-map versions are kept alongside as shape checks, so
+the aggregation is still proved to be the path a real map takes.
+
+#### One more thing the sweep settled
+
+A map shipping in **both** forms is one map, and a walk of `map/map/*` counts it
+twice. This cost a real number: sweeping 6609 by directory entry reported 1,272
+`=`-marked cover records with 1,266 in `horserate-s`, **exactly double** the
+true 636 / 633, because 6609 ships that map as a loose `.DMap` *and* a `.7z`.
+Enumerate with `dmap.map_names(root)` and read with `dmap.open_map(root, name)`,
+which lets the registry decide which twin the client actually opens. 7878 is
+immune only by accident — it ships no loose `.DMap` at all.
 
 ---
 

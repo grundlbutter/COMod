@@ -73,6 +73,7 @@ py-modules = [
     "npcalloc",
     "verdict",     # cache decoded tables between runs; a cached decode is
                   #   reported as its own control kind, never as a fresh one
+    "splitoffer",
     "weaponparts",# one weapon's motions, effects and alt skins, per install:
                   #   a four-status Facet per surface, and a key grammar that
                   #   is DETECTED because the two installs spell it
@@ -86,6 +87,20 @@ py-modules = [
                  # role is written, and whether it is a per-row SPLIT or a
                  # cohort-wide OVERWRITE.  Domain logic, not UI: the page
                  # renders what this decides.
+    "npcaltskin",  # which NPCs share one NPC's mesh, and what skins that mesh
+                 # wears.  Carries `Membership`, the one-user / absent /
+                 # unknown split that `npcart.audit`'s `len(v) > 1` maps
+                 # cannot express -- 48 of CCO's 86 NPC geometries are solo
+                 # and invisible to them.  Imports only npcart.
+    "weaponcollect",  # the COLLECT PATH for weapons: the plan, the target
+                 # verdict, and the resolver's absence.  Owns none of the
+                 # weapon tables -- it reaches `weaponparts` only through
+                 # an injected provider.
+    "swapsides", # what LEFT and RIGHT MEAN on the swap page: the library's
+                 # four states (stocked/empty/unreadable/unconfigured, never
+                 # collapsed) and whether an install is OFFERED as a target.
+                 # Pins CCO by declared identity, refuses when it cannot
+                 # tell.  Describes only -- nothing here writes.
                   #   what OBSERVABLY changes when it is flipped. Imports only
                   #   coroot and the stdlib, so COre stays extractable.
 ]

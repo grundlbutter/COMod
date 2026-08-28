@@ -843,6 +843,38 @@
     const host = $('#mid-body');
     host.textContent = '';
     const D = V.donor.sel, T = V.target.sel;
+
+    // The right pane refused, so there is no swap to describe and the middle
+    // says which side is missing rather than waiting silently for a pick
+    // that cannot be made.
+    if (SIDES && SIDES.right.verdict !== 'offered') {
+      host.innerHTML = '';
+      host.appendChild(stateBox('served',
+        'No swap can be described against this install.',
+        SIDES.right.note, [SIDES.right.install]));
+      plan = null;
+      return;
+    }
+
+    // **A library entry cannot be planned yet, and this says so.**
+    // `/api/swap/plan` takes a donor path in the INSTALL's namespace;
+    // a collected entry's mesh lives inside the library and is not
+    // addressable there. Rendering "pick a donor" while one is plainly
+    // selected on the left would read as a broken page; rendering a plan
+    // from the entry's `sourceMesh` would silently plan a swap from
+    // whichever install is loaded, which is not the art that was collected.
+    if (LIB.sel && !D) {
+      host.innerHTML = '';
+      host.appendChild(stateBox('stub',
+        'NOT WIRED IN: planning a swap from a library entry.',
+        '"' + (LIB.sel.name || LIB.sel.id) + '" is selected, but /api/swap/plan '
+        + 'addresses donors by their path inside the install and a collected '
+        + 'entry lives in the library. This is the next step, not a failure. '
+        + 'Owner: COMod Explorer.', []));
+      plan = null;
+      return;
+    }
+
     if (!D || !T) {
       host.appendChild(el('div', null,
         !D && !T ? 'Pick something from your library, then the NPC it replaces.'

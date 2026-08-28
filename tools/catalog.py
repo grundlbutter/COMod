@@ -459,6 +459,42 @@ def role_of(path: str, head: bytes = b"") -> str:
     return "data" if by_ext in SNIFFABLE_ROLES else by_ext
 
 
+#: Rows one map group will list before it stops and says how many there were.
+#:
+#: MEASURED over 7878's 470 maps: the worst single map names **1,211 distinct
+#: (sheet, key) cover pairs** (`n-newplain08`), while terrain, effects and
+#: sound peak at 12, 13 and 10.  So the cap only ever bites on cover, and a
+#: card is not the place for a 1,211-row second catalogue.  The note states
+#: the true total, so the cap is never mistaken for the data.
+MAP_GROUP_CAP = 256
+
+#: Where a world grid lives.  Both suffixes, because 7878 ships **470 `.7z`
+#: and not one loose `.DMap`** while 5017/5065/5165 ship only `.DMap` -- a
+#: check for one spelling answers "not a map" on half the installs.
+_MAP_GRID_SUFFIXES = (".dmap", ".7z")
+
+
+def map_name_of(path: str) -> str:
+    """The map NAME a `map/map/...` selection is about, or "".
+
+    A world grid is the one selection whose companions are not files beside
+    it: it is a container of layers.  This is the test that routes such a
+    selection to `AssetCatalog.map_layer_groups`, and it is deliberately
+    narrow -- `map/puzzle/island.pul` and `data/map/mapobj/...` are map ART,
+    already classified under `map`, and must NOT be treated as grids.
+
+    The name is returned rather than the path because every reader downstream
+    (`dmap.open_map`, `dmap.parse_map`, the registry in `GameMap.dat`) is
+    keyed by name, and because the two suffixes are two spellings of one map.
+    """
+    p = str(path or "").replace("\\", "/").lstrip("/")
+    parts = p.split("/")
+    if len(parts) != 3 or parts[0].lower() != "map" or parts[1].lower() != "map":
+        return ""
+    q = Path(parts[2])
+    return q.stem if q.suffix.lower() in _MAP_GRID_SUFFIXES else ""
+
+
 class AssetCatalog:
     """Classifies logical asset paths and gathers "what goes with this".
 
@@ -475,6 +511,15 @@ class AssetCatalog:
         self.root = Path(root)
         self._tables = table_membership or (lambda p: [])
         self._exists = exists or (lambda p: (self.root / p).is_file())
+        #: True when nobody injected `exists` and the fallback above -- a
+        #: LOOSE-FILE STAT -- is what answers. It cannot see inside `c3.tpd`
+        #: or `c3.wdf`, so on an archive-heavy install it reports art that
+        #: ships as absent. MEASURED on 7878's map effect layers: the loose
+        #: walk calls **1,659 of 2,941 records (56.4%)** mesh-absent where
+        #: `coassets.AssetRoot.exists` -- which asks the containers too --
+        #: calls **0**. `map_layer_groups` reads this and says so on the
+        #: group rather than presenting the artefact as the data.
+        self._exists_is_loose_only = exists is None
         self._list_under = list_under or (lambda prefix: [])
         self._npc = npc_membership or (lambda p: False)
         #: First bytes of a logical path, for `role_of`'s content sniff, or
@@ -495,6 +540,20 @@ class AssetCatalog:
         self._weapon_motion: Optional[dict[str, str]] = None
         self._linkage: Optional[dict] = None
         self._linkage_status: Optional[dict] = None
+        #: Where `map_layer_groups` looks for `map/map/`, `ani/` and
+        #: `GameMap.dat`.  Separate from `self.root` because a **server view**
+        #: reads its maps from a materialized root under `out/serverviews/`
+        #: while every other lookup still goes to the install -- see
+        #: `coviewer`'s `_map_root`, which assigns this.  Defaulting it to
+        #: `self.root` rather than requiring it keeps every existing caller
+        #: correct; a server view that forgets to assign it reads the
+        #: install's maps, which is wrong but visible, not silently empty.
+        self.map_root = self.root
+        #: `.ani` sheet -> (logical rel, frame index). See `_ani_table`.
+        self._ani_cache: dict[str, tuple] = {}
+        #: Lower-cased `3DEffect.ini` section names, built on first map
+        #: selection only. See `_effect_db`.
+        self._effect_names: Optional[set] = None
 
     # -- classification ----------------------------------------------------
     def classify(self, path: str) -> Classification:
@@ -723,8 +782,315 @@ class AssetCatalog:
                     [{"path": hit["mesh"], "role": "mesh",
                       "label": "swing animation"}] if hit else [],
                     "from ini/WeaponMotion.ini")
+            map_name = map_name_of(path)
+            if map_name:
+                groups.extend(self.map_layer_groups(map_name))
 
         return [g for g in groups if g["items"] or g["pending"]]
+
+    # -- what goes with a MAP ----------------------------------------------
+
+    def map_layer_groups(self, name: str) -> list[dict]:
+        r""""What goes with this map", as the same labelled groups.
+
+        A map is not one asset with satellites: it is a **container of four
+        independent layer kinds**, each with its own resolution chain, so this
+        returns up to four groups and never one flat list.  The fourth is
+        **sound**, and it is the one a visual browser drops -- a map goes with
+        its sounds.  See `docs/viewer.md` section *What goes with this* ->
+        *When the selection is a MAP* for the measurement this implements.
+
+        MEASURED over all 470 of 7878's maps, 2026-08-27:
+
+            tag  1 terrain     2,294 records  100.00%  -> map/Scene/*.scene
+            tag  4 + 24 cover  244,086         99.90%  -> .ani sheet + key
+            tag 10 effect      2,941           94.15%  -> 3DEffect.ini, 3 hops
+            tag 15 sound       1,412           85.62%  -> sound/*.wav
+            tag  5             0 records in all 470 maps
+
+        **`range` and `volume` ride the RECORD, not the file.**  20 distinct
+        `.wav` files carry **32 distinct `(range, volume)` pairs**;
+        `sound/water.wav` alone is placed under 12 of them.  A group listing
+        twenty filenames has thrown the layer away, so a sound row carries
+        both fields and its origin.
+
+        **An empty group is nearly always the data.**  Of 470 maps, 404 carry
+        cover, 69 terrain, 59 effects and **27 sound**, and 48 declare no
+        layers at all.  Every group therefore ships a `note` saying what the
+        emptiness means, the way the weapon *attack trail* group does.
+
+        **The map is opened through the registry, not by globbing.**
+        `dmap.open_map` lets `GameMap.dat` pick which twin the client actually
+        reads; a directory walk counts a map that ships as BOTH `.DMap` and
+        `.7z` twice.  That is not hypothetical -- it doubled a 6609 cover
+        figure to 1,272 / 1,266 from the true 636 / 633.
+
+        Returns `[]` for a name this install does not ship, and a single
+        `pending` group when the map is there and would not parse -- those are
+        different facts and an empty card cannot tell them apart.
+        """
+        try:
+            import dmap as _dmap
+        except Exception as exc:                          # pragma: no cover
+            return [{"title": "Map layers", "note": f"core/dmap.py: {exc}",
+                     "items": [], "pending": True}]
+
+        raw, why = _dmap.open_map(self.map_root, name)
+        if raw is None:
+            return []
+        try:
+            d = _dmap.parse(self.map_root / "map" / "map" / f"{name}.DMap",
+                            data=raw, want_cells=False, verify=False)
+        except Exception as exc:
+            return [{"title": "Map layers",
+                     "note": f"{why}: did not parse: {exc}",
+                     "items": [], "pending": True}]
+        return self.map_groups_for_layers(d.layers)
+
+    def map_groups_for_layers(self, layers: list[dict]) -> list[dict]:
+        r"""The four groups, from a decoded layer table.
+
+        **Split out from `map_layer_groups` so it can be tested at all**, and
+        that is not a stylistic preference -- it is a defect this split fixed.
+        The first version of these tests asserted the blank-row skip and the
+        sound dedupe key against whichever map the configured install happened
+        to ship. Both went GREEN with the code deliberately broken: the
+        fixture map had no all-zero cover rows and no file placed at two
+        volumes, so neither assertion could reach the thing it was named for.
+        *An instrument whose output is independent of the hypothesis cannot
+        test it, however true that output is.* Feeding synthetic layers in
+        here makes the negative control fire on every install.
+
+        `layers` is `dmap.DMap.layers` -- a list of `decode_layer` dicts.
+        """
+        scenes: dict[str, int] = {}
+        cover: dict[tuple, int] = {}
+        names: dict[str, int] = {}
+        sounds: dict[tuple, int] = {}
+        # Folded key -> the first spelling seen, so rows group correctly and
+        # still display the path the map actually wrote.
+        spelling: dict[str, str] = {}
+        unfilled = 0
+
+        def fold(p: str) -> str:
+            r"""One map path, folded for GROUPING.
+
+            Both `\`->`/` AND case, because the same sheet is written
+            `ani\mapscene-new.ani` and `ani/MapScene-new.ani` in the wild and
+            folding only the separator counts one file as two. That is the
+            double-count this repo has now paid for twice -- here, and in the
+            `.DMap`/`.7z` twin walk `open_map` above avoids.
+            """
+            f = str(p).replace("\\", "/")
+            spelling.setdefault(f.lower(), f)
+            return f.lower()
+
+        for lay in layers:
+            shape = lay.get("shape")
+            if shape == "scene":
+                p = lay.get("path") or ""
+                if p:
+                    k = fold(p)
+                    scenes[k] = scenes.get(k, 0) + 1
+            elif shape == "cover":
+                p = lay.get("path") or ""
+                # Two distinct kinds of never-filled editor row, and
+                # `size == [0,0]` is NOT the same test as `"=" in path`:
+                # on 7878 they catch 917 and 2, on 6609 1,819 and 636. The
+                # `=` form has the ini FIELD NAMES where the values go
+                # (`AniTitle=` / `PosCell=[0,0]`); the other is all zero.
+                # Either test alone leaves one kind of blank row in the card.
+                if "=" in p or lay.get("size") == [0, 0]:
+                    unfilled += 1
+                    continue
+                k = (fold(p), lay.get("key") or "")
+                cover[k] = cover.get(k, 0) + 1
+            elif shape == "effect":
+                n = lay.get("name") or ""
+                if n:
+                    names[n] = names.get(n, 0) + 1
+            elif shape == "sound":
+                p = lay.get("path") or ""
+                if p:
+                    k = (fold(p), lay.get("range"), lay.get("volume"))
+                    sounds[k] = sounds.get(k, 0) + 1
+
+        loose = (" — resolution is a LOOSE-FILE stat, so anything that ships "
+                 "only inside c3.tpd / c3.wdf reads as absent"
+                 if self._exists_is_loose_only else "")
+
+        def cap(rows: list) -> tuple[list, str]:
+            if len(rows) <= MAP_GROUP_CAP:
+                return rows, ""
+            return (rows[:MAP_GROUP_CAP],
+                    f" — showing {MAP_GROUP_CAP} of {len(rows)}")
+
+        out: list[dict] = []
+
+        # -- terrain
+        rows = [{"path": spelling[k], "role": "mapdata",
+                 "label": Path(k).name,
+                 "count": c, "found": bool(self._exists(k))}
+                for k, c in sorted(scenes.items(), key=lambda kv: -kv[1])]
+        rows, more = cap(rows)
+        out.append({
+            "title": "Terrain scenes", "items": rows,
+            "note": ("tag 1 — the layer's `path` IS a file. 100.00% of 7878's "
+                     "2,294 records resolve, so a miss here is worth a look. "
+                     "Only 69 of 470 maps carry terrain: empty is the data"
+                     + more + loose),
+            "pending": not rows})
+
+        # -- cover
+        sheets: dict[str, int] = {}
+        for (sh, _k), c in cover.items():
+            sheets[sh] = sheets.get(sh, 0) + c
+        rows = []
+        # A cover record can fail in TWO places and they are different facts,
+        # so the row carries both rather than one merged `found`:
+        #   * the `key` is not a section in the sheet -- an ini bug. 254
+        #     records over 16 keys on 7878, and 15 of those 16 are defined in
+        #     no install's copy of the same sheet.
+        #   * the key IS there and one of its frame files is absent -- 509
+        #     records over 121 files, all 121 absent from every install.
+        # Merging them puts 99.90% and 99.69% behind one flag and loses the
+        # ability to say WHICH half of the chain broke.
+        for (sh, key), c in sorted(cover.items(), key=lambda kv: -kv[1]):
+            rel, table = self._ani_table(sh)
+            frames = None
+            for k2, v2 in table.items():
+                if k2.lower() == key.lower():
+                    frames = v2
+                    break
+            missing = ([f for f in frames if not self._exists(f)]
+                       if frames else [])
+            rows.append({"path": spelling[sh], "role": "mapdata",
+                         "label": f"{Path(sh).name} [{key}]", "key": key,
+                         "count": c, "sheet": rel or spelling[sh],
+                         "frames": len(frames or []),
+                         "framesMissing": len(missing),
+                         "found": frames is not None})
+        rows, more = cap(rows)
+        out.append({
+            "title": "Cover sheets", "items": rows,
+            "note": (f"tags 4 and 24 — `path` is an .ani sheet and `key` is a "
+                     f"frame section inside it. {len(sheets)} sheet(s) here; "
+                     f"all 470 of 7878's maps together use only 7. "
+                     f"`found` false means the KEY is missing from the sheet; "
+                     f"`framesMissing` means the key is there and the art is "
+                     f"not — two different faults, both in the ini rather than "
+                     f"in the lookup. "
+                     f"{unfilled} never-filled editor row(s) skipped"
+                     + more + loose),
+            "pending": not rows})
+
+        # -- effects
+        rows = []
+        for n, c in sorted(names.items(), key=lambda kv: -kv[1]):
+            rows.append({"path": "", "role": "effect", "label": n,
+                         "effect": n, "count": c,
+                         "found": self._effect_defined(n)})
+        rows, more = cap(rows)
+        # `found` here can only be False for two reasons and they are not
+        # the same fact, so the note names the second one explicitly.
+        no_table = ("effect names cannot be checked: tools/effects.py did "
+                    "not import, so every row reads undefined"
+                    if self._effect_db() is None else "")
+        out.append({
+            "title": "Effects", "items": rows,
+            "note": ((no_table or
+                      "tag 10 — the layer carries a NAME, not a path: "
+                      "3DEffect.ini -> EffectId/TextureId -> 3DEffectObj.ini "
+                      "and 3dtexture.ini -> the .c3. 18 map-sourced names "
+                      "are undefined on 7878 (172 records) — because it "
+                      "ships no compiled 3DEffect.dbc, not because its "
+                      "3DEffect.ini differs: that ini is byte-identical to "
+                      "6609's. A DIFFERENT population from the 2,255 "
+                      "weapon/item names, which all resolve") + more),
+            "pending": not rows})
+
+        # -- sound
+        rows = []
+        for (p, rng, vol), c in sorted(sounds.items(), key=lambda kv: -kv[1]):
+            rows.append({"path": spelling[p], "role": "sound",
+                         "label": (f"{Path(spelling[p]).name}"
+                                   f" · range {rng} · volume {vol}"),
+                         "range": rng, "volume": vol, "count": c,
+                         "found": bool(self._exists(p))})
+        rows, more = cap(rows)
+        out.append({
+            "title": "Sounds", "items": rows,
+            "note": ("tag 15 — **range and volume are per RECORD**, not "
+                     "properties of the .wav: 20 files carry 32 distinct "
+                     "(range, volume) pairs across 7878, water.wav alone "
+                     "under 12. Only 27 of 470 maps carry sound at all, so an "
+                     "empty panel here is the data and not a broken chain"
+                     + more + loose),
+            "pending": not rows})
+
+        return out
+
+    def _ani_table(self, rel: str) -> tuple[str, dict]:
+        """One `.ani` frame index, loaded once per sheet.
+
+        Cached because 7878's 244,086 cover records reach only **7** distinct
+        sheets and `MapScene-new.ani` alone holds 13,516 sections -- 35 ms to
+        read. Keyed on the path folded BOTH ways, `\\`->`/` and case, because
+        `ani\\mapscene-new.ani` and `ani/MapScene-new.ani` are one file and
+        counting them as two is the double-count this cache exists to avoid.
+        """
+        key = str(rel).replace("\\", "/").lower()
+        if key in self._ani_cache:
+            return self._ani_cache[key]
+        try:
+            import dmap as _dmap
+            hit = _dmap.load_ani(self.map_root, rel)
+        except Exception:                                  # pragma: no cover
+            hit = ("", {})
+        self._ani_cache[key] = hit
+        return hit
+
+    def _effect_defined(self, name: str) -> bool:
+        """Is `name` defined in this install's LIVE 3DEffect table?
+
+        The live table is the compiled `ini/3DEffect.dbc` where one ships
+        and the plaintext `ini/3DEffect.ini` otherwise -- `EffectDB` picks,
+        the same way `GraphicData.dll` does. **Not "is it in the ini", and
+        the difference is not academic:** `3DEffect.ini` is byte-identical
+        across 5165/5517/6090/6609/7878 (599,875 B, sha256 aa059fc7a8fc...),
+        so every disagreement between those installs is a disagreement
+        about whether a `.dbc` ships -- 6609 reads 5,290 names from a 2017
+        twin, 7878 reads 2,595 from the 2009 ini and has no twin at all.
+        Describing this as an ini difference is a false claim that was
+        written down once already; see docs/viewer.md gap 2.
+
+        Case-folded, because a map writes `zf2-e225` and the table's
+        spelling is its own. False when `tools/effects.py` is not
+        importable at all -- the group's note carries that reason, so this
+        is never the only signal.
+        """
+        db = self._effect_db()
+        if db is None:
+            return False
+        return name.lower() in db
+
+    def _effect_db(self) -> Optional[set]:
+        """Lower-cased `3DEffect.ini` section names, built once, or None.
+
+        `EffectDB` costs ~100 ms to construct and reads the compiled `.dbc`
+        twin where one ships, so this is lazy and cached rather than built in
+        `__init__`: most selections are not maps and never need it.
+        """
+        if self._effect_names is None:
+            if effects is None:
+                self._effect_names = set()
+            else:
+                try:
+                    db = effects.EffectDB(self.root)
+                    self._effect_names = {k.lower() for k in db.effects}
+                except Exception:                          # pragma: no cover
+                    self._effect_names = set()
+        return self._effect_names or None
 
     def weapon_linkage(self) -> dict:
         r"""`out/effects/linkage.json` from task #13. Loaded once, lazily.
@@ -955,6 +1321,45 @@ class AssetCatalog:
         return out, True
 
 
+
+
+#: WHEN THE DERIVED CHANNEL IS UNAVAILABLE, SAY SO. Measured 2026-08-15 and
+#: still true 2026-08-27: with `CO_DERIVED_FALLBACK=0` this tool reports
+#: 53,757 resolvable assets instead of 77,825 on CCO, and 54,215 instead of
+#: 77,475 on 6090 -- with EXIT CODE 0, no warning line and no banner. It
+#: reports a smaller world as though it were complete.
+#:
+#: `tools/health.py` is the one tool that names the loss, and it also exits 0.
+#: The knowledge existed and nothing carried it here: a wiring gap, not a
+#: knowledge gap. The rule this implements, decided 2026-08-27 after the
+#: finding sat twelve days in a dark seat's charter: "fewer assets" and "all
+#: the assets" must not be the same exit code with the same silence.
+def derived_channel_suppressed():
+    """Why this run may under-count, or None.
+
+    Fires only when the fallback is switched OFF *and* a primary checkout
+    exists to have been read -- i.e. when there is a real loss to name. A
+    checkout with no primary is not suppressed, it is alone, and saying
+    otherwise would cry wolf on every ordinary clone.
+    """
+    import os
+    try:
+        import coroot
+    except ImportError:
+        return None
+    val = os.environ.get(coroot.DERIVED_FALLBACK_VAR, "").strip().lower()
+    if val not in ("0", "off", "no"):
+        return None
+    primary = coroot.primary_checkout()
+    if primary is None:
+        return None
+    return ("%s=%s -- derived artefacts in %s were NOT read. This count is a "
+            "LOWER BOUND, not a census: the same corpus reports 53,757 "
+            "instead of 77,825 with this switch off. Unset it, or run "
+            "tools/health.py, before quoting any number below."
+            % (coroot.DERIVED_FALLBACK_VAR, val or "0", primary))
+
+
 def _cli(argv):
     import argparse
     import collections
@@ -980,6 +1385,10 @@ def _cli(argv):
                           exists=cat.exists)
         s = ac.summarise(cat.all_paths)
         total = sum(v["count"] for v in s.values())
+        suppressed = derived_channel_suppressed()
+        if suppressed:
+            print("UNDER-COUNTING: " + suppressed)
+            print()
         print(f"{total} resolvable assets\n")
         for cid in CATEGORY_IDS:
             e = s.get(cid)
@@ -1000,7 +1409,9 @@ def _cli(argv):
                 print(f"   {k:<44}{v:>6}")
     finally:
         cat.close()
-    return 0
+    # A caller that cannot see the banner still gets the answer in its
+    # exit status. 3 = "ran, and the number is short".
+    return 3 if derived_channel_suppressed() else 0
 
 
 if __name__ == "__main__":

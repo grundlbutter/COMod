@@ -260,6 +260,10 @@ class Placed:
     scene_path: str = ""
     offset_elevation: int = 0
     cells: list[tuple[int, int, int]] = field(default_factory=list, repr=False)
+    #: The DMap layer tag this record actually carried. v1006 renumbered
+    #: COVER from 4 to 24, so the tag is NOT derivable from `kind` -- it has
+    #: to travel with the record. 0 means it was not recorded.
+    layer_tag: int = 0
 
     # -- geometry ----------------------------------------------------------
 
@@ -313,6 +317,27 @@ class Scenery:
     def sorted_covers(self) -> list[Placed]:
         return sorted(self.covers, key=lambda p: p.depth())
 
+    def layer_tag(self, layer: str) -> Optional[int]:
+        """The DMap tag the records in `layer` were actually read from.
+
+        v1006 renumbered COVER from 4 to 24. Selection dispatches on `shape`,
+        so this tag never picks anything -- but anything RECORDING the tag
+        has to record the one in the file, not the one the format used when
+        the recorder was written.
+
+        Measured over 2,027 maps across all 12 install trees on this box:
+        NO map draws one shape from more than one tag, so the first record
+        with a tag speaks for the layer. *6609 ships both cover tags (4 on
+        92,073 records, 24 on 375) but never both in the same map*, which is
+        why the census has to be per map and not per install. Returns None
+        when the layer holds no records and there is nothing to observe.
+        """
+        parts = self.covers if layer == "cover" else self.scenes
+        for p in parts:
+            if p.layer_tag:
+                return p.layer_tag
+        return None
+
     def to_json(self, *, with_items: bool = True) -> dict:
         d = {"name": self.name, "sceneParts": len(self.scenes),
              "covers": len(self.covers), "missingScenes": self.missing_scenes}
@@ -353,7 +378,8 @@ def gather(layers: Iterable[dict], lib: SceneLibrary) -> Scenery:
                     layer_index=idx, thickness=part.thickness,
                     scene_path=L.get("path", ""),
                     offset_elevation=part.offset_elevation,
-                    cells=part.cells))
+                    cells=part.cells,
+                    layer_tag=int(L.get("type", 0) or 0)))
         elif shape == "cover":
             ox, oy = L.get("origin", (0, 0))
             w, h = L.get("size", (1, 1))
@@ -363,7 +389,8 @@ def gather(layers: Iterable[dict], lib: SceneLibrary) -> Scenery:
                 anchor=(ox, oy), width=max(1, w), height=max(1, h),
                 pixel_offset=(-dx, -dy),
                 frame_interval=int(L.get("frame_interval", 0) or 0),
-                layer_index=idx))
+                layer_index=idx,
+                layer_tag=int(L.get("type", 0) or 0)))
     return out
 
 

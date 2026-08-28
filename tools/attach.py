@@ -327,17 +327,16 @@ class PartMesh:
     other: list[bytes] = field(default_factory=list)
     #: **The install these bytes came from**, so socket classification asks
     #: THIS client's `[Dumy]` vocabulary and not `DEFAULT_ROOT`'s. `load()`
-    #: knows it and sets it; `parse()` is handed bare bytes and cannot, so it
-    #: stays None and the module default applies -- which is the old behaviour,
-    #: preserved deliberately rather than guessed at. Callers that hold a root
-    #: and parse bytes (`parts.moti_sockets`, `thumbs.mesh_geometry`,
-    #: `superfx._bbox`) still get `DEFAULT_ROOT`; threading it to them is the
-    #: other half of this fix and is not done here.
+    #: knows it and sets it; `parse()` is handed bare bytes, so it takes the
+    #: root as an argument from a caller that holds one and leaves this None
+    #: only when nobody does -- and then the module default applies, which is
+    #: the old behaviour, preserved deliberately rather than guessed at.
     root: Optional[Path] = None
 
     # -- loading ----------------------------------------------------------
     @classmethod
-    def parse(cls, data: bytes, logical: str = "<memory>") -> "PartMesh":
+    def parse(cls, data: bytes, logical: str = "<memory>",
+              root: Optional[Path | str] = None) -> "PartMesh":
         """Two independent ordinal lists, NOT adjacent pairs.
 
         `MeshCreate` (graphic.dll `0x28360`) builds the phy array and then
@@ -346,8 +345,14 @@ class PartMesh:
         with the `PHY` that happens to precede it is therefore wrong, and it
         really does break: `c3/mount/850/8500000.c3` stores all eight `PHY`
         chunks first and all eight `MOTI` chunks after them.
+
+        `root` is the install `data` was read out of. It is optional because a
+        caller may genuinely not know, but a caller that *does* know must pass
+        it: it is what `_root()` -- and therefore every socket test on this
+        mesh -- reads, and leaving it None silently substitutes whichever
+        install `CO_ROOT` happens to name. See `is_socket_name`.
         """
-        m = cls(logical)
+        m = cls(logical, root=None if root is None else Path(root))
         phys: list = []
         motions: list = []
         for tag, body in c3phy.iter_chunks(data):

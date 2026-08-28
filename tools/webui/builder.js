@@ -486,6 +486,19 @@ function slotCard(s) {
         unequip(s.name);
       });
       acts.appendChild(rm);
+      // Collect, for the slots whose contents are looked up in the weapon
+      // tables. The owner had Change / Remove / inspect here and no way to
+      // keep the weapon they were looking at.
+      if (isWeaponSlot(s.name)) {
+        const keep = el('button', 'ghost tiny', 'Collect…');
+        keep.title = 'Keep this weapon and everything the tables link to it: '
+                   + 'its appearance, motions, effects and alternate skins.';
+        keep.addEventListener('click', ev => {
+          ev.stopPropagation();      // the card itself opens the picker
+          openWeaponCollect(s.name);
+        });
+        acts.appendChild(keep);
+      }
       const look = el('a', 'small', 'inspect →');
       look.href = '/#' + loadoutParams().toString();
       look.title = 'open this part in the asset browser';
@@ -2594,6 +2607,257 @@ async function renderCollect({ force = false } = {}) {
     host.appendChild(drop);
     host.appendChild(panel);
   }
+}
+
+// ------------------------------------------------------------ weapon collect
+//
+// Everything below renders by reading a STATUS, never by asking whether a
+// list came back empty.
+//
+// That is not style. `empty` and `unavailable` both carry zero rows and mean
+// opposite things -- "weaponeffect.ini was consulted and has nothing for this
+// weapon" versus "no table that could answer this ships here" -- and a third
+// zero-row case, the resolver not being wired in at all, means a third thing
+// again. A renderer keyed on `rows.length` collapses all three into one
+// reassuring blank. So the discriminator is always `f.status`, looked up in
+// WC_FACET below, and the row list is touched only inside the branch that has
+// already established there are rows to show.
+
+/** status -> how that status looks. The keys ARE the discriminator.
+ *
+ *  Exactly the four `Facet.STATUSES` from core/weaponparts.py. A fifth status
+ *  arriving here renders as `wc-unknown` and says so, rather than silently
+ *  falling through to the blank that looks like "nothing to see".
+ */
+const WC_FACET = {
+  present:     { cls: 'wc-yes',     chip: 'present' },
+  partial:     { cls: 'wc-partial', chip: 'partial' },
+  empty:       { cls: 'wc-empty',   chip: 'none' },
+  unavailable: { cls: 'wc-unknown', chip: 'not looked up' },
+};
+
+/** displacement state -> how it looks.
+ *
+ *  These answer ONE question: will writing this overwrite art that is already
+ *  there? They are keyed on whether the resolved mesh BYTES differ, never on
+ *  whether the two installs' tables name the same mesh id. Measured
+ *  2026-08-17: the tables agree while the bytes differ on 3,763 of 4,710
+ *  shared ids, so a table-keyed chip renders the common overwrite green.
+ *
+ *  `undetermined` is not merged into either safe state. "Could not read it"
+ *  and "read it, nothing will break" are opposite instructions to someone
+ *  about to overwrite something -- the same reason `unavailable` is not
+ *  `empty` in WC_FACET above. */
+const WC_VERDICT = {
+  not_on_target: { cls: 'wc-yes',     chip: 'safe to add' },
+  no_op:         { cls: 'wc-empty',   chip: 'identical' },
+  replaces:      { cls: 'wc-danger',  chip: 'WOULD REPLACE' },
+  undetermined:  { cls: 'wc-unknown', chip: 'CANNOT TELL' },
+};
+
+function wcBlock(cls, chip, headline, detail) {
+  const box = el('div', 'wc-block ' + cls);
+  const head = el('div', 'wc-head');
+  head.appendChild(el('span', 'wc-chip', chip));
+  head.appendChild(el('b', null, headline || ''));
+  box.appendChild(head);
+  if (detail) box.appendChild(el('div', 'wc-detail small', detail));
+  return box;
+}
+
+/** The resolver's own absence, rendered so it cannot be mistaken for an
+ *  answer. `unavailable` says a table was missing; THIS says the thing that
+ *  reads tables is missing, and the two must not look alike. */
+function wcResolverBlock(r) {
+  if (r.available) return null;
+  const box = wcBlock('wc-stub', 'NOT WIRED IN', r.headline, r.detail);
+  const who = el('div', 'wc-detail small');
+  who.appendChild(document.createTextNode('awaiting '));
+  who.appendChild(el('code', null, r.contract || ''));
+  who.appendChild(document.createTextNode(' from ' + (r.owner || '?')
+                                          + ' (' + (r.module || '?') + ')'));
+  box.appendChild(who);
+  return box;
+}
+
+function wcFacetRow(f) {
+  const look = WC_FACET[f.status]
+    || { cls: 'wc-unknown', chip: 'status ' + f.status + '?' };
+  const box = el('div', 'wc-facet ' + look.cls);
+  const head = el('div', 'wc-head');
+  head.appendChild(el('span', 'wc-chip', look.chip));
+  head.appendChild(el('b', null, f.surface));
+  box.appendChild(head);
+  box.appendChild(el('div', 'wc-detail small', f.headline || ''));
+  if (f.detail) box.appendChild(el('div', 'wc-detail small mut', f.detail));
+  if (f.source) box.appendChild(el('div', 'idline small', f.source));
+  // Only now, having switched on the status, is the row list looked at --
+  // and only for the two statuses whose contract guarantees it is non-empty.
+  if (f.status === 'present' || f.status === 'partial') {
+    const ul = el('div', 'wc-rows small');
+    for (const r of f.rows.slice(0, 8)) {
+      ul.appendChild(el('div', 'idline',
+        r.mesh ? (r.mesh + (r.texture ? ' / ' + r.texture : ''))
+               : JSON.stringify(r)));
+    }
+    if (f.rows.length > 8) {
+      ul.appendChild(el('div', 'mut', '+' + (f.rows.length - 8) + ' more'));
+    }
+    box.appendChild(ul);
+  }
+  return box;
+}
+
+/** Collect the weapon held in `slot`, with its linked effects and alt skins. */
+async function openWeaponCollect(slot) {
+  const v = B.loadout[slot];
+  if (!v || !v.id) { toast('nothing in that slot'); return; }
+  const host = $('#collect-body');
+  if (!host) return;
+  host.innerHTML = '';
+  collectFor = null;                       // this panel owns the card now
+  host.appendChild(el('div', 'mut small', 'Collect weapon ' + v.id
+                      + (v.name ? ' — ' + v.name : '')));
+  const busy = el('div', 'mut small', 'reading the weapon tables…');
+  host.appendChild(busy);
+
+  let d;
+  try {
+    d = await api('/api/keep/weapon?id=' + encodeURIComponent(v.id));
+  } catch (e) {
+    busy.remove();
+    host.appendChild(wcBlock('wc-unknown', 'request failed',
+      'Could not ask the server about this weapon.', e.message));
+    return;
+  }
+  busy.remove();
+
+  // 1. Is the resolver even here? Checked before anything else, because when
+  //    it is not there are no facets at all -- not four empty ones.
+  const stub = wcResolverBlock(d.resolver || {});
+  if (stub) host.appendChild(stub);
+
+  // 2. What would this do to the install being modded?
+  const ver = d.verdict || {};
+  const vl = WC_VERDICT[ver.state]
+    || { cls: 'wc-unknown', chip: 'state ' + ver.state + '?' };
+  // An absent displacement resolver is styled like the missing weapon_parts
+  // resolver, not like a verdict: it is a fact about our build. It still
+  // reports state `undetermined`, so nothing downstream can read it as safe.
+  const vb = wcBlock(ver.stub ? 'wc-stub' : vl.cls,
+                     ver.stub ? 'NOT WIRED IN' : vl.chip,
+                     ver.headline, ver.detail);
+  if (ver.stub) {
+    const who = el('div', 'wc-detail small');
+    who.appendChild(document.createTextNode('awaiting '));
+    who.appendChild(el('code', null, ver.contract || ''));
+    who.appendChild(document.createTextNode(' from ' + (ver.owner || '?')));
+    vb.appendChild(who);
+  }
+  // The table-key question, reported beside the verdict and never driving it.
+  // Measured 2026-08-17: table-key disagreement is a strict subset of byte
+  // difference (0 counterexamples), so this can corroborate a warning but can
+  // never be the reason for one.
+  const tk = ver.tableKeys || {};
+  if (tk.comparable && tk.note) {
+    vb.appendChild(el('div', 'wc-detail small mut',
+      (tk.differ ? 'Tables also disagree: ' : 'For reference: ') + tk.note));
+  }
+  host.appendChild(vb);
+
+  // 3. The four surfaces, each by its own status.
+  const donor = d.donor || {};
+  if (donor.resolverAvailable && donor.presence === 'on_install') {
+    for (const surface of ['appearance', 'motions', 'effects', 'skins']) {
+      const f = (donor.facets || {})[surface];
+      if (f) host.appendChild(wcFacetRow(f));
+    }
+  } else if (donor.resolverAvailable) {
+    host.appendChild(wcBlock('wc-unknown', donor.presence || 'unknown',
+                             donor.headline, donor.detail));
+  }
+
+  // 4. What would actually travel.
+  const plan = d.plan || {};
+  const nMotion = (plan.motions || []).length;
+  const nEffect = (plan.effects || []).length;
+  const nExtra = (plan.extraParts || []).length;
+  // The button says which of the three it is. `undetermined` is not styled as
+  // safe -- but it also does not get the modal below, and that is deliberate:
+  // until the displacement resolver lands EVERY weapon is undetermined, and a
+  // modal that fires on every single collect is one users learn to dismiss
+  // without reading. Spending the interruption on the state we actually know
+  // is destructive is what keeps it worth reading when it appears.
+  const go = el('button', ver.safe ? 'primary' : 'ghost',
+                ver.state === 'replaces' ? 'Collect anyway'
+                : ver.state === 'undetermined' ? 'Collect (unverified)'
+                : 'Collect this weapon');
+  go.style.marginTop = '6px';
+  const summary = el('div', 'mut small',
+    plan.mesh ? (plan.mesh + ' · ' + nMotion + ' motion, ' + nEffect
+                 + ' effect, ' + nExtra + ' extra part file(s)')
+              : 'No mesh could be resolved for this weapon.');
+  host.appendChild(summary);
+  // Files a table NAMED and the install does not have. Shown rather than
+  // dropped: "the effect is m-b02 and m-b02 is not here" is a fact about the
+  // weapon you are about to collect, and silence about it is how you find out
+  // in the game instead.
+  for (const sk of (plan.skipped || []).slice(0, 6)) {
+    host.appendChild(el('div', 'wc-detail small mut',
+      sk.surface + '/' + sk.role + ' “' + sk.name + '”: ' + sk.reason));
+  }
+  // Keys where the compiled table and its plaintext twin name different
+  // files. Rare, and not a reason to refuse -- but the collected entry then
+  // depends on which table was believed, so it is said out loud.
+  for (const cf of (plan.conflicts || []).slice(0, 4)) {
+    host.appendChild(wcBlock('wc-partial', 'tables disagree',
+      'Motion key ' + cf.key + ': ' + cf.reason,
+      (cf.tables || []).join(' vs ') + ' — took ' + cf.path));
+  }
+  if (!plan.mesh) { go.disabled = true; }
+  go.addEventListener('click', async () => {
+    // `undetermined` confirms too, since 2026-08-27. It was suppressed
+    // on ONE argument: with no displacement provider wired in, EVERY
+    // weapon reported `undetermined`, so the modal would fire on 100%
+    // of collects -- and a modal that always fires is one users learn
+    // to dismiss unread. A provider is now resolvable, so the state
+    // means something else: 'this pair could not be read', ~5% of
+    // shared ids. Rare, and a real uncertainty about whether something
+    // gets overwritten. The premise that justified suppressing it is
+    // GONE rather than weakened, which is why this is a re-decision
+    // and not a threshold being loosened.
+    if ((ver.state === 'replaces' || ver.state === 'undetermined')
+        && !confirm(ver.headline + '\n\n' + ver.detail
+                    + '\n\nCollecting only files this in your Collection — '
+                    + 'the target is written when you stage or install it. '
+                    + '\n\nKeep this weapon anyway?')) return;
+    go.disabled = true;
+    try {
+      const r = await api('/api/keep/add', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: plan.mesh, texture: plan.texture, category: 'Weapons',
+          name: v.name || String(v.id),
+          // Sent even when empty: `motions` present means "the tables were
+          // asked", and its absence would put the directory sweep back --
+          // which returns nothing for every weapon. See core/weaponcollect.py.
+          motions: plan.motions || [],
+          effects: (plan.effects || []).concat(plan.extraParts || []),
+        }) });
+      collectionMeta = null;
+      const np = (r.entry.parts || []).length;
+      toast('collected ' + r.entry.id + (np ? ' (+' + np + ' file(s))' : ''));
+      renderCollect({ force: true });
+    } catch (e) {
+      toast('collect failed: ' + e.message, 5000);
+      go.disabled = false;
+    }
+  });
+  host.appendChild(go);
+  const back = el('button', 'ghost tiny', 'Back');
+  back.style.marginLeft = '6px';
+  back.addEventListener('click', () => renderCollect({ force: true }));
+  host.appendChild(back);
 }
 
 /** The card when the thing on the stage IS a Collection entry's own copy.

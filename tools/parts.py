@@ -387,7 +387,8 @@ def _orthonormal(mat):
     return mat
 
 
-def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None) -> dict[str, Anchor]:
+def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None,
+                 root=None) -> dict[str, Anchor]:
     r"""Socket transforms read from the mesh's own `MOTI` tracks.
 
     **VERIFIED against the data.** Each socket submesh is its own PHY chunk
@@ -409,11 +410,23 @@ def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None) -> dict[str, A
     every one of its vertices carries `BLENDINDICES0 == 0`. The `PHY`/`MOTI`
     pairing being ordinal rather than adjacent is the part this module used to
     get wrong.
+
+    **`root` is the install `body_c3` came from**, and which chunks count as
+    sockets is read from its `ini/RolePart.ini [Dumy]`. Passing it matters
+    because the answer really does differ: measured 2026-08-24 over the nine
+    installs on this rig, `[Dumy]` declares 52 names under CCO and 7878 and 7
+    under the other seven -- and the 7 are a **strict subset** of the 52, which
+    is what makes the failure one-directional. This function keeps a chunk only
+    if the socket test accepts it, so classifying a 52-name client's body under
+    the 7-name list **drops** its `v_head`, `v_back`, `v_slot`, ... anchors --
+    silently, since a short list parses fine and simply matches less. Leaving it
+    None falls back to `attach.DEFAULT_ROOT` (i.e. `CO_ROOT`), which is right
+    only by luck.
     """
     if attachmod is None:
         return {}
     try:
-        pm = attachmod.PartMesh.parse(body_c3)
+        pm = attachmod.PartMesh.parse(body_c3, root=root)
     except Exception:
         return {}
 
@@ -422,7 +435,7 @@ def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None) -> dict[str, A
            if motion_set is not None else "the mesh's own embedded MOTI")
     for c in pm.chunks:
         name = c.name
-        if not name or not attachmod.is_socket_name(name):
+        if not name or not attachmod.is_socket_name(name, pm._root()):
             continue
         if c.motion is None and motion_set is None:
             continue
@@ -447,7 +460,7 @@ def moti_sockets(body_c3: bytes, frame: int = 0, motion_set=None) -> dict[str, A
 
 
 def socket_anchors(body_c3: bytes, motion_set=None,
-                   frame: int = 0) -> dict[str, Anchor]:
+                   frame: int = 0, root=None) -> dict[str, Anchor]:
     """Where each socket sits on a body mesh.
 
     The real answer comes from `moti_sockets` (the engine's own transforms, via
@@ -455,9 +468,12 @@ def socket_anchors(body_c3: bytes, motion_set=None,
     ship no usable motion: an estimate measured off the body's own skin
     clusters, position only, no rotation. It is labelled `inferred` and every
     part reports which of the two it got.
+
+    `root` is the install `body_c3` came from; it reaches the socket test via
+    `moti_sockets`, whose docstring says why the fallback is not harmless.
     """
     # Prefer the engine's own transforms.
-    exact = moti_sockets(body_c3, frame=frame, motion_set=motion_set)
+    exact = moti_sockets(body_c3, frame=frame, motion_set=motion_set, root=root)
 
     meshes = [m for m in c3phy.meshes_from_c3(body_c3)]
     if not meshes:
@@ -678,16 +694,22 @@ def compose_attachment(chain: dict, *, apply_part_motion: bool = False) -> dict:
             "confidence": "inferred"}
 
 
-def body_bounds(body_c3: bytes, motion_set=None, frame: int = 0) -> Optional[dict]:
+def body_bounds(body_c3: bytes, motion_set=None, frame: int = 0,
+                root=None) -> Optional[dict]:
     """Render-space bounds of the body mesh alone. The camera frames on this and
     only this, so equipping a long weapon never yanks the view.
 
     When `motion_set` is given the body is posed by it first, so the bounds
     match what is actually drawn rather than the stored positions.
+
+    `root` is the install `body_c3` came from. Here a miss goes the *other*
+    way from `moti_sockets`: an unrecognised socket chunk is counted as
+    geometry, so the box grows to enclose an attachment point and the camera
+    frames on a model that is partly empty air.
     """
     if attachmod is not None:
         try:
-            pm = attachmod.PartMesh.parse(body_c3)
+            pm = attachmod.PartMesh.parse(body_c3, root=root)
             world = attachmod.IDENTITY
             lo = [1e30] * 3
             hi = [-1e30] * 3
@@ -695,7 +717,7 @@ def body_bounds(body_c3: bytes, motion_set=None, frame: int = 0) -> Optional[dic
             for c in pm.chunks:
                 if not getattr(c.phy, "vertices", None):
                     continue
-                if attachmod.is_socket_name(c.name):
+                if attachmod.is_socket_name(c.name, pm._root()):
                     continue
                 q = c3phy.apply_matrix_copy(c.phy)
                 mo = c.motion

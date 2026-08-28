@@ -572,15 +572,130 @@ def cmd_catalogs(args) -> int:
               "id:")
         print("    the frozen lookup tables name mesh and texture ids the "
               "archives do not")
-        print("    ship, so `show` resolves the row and reports NOT FOUND. "
-              "Measured 0 of 421")
-        print("    across all seven part tables, against 160 of 201 on 6090 "
-              "and 5517.")
+        print("    ship for MOST rows, so `show` often resolves the row "
+              "and reports NOT")
+        print("    FOUND. RE-MEASURED 2026-08-27 over ALL seven tables "
+              "and every part, not a")
+        print("    sample: 1,614 of 13,902 parts resolve a mesh (11.6%) "
+              "and 2,148 a texture")
+        print("    (15.5%). This said 0 of 421 until today, before "
+              "`armet` was in either")
+        print("    search list and before the garment rule "
+              "(<body type><item id>) existed.")
+        print("    The rest is the INSTALL's gap, not the tool's: its "
+              "tables are dated")
+        print("    2008-2009 and name a largely different item set from "
+              "the art it ships.")
         print("    `info <path>` and `extract <path>` work; the archives hold "
               "146,194 entries.")
     _recommend("\nNote: `browse <subject> [query]` lists rows; `show <id>` "
                "resolves an appearance\nto mesh and texture files.")
     return 0
+
+
+def _browse_art(root, rows) -> dict:
+    """`{row id: where its 3D art lives}` for the rows on screen.
+
+    THE LINK THIS USES DID NOT EXIST UNTIL 7878.  On older clients a
+    gameplay id and an appearance id are separate spaces and the only
+    bridge is `armor.ini`/`armet.ini`/`weapon.ini` -- which is what the
+    note under `browse` has always said, and it is still true there.
+
+    From 7878 the garment id IS the art key: the last six digits of the
+    file stem are the item id, with a BODY TYPE in front.  Item 101000
+    "MysticWindrobe" is `c3/body/7101000.c3` and `8101000.c3`.  So a row
+    can be answered directly, without going through an appearance table
+    that on this install is dated 2008-2009 and names a largely different
+    item set.
+
+    Rows with no art print `-`, and that is a real answer rather than a
+    gap in the tool: 7878 ships art for a fraction of its 55,420-row item
+    catalogue because the rest arrives by patch.  `AssetRoot.resolve_garment`
+    only ever returns stems that EXIST, so a `-` cannot be a near miss
+    silently rendered as a hit.
+
+    REJECTED, and recorded so it is not re-derived: an obvious-looking
+    "tier" rule -- zero the last digit and retry, so 101003 borrows
+    101000's art -- takes the linked rows from 374 to 2,003, a 5.4x gain.
+    It is WRONG.  Tested against a property it does not control, the item
+    NAME, on the 1,629 rows it would newly link:
+
+        name agrees with the base row     574   35.2%
+        name DISAGREES                    165   10.1%
+        base id not in itemtype at all    890   54.6%
+
+    `350011 Broom` borrows from `350010 IceStick`.  A broom would render
+    as an ice stick, and a browse column asserting it would be believed.
+    **A rule is not validated by producing more hits, which is the only
+    evidence this one has.**  Wrong art is worse than a dash.
+    """
+    try:
+        with AssetRoot(root) as R:
+            if R._c3_names() is None:
+                # A hash-indexed .wdf cannot be enumerated, so the garment
+                # index cannot be built and this column would be a row of
+                # dashes that MEANT "unknown" while READING as "no art".
+                return {str(i): "(not enumerable on this layout)"
+                        for i, _ in rows}
+            # `ini/c3.wdb` FIRST, and by the row's LABEL rather than its id.
+            # It is the client's own mesh index -- a table that names both
+            # sides -- so a hit is confirmed by something outside the id
+            # space rather than by a pattern that fits it. Measured on
+            # 7878's mounts: 108 of 1,399 distinct labels resolve, ZERO are
+            # named-but-not-shipped, and 0 row IDS are wdb keys. The id is
+            # not the art key and the label is.
+            #
+            # CROSS-VALIDATED, and this is better evidence than either
+            # route's hit count. Over 55,420 item rows the two rules --
+            # c3.wdb (the client's index) and the garment convention
+            # (discovered from the id space) -- overlap on 308 ids and
+            # name the SAME FILE on all 308. Zero disagreements. Two
+            # methods derived from unrelated sources agreeing exactly
+            # where they meet is the check neither could run on itself.
+            #
+            # They are also complementary, so both are kept: c3.wdb
+            # alone finds 27 the garment rule misses, the garment rule
+            # alone finds 67 c3.wdb misses, union 402.
+            #
+            # It gives FEWER hits than the prefix guess it replaced -- 108
+            # against 272 -- and that is the point: the 272 counted a
+            # 3-character directory like `801` prefixing any label that
+            # happened to start with it.
+            live = None
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parent.parent
+                                       / "core"))
+                import wdb                                  # noqa: PLC0415
+                wp = Path(root) / "ini" / "c3.wdb"
+                if wp.is_file():
+                    live = wdb.ResourceDb(wp)
+            except Exception:                               # noqa: BLE001
+                live = None
+
+            out = {}
+            for ident, label in rows:
+                where = "-"
+                if live is not None:
+                    for key in (str(label), str(ident)):
+                        try:
+                            q = live.path_for(key)
+                        except Exception:                   # noqa: BLE001
+                            q = None
+                        if q:
+                            loc = R.locate(q.replace(chr(92), "/"))
+                            if loc:
+                                where = loc.logical
+                                break
+                if where == "-":
+                    for kind in ("body", "armet", "weapon", "hair", "mount"):
+                        hit = R.resolve_garment(str(ident), (kind,), ".c3")
+                        if hit:
+                            where = hit[0].logical
+                            break
+                out[str(ident)] = where
+            return out
+    except Exception:                                    # noqa: BLE001
+        return {str(i): "?" for i, _ in rows}
 
 
 def cmd_browse(args) -> int:
@@ -602,8 +717,26 @@ def cmd_browse(args) -> int:
         print(f"  {args.subject}: REFUSED")
         print(f"  {_refusal(refusal)}")
         return 1
+    art = _browse_art(root, rows) if getattr(args, "art", False) else None
     for ident, label in rows:
-        print(f"  {ident:>12}  {label}")
+        if art is None:
+            print(f"  {ident:>12}  {label}")
+        else:
+            print(f"  {ident:>12}  {label:<34} {art.get(str(ident), '-')}")
+    if art is not None:
+        # Only a real logical path counts as a hit. "-" is a MISS and
+        # "(not enumerable...)" is UNKNOWN, and collapsing those two into
+        # "present" produces a summary that contradicts the column printed
+        # directly above it -- which is how a tool gets believed over its
+        # own output. Measured on a WDF root, where every row is unknown:
+        # the first version of this line said "art present for 4 of the 4".
+        have = sum(1 for v in art.values() if "/" in v)
+        unknown = sum(1 for v in art.values() if v.startswith("("))
+        if unknown:
+            print(f"\n  art: NOT KNOWABLE for {unknown} of the {len(rows)} "
+                  f"row(s) shown -- this layout cannot be enumerated")
+        else:
+            print(f"\n  art present for {have} of the {len(rows)} row(s) shown")
     shown = f", showing {len(rows)}" if total > len(rows) else ""
     print(f"\n{total} row(s){shown}")
     if not total:
@@ -619,9 +752,11 @@ def cmd_browse(args) -> int:
             "  So the row -> model link is not established here. `browse` "
             "is the table.")
     elif args.subject in ("item", "item:sub", "garment"):
-        _recommend("\nNote: these are gameplay ids. The 3D look is keyed by "
-                   "appearance id in\narmor.ini / weapon.ini / armet.ini -- "
-                   "`show <id>` resolves one, `tables` lists them.")
+        _recommend("\nNote: these are gameplay ids. On clients before 7878 "
+                   "the 3D look is keyed\nby appearance id in armor.ini / "
+                   "weapon.ini / armet.ini -- `show <id>`\nresolves one, "
+                   "`tables` lists them. From 7878 the row id IS the art "
+                   "key:\n`--art` answers each row directly.")
         _print_art_caveat(plug)
     else:
         _recommend("\nNote: `show <id>` resolves an appearance ID to "
@@ -646,12 +781,16 @@ def _print_art_caveat(plug) -> None:
     # the 0-of-421 figure unconditionally, because that is a fact about the
     # client rather than advice about what to run next.
     _recommend(
-        "  On this install `show` will resolve the row and report NOT FOUND "
-          "for the\n  mesh and texture: the lookup tables are the frozen 2008 "
-          "files and name ids\n  the archives do not ship. MEASURED 0 of 421 "
-          "across all seven part tables,\n  against 160 of 201 on 6090 and "
-          "5517. Reach 7878 art by logical path\n  instead -- `info <path>` "
-          "and `extract <path>` work; the archives hold 146,194 entries.")
+        "  On this install `show` resolves a MINORITY of rows to files. "
+          "RE-MEASURED\n  2026-08-27 over all seven part tables and every "
+          "part: 1,614 of 13,902\n  resolve a mesh (11.6%), 2,148 a texture "
+          "(15.5%). This said 0 of 421 until\n  today, before `armet` was in "
+          "either search list and before the garment\n  rule "
+          "(<body type><item id>) existed. The rest is the INSTALL's gap:\n"
+          "  its tables are dated 2008-2009 and name a largely different "
+          "item\n  set from the art it ships. `--art` answers a row "
+          "directly; `info <path>`\n  and `extract <path>` reach anything "
+          "by logical path.")
 
 
 def cmd_tables(args) -> int:
@@ -1440,6 +1579,8 @@ def main(argv=None) -> int:
     p.add_argument("query", nargs="?", default="",
                    help="substring of the name or id")
     p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--art", action="store_true",
+                   help="also show which rows have 3D art in THIS install")
     p.set_defaults(func=cmd_browse)
 
     p = sub.add_parser("settings",

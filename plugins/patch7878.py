@@ -605,6 +605,43 @@ class Patch7878(PlaintextFamily):
         from .catalog import censused as _cens
         return _cens.specs_for(self.name)
 
+    def _shadowed_by_catalog(self, spec, root) -> bool:
+        """Does a curated catalog claim this subject from a DIFFERENT file?
+
+        The censused sweep claims every `.ini` it can parse, vestigial ones
+        included. `mount` was claimed from `ini/mount.ini` -- a 49-byte stub
+        dated January 2003 with one section -- while `catalogs()` reported
+        1,937 rows from `mounttype.dat`. So `comod catalogs` told the user
+        1,937 and `comod browse mount` showed them 1, and neither output
+        hinted that the two had read different files.
+
+        THE DISCRIMINATOR IS THE FILENAME, and it had to be measured rather
+        than guessed. My first attempt tested `spec.source` for emptiness:
+        ALL 154 censused specs have an empty source, so it separated nothing
+        and made every browse pay an uncached 0.7 s `catalogs()` call -- the
+        agreement test went from 0.97 s to a timeout. Comparing
+        `spec.filename` against `catalog.source` separates exactly one
+        subject from 153, which is the shape a discriminator should have.
+
+        `catalogs()` is not cached upstream and costs ~0.7 s, so it is
+        memoised per root here; browse is called once per subject listed.
+        """
+        # Lazily, rather than in __init__: this class is constructed by a
+        # registry and adding a constructor requirement would be a change
+        # to how every plugin is built, for a cache.
+        if getattr(self, "_cat_cache", None) is None:
+            self._cat_cache = {}
+        cats = self._cat_cache.get(str(root))
+        if cats is None:
+            cats = self.catalogs(root)
+            self._cat_cache[str(root)] = cats
+        cat = cats.get(spec.subject)
+        if cat is None or not getattr(cat, "ok", False):
+            return False
+        fn = (getattr(spec, "filename", "") or "").lower().rsplit("/", 1)[-1]
+        src = (getattr(cat, "source", "") or "").lower().rsplit("/", 1)[-1]
+        return bool(fn and src and fn != src)
+
     def browse(self, subject: str, root, query: str = "",
                limit: int = 0) -> tuple:
         """`(rows, total, refusal)` -- `(id, name)` pairs for one subject.
@@ -626,7 +663,23 @@ class Patch7878(PlaintextFamily):
         #
         # The curated subjects stay on the path below: their sources are
         # derived-corpus files that the base class cannot locate.
-        if any(s.subject == subject for s in self.table_specs(root)):
+        # ...UNLESS a curated catalog claims the same subject and names a
+        # source the censused spec does not. The censused sweep claims every
+        # `.ini` it can parse, INCLUDING VESTIGIAL ONES: `mount` was claimed
+        # from `ini/mount.ini`, a 49-byte stub dated January 2003 with one
+        # section, while `catalogs()` reported 1,937 rows from
+        # `mounttype.dat`. So `comod catalogs` told the user 1,937 and
+        # `comod browse mount` showed them 1, and neither output hinted that
+        # the two had read different files.
+        #
+        # The test is the spec having NO source of its own: a censused entry
+        # that names nothing cannot outrank a curated one that names a file.
+        # MEASURED on 7878 before changing this -- 154 censused subjects, 164
+        # catalog subjects, all 154 in both, and exactly ONE disagreed. The
+        # blast radius of this precedence is that one subject.
+        spec = next((s for s in self.table_specs(root)
+                     if s.subject == subject), None)
+        if spec is not None and not self._shadowed_by_catalog(spec, root):
             return super().browse(subject, root, query, limit)
 
         cat = self.catalogs(root).get(subject)

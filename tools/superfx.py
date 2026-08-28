@@ -262,11 +262,19 @@ def family_of(logical: str) -> str:
 
 def _bbox(part: attach.PartMesh, world: Mat4 = attach.IDENTITY,
           frame: int = 0, use_motion: bool = True):
+    """Bounds of the drawable chunks, socket markers excluded.
+
+    The socket test asks `part._root()` -- the install `SuperFxDB.mesh` loaded
+    these bytes out of -- not `attach.DEFAULT_ROOT`. Every span printed here is
+    a *measurement*, so borrowing another install's `[Dumy]` list would not
+    just draw a box: it would count that box's vertices into the number the
+    anchoring evidence is read off.
+    """
     lo = [1e30] * 3
     hi = [-1e30] * 3
     n = 0
     for c in part.bind_chunks():
-        if attach.is_socket_name(c.name):
+        if attach.is_socket_name(c.name, part._root()):
             continue
         q = c3phy.apply_matrix_copy(c.phy)
         for v in q.vertices:

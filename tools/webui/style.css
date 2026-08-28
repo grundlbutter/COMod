@@ -696,3 +696,73 @@ body.builder aside { background: var(--panel); }
 .dircount { margin-left: auto; opacity: .6; font-size: 11px; padding-left: 8px; }
 .dirkids { margin-left: 10px; border-left: 1px solid var(--line); }
 .dirnode.closed > .dirkids { display: none; }
+
+
+/* ------------------------------------------------------- weapon collect
+   The blocks openWeaponCollect() builds in the Collection card.
+
+   The colours carry the whole point of the panel, so they are assigned by
+   MEANING and not by tidiness. Three of these states have zero rows behind
+   them and mean different things:
+
+     .wc-empty    a table was consulted and said nothing about this weapon
+     .wc-unknown  no table that could answer this ships on the install
+     .wc-stub     the resolver itself is not wired in -- nothing was consulted
+
+   They must never converge on the same neutral grey, because the whole
+   failure this panel exists to prevent is a reader seeing a blank and
+   concluding "nothing to collect". .wc-stub is deliberately the loudest of
+   the three: an absent resolver is a fact about OUR build, not about the
+   owner's weapon.
+
+   .wc-danger is the id-present-but-different-art verdict. It is rare (392 of
+   4,718 shared ids, measured 2026-08-17) which is exactly why it is styled
+   like a stop sign -- the common case teaches the opposite habit. */
+.wc-block, .wc-facet {
+  margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel2);
+}
+.wc-head { display: flex; align-items: baseline; gap: 6px; }
+.wc-chip {
+  font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); color: var(--mut);
+}
+.wc-detail { margin-top: 3px; color: var(--mut); }
+.wc-rows { margin-top: 4px; display: flex; flex-direction: column; gap: 1px; }
+.wc-rows .idline, .wc-facet .idline {
+  font-family: var(--mono); font-size: 10px; opacity: .85;
+}
+
+.wc-yes     { border-color: #57c98a55; background: #57c98a14; }
+.wc-yes     .wc-chip { border-color: #57c98a77; color: var(--good); }
+.wc-partial { border-color: #e6b45555; background: #e6b45514; }
+.wc-partial .wc-chip { border-color: #e6b45577; color: var(--warn); }
+
+/* Consulted and silent. Muted, but still a box with a sentence in it -- an
+   answer, not an absence. */
+.wc-empty   { border-color: var(--line); background: var(--panel2); }
+.wc-empty   .wc-chip { color: var(--mut); }
+
+/* Not looked up. Dashed, because the edge of what is known is not a fact. */
+.wc-unknown { border-color: #9297a166; border-style: dashed;
+              background: #9297a10f; }
+.wc-unknown .wc-chip { color: var(--mut); border-style: dashed; }
+
+/* The resolver is missing. Loud, striped, and nothing like the two above. */
+.wc-stub {
+  border: 1px solid var(--accent); border-left: 4px solid var(--accent);
+  background: repeating-linear-gradient(
+    -45deg, #6aa9ff14, #6aa9ff14 8px, #6aa9ff22 8px, #6aa9ff22 16px);
+}
+.wc-stub .wc-chip { border-color: var(--accent); color: var(--accent); }
+.wc-stub code { font-family: var(--mono); font-size: 10px; }
+
+/* Displacement. */
+.wc-danger {
+  border: 1px solid var(--bad); border-left: 4px solid var(--bad);
+  background: #e8695f1a;
+}
+.wc-danger .wc-chip {
+  border-color: var(--bad); color: #ffd9d5; background: #e8695f55;
+}

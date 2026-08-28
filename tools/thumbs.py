@@ -129,7 +129,13 @@ def _apply_output(server: str = "", root=None) -> None:
 
 #: Bump when a change alters pixels.  It is part of every cache key, so a bump
 #: makes `--resume` re-render everything instead of silently mixing versions.
-RENDERER_VERSION = 1
+#:
+#: 2 (2026-08-24): the socket test reads the rendered install's `[Dumy]` list
+#: instead of `CO_ROOT`'s.  On a rig whose `CO_ROOT` named a short-list client,
+#: every CCO/7878 mesh was drawn with its attachment points as geometry, and
+#: those PNGs are on disk with a v1 key -- nothing else in the key changes, so
+#: without this bump `--resume` would keep serving them forever.
+RENDERER_VERSION = 2
 
 #: Output edge in px, and the disk each thumbnail costs at it.  Named rather
 #: than written twice, because `health.thumbnail_corpus` prices a run from
@@ -260,14 +266,27 @@ def _skin(pos: np.ndarray, bone0, bone1, w0, has_w1, motion, frame: int) -> np.n
 
 def mesh_geometry(data: bytes, frame: int = 0, want_normals: bool = False,
                   include_sockets: bool = False,
-                  apply_motion: bool = True) -> tuple[list[ChunkGeom], dict]:
+                  apply_motion: bool = True,
+                  root=None) -> tuple[list[ChunkGeom], dict]:
     """Parse a `.c3` and return its drawable chunks, posed, in render space.
 
     `attach.PartMesh.parse` does the PHY/MOTI **ordinal** pairing; this function
     is the vectorised equivalent of `attach.PartMesh.world_vertices(IDENTITY)`
     and is checked against it by `--selftest`.
+
+    **`root` is the install `data` came from, and here the consequence is
+    durable.** Which chunks are attachment points is read from that install's
+    `ini/RolePart.ini [Dumy]`, and the lists disagree -- measured 2026-08-24, 52
+    names under CCO and 7878 against 7 under the other seven installs on this
+    rig, the 7 a strict subset of the 52. Classify a 52-name client's mesh under
+    the 7-name list and the 45 names it lacks -- `v_head`, `v_back`, `v_zero`,
+    `v_slot`, ... -- come back with `is_socket=False`, are rasterised as
+    geometry, and the model grows textured boxes with `v_zero` sitting on the
+    ground at its feet. Unlike the viewer's, that answer is then **written to a
+    PNG and cached**, so a run under the wrong root outlives the run. Leaving it
+    None falls back to `attach.DEFAULT_ROOT` (i.e. `CO_ROOT`).
     """
-    part = attach.PartMesh.parse(data)
+    part = attach.PartMesh.parse(data, root=root)
     geoms: list[ChunkGeom] = []
     stats = {"chunks": len(part.chunks), "sockets": 0, "empty": 0,
              "other_tags": sorted({t.decode("latin-1", "replace")
@@ -278,7 +297,7 @@ def mesh_geometry(data: bytes, frame: int = 0, want_normals: bool = False,
         if not verts or not getattr(phy, "faces", None):
             stats["empty"] += 1
             continue
-        socket = attach.is_socket_name(phy.name)
+        socket = attach.is_socket_name(phy.name, part._root())
         if socket:
             stats["sockets"] += 1
             if not include_sockets:
@@ -985,6 +1004,11 @@ def _init_worker(root: str, opts: dict, library: str = "",
         _W["assets"] = AssetRoot(root)
     _W["opts"] = opts
     _W["tex_cache"] = {}
+    # The install being rendered, so the socket test reads THIS client's
+    # [Dumy] list. `_W["assets"].root` is the same path for an AssetRoot, but a
+    # ServerView's is the baseline it was layered over, and the meshes a worker
+    # renders come from the root it was handed.
+    _W["root"] = Path(root)
 
 
 def _texture_rgba(logical: str):
@@ -1082,11 +1106,14 @@ def render_job(job: Job) -> dict:
         lit = opts["shade"] == "lit"
         fallbacks: list[str] = []
 
-        geoms, stats = mesh_geometry(data, frame=opts["frame"], want_normals=lit)
+        root = _W["root"]
+        geoms, stats = mesh_geometry(data, frame=opts["frame"], want_normals=lit,
+                                     root=root)
         sockets_only = False
         if not geoms:
             geoms, stats = mesh_geometry(data, frame=opts["frame"],
-                                         want_normals=lit, include_sockets=True)
+                                         want_normals=lit, include_sockets=True,
+                                         root=root)
             sockets_only = bool(geoms)
         if not geoms:
             res["status"] = "failed"
@@ -1102,7 +1129,7 @@ def render_job(job: Job) -> dict:
         if float((allpos.max(0) - allpos.min(0)).max()) < 1e-4:
             g2, s2 = mesh_geometry(data, frame=opts["frame"], want_normals=lit,
                                    include_sockets=sockets_only,
-                                   apply_motion=False)
+                                   apply_motion=False, root=root)
             p2 = np.concatenate([g.pos for g in g2]) if g2 else None
             if p2 is not None and float((p2.max(0) - p2.min(0)).max()) >= 1e-4:
                 geoms, stats, allpos = g2, s2, p2
@@ -1366,7 +1393,7 @@ def selftest(root: str) -> int:
     print(f"reference: {REFERENCE}")
     data = assets.read(REFERENCE)
 
-    geoms, stats = mesh_geometry(data)
+    geoms, stats = mesh_geometry(data, root=root)
     names = [g.name for g in geoms]
     print(f"  chunks {stats['chunks']}, sockets skipped {stats['sockets']}, "
           f"drawn {names}")
@@ -1375,7 +1402,7 @@ def selftest(root: str) -> int:
         bad += 1
 
     # 1. agreement with tools/attach.py's own scalar implementation
-    part = attach.PartMesh.parse(data)
+    part = attach.PartMesh.parse(data, root=root)
     ref = np.array(list(part.world_vertices(attach.IDENTITY, 0)), np.float64)
     ref[:, 2] *= -1.0                                    # attach stays in C3 space
     mine = np.concatenate([g.pos for g in geoms]).astype(np.float64)

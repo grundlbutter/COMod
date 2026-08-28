@@ -358,19 +358,75 @@ const TileGround = (() => {
               x0, y0, u0, v0,  x1, y1, u1, v1,  x0, y1, u0, v1];
     }
 
+    /** The piece of this plane behind a ground rect, parallax-shifted.
+     *  Mirrors `puzzle.Backdrop.sample_rect` INCLUDING ITS ROUNDING: that
+     *  reference uses Python `int()`, which truncates TOWARD ZERO, and the
+     *  `/ 100` is the client's own (see `backdrops()` for the disassembly
+     *  site). `Math.floor` rounds toward -INFINITY instead. The two agree
+     *  for every rect with a non-negative origin -- which is every rect any
+     *  harness in this tree has ever sampled -- and disagree the moment the
+     *  camera pans west or north of the origin, where floor lands one whole
+     *  pixel further out and the plane shifts against the ground.
+     *
+     *  Static, and separated from `_drawPlane` for that reason: it is now
+     *  callable with NO GL context, so it can be pinned by an executed test
+     *  rather than by reading the source for the word `trunc`. */
+    static _sampleRect(rect, parallax) {
+      const [x0, y0, x1, y1] = rect;
+      const [ppx, ppy] = parallax || [100, 100];
+      const sx0 = Math.trunc(x0 * ppx / 100), sy0 = Math.trunc(y0 * ppy / 100);
+      return [sx0, sy0, sx0 + (x1 - x0), sy0 + (y1 - y0)];
+    }
+
+    /** The first tile boundary at or BELOW `v`, the origin of the wrapped
+     *  copy that covers it. Mirrors the reference's `(sy0 // ph) * ph`, and
+     *  Python `//` IS FLOOR DIVISION -- toward negative infinity.
+     *
+     *  This one is FLOOR and `_sampleRect` is TRUNCATION, two lines apart,
+     *  and that asymmetry is deliberate: the reference uses `int()` for the
+     *  parallax `/ 100` and `//` for this. Making them agree in either
+     *  direction is wrong. Truncating here would snap a negative origin
+     *  TOWARD zero, i.e. to the boundary ABOVE `v`, leaving the strip
+     *  between `v` and that boundary uncovered -- a seam that only appears
+     *  west or north of the origin.
+     *
+     *  Extracted because the mutation `floor -> trunc` SURVIVED here
+     *  (`tools/mutant.py`, exit 3) while the same mutation was killed two
+     *  lines up: the rounding that must not change was the one nothing
+     *  pinned. */
+    /** Which frame of an animated cover shows at `timeMs`. THREE identical
+     *  copies of this ternary were inline -- two draw paths and the
+     *  signature that decides whether to rebuild -- so a fix to one left
+     *  two, and the signature could disagree with what was drawn.
+     *
+     *  NOTE THE GUARD: `timeMs` itself is tested and 0 is FALSY, so t=0
+     *  returns 0 WITHOUT evaluating the formula. An off-by-one in the
+     *  formula is invisible at t=0 -- which is exactly where a first
+     *  fixture naturally lands. The pin uses t>0 for that reason.
+     *
+     *  MEASURED before this existed: the `js-frame-index` mutation
+     *  SURVIVED test_backdrop_roll, test_ground_animation,
+     *  test_tilebake_exec AND test_page_constants -- all four. */
+    static _frameIndex(timeMs, interval, nFrames) {
+      return (interval > 0 && nFrames > 1 && timeMs)
+        ? Math.floor(timeMs / interval) % nFrames : 0;
+    }
+
+    static _tileOrigin(v, span) {
+      return Math.floor(v / span) * span;
+    }
+
     /** Draw one backdrop plane behind `rect`, from its own resident tiles:
      *  parallax-shifted, wrapped in both axes -- puzzle.Backdrop.render_tiled
      *  in GPU form. Opaque (planes are the floor of the compositing stack). */
     _drawPlane(p, rect) {
       const [x0, y0, x1, y1] = rect;
-      const [ppx, ppy] = p.parallax || [100, 100];
-      const sx0 = Math.floor(x0 * ppx / 100), sy0 = Math.floor(y0 * ppy / 100);
-      const sx1 = sx0 + (x1 - x0), sy1 = sy0 + (y1 - y0);
+      const [sx0, sy0, sx1, sy1] = Baker._sampleRect(rect, p.parallax);
       const pw = Math.max(1, p.pixels[0]), ph = Math.max(1, p.pixels[1]);
       const G = p.grid, [tw, th] = p.pul;
       const groups = new Map();
-      for (let oy = Math.floor(sy0 / ph) * ph; oy < sy1; oy += ph)
-        for (let ox = Math.floor(sx0 / pw) * pw; ox < sx1; ox += pw)
+      for (let oy = Baker._tileOrigin(sy0, ph); oy < sy1; oy += ph)
+        for (let ox = Baker._tileOrigin(sx0, pw); ox < sx1; ox += pw)
           for (let j = 0; j < th; j++)
             for (let i = 0; i < tw; i++) {
               const idx = p.slotGrid[j * tw + i];
@@ -402,8 +458,7 @@ const TileGround = (() => {
     _drawPlacements(list, rect, timeMs) {
       const [x0, y0, x1, y1] = rect;
       for (const c of list) {
-        const fi = (c.interval > 0 && c.frames.length > 1 && timeMs)
-          ? Math.floor(timeMs / c.interval) % c.frames.length : 0;
+        const fi = Baker._frameIndex(timeMs, c.interval, c.frames.length);
         const ent = c.frames[fi];
         const meta = this.spriteMeta && this.spriteMeta[ent];
         const tex = this.sprites[ent];
@@ -649,8 +704,8 @@ const TileGround = (() => {
         // and its runs still land contiguously.  docs/ground_animation.md 5
         const anim = p.anim || {};
         const perKey = new Map();
-        for (let oy = Math.floor((by0 - padY) / ph) * ph; oy < by1 + padY; oy += ph)
-          for (let ox = Math.floor((bx0 - padX) / pw) * pw; ox < bx1 + padX; ox += pw)
+        for (let oy = Baker._tileOrigin(by0 - padY, ph); oy < by1 + padY; oy += ph)
+          for (let ox = Baker._tileOrigin(bx0 - padX, pw); ox < bx1 + padX; ox += pw)
             for (let j = 0; j < pth; j++)
               for (let i = 0; i < ptw; i++) {
                 const idx = p.slotGrid[j * ptw + i];
@@ -721,8 +776,7 @@ const TileGround = (() => {
       const runs = [];
       let cur = null;
       for (const c of list) {                        // already depth-sorted
-        const fi = (c.interval > 0 && c.frames.length > 1 && timeMs)
-          ? Math.floor(timeMs / c.interval) % c.frames.length : 0;
+        const fi = Baker._frameIndex(timeMs, c.interval, c.frames.length);
         const ent = c.frames[fi];
         const meta = this.spriteMeta && this.spriteMeta[ent];
         const tex = this.sprites[ent];
@@ -737,8 +791,7 @@ const TileGround = (() => {
     _rebuildCovers(timeMs) {
       // Frame signature: skip the rebuild when no animated cover changed cell.
       const sig = (this.covers || []).map(c =>
-        (c.interval > 0 && c.frames.length > 1 && timeMs)
-          ? Math.floor(timeMs / c.interval) % c.frames.length : 0).join(',');
+        Baker._frameIndex(timeMs, c.interval, c.frames.length)).join(',');
       if (sig === this._coverSig) return;
       this._coverSig = sig;
       const gl = this.gl;

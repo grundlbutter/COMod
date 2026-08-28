@@ -490,7 +490,8 @@ def row_checksum(cells, y: int, width: int) -> int:
     return cs & MASK32
 
 
-def parse(path: str | Path, want_cells: bool = True, verify: bool = True) -> DMap:
+def parse(path: str | Path, want_cells: bool = True,
+          verify: bool = True, data: bytes | None = None) -> DMap:
     p = Path(path)
     # `map_names()` yields NAMES ("desert"); this function takes a PATH.  The
     # by-name entry points are `open_map(root, name)` and `parse_map(root,
@@ -510,7 +511,11 @@ def parse(path: str | Path, want_cells: bool = True, verify: bool = True) -> DMa
             f"this is what `map_names()` yields. Use "
             f"`parse_map(root, {str(path)!r})` for a name, or pass a path "
             f"with a directory or a suffix.")
-    b = p.read_bytes()
+    # `data` lets a caller supply bytes it already holds -- specifically a
+    # `.DMap` lifted out of a `.7z` by `archive_bytes`, which is the ONLY
+    # form 7878's 730 maps ship in. Everything below this line was already
+    # pure byte parsing; `path` stays the provenance the DMap reports.
+    b = p.read_bytes() if data is None else data
     if len(b) < GRID_OFF:
         raise ValueError(f"{p.name}: too small ({len(b)} bytes)")
 
@@ -781,6 +786,164 @@ class _Hdr:
     def crcs(self, n: int) -> list:
         defined = [True] * n if self.u8() else self.bits(n)
         return [self.u32() if d else None for d in defined]
+
+
+def archive_head(path: str | Path, n: int = 64) -> bytes | None:
+    """The FIRST `n` bytes of the file inside a one-file ``.7z``.
+
+    **The result is NOT CRC-VERIFIED and cannot be** -- a CRC covers the whole
+    file, and this deliberately stops early.  `archive_bytes` is the verified
+    call; use it whenever the content matters.  This exists only for cheap
+    header reads, where the alternative is decompressing 6 MB to look at 28
+    bytes.
+
+    Why the distinction is worth two functions rather than a flag: a verified
+    and an unverified read returning the same type from the same name is how a
+    caller ends up trusting bytes nothing checked.  The names differ so the
+    choice is visible at the call site.
+
+    A `.DMap` header -- version, puzzle path, width, height -- lives in the
+    first 28 bytes, so `n=64` answers the map picker for 730 maps in the time
+    one full extraction takes.
+    """
+    import lzma
+
+    meta = archive_entry(path)
+    if meta is None:
+        return None
+    want_size, _crc = meta
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 32 or raw[:6] != SZ_SIG:
+        return None
+    nh_off = int.from_bytes(raw[12:20], "little")
+    packed = raw[32:32 + nh_off]
+    if not packed:
+        return None
+    hdr = raw[32 + nh_off:32 + nh_off + int.from_bytes(raw[20:28], "little")]
+    want = min(n, want_size)
+
+    i = hdr.find(b"\x03\x01\x01\x05")
+    if i >= 0 and i + 9 <= len(hdr):
+        pb = hdr[i + 4]
+        try:
+            dec = lzma.LZMADecompressor(
+                format=lzma.FORMAT_RAW,
+                filters=[{"id": lzma.FILTER_LZMA1, "lc": pb % 9,
+                          "lp": (pb // 9) % 5, "pb": (pb // 9) // 5,
+                          "dict_size": max(int.from_bytes(hdr[i + 5:i + 9],
+                                                          "little"), 4096)}])
+            out = dec.decompress(packed, max_length=want)
+            if len(out) == want:
+                return out
+        except Exception:
+            pass
+
+    for props in range(41):
+        try:
+            dec = lzma.LZMADecompressor(
+                format=lzma.FORMAT_RAW,
+                filters=[{"id": lzma.FILTER_LZMA2,
+                          "dict_size": (2 | (props & 1)) << (props // 2 + 11)}])
+            out = dec.decompress(packed, max_length=want)
+        except Exception:
+            continue
+        if len(out) == want:
+            return out
+    return None
+
+
+def archive_bytes(path: str | Path) -> bytes | None:
+    """The single file inside a one-file ``.7z``, decompressed IN MEMORY.
+
+    Companion to `archive_entry`, which reads the header and never touches the
+    content.  This reads the content, with the STANDARD LIBRARY only: these
+    archives are LZMA2 with a plain header, and `lzma` handles LZMA2 natively.
+    No `py7zr`, no `7z.exe`, no temp file.
+
+    WHY IT MATTERS.  From 5517 on a map ships only as ``map/map/<stem>.7z``,
+    and every one of 7878's 730 does.  Anything that globbed for loose
+    ``.DMap`` therefore saw a client with 730 maps as a client with none --
+    `cobrowse maps` reported zero, and `MapEditor` listed all 730 with
+    ``width``/``height``/``area`` all 0 because the dimensions live in the
+    ``.DMap`` it could not open.
+
+    VERIFIED, not assumed: the output is checked against the CRC32 the header
+    carries.  A mismatch returns None.  So a caller cannot receive plausible
+    wrong bytes -- the failure is *no answer*, never *a wrong answer*.
+
+    Returns None for anything outside the narrow shape `archive_entry` accepts,
+    which callers must treat as UNKNOWN and never as EMPTY.
+    """
+    import lzma
+    import zlib
+
+    meta = archive_entry(path)
+    if meta is None:
+        return None
+    want_size, want_crc = meta
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 32 or raw[:6] != SZ_SIG:
+        return None
+    nh_off = int.from_bytes(raw[12:20], "little")
+    packed = raw[32:32 + nh_off]
+    if not packed:
+        return None
+
+    raw_hdr = raw[32 + nh_off:32 + nh_off + int.from_bytes(raw[20:28], "little")]
+
+    def _ok(out):
+        return out is not None and len(out) == want_size             and zlib.crc32(out) == want_crc
+
+    # TWO CODERS ARE IN USE and assuming one silently loses the other. Across
+    # 7878's 470 map archives: 345 are LZMA2 (coder id 0x21) and 125 are LZMA1
+    # (0x030101). A LZMA2-only reader returns None for the 125 -- which a caller
+    # cannot distinguish from "not a map".
+    #
+    # LZMA1 carries its properties explicitly in the header (props length 5:
+    # one lc/lp/pb byte then a little-endian dict size), so they are PARSED.
+    i = raw_hdr.find(b"\x03\x01\x01\x05")
+    if i >= 0 and i + 9 <= len(raw_hdr):
+        pb_byte = raw_hdr[i + 4]
+        dict_size = int.from_bytes(raw_hdr[i + 5:i + 9], "little")
+        lc = pb_byte % 9
+        rem = pb_byte // 9
+        try:
+            dec = lzma.LZMADecompressor(
+                format=lzma.FORMAT_RAW,
+                filters=[{"id": lzma.FILTER_LZMA1, "lc": lc, "lp": rem % 5,
+                          "pb": rem // 5, "dict_size": max(dict_size, 4096)}])
+            # BOUNDED: a raw LZMA1 stream carries no end marker, so an
+            # unbounded decompress runs past the file and raises. The header
+            # already told us the exact output size; use it. 37 of 470 archives
+            # failed for this reason alone and looked like a codec problem.
+            out = dec.decompress(packed, max_length=want_size)
+            if _ok(out):
+                return out
+        except Exception:
+            pass
+
+    # LZMA2's dictionary size is a single properties byte whose position varies
+    # with the header layout, so the 41 legal codes are tried and the archive's
+    # OWN CRC decides. A wrong dictionary size cannot produce an accepted
+    # result, which is what makes brute force safe here rather than sloppy.
+    for props in range(41):
+        try:
+            dec = lzma.LZMADecompressor(
+                format=lzma.FORMAT_RAW,
+                filters=[{"id": lzma.FILTER_LZMA2,
+                          "dict_size": (2 | (props & 1)) << (props // 2 + 11)}])
+            out = dec.decompress(packed, max_length=want_size)
+        except Exception:
+            continue
+        if _ok(out):
+            return out
+    return None
 
 
 def archive_entry(path: str | Path) -> tuple[int, int] | None:
@@ -1268,6 +1431,126 @@ def read_pux(path: str | Path) -> Optional[dict]:
         return None                       # not the shape; refuse rather than guess
     return {"width": w, "height": h, "const_a": a, "const_b": c,
             "bytes": len(b)}
+
+
+#: A `.pux` layer entry: u16 index into the terrain table, then two i16.
+PUX_LAYER = 6
+
+#: The u32 that separates the two terrain tables. 1000 on all 136 files.
+PUX_SECTION = 1000
+
+
+def read_pux_full(path: str | Path, data: bytes | None = None) -> Optional[dict]:
+    r"""A `map/PuzzleSave/*.pux` DECODED -- terrain tables and tile payload.
+
+    `read_pux` reads the header and stops; this reads the whole file.  The
+    payload was previously believed not to be a compiled index, on the
+    evidence that it runs 20.8 to 172.2 bytes per tile and no linear fit
+    holds.  **Both observations are correct and the conclusion did not
+    follow**: the tile records are variable-length because a tile carries a
+    VARIABLE NUMBER OF LAYERS, and the per-tile byte cost varies with how
+    many.  Layer counts run 0 to 11+ across the corpus.
+
+    Grammar, and every field below is checked rather than assumed::
+
+        +0    char[10]  "TqTerrain\0"          magic
+        +20   u32 u32   width, height           in tiles
+        +32   u16 n1;   n1 x record             the terrain table
+              u32       1000                    section separator
+              u16 n2;   n2 x record             a SECOND table, n2 == 0 on
+                                                every map before 2024
+              u16       tile count              == width * height, ALWAYS
+              width*height x { u8 k; k x 6 }    the tile grid
+              0..2 x { u8 k; k x 6 }            a trailing section
+              4..6 bytes                        all zero
+
+        record := u16 n; char[n]   terrain name, GBK
+                  u16 n; char[n]   the .ANI file the art lives in
+                  u16 n; char[n]   the "PuzzleNN" key inside that .ANI
+                  5 x i32          unnamed
+
+    THE SECOND TABLE IS WHY THE NEW MAPS FAILED.  Before 2024 it is empty and
+    its two-byte count sits where a reader that does not know about it reads
+    a tile count -- harmlessly, because zero.  From 2024 it is populated
+    (1173 and 1192 records on this install) and a reader without it walks
+    into the middle of a record table believing it is tile data.  That is
+    exactly the 13 maps -- `2024stage`, `2025love01`, `monk01`..`monk04`,
+    `faction02`, `faction03` and the rest -- that would not open.
+
+    VERIFIED, and by a predicate this parser does NOT force: the u16 before
+    the grid equals `width * height` on **all 136** `.pux` in 7878, and the
+    walk ends on an ALL-ZERO remainder on all 136.  A grammar that had
+    drifted would have to land on both by luck, 136 times.
+
+    Returns None rather than a partial decode -- a half-read map is worse
+    than none, and the caller cannot tell a truncated grid from a small one.
+    """
+    if data is None:
+        try:
+            b = Path(path).read_bytes()
+        except OSError:
+            return None
+    else:
+        b = data
+    if len(b) < 34 or b[:10] != PUX_MAGIC:
+        return None
+    try:
+        w, h = struct.unpack_from("<II", b, 20)
+        if not (0 < w < 4096 and 0 < h < 4096):
+            return None
+
+        def table(o: int):
+            (n,) = struct.unpack_from("<H", b, o)
+            o += 2
+            out = []
+            for _ in range(n):
+                fields = []
+                for _ in range(3):
+                    (ln,) = struct.unpack_from("<H", b, o)
+                    o += 2
+                    fields.append(b[o:o + ln].decode("gbk", "replace"))
+                    o += ln
+                out.append({"name": fields[0], "ani": fields[1],
+                            "key": fields[2],
+                            "nums": struct.unpack_from("<5i", b, o)})
+                o += 20
+            return out, o
+
+        t1, o = table(32)
+        (sep,) = struct.unpack_from("<I", b, o)
+        o += 4
+        if sep != PUX_SECTION:
+            return None                  # not the shape; refuse
+        t2, o = table(o)
+        (tc,) = struct.unpack_from("<H", b, o)
+        o += 2
+        if tc != w * h:
+            return None                  # the check that pins the grammar
+        tiles = []
+        for _ in range(w * h):
+            k = b[o]
+            o += 1
+            tiles.append([struct.unpack_from("<Hhh", b, o + j * PUX_LAYER)
+                          for j in range(k)])
+            o += k * PUX_LAYER
+        # 0..2 further tile-shaped records, then an all-zero remainder.
+        while len(b) - o > PUX_LAYER:
+            k = b[o]
+            if o + 1 + k * PUX_LAYER > len(b):
+                break
+            o += 1 + k * PUX_LAYER
+        if any(b[o:]):
+            return None                  # unexplained trailing bytes: refuse
+    except (struct.error, IndexError):
+        return None
+    return {"width": w, "height": h, "terrain": t1, "terrain2": t2,
+            "tiles": tiles, "bytes": len(b),
+            # The count as the FILE declares it, not len(tiles) -- which
+            # is w*h by construction and so cannot witness anything. A
+            # caller comparing this against width*height is testing the
+            # grammar; comparing len(tiles) is testing the loop bound.
+            "declared_tiles": tc,
+            "max_layers": max((len(t) for t in tiles), default=0)}
 
 
 def read_gamemap_dat(path: str | Path) -> list[dict] | None:

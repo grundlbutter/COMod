@@ -215,11 +215,194 @@ def cmd_maps(args) -> int:
             f"<td>{html.escape(p.name)}</td><td>{m.version}</td>"
             f"<td>{m.width}&times;{m.height}</td><td>{pct}%</td>"
             f"<td>{m.layer_count}</td><td>{html.escape(m.puzzle_path)}</td></tr>")
+    if not rows:
+        # No loose .DMap: this client ships them inside .7z. Report the
+        # REGISTRY rather than an empty page -- "0 maps" for a client holding
+        # 730 of them is the failure this fallback exists for.
+        reg = read_gamemap(root)
+        if reg:
+            rows = ["<tr data-k='%s'><td>%s<td colspan=4>%s<td>%s</tr>"
+                    % (html.escape(pp.lower()), mid, html.escape(pp), tile)
+                    for mid, pp, tile in reg]
+            print("  no loose .DMap files; read ini/GameMap.dat instead "
+                  "(%d registered maps)" % len(reg))
     body = ("<table><tr><th>file<th>ver<th>size<th>walkable<th>layers<th>puzzle</tr>"
             + "".join(rows) + "</table>")
     dest = out / "maps.html"
     dest.write_text(_page("CO map index", f"{len(rows)} maps in map/map/", body), "utf-8")
     print(f"wrote {dest}  ({len(rows)} maps)")
+    return 0
+
+
+def read_gamemap(root) -> list:
+    """`ini/GameMap.dat` as [(id, archive_path, tile)] -- it is NOT encrypted.
+
+    7878 has ZERO loose `.DMap` files: every map ships inside a `.7z` under
+    `map/map/`, so `cmd_maps`'s glob found nothing and reported an empty index
+    for a client carrying 730 maps.
+
+    Layout, verified by EXACT CONSUMPTION rather than by eye: a u32 count, then
+    `count` records of (u32 id, u32 len, len bytes of path, u32 tile). On 7878
+    that consumes 24,413 of 24,413 bytes and the declared count equals the
+    record count. A parse off by one field ends mid-file, so the two checks
+    together are the guard and either alone is not.
+    """
+    import struct
+    f = Path(root) / "ini" / "GameMap.dat"
+    if not f.exists():
+        return []
+    b = f.read_bytes()
+    if len(b) < 4:
+        return []
+    declared = struct.unpack_from("<I", b, 0)[0]
+    off, out = 4, []
+    while off + 8 <= len(b):
+        mid, ln = struct.unpack_from("<II", b, off)
+        off += 8
+        if ln > 512 or off + ln > len(b):
+            break
+        path = b[off:off + ln].decode("latin-1")
+        off += ln
+        tile = struct.unpack_from("<I", b, off)[0] if off + 4 <= len(b) else 0
+        off += 4
+        out.append((mid, path, tile))
+    if off != len(b) or declared != len(out):
+        # Say so rather than returning a plausible short list. A registry that
+        # parsed 80% of the way reads as "this client has fewer maps", which is
+        # the wrong conclusion arrived at confidently.
+        print("  GameMap.dat: PARTIAL parse -- %d records, declared %d, "
+              "consumed %d of %d bytes. Not trusted."
+              % (len(out), declared, off, len(b)))
+        return []
+    return out
+
+
+def cmd_data(args) -> int:
+    """A searchable page over the DECRYPTED `.dat` corpus.
+
+    The asset browser answers "what does this look like". Nothing answered
+    "what is in the game data". This does, over the tables whose joins are
+    established in `docs/dat_corpus_index_2026-08-27.md`.
+    """
+    out = out_dir(args.root)
+    out.mkdir(parents=True, exist_ok=True)
+    corpus = Path(args.corpus)
+    if not corpus.is_dir():
+        sys.exit("no decrypted corpus at %s -- pass --corpus" % corpus)
+
+    def rows_of(name):
+        f = corpus / (name + ".dat.out")
+        if not f.exists():
+            return []
+        acc = []
+        for ln in f.read_text(encoding="latin-1").split(chr(10)):
+            ln = ln.strip()
+            if not ln or ln.startswith(";"):
+                continue
+            x = ln.split("@@")
+            if x and x[-1] == "":
+                x = x[:-1]
+            acc.append(x)
+        return acc
+
+    items = {int(x[0]): x[1] for x in rows_of("itemtype") if x and x[0].isdigit()}
+    if not items:
+        # Every lookup below would return "" and every table would render with
+        # blank names -- a page that looks built and says nothing.
+        sys.exit("itemtype parsed to ZERO rows; refusing to build a page whose "
+                 "every lookup would silently miss")
+
+    def nm(v):
+        try:
+            return items.get(int(v), "")
+        except (TypeError, ValueError):
+            return ""
+
+    sections, counts = [], {}
+
+    inst = rows_of("instancetype")
+    if inst:
+        r = ["<tr data-k='%s'><td>%s<td>%s</tr>"
+             % (html.escape((x[1] + " " + x[0]).lower()),
+                html.escape(x[0]), html.escape(x[1].replace("~", " ")))
+             for x in inst if len(x) > 1]
+        counts["instances"] = len(r)
+        sections.append("<h2>Instances</h2><table><tr><th>id<th>name</tr>"
+                        + "".join(r) + "</table>")
+
+    ex = rows_of("exchange_shop_goods")
+    if ex:
+        r = []
+        for x in ex:
+            if len(x) < 7:
+                continue
+            got, cur = nm(x[1]), nm(x[5])
+            if not got:
+                continue
+            r.append("<tr data-k='%s'><td>%s<td>%s<td>%s</tr>"
+                     % (html.escape((got + " " + cur).lower()),
+                        html.escape(got), html.escape(x[6]), html.escape(cur)))
+        counts["exchange offers"] = len(r)
+        sections.append("<h2>Exchange shop</h2><table>"
+                        "<tr><th>reward<th>price<th>paid in</tr>"
+                        + "".join(r) + "</table>")
+
+    tr = rows_of("task_reward_type")
+    if tr:
+        r = []
+        for x in tr:
+            if len(x) < 30:
+                continue
+            tot = sum(int(x[c]) for c in range(22, 30)
+                      if x[c].lstrip("-").isdigit())
+            if not tot:
+                continue
+            for c in range(14, 22):
+                w = int(x[c + 8]) if x[c + 8].lstrip("-").isdigit() else 0
+                if not w:
+                    continue
+                # An id that does not resolve is SHOWN, not dropped. Skipping
+                # it made 4 of 220 tables render totals of 84%, 10% and 0% with
+                # nothing on the page saying why -- a reader would read those
+                # as the game's own drop rates. Now every table sums to 100%
+                # and an unresolved entry is visibly unresolved.
+                n = nm(x[c]) or ("&lt;unresolved id %s&gt;" % html.escape(x[c]))
+                # Normalise by the ROW's own total, never by a constant: two
+                # rows in this table sum to 100,000 and the rest to 10,000.
+                r.append("<tr data-k='%s'><td>%s<td>%s<td>%.2f%%</tr>"
+                         % (html.escape((n + " " + x[0]).lower()),
+                            html.escape(x[0]), n, 100.0 * w / tot))
+        counts["drop entries"] = len(r)
+        sections.append("<h2>Task rewards (drop tables)</h2><table>"
+                        "<tr><th>table<th>item<th>chance</tr>"
+                        + "".join(r) + "</table>")
+
+    maps = read_gamemap(args.root)
+    if maps:
+        r = ["<tr data-k='%s'><td>%s<td>%s<td>%s</tr>"
+             % (html.escape(pth.lower()), mid, html.escape(pth), tile)
+             for mid, pth, tile in maps]
+        counts["maps"] = len(r)
+        sections.append("<h2>Maps</h2><table><tr><th>id<th>archive<th>tile</tr>"
+                        + "".join(r) + "</table>")
+
+    # Two renderings, because one string cannot serve both surfaces: the page
+    # wants an HTML entity and the console wants a character. Printing the
+    # HTML form leaked a literal "&middot;" into the operator's terminal.
+    parts = ["%s %s" % ("{:,}".format(v), k) for k, v in counts.items()]
+    sub_html = " &middot; ".join(parts)
+    sub_text = " | ".join(parts)
+    dest = out / "data.html"
+    dest.write_text(_page("CO game data", sub_html or "nothing parsed",
+                          "".join(sections)), "utf-8")
+    # Every line is either prose or a command, and never both. The first
+    # version printed "  open it:  start ..." -- the owner pasted the whole
+    # block into PowerShell and got two parse errors, because an indented line
+    # that CONTAINS a command reads as a command. Prose is prefixed with #.
+    print("# wrote %s" % dest)
+    print("# %s" % (sub_text or "nothing parsed"))
+    print("# to open it, run the line below")
+    print('start "" "%s"' % dest)
     return 0
 
 
@@ -238,6 +421,14 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("maps", help="index of all world maps")
     p.set_defaults(func=cmd_maps)
+
+    p = sub.add_parser("data",
+                       help="searchable page over the decrypted .dat corpus")
+    p.add_argument("--corpus",
+                   default=str(coroot.assets_dir() / "derived"
+                               / "7878-dat-decrypted"),
+                   help="directory of decrypted *.dat.out files")
+    p.set_defaults(func=cmd_data)
 
     args = ap.parse_args(argv)
     return args.func(args)

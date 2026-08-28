@@ -360,6 +360,37 @@ class MapArt:
         return None
 
     @property
+    def archive_path(self) -> Optional[Path]:
+        """The `map/map/<name>.7z` this map ships in, if there is one.
+
+        From 5517 on a map ships as an archive and the loose `.DMap` is the
+        exception; every one of 7878's 730 is archive-only. Before this the
+        editor listed all 730 with width/height/area all 0, because
+        `dmap_path` found nothing and every reader downstream received None.
+        """
+        root = self.lib.root
+        if root is None:
+            return None
+        p = root / "map" / "map" / f"{self.name}.7z"
+        return p if p.is_file() else None
+
+    def _archive_dmap_bytes(self) -> Optional[bytes]:
+        """The `.DMap` inside this map's archive, decompressed in memory.
+
+        Standard library only -- these are LZMA1 and LZMA2 with plain headers.
+        `archive_bytes` verifies its output against the CRC32 the archive
+        carries, so this returns correct bytes or None, never plausible wrong
+        ones.
+        """
+        a = self.archive_path
+        if a is None:
+            return None
+        try:
+            return dmapmod.archive_bytes(a)
+        except Exception:
+            return None
+
+    @property
     def dmap_logical(self) -> str:
         """The map's logical `.DMap` path, by NAME.
 
@@ -422,7 +453,14 @@ class MapArt:
             if self._dmap_header is None:
                 p = self.read_path()
                 if p is None:
-                    return None
+                    # No loose .DMap: read it out of the .7z.
+                    raw = self._archive_dmap_bytes()
+                    if raw is None:
+                        return None
+                    self._dmap_header = dmapmod.parse(
+                        self.archive_path, want_cells=False,
+                        verify=False, data=raw)
+                    return self._dmap_header
                 self._dmap_header = dmapmod.parse(p, want_cells=False, verify=False)
             return self._dmap_header
 
@@ -433,7 +471,13 @@ class MapArt:
             if self._dmap_cells is None:
                 p = self.read_path()
                 if p is None:
-                    return None
+                    raw = self._archive_dmap_bytes()
+                    if raw is None:
+                        return None
+                    self._dmap_cells = dmapmod.parse(
+                        self.archive_path, want_cells=True,
+                        verify=False, data=raw)
+                    return self._dmap_cells
                 self._dmap_cells = dmapmod.parse(p, want_cells=True, verify=False)
             return self._dmap_cells
 
@@ -535,6 +579,15 @@ class MapArt:
         and wrong for a layer that has to let the background show through."""
         if idx in self._tile_rgba:
             return self._tile_rgba[idx]
+        # A `.pux` tile is a STACK of terrain rows, and the editor gets it
+        # from the same composite the still renderer uses. Without this the
+        # index is synthetic, `tile_path` finds nothing, and every stacked
+        # tile renders as a HOLE -- which on a map whose tiles are mostly
+        # stacks is indistinguishable from the map not loading at all.
+        if self.pm is not None and idx in getattr(self.pm, "stacks", ()):
+            out = self.pm.composite_rgba(idx)
+            self._tile_rgba[idx] = out
+            return out
         out = None
         path = self.pm.tile_path(idx) if self.pm else ""
         if path and self.lib.assets is not None:
@@ -1067,6 +1120,13 @@ class StageFirst:
         return getattr(self._base, name)
 
 
+def _cstr_head(head: bytes) -> str:
+    """The puzzle path from a header-only `.DMap` slice."""
+    raw = head[dmapmod.HEADER_PATH_OFF:
+               dmapmod.HEADER_PATH_OFF + dmapmod.HEADER_PATH_LEN]
+    return raw.split(b"\x00", 1)[0].decode("latin-1", "replace")
+
+
 class MapEditor:
     """Every map the editor can offer, and the shared caches behind them.
 
@@ -1198,9 +1258,34 @@ class MapEditor:
                "state": "missing", "why": "", "consistent": None,
                "inGameMap": gm is not None}
         if path is None:
-            # Spelling-neutral: this row can come from GameMap.json or from
-            # GameMap.dat, and naming the wrong one sends a reader to a file
-            # their install does not have.
+            # NO LOOSE .DMap. From 5517 on that is the NORM rather than an
+            # error -- every one of 7878's 730 maps ships only as a .7z --
+            # and this branch used to return a row reading 0x0 "no .DMap
+            # ships", which is a client with 730 maps presenting as a client
+            # with none.
+            #
+            # The dimensions live at DIMS_OFF (268), so only the first
+            # GRID_OFF bytes are decompressed: 470 archives in 0.1s against
+            # 2.9s to extract them whole. `archive_head` is deliberately the
+            # UNVERIFIED call -- a CRC covers a whole file and this stops
+            # early -- so the row is marked `archive` and the editor still
+            # reads the full, CRC-checked bytes when it OPENS the map.
+            arch = (self.root / "map" / "map" / f"{stem}.7z"
+                    if self.root else None)
+            if arch is not None and arch.is_file():
+                head = dmapmod.archive_head(arch, dmapmod.GRID_OFF)
+                if head and len(head) >= dmapmod.DIMS_OFF + 8:
+                    w, h = struct.unpack_from("<II", head, dmapmod.DIMS_OFF)
+                    if 0 < w <= 65536 and 0 < h <= 65536:
+                        row |= {"width": w, "height": h, "area": w * h,
+                                "state": "archive",
+                                "puzzle": _norm(_cstr_head(head)),
+                                "why": "ships only inside a .7z; "
+                                       "dimensions read from the archive"}
+                        return row
+                row["why"] = ("ships only inside a .7z and its header did "
+                              "not read")
+                return row
             row["why"] = "the map registry names it but no .DMap ships"
             return row
         try:

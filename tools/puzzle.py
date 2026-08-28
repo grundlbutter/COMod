@@ -135,7 +135,17 @@ class PuzzleMap:
     #: existing field. See `docs/ground_animation.md`.
     frame_list: dict = field(repr=False, default_factory=dict)
     assets: Optional[AssetRoot] = field(repr=False, default=None)
+    #: synthetic tile index -> the terrain rows to composite, bottom
+    #: first. Only `.pux` fills this. A `.pul` tile is ONE texture and
+    #: `tiles` holds its index directly; a `.pux` tile is a STACK, and
+    #: rather than teach the render loop about stacks -- which would
+    #: cost its per-index cache, the thing that makes it fast -- each
+    #: DISTINCT stack is given a synthetic index and cached like any
+    #: other tile. A map reuses a few dozen stacks thousands of times,
+    #: so the cache still does its job.
+    stacks: dict = field(repr=False, default_factory=dict)
     _tile_rgb: dict = field(repr=False, default_factory=dict)
+    _layer_cache: dict = field(repr=False, default_factory=dict)
 
     # -- geometry ----------------------------------------------------------
 
@@ -238,6 +248,10 @@ class PuzzleMap:
         Cached: a map reuses a few dozen tiles thousands of times."""
         if idx in self._tile_rgb:
             return self._tile_rgb[idx]
+        if idx in self.stacks:
+            out = self._composite(self.stacks[idx])
+            self._tile_rgb[idx] = out
+            return out
         out = None
         path = self.tile_path(idx)
         if path and self.assets is not None:
@@ -248,6 +262,98 @@ class PuzzleMap:
                 out = None
         self._tile_rgb[idx] = out
         return out
+
+    def _layer_rgba(self, row: int):
+        """One terrain row's texture as ``grid*grid*4`` RGBA, or None.
+
+        Kept separate from `_tile_pixels` because a LAYER must keep its
+        alpha -- that is the whole point of stacking -- while a finished
+        tile has it flattened onto VOID.
+        """
+        cache = self._layer_cache
+        if row in cache:
+            return cache[row]
+        out = None
+        path = self.frames.get(row, "")
+        if path and self.assets is not None:
+            try:
+                w, h, rgba = dds.decode(self.assets.read(path))
+                out = _resample_rgba(rgba, w, h, self.grid)
+            except Exception:                            # noqa: BLE001
+                out = None
+        cache[row] = out
+        return out
+
+    def composite_rgba(self, idx: int) -> Optional[bytes]:
+        """A stack as ``grid*grid*4`` RGBA, ALPHA KEPT, or None.
+
+        Public because there are two ground renderers and they need
+        different things from the same stack: this module flattens onto
+        VOID for a finished still, and `mapedit` keeps the alpha so a layer
+        can let the background through.  Sharing the composite rather than
+        writing it twice -- the second copy is how one of them stays wrong.
+        """
+        rows = self.stacks.get(idx)
+        if not rows:
+            return None
+        return self._composite_rgba(rows)
+
+    def _composite_rgba(self, rows) -> Optional[bytes]:
+        """Alpha-composite terrain rows, bottom first. RGBA out."""
+        base = None
+        for row in rows:
+            lay = self._layer_rgba(row)
+            if lay is None:
+                continue
+            if base is None:
+                base = bytearray(lay)
+                continue
+            _over(base, lay, self.grid)
+        return bytes(base) if base is not None else None
+
+    def _composite(self, rows) -> Optional[bytes]:
+        """Alpha-composite a stack of terrain rows, BOTTOM FIRST, onto VOID.
+
+        The stack order is the file's order.  The two `i16` that follow each
+        layer's row index are NOT applied, and they are now characterised
+        rather than merely unnamed.  Measured over 155,404 layer entries:
+
+            field B   bounded 0..511 on EVERY entry -- 9 bits, never more.
+                      Its popcount distribution is a clean U: 26.3% zero,
+                      26.2% all-nine, and a smooth tail between.  Layer 0 is
+                      overwhelmingly 511 while overlays are mostly 0, and
+                      the recurring values are coherent 3x3 shapes -- 16 is
+                      the centre bit alone, 495 is a ring with the centre
+                      missing.  It is A NINE-BIT MASK.
+            field A   full i16 range, 9,762 distinct, 45.7% negative, with
+                      -1 (34,707) and -32768 (5,305) dominant.  Sentinel-
+                      shaped.  Not characterised further.
+
+        **REFUTED, and recorded so it is not re-tried:** the obvious reading
+        of field B is an autotile / neighbour-transition mask.  It is not.
+        Tested over 91,324 comparisons on partial masks -- excluding the
+        saturated 0 and 511, which cannot discriminate -- asking whether a
+        set bit predicts that the neighbour in that direction carries the
+        same terrain id: **48.5%, which is chance.**  The 3x3 shapes are
+        persuasive and the hypothesis is still wrong; only the neighbour
+        test could show that.
+
+        The surviving reading, UNTESTED and named as such, is intra-tile
+        coverage -- which ninths of its own tile a layer paints.  That is
+        consistent with everything above (a base layer covering all nine, a
+        ring painting the border) and it would NOT correlate with
+        neighbours, which is why the negative does not touch it.  Proving
+        it needs a render comparison against the client, not another
+        statistic.
+
+        So the layers are stacked FULL-TILE.  That is the standard terrain
+        model and it is an assumption -- if a map renders with the wrong
+        blend, this is where to look first.
+        """
+        out = self._composite_rgba(rows)
+        if out is None:
+            return None
+        return _flatten(out, self.grid, self.grid, self.grid)
 
     def render(self, rect: tuple[int, int, int, int], *, scale: int = 1) -> tuple[int, int, bytes]:
         """Flatten the painted image over a pixel rectangle to RGB bytes.
@@ -315,6 +421,55 @@ class PuzzleMap:
             "paintedTiles": sum(1 for t in self.tiles if t != EMPTY),
             "tileSlots": len(self.tiles),
         }
+
+
+def _resample_rgba(rgba: bytes, w: int, h: int, grid: int) -> bytes:
+    """RGBA resampled to ``grid*grid``, alpha KEPT. Companion to `_flatten`,
+    which is the same resample followed by a flatten onto VOID."""
+    if (w, h) == (grid, grid):
+        return rgba
+    if _np is not None:
+        a = _np.frombuffer(rgba, dtype=_np.uint8).reshape(h, w, 4)
+        yi = (_np.arange(grid) * h // grid).clip(0, h - 1)
+        xi = (_np.arange(grid) * w // grid).clip(0, w - 1)
+        return a[yi][:, xi].tobytes()
+    out = bytearray(grid * grid * 4)
+    for y in range(grid):
+        sy = y * h // grid
+        for x in range(grid):
+            sx = x * w // grid
+            s0 = (sy * w + sx) * 4
+            o = (y * grid + x) * 4
+            out[o:o + 4] = rgba[s0:s0 + 4]
+    return bytes(out)
+
+
+def _over(base: bytearray, top: bytes, grid: int) -> None:
+    """Source-over composite `top` onto `base`, both ``grid*grid`` RGBA.
+
+    In place, because a stack is composited one layer at a time and copying
+    the accumulator per layer is the whole cost on a map with nine of them.
+    """
+    if _np is not None:
+        b = _np.frombuffer(bytes(base), dtype=_np.uint8).reshape(-1, 4).astype(_np.uint16)
+        t = _np.frombuffer(top, dtype=_np.uint8).reshape(-1, 4).astype(_np.uint16)
+        ta = t[:, 3:4]
+        rgb = (t[:, :3] * ta + b[:, :3] * (255 - ta) + 127) // 255
+        al = ta[:, 0] + (b[:, 3] * (255 - ta[:, 0]) + 127) // 255
+        outa = _np.concatenate([rgb, _np.minimum(al, 255)[:, None]], axis=1)
+        base[:] = outa.astype(_np.uint8).tobytes()
+        return
+    for i in range(0, grid * grid * 4, 4):
+        ta = top[i + 3]
+        if ta == 0:
+            continue
+        if ta == 255:
+            base[i:i + 4] = top[i:i + 4]
+            continue
+        inv = 255 - ta
+        for c in range(3):
+            base[i + c] = (top[i + c] * ta + base[i + c] * inv + 127) // 255
+        base[i + 3] = min(255, ta + (base[i + 3] * inv + 127) // 255)
 
 
 def _flatten(rgba: bytes, w: int, h: int, grid: int) -> bytes:
@@ -579,29 +734,83 @@ class PuzzleLibrary:
         if not pul.is_file():
             self.reason = f"{src} names {rel}, which is not present"
             return None
+        if pul.suffix.lower() == ".pux":
+            # TqTerrain. This used to return None with a message saying the
+            # tile payload "is not a compiled index". The geometry half of
+            # that message was right and the conclusion was wrong: the tile
+            # records are variable-length because a tile carries a VARIABLE
+            # NUMBER OF LAYERS (0 to 11+ here), which is exactly the 20.8 to
+            # 172.2 bytes per tile that was measured and read as disproof of
+            # an index. `dmap.read_pux_full` decodes it -- 149 of 149 files
+            # on 6609 and 7878, none refused.
+            #
+            # A `.pux` differs from a `.pul` in one way that matters here:
+            # a `.pul` names ONE .ani for the whole map and its tiles index
+            # into it, while a `.pux` carries a terrain TABLE whose every
+            # row names its own .ani and PuzzleNN key. So the tile values
+            # below index the terrain table, and `frames` is filled per row
+            # rather than from a single table.
+            from dmap import read_pux_full, PUX_GRID     # noqa: PLC0415
+            px = read_pux_full(pul)
+            if px is None:
+                self.reason = (f"{src} uses {rel} -- TqTerrain (.pux), and it "
+                               f"did not decode (see dmap.read_pux_full)")
+                return None
+            # Layer 0 is the ground; the rest are overlays this renderer does
+            # not place yet. Stated because a map with layers drawn from
+            # layer 0 alone is INCOMPLETE, not wrong, and a reader comparing
+            # it against the client will see the difference.
+            # Give every DISTINCT layer stack one synthetic index. A tile
+            # with a single layer keeps that layer's own index, so a .pux
+            # that happens to be flat costs exactly what it did before.
+            SYNTH = 1 << 20                  # far above any terrain row
+            stacks: dict = {}
+            by_key: dict = {}
+            tiles = []
+            for t in px["tiles"]:
+                if not t:
+                    tiles.append(EMPTY)
+                elif len(t) == 1:
+                    tiles.append(t[0][0])
+                else:
+                    key = tuple(e[0] for e in t)
+                    sid = by_key.get(key)
+                    if sid is None:
+                        sid = SYNTH + len(by_key)
+                        by_key[key] = sid
+                        stacks[sid] = key
+                    tiles.append(sid)
+            pm = PuzzleMap(
+                name=str(name), map_id=self._doc_id.get(str(name).lower()),
+                map_width=m.width, map_height=m.height,
+                grid=PUX_GRID, pul_w=px["width"], pul_h=px["height"],
+                tiles=tiles, ani="", pul_path=rel.lower(), assets=self.assets,
+                stacks=stacks,
+            )
+            # Every row any tile OR any stack names -- a stack's rows never
+            # appear in `tiles` (they are replaced by the synthetic index),
+            # so iterating `tiles` alone leaves every stacked layer with no
+            # texture and the map renders as its single-layer tiles only.
+            wanted = {i for i in tiles if i != EMPTY and i < SYNTH}
+            for key in stacks.values():
+                wanted.update(key)
+            for idx in wanted:
+                if idx >= len(px["terrain"]):
+                    continue
+                row = px["terrain"][idx]
+                v = self._ani_table(row["ani"]).get(row["key"])
+                if isinstance(v, str):
+                    v = [v]
+                if v:
+                    seq = [str(x).replace("\\", "/").lstrip("/").lower()
+                           for x in v]
+                    pm.frames[idx] = seq[0]
+                    pm.frame_list[idx] = seq
+            self.reason = ""
+            return pm
         if pul.suffix.lower() != ".pul":
-            # map/PuzzleSave/*.pux is "TqTerrain", a different and undecoded
-            # format. Four maps use it on 5517; 12 do on 6609, where the
-            # map/PuzzleSave/*.pux is "TqTerrain".  Its HEADER is decoded --
-            # `dmap.read_pux` gives the puzzle's tile dimensions and
-            # `dmap.PUX_GRID` the 256-pixel tile the placement identity solves
-            # for on all 160 maps that name one -- but the tile PAYLOAD is not:
-            # 20.8 to 172.2 bytes per tile, so it is not a compiled index.
-            # Say what is known, because "not decoded" sent every reader back
-            # to the format when the geometry was already in hand.
-            from dmap import read_pux, PUX_GRID          # noqa: PLC0415
-            hdr = read_pux(pul)
-            if hdr:
-                self.reason = (
-                    f"{src} uses {rel} -- TqTerrain (.pux).  Its geometry IS "
-                    f"known: {hdr['width']}x{hdr['height']} tiles at "
-                    f"{PUX_GRID} px, implying a "
-                    f"{(hdr['width']*PUX_GRID)//64 + (hdr['height']*PUX_GRID)//32}"
-                    f"-cell map.  What is missing is the tile payload, which "
-                    f"is not a compiled index (see dmap.read_pux)")
-            else:
-                self.reason = (f"{src} uses {rel} -- the TqTerrain (.pux) "
-                               f"format, and its header did not read")
+            self.reason = (f"{src} names {rel}, which is neither a .pul nor "
+                           f"a .pux -- no reader for that form")
             return None
         try:
             z = Pul.load(pul)
