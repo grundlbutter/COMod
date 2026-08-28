@@ -49,6 +49,34 @@ login_history.json
 # fails loudly if this file ever lands in git's index.
 .sanitize-local
 
+# YOUR game clients, and everything derived beside them. A client directory
+# holds a whole install -- Conquer.exe, data.wdf, loose art -- and THIS IS A
+# PUBLIC REPOSITORY whose one-sentence claim is that it ships no game data.
+#
+# This was enforced per-directory: each client folder carried its own
+# `.gitignore` (`*`, `!.gitignore`, `!.gitkeep`). That protects only the
+# folders somebody remembered to create the pair for, and on 2026-08-27 it
+# failed twice in one day -- `4274` left 5,973 files visible, and `6271`
+# left 70,045, each one `git add -A` away from publishing a game client.
+#
+# The rules below cover every client directory including the ones that do
+# not exist yet, so a new install is protected the moment it is dropped in
+# rather than when somebody remembers. The per-directory files stay: they are
+# harmless, and they keep working if this block is ever edited away.
+ConquerAssets/Clients/*/*
+!ConquerAssets/Clients/*/.gitignore
+!ConquerAssets/Clients/*/.gitkeep
+
+ConquerAssets/derived/*
+!ConquerAssets/derived/.gitignore
+!ConquerAssets/derived/.gitkeep
+
+# Sibling trees under ConquerAssets/ are the same kind of thing: extracted or
+# variant game art. Named explicitly rather than with a catch-all so that a
+# NEW sibling shows up as untracked and gets a decision, instead of being
+# silently swallowed by a rule nobody revisits.
+ConquerAssets/_variants/*
+
 # Editor / OS noise
 .vscode/
 .idea/
