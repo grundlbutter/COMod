@@ -63,6 +63,13 @@ login_history.json
 # not exist yet, so a new install is protected the moment it is dropped in
 # rather than when somebody remembers. The per-directory files stay: they are
 # harmless, and they keep working if this block is ever edited away.
+# Loose files dropped straight into Clients/ -- installers usually, before
+# anyone has extracted them into a per-client folder. The rule below this
+# one only covers files INSIDE a client directory, so seven 3.5GB
+# installers sat git-visible here on 2026-08-28 until this was added.
+# Directories are re-included so git still descends into real clients.
+ConquerAssets/Clients/*
+!ConquerAssets/Clients/*/
 ConquerAssets/Clients/*/*
 !ConquerAssets/Clients/*/.gitignore
 !ConquerAssets/Clients/*/.gitkeep
