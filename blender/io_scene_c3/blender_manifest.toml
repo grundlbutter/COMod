@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_scene_c3"
-version = "1.0.0"
+version = "1.2.15"
 name = "Conquer Online C3 (mesh)"
 tagline = "Import and export Conquer Online PHY meshes, byte-exactly"
 maintainer = "CO Client RE project"

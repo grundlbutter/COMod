@@ -83,7 +83,9 @@
     rows.push([th.ok ? 'ok' : 'warn', 'Thumbnails', th.status || 'unknown',
                th.status === 'none' ? 'none generated \u2014 optional, see below'
                  : `${(th.meshes || 0).toLocaleString()} mesh + ` +
-                   `${(th.textures || 0).toLocaleString()} texture`]);
+                   `${(th.textures || 0).toLocaleString()} texture` +
+                   (th.legacy ? ' (shown from an older per-checkout folder; ' +
+                                'the shared folder is still empty)' : '')]);
 
     const MARK = { ok: '\u2713', warn: '!', bad: '\u2717' };
     for (const [level, what, value, detail] of rows) {
@@ -225,8 +227,8 @@
     box.appendChild(actions);
 
     box.appendChild(mk('p', 'mut small',
-      'You can start this later from the "Health & thumbnails" button, or on ' +
-      'the command line: ' + (plan.cli || 'py -3 tools/thumbs.py --all')));
+      'You can start this later from Settings → Health management, or ' +
+      'on the command line: ' + (plan.cli || 'py -3 tools/thumbs.py --all')));
     return box;
   }
 

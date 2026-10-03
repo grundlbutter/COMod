@@ -250,9 +250,17 @@ class TpdArchive:
                                                str(self.tpi))
         self._by_name = {e.name.lower(): e for e in self.entries}
         self._fh = open(self.tpd, "rb")
-        head = self._fh.read(16)
-        if head != TPD_MAGIC:
-            raise TpdFormatError(f"{self.tpd}: not a NetDragonDatPkg data file")
+        # THE MAGIC CHECK RAISES WITH THE HANDLE OPEN, and a constructor that
+        # raises leaves the caller nothing to `close()`.  Same defect, same
+        # shape, as the one `WdfArchive.__init__` carries.
+        try:
+            head = self._fh.read(16)
+            if head != TPD_MAGIC:
+                raise TpdFormatError(
+                    f"{self.tpd}: not a NetDragonDatPkg data file")
+        except Exception:
+            self._fh.close()
+            raise
 
     # -- context manager ---------------------------------------------------
     def __enter__(self) -> "TpdArchive":
@@ -278,10 +286,27 @@ class TpdArchive:
             return b""
         if e.flag != 1 and e.flag != 2:
             return self.read_compressed(e)
+        return self.inflate(e, self.read_compressed(e))
+
+    @staticmethod
+    def inflate(e: TpdEntry, stored: bytes) -> bytes:
+        """`read`, from stored bytes the caller already has.
+
+        Split out so a cache keyed on the STORED bytes (`core/tpdcache.py`)
+        can hash them and, on a miss, inflate the same bytes instead of
+        seeking and reading the entry a second time. `stored` is exactly what
+        `read_compressed(e)` returns: the chunks concatenated in order, so
+        each chunk is sliced back out by its compressed size.
+        """
+        if e.flag == 0:
+            return b""
+        if e.flag != 1 and e.flag != 2:
+            return stored
         out = []
+        pos = 0
         for c_comp, c_unc, c_off in e.chunks:
-            self._fh.seek(c_off)
-            part = zlib.decompress(self._fh.read(c_comp))
+            part = zlib.decompress(stored[pos:pos + c_comp])
+            pos += c_comp
             if len(part) != c_unc:
                 raise TpdFormatError(
                     f"{e.name}: chunk at {c_off} inflated to {len(part)} "

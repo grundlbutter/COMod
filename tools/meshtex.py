@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from coassets import AssetRoot, C3File, DEFAULT_ROOT, parse_ini   # noqa: E402
+from wdf import detect_magic                                     # noqa: E402
 import c3phy                                                      # noqa: E402
 import coroot                                                     # noqa: E402
 import provenance                                                 # noqa: E402
@@ -162,6 +164,18 @@ class Match:
 
 def _norm(p: str) -> str:
     return p.replace("\\", "/").strip().lstrip("/").lower()
+
+
+def _loose_files(root) -> set[str]:
+    """Every regular file under `root`, as `_norm`ed paths relative to it."""
+    top = os.path.join(str(root), "")          # exactly one trailing separator
+    n = len(top)
+    out: set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(top):
+        rel = dirpath[n:]
+        for fn in filenames:
+            out.add(_norm(os.path.join(rel, fn) if rel else fn))
+    return out
 
 
 def pooled_names() -> tuple[set[str], bool]:
@@ -284,6 +298,9 @@ class MeshTextureIndex:
         #: size; at comparable sizes it is accepted in silence.
         self.CACHE = coroot.derived_path("out/meshtex/mesh_index.json", self.root)
         self.ini = self.root / "ini"
+        #: ini tables this install does not ship, in the order they were
+        #: asked for.  Filled by `_sections`; reported once by `_load_tables`.
+        self.missing_tables: list[str] = []
         self.assets = assets or AssetRoot(self.root)
         self._owns_assets = assets is None
         self.universe: set[str] = set()
@@ -314,8 +331,10 @@ class MeshTextureIndex:
         rejected cache (``_cache_covers``, ``C-2026-08-10-quickfix-gap210``).
 
         So the pooled names are kept, but *marked*.  ``_global_only`` is the
-        subset that no loose file backs, i.e. exactly the names whose
-        presence this install has not yet been asked to confirm.  Callers
+        subset that neither a loose file nor a CONTAINER-DECLARED path backs,
+        i.e. exactly the names whose presence this install has not yet been
+        asked to confirm.  A declared path is not among them: a `.tpi` stores
+        the path, so the install itself is what named it.  Callers
         that need a per-base answer resolve them through ``_in_this_install``
         -- one TQ hash into this install's own WDF index, which is the same
         decisive check ``exists`` already falls through to.
@@ -325,16 +344,41 @@ class MeshTextureIndex:
         never ask a coverage question; ``_cache_covers`` only ever needs the
         few hundred that a cache actually misses.  Pay it where it is owed.
         """
-        loose: set[str] = set()
-        for p in self.root.rglob("*"):
-            if p.is_file():
-                loose.add(_norm(str(p.relative_to(self.root))))
+        # `os.walk`, not `rglob("*") + is_file()` -- the third site of the
+        # substitution `coassets` made twice (see `_c3_names`). rglob asks
+        # the OS again, one stat per entry, for what the directory listing
+        # already said. MEASURED 2026-09-18 (loadharness, box exclusive, walk
+        # alone, median of 3): 7878 8.31 s -> 0.69 s of a 12.64 s index
+        # build; 6609 4.91 -> 0.30 of 7.02; 6090 2.41 -> 0.15 of 3.34.
+        #
+        # The SET MUST NOT CHANGE: a smaller universe here is a wrong answer,
+        # not a fast one. `tests/test_meshtex_walk.py` pins the two
+        # constructions equal, path by path, on every installed client.
+        loose = _loose_files(self.root)
         self.universe.update(loose)
+        # What the install's own containers DECLARE. A `.tpd`/`.tpi` pair
+        # stores the path, so these need no recovered-name table and are not
+        # "unconfirmed" in the sense `_global_only` means -- this install is
+        # the thing that named them. `AssetRoot.locate` has always preferred
+        # a declared path to a hash; enumerating them is what was missing,
+        # and on a TPD client it is almost the whole corpus: Zephyr offered
+        # 324 loose `.c3` against a census of 31,421 until this line existed.
+        try:
+            declared = {_norm(n) for n in self.assets.container_names()}
+        except Exception:
+            # A container that cannot be enumerated must not take the index
+            # down with it; the recovered tables below are still true.
+            declared = set()
+        self.universe.update(declared)
+        #: Kept because `scan_meshes` asks a different question of it than
+        #: the universe does: whether this install's corpus is COMPLETE
+        #: without any recovered table, which is what decides the cache.
+        self._declared = declared
         pooled, self.names_loaded = pooled_names()
         self.universe.update(pooled)
         #: Pooled names with no loose file behind them -- unconfirmed against
         #: this install until `_in_this_install` says otherwise.
-        self._global_only = pooled - loose
+        self._global_only = pooled - loose - declared
         self.textures = {p for p in self.universe if p.endswith(".dds")}
         self.c3_files = {p for p in self.universe if p.endswith(".c3")}
         self._exists_cache: dict[str, bool] = {}
@@ -356,6 +400,82 @@ class MeshTextureIndex:
             self._exists_cache[p] = hit
         return hit
 
+    def claim_by_content(self) -> tuple[set[str], dict[str, int]]:
+        """`.dds`-NAMED files whose bytes are a C3 mesh, and how many could
+        not be claimed.
+
+        TQ shelved some animated meshes under texture names -- `MAXFILE C3
+        00001`, PHY+MOTI, one with CAME -- and the texture pass then failed on
+        them with UnidentifiedImageError. Confirmed by content out of Zephyr's
+        containers: at least EIGHT, not the four first found, and one of them
+        is `c3/effect/flash/2996158.dds`, which is NOT under `c3/texture/`.
+        **So the only rule that works is BY CONTENT**: a rule keyed on the
+        texture shelf misses that file, and the shelf is not even
+        consistently the wrong shelf.
+
+        Classified with `wdf.detect_magic` over `AssetRoot.peek` -- the
+        EXISTING classifier and the containers' existing `peek`, so there is
+        no third definition of "what is this file" to drift from the other
+        two.
+
+        Returns the claimed paths and a count of C3-by-content entries this
+        index could NOT claim, because a WDF index stores only a hash and a
+        path that no recovered table names cannot be offered to anything.
+        Those are counted, not dropped silently -- the same shape as
+        `in_scope_textures`' withheld count.
+
+        Called from `scan_meshes`, not `__init__`: every tool builds an
+        index, only the mesh census needs this, so this is where it is owed.
+        """
+        claimed: set[str] = set()
+        for p in self.textures:
+            if p in self._global_only and not self._resolvable_unconfirmed(p):
+                continue                 # not in this install; nothing to peek
+            try:
+                head = self.assets.peek(p, 16)
+            except (OSError, KeyError, ValueError):
+                continue
+            if detect_magic(head)[1] == ".c3":
+                claimed.add(p)
+        # C3 content in a hash-only WDF whose hash NO path in this universe
+        # produces: present in this install, and unclaimable, because there is
+        # no name to offer it under. Counted so it is not invisible.
+        from tqhash import tq_hash                      # noqa: PLC0415
+        known = {tq_hash(p) for p in self.universe}
+        unnamed = 0
+        for arc in getattr(self.assets, "_archives", {}).values():
+            if getattr(arc, "names", None) is not None:
+                continue                 # a TPD stores every entry's path
+            for e in getattr(arc, "entries", []):
+                if (detect_magic(arc.peek(e, 16))[1] == ".c3"
+                        and e.hash not in known):
+                    unnamed += 1
+        return claimed, {"claimed": len(claimed), "wdf_unnamed": unnamed}
+
+    def _resolvable_unconfirmed(self, p: str) -> bool:
+        """Is `p` -- known to be in `_global_only` -- actually in this install?
+
+        `_global_only` is the pooled names with no loose file and no
+        container declaration behind them, so `locate`'s loose-file stat
+        cannot succeed for one of them and costs 0.32 ms against
+        `in_archives`' 0.01 ms (measured, 2,000 names on 5017).
+
+        **The overlay is the exception and it is why this is not simply
+        `in_archives`.** An overlay supplies paths no archive holds -- that
+        is its entire purpose -- so an install with one configured falls back
+        to the full `locate`. Fast where it is safe, correct where it is not.
+        """
+        if self.assets.overlays:
+            return self._in_this_install(p)
+        hit = self._exists_cache.get(p)
+        if hit is None:
+            try:
+                hit = self.assets.in_archives(p)
+            except Exception:
+                hit = False
+            self._exists_cache[p] = hit
+        return hit
+
     def in_scope_c3(self) -> set[str]:
         """`c3_files` restricted to what this install can actually open.
 
@@ -366,6 +486,73 @@ class MeshTextureIndex:
         """
         return {p for p in self.c3_files
                 if p not in self._global_only or self._in_this_install(p)}
+
+    def in_scope_textures(self) -> tuple[set[str], dict[str, int]]:
+        """`textures` restricted to what this install can actually open,
+        with a COUNT OF WHAT WAS DROPPED AND WHY.
+
+        The mesh side has had `in_scope_c3` since it was written; the texture
+        side never asked, and `thumbs.texture_universe` returned
+        `self.textures` -- the raw union -- straight to the renderer.
+        `pooled_names()` is GLOBAL, "one set of names pooled from every
+        install anyone has ever unpacked", so the work list offered every
+        recovered `.dds` name on the box to whichever client was selected and
+        the renderer discovered the absence one file at a time: **7,507 of
+        142,435 on 7878, 848 on CCO** in the nine-client matrix, every
+        sampled one "path does not exist".
+
+        Returns the dropped paths BY REASON rather than a single number,
+        because "the corpus cannot read 7,507 paths" and "7,507 paths were
+        never in this install to begin with" are different problems and only
+        the second one is benign:
+
+            pooled_not_here    a GLOBAL recovered name this install's archive
+                               index does not resolve, and nothing in this
+                               install asks for it. Somebody else's client
+                               shipped it; benign, and expected to be the
+                               bulk.
+            table_named_absent the same, EXCEPT that one of this install's
+                               OWN tables names it (`3dtexture.ini` and
+                               friends, via `tex_paths`). Not benign: the
+                               client says it needs a file it does not ship,
+                               so an asset will render untextured in the
+                               game and not only in our previews.
+
+        A third bucket, "referenced by a table and present", cannot appear
+        here: such a path resolves and is kept. And there is no "other" --
+        a dropped path is by construction one the pool offered and this
+        install does not resolve, so the two above partition the drop
+        exactly. Stated rather than left implicit, because a bucket that
+        cannot be non-zero is not a measurement.
+
+        The cost this pays is the one `_build_universe` deliberately deferred
+        ("Pay it where it is owed"): one hash and one index lookup per
+        unconfirmed name, shared through `_exists_cache`. A thumbnail run is
+        exactly where it is owed -- it is about to open every one of these
+        paths anyway, and failing at `Image.open` costs more than failing at
+        a dict lookup.
+        """
+        # `3dtexture.ini` DIRECTLY rather than `_load_tables()`, which builds
+        # the appearance, npc, motion and effect tables too. MEASURED: the
+        # full load dominated this call at ~19 s against the confirmation's
+        # ~1 s, to populate one dict this needs and four it does not. Same
+        # values -- `_load_tables` builds `tex_paths` from this very file.
+        wanted = {_norm(v) for v in _flat_ini(self.ini / "3dtexture.ini").values()}
+        keep: set[str] = set()
+        why: dict[str, int] = {"pooled_not_here": 0, "table_named_absent": 0}
+        for p in self.textures:
+            if p not in self._global_only:
+                # Backed by a loose file or declared by a container: this
+                # install named it, so it is in scope without a lookup.
+                keep.add(p)
+                continue
+            if self._resolvable_unconfirmed(p):
+                keep.add(p)
+            elif p in wanted:
+                why["table_named_absent"] += 1
+            else:
+                why["pooled_not_here"] += 1
+        return keep, why
 
     def exists(self, logical: str) -> bool:
         """Does the client have this asset?
@@ -462,6 +649,11 @@ class MeshTextureIndex:
         self._build_simplerole_table()
         self._build_appearance_table()
         self._build_motion_table()
+        if self.missing_tables:
+            print(f"[meshtex] {len(self.missing_tables)} ini table(s) this "
+                  f"install does not ship, so their pairings are absent "
+                  f"rather than empty: {', '.join(self.missing_tables)}",
+                  file=sys.stderr, flush=True)
 
         #: .c3 files grouped by directory, for the dir_consensus rule.
         self._c3_by_dir: dict[str, list[str]] = collections.defaultdict(list)
@@ -479,6 +671,33 @@ class MeshTextureIndex:
                 return
         d[mesh].append((tex, detail))
 
+    def _sections(self, name: str, *, allow_stale: bool = False
+                  ) -> dict[str, dict[str, str]]:
+        """`parse_ini` for a table an install may legitimately not ship.
+
+        `_flat_ini` has returned `{}` for an absent file since it was
+        written; the SECTIONED reader did not, and the difference was not a
+        style one.  A client missing one of these tables did not lose that
+        table's rule -- `parse_ini` raised FileNotFoundError out of
+        `_load_tables`, so the install built NOTHING.  Measured on Zephyr
+        2026-09-18: 6 of the 10 ini tables this module names are absent
+        there, 4 of them behind `_flat_ini` (silent, correct) and 2 behind
+        this reader (fatal).  Zephyr produced 0 of its 31,421 meshes for
+        want of two files that only ever contributed mesh<->texture
+        PAIRINGS, never corpus.
+
+        An absence is recorded rather than swallowed: `self.missing_tables`
+        is printed once by `_load_tables`, because "this install has no
+        effect table" and "this install's effect table is empty" are
+        different facts and the second one is the one that hides.
+        """
+        p = self.ini / name
+        if not p.is_file():
+            if name not in self.missing_tables:
+                self.missing_tables.append(name)
+            return {}
+        return parse_ini(p, allow_stale=allow_stale)
+
     def _build_effect_table(self) -> None:
         """ini/3DEffect.ini: per effect, `Amount=N` parts each with
         `EffectId<i>` (-> 3DEffectObj.ini, a .c3) and `TextureId<i>`
@@ -494,8 +713,8 @@ class MeshTextureIndex:
         # switching moves *this tool's* coverage index on 5517/6090, and
         # rebuilding those indexes is meshtex's owner's call rather than a
         # passing session's (C21).
-        for sec, kv in parse_ini(self.ini / "3DEffect.ini",
-                                 allow_stale=True).items():
+        for sec, kv in self._sections("3DEffect.ini",
+                                      allow_stale=True).items():
             try:
                 n = int(kv.get("Amount", "0") or 0)
             except ValueError:
@@ -519,8 +738,8 @@ class MeshTextureIndex:
         # is not a gate session's call (C21 -- a coverage index that changes
         # under other sessions is exactly what caused the cross-base leak).
         # Declared here; conversion is listed in docs/gamedata.md.
-        for sec, kv in parse_ini(self.ini / "3DSimpleObj.ini",
-                                 allow_stale=True).items():
+        for sec, kv in self._sections("3DSimpleObj.ini",
+                                      allow_stale=True).items():
             try:
                 n = int(kv.get("PartAmount", "0") or 0)
             except ValueError:
@@ -630,13 +849,13 @@ class MeshTextureIndex:
         naming a `3DSimpleObjID` (-> 3DSimpleObj.ini, giving the texture) and
         two motion ids that are bare mesh ids in 3dobj.ini / c3/mesh/.
         VERIFIED by inspection; this is what backs c3/mesh/99988*.c3."""
-        p = self.ini / "3DsimpleRole.ini"
-        if not p.is_file():
+        roles = self._sections("3DsimpleRole.ini")
+        if not roles:
             return
         # STALE-INI: same SIMO twin as _build_simpleobj_table above.
-        simple = parse_ini(self.ini / "3DSimpleObj.ini", allow_stale=True)
+        simple = self._sections("3DSimpleObj.ini", allow_stale=True)
         motion = _flat_ini(self.ini / "3dmotion.ini")
-        for sec, kv in parse_ini(p).items():
+        for sec, kv in roles.items():
             obj = simple.get(f"ObjIDType{kv.get('3DSimpleObjID')}")
             if not obj:
                 continue
@@ -1136,21 +1355,49 @@ class MeshTextureIndex:
         """Parse every `.c3` in the universe.  ~2 minutes; cached in
         out/meshtex/mesh_index.json.
 
-        The cache is only written when the recovered name tables were
-        loaded: a census taken without them sees only loose files, and
+        The cache is written when THE CORPUS IS COMPLETE.  That is the
+        question; "were the recovered name tables loaded" was only ever a
+        proxy for it.
+
+        **THE PROXY USED TO BE EXACT AND THIS COMMIT FALSIFIES IT.**  The
+        rule here read `if not self.names_loaded`, and its reason was
+        written as: *a census taken without them sees only loose files, and
         persisting it would poison every later run with a half-sized index
-        that looks fine."""
+        that looks fine.*  True of every install when it was written --
+        every archive on the box was a `.wdf`, whose index stores only
+        `tq_hash(name)`, so with no recovered table there was nothing but
+        the loose tree.  A `.tpd`/`.tpi` pair declares its own paths
+        (`coassets.AssetRoot.container_names`), so such an install has a
+        COMPLETE corpus and no recovered table, and never will have one --
+        there is no WDF to recover names from.  Measured on Zephyr: the
+        census is 29,717 of 29,717 `.c3`, and the old rule refused to cache
+        it, re-scanning all 29,717 container entries on every run and
+        telling the user to run the bootstrap they had just run.
+
+        So a half-sized census is still refused, and a complete one is kept
+        however it was completed."""
         out: dict[str, dict] = {}
-        paths = sorted(self.c3_files)
+        claimed, why = self.claim_by_content()
+        if claimed or why["wdf_unnamed"]:
+            # LOUD, the way `in_scope_textures`' withheld count is: a mesh
+            # the census gained by content, or one it knows exists and cannot
+            # name, must be a number someone sees.
+            print(f"[meshtex] {why['claimed']} .dds-named file(s) are C3 meshes "
+                  f"by content and were added to the mesh census; "
+                  f"{why['wdf_unnamed']} more C3-by-content entries sit in a "
+                  f"hash-only WDF under no known name and cannot be claimed",
+                  file=sys.stderr, flush=True)
+        paths = sorted(self.c3_files | claimed)
         for i, p in enumerate(paths):
             if progress and i % 500 == 0:
                 print(f"  scan {i}/{len(paths)}", file=sys.stderr, flush=True)
             rec = self._scan_one(p)
             if rec is not None:
                 out[p] = rec
-        if not self.names_loaded:
+        if not (self.names_loaded or self._declared):
             print("[meshtex] WARNING: no recovered name tables "
-                  "(out/wdf/*_names.json, out/dll/wdf_name_recovery.json) -- "
+                  "(out/wdf/*_names.json, out/dll/wdf_name_recovery.json) "
+                  "and no container declares its own paths -- "
                   f"this census sees only {len(paths)} loose .c3 files and "
                   "none of the ~25,000 archived assets. It will NOT be "
                   "cached. Run `py -3 tools/health.py --bootstrap` first.",
@@ -1231,8 +1478,21 @@ class MeshTextureIndex:
 # coverage report
 # ---------------------------------------------------------------------------
 
-def build_coverage(idx: MeshTextureIndex, verify: bool = False) -> dict:
+#: Matches kept per mesh in coverage.json. ONE number for both writers: the
+#: CLI and the viewer's live build (`unify.UnifiedIndex`) both go through
+#: `build_coverage`, so what the viewer builds live and what it later loads
+#: from the file are the same answer. Before 2026-09-18 the live build kept
+#: EVERY match while the file kept 12, and the viewer's texture-owner table
+#: differed between the two states.
+COVERAGE_MATCHES = 12
+
+
+def build_coverage(idx: MeshTextureIndex, verify: bool = False,
+                   progress=None) -> dict:
+    """The coverage report for `idx`. `progress(done, total)` is ticked every
+    250 meshes and on the last one -- the viewer's build shows it."""
     meshes = idx.all_meshes()
+    total = len(meshes)
     entries = {}
     by_dir: dict[str, dict] = collections.defaultdict(
         lambda: {"meshes": 0, "matched": 0, "authored": 0, "unmatched": []})
@@ -1241,11 +1501,14 @@ def build_coverage(idx: MeshTextureIndex, verify: bool = False) -> dict:
     unmatched: list[str] = []
     verified_ok = verified_bad = 0
 
-    for m in meshes:
+    for i, m in enumerate(meshes):
+        if progress is not None and (i % 250 == 0 or i + 1 == total):
+            progress(i + 1, total)
         ms = idx.matches(m)
         d = "/".join(m.split("/")[:2])
         by_dir[d]["meshes"] += 1
-        rec = {"matches": [x.as_dict() for x in ms[:12]], "n_matches": len(ms)}
+        rec = {"matches": [x.as_dict() for x in ms[:COVERAGE_MATCHES]],
+               "n_matches": len(ms)}
         if ms:
             by_dir[d]["matched"] += 1
             best_method[ms[0].method] += 1
@@ -1285,6 +1548,32 @@ def build_coverage(idx: MeshTextureIndex, verify: bool = False) -> dict:
         summary["verified_ok"] = verified_ok
         summary["verified_failed"] = verified_bad
     return {"summary": summary, "unmatched": unmatched, "meshes": entries}
+
+
+def write_coverage(rep: dict, root, *, tool: str) -> Path:
+    """Persist a `build_coverage` report for `root`'s base -- THE ONE WRITER.
+
+    `out/meshtex/` resolves per base (`coroot.derived_path`), so a patched
+    install -- a new base id -- gets its own file and never inherits the old
+    base's answers. coverage.json is written to a temp name and moved into
+    place, so a reader (another viewer, the CLI) never sees half a file; the
+    provenance sidecar is stamped LAST, over the finished bytes.
+    """
+    import os
+    out = coroot.derived_path("out/meshtex", root)
+    out.mkdir(parents=True, exist_ok=True)
+    dest = out / "coverage.json"
+    tmp = out / f"coverage.json.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(rep, indent=1), "utf-8")
+    os.replace(tmp, dest)
+    # Sidecar, not an envelope: seven modules read this file's shape
+    # directly, so changing it to carry a stamp would mean changing
+    # all seven at once. The sidecar leaves the artefact byte-
+    # identical and still lets a reader ask what built it.
+    provenance.stamp_file(dest, root, tool=tool)
+    (out / "summary.json").write_text(json.dumps(rep["summary"], indent=1), "utf-8")
+    (out / "unmatched.txt").write_text("\n".join(rep["unmatched"]), "utf-8")
+    return dest
 
 
 def measure_precision(idx: MeshTextureIndex) -> dict:
@@ -1409,18 +1698,8 @@ def _main(argv: list[str]) -> int:
                   file=sys.stderr)
             idx._load_mesh_index()
             rep = build_coverage(idx, verify="--verify" in flags)
-            out = coroot.derived_path("out/meshtex", root)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "coverage.json").write_text(json.dumps(rep, indent=1), "utf-8")
-            # Sidecar, not an envelope: seven modules read this file's shape
-            # directly, so changing it to carry a stamp would mean changing
-            # all seven at once. The sidecar leaves the artefact byte-
-            # identical and still lets a reader ask what built it.
-            provenance.stamp_file(out / "coverage.json", idx.root,
-                                  tool="meshtex.py --coverage")
+            dest = write_coverage(rep, idx.root, tool="meshtex.py --coverage")
             s = rep["summary"]
-            (out / "summary.json").write_text(json.dumps(s, indent=1), "utf-8")
-            (out / "unmatched.txt").write_text("\n".join(rep["unmatched"]), "utf-8")
             print(f"\n{s['meshes']} meshes ({s['c3_files_total']} .c3 files, "
                   f"{s['c3_files_without_geometry']} of them geometry-free)")
             print(f"matched {s['matched']}  = {s['coverage_pct']}%   "
@@ -1433,7 +1712,7 @@ def _main(argv: list[str]) -> int:
             for k, v in s["by_directory"].items():
                 print(f"  {k:<22}{v['meshes']:>8}{v['matched']:>9}"
                       f"{v['matched']/v['meshes']*100:>7.1f}%{v['authored']:>10}")
-            print(f"\nwrote {out/'coverage.json'}")
+            print(f"\nwrote {dest}")
             return 0
 
         for a in args:

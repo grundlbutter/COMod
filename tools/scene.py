@@ -95,6 +95,8 @@ Read-only. Nothing here writes to the game install.
 """
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 import struct
@@ -123,6 +125,91 @@ except Exception:                                          # noqa: BLE001
 LAYER_TERRAIN = 1
 LAYER_SCENE = 3
 LAYER_COVER = 4
+
+#: WHICH WAY THE CELL WALK RUNS ACROSS ONE DEPTH LINE. **A COIN FLIP, AND
+#: LABELLED AS ONE.** Set to "+x" or "-x"; `CO_COVER_TIE` overrides at runtime.
+#:
+#: Two covers with the same `x + y` sit at the SAME screenY (the affine in
+#: `Placed.depth`) and `64 * dx` apart horizontally, so which is drawn second
+#: is visible wherever their sprites are wider than that gap. Measured on
+#: 7878: **361 such overlapping pairs on `2024thx_new`, 231 on
+#: `2024xmas_new`.**
+#:
+#: There are exactly TWO candidates and they are REVERSES of each other:
+#: because `y = sum - x`, ordering equal-sum cells by increasing x IS ordering
+#: them by decreasing y, so "increasing x", "decreasing x" and "row-major in
+#: y" are one axis and its reverse rather than three options. Equal sum AND
+#: equal x is the same cell. **So for every equal-sum pair in different cells
+#: the two candidates disagree, and no amount of analysis of OUR data can
+#: choose between them** -- the client's walk direction decides, and ~63
+#: static probes did not isolate it (class `CTerrainLayer`, vtable
+#: `0x15f74e8`, no method-name anchors the way `.pux`'s `AlphaAt` had).
+#:
+#: **THE FALSIFIER, and it is one observation.** Watch the actual draw order
+#: of two overlapping equal-sum covers in a running client. If the one with
+#: the LARGER cellX is drawn second, "+x" is right; if the smaller, "-x" is.
+#: That is a rig action and belongs to the owner -- `launchgate` is per binary
+#: by path, and a PASS there is evidence, never permission. Until then this
+#: constant is a guess with a known exposure, not a finding.
+#:
+#: Chosen by the owner on 2026-09-14 from a side-by-side render of both.
+COVER_TIE_BREAK = os.environ.get("CO_COVER_TIE", "+x")
+
+
+def _tie(ax: int) -> int:
+    """The secondary key. See `COVER_TIE_BREAK`."""
+    return ax if COVER_TIE_BREAK == "+x" else -ax
+
+
+def cover_paint_key(p) -> tuple:
+    """The paint key for ONE cover: its position in the `.DMap` record list."""
+    return (p.layer_index,)
+
+
+def cover_paint_order(covers) -> list:
+    r"""Covers in the order the client paints them -- **`.DMap` list order.**
+
+    THE SINGLE HOME FOR COVER PAINT ORDER. Four call sites used to write
+    `sorted(covers, key=lambda q: q.depth())` independently; a rule kept in
+    four places is a rule that gets corrected in three.
+
+    **WE INVENTED THE DEPTH SORT AND THE CLIENT HAS NONE.** Measured in
+    `7878/Env_DX9/Conquer.exe` by the Director of RE, 2026-09-16:
+
+    * Covers are `C2DMapTerrainObj` (RTTI ``0x01938148``), held by
+      `CTerrainObjManager` (``0x01938578``).
+    * There IS a comparator over them -- `sub_83E56C`, ``[a+0xC] - [b+0xC]``
+      ascending, handed to CRT `qsort`. **It is installed at exactly one site**
+      (``0x84368B``, inside the sort helper at ``0x843618``) **and that helper
+      has exactly two callers, both protobuf serialisation** (``0x83DF02`` on
+      `"pb.Buffer"`, ``0x83EC2F`` on `"invalid varint value at offset %d"`).
+      So ``+0x0C`` is a SAVE-ordering key and never runs at draw time.
+    * No other cover comparator exists. The render walks the container by
+      index through a generic `std::vector` for-each (``0x869171``).
+
+    **So there is nothing for an `x + y` key to be a version of.** Covers are
+    painted in the order they sit in the list, and `layer_index` is that
+    position -- measured strictly increasing in list order on every map
+    checked, so this sort is a no-op reorder that states the rule explicitly
+    rather than relying on the parser's insertion order.
+
+    **THE OWNER'S CASE, which started this.** On `2024tsf_new`,
+    `data/map/l/c/lc68.dds` and `lc69.dds` should draw over
+    `data/map/l/f/lf32.dds` and did not: `lf32` has the larger `x + y` so the
+    invented key put it on top, while it is declared at index 2,170 against
+    5,880 and 5,886. Pinned by `tests/test_cover_paint_order.py`.
+
+    **THE ONE THING THIS DOES NOT SETTLE, and RE said it plainly rather than
+    letting it pass.** Whether the stored order the render walks is *pure
+    declaration order* or a *load-time cell-bucketed order* is not readable off
+    the disassembly -- the draw pass is templated and inlined past isolation.
+    The two differ exactly on equal-`x+y` pairs. **It is provably NOT a depth
+    sort, and empirically list order, with the within-tie case still open**;
+    RE's item-37 runtime capture (`coverorder.py` + `clientshot.py`, read-only,
+    one screenshot, owner client time) is what closes it.
+    """
+    return sorted(covers, key=cover_paint_key)
+
 
 #: A part header's `offset elevation` is uninitialised on a minority of parts.
 #: Anything outside this is debris rather than data.
@@ -285,11 +372,36 @@ class Placed:
         cx, cy = pm.cell_px(*self.anchor)
         return cx + self.pixel_offset[0], cy + self.pixel_offset[1]
 
-    def depth(self) -> tuple[int, int]:
-        """Painter's-order key. In a 2:1 isometric view screen-y grows with
-        `x + y`, so a larger sum is nearer the viewer and drawn later."""
+    def depth(self) -> tuple:
+        """Isometric key `(x + y, tie, declaration)`. **NOT the cover key.**
+
+        **RETRACTED FOR COVERS, 2026-09-16: THE CLIENT DOES NOT DEPTH-SORT
+        THEM, SO THIS KEY WAS AN INVENTION OF OURS.**  See
+        `cover_paint_order()` below, which is what paints a cover layer now.
+        Every word of the affine paragraph that follows is still true and it
+        never implied a sort -- a projection that is monotonic in `x + y`
+        says where a sprite LANDS, not which sprite is painted second.
+        Inferring the second from the first is the error.
+
+        Still the key for SCENE and INTERACTIVE placements, because RE's
+        measurement named the cover container and nothing else. That is a
+        scope limit, not a finding: see `cover_paint_order()`.
+
+        The terrain-layer cell->screen projection at
+        `Clients/7878/Env_DX9/Conquer.exe` RVA `0x86A8E2` computes::
+
+            screenX = 32*(cellX - cellY) + originX
+            screenY = 16*(cellX + cellY) + originY
+
+        the exact 2:1 dimetric affine, so `screenY` is MONOTONIC in `x + y`.
+        This used to say *"in a 2:1 isometric view screen-y grows with x+y"* as
+        an inference; it is now evidence. `docs/comod_backlog.md` item 37.
+
+        **THE TIE IS A LABELLED COIN FLIP.** `COVER_TIE_BREAK` below. It no
+        longer reaches a cover.
+        """
         ax, ay = self.anchor
-        return (ax + ay, self.layer_index)
+        return (ax + ay, _tie(ax), self.layer_index)
 
     def to_json(self) -> dict:
         return {
@@ -309,13 +421,42 @@ class Scenery:
     name: str = ""
     scenes: list[Placed] = field(default_factory=list)
     covers: list[Placed] = field(default_factory=list)
+    #: v1006's SECOND record list -- real cover sprites that were never drawn.
+    #:
+    #: `core/dmap.py` has parsed this for months (`DMap.late_layers`) and every
+    #: consumer called `gather(d.layers, ...)`, so the second list went in
+    #: nobody's picture. The owner found it by eye: `gsjx03_new` shows walkable
+    #: platforms on its right-hand side with no art under them.
+    #:
+    #: **IT IS THE `.OtherData` `InteractiveLayer`, PROVEN BY EXACT COUNT.**
+    #: `InteractiveLayerPicSize0.MapObjAmount` equals the number of tag-4
+    #: records in this list on **152 of 152 v1006 maps**. The v1004 maps have
+    #: no late list at all, and their 13 "matches" are 0 == 0 -- excluded as
+    #: vacuous rather than counted, which is the difference between 152/152 and
+    #: a much worse-looking 165/321 over a population that cannot answer.
+    #:
+    #: Kept SEPARATE from `covers` rather than appended, for three reasons:
+    #: `layer_tag()` documents that no map draws one shape from more than one
+    #: tag (main covers are 24 here, these are 4) and merging would quietly
+    #: falsify it; `mapedit`'s `.OtherData` TERRAIN tint binds by position in
+    #: `covers` and appending would not move those but would invite someone to
+    #: reorder; and the owner gets a layer they can toggle, which is how this
+    #: was found in the first place.
+    late_covers: list[Placed] = field(default_factory=list)
     missing_scenes: list[str] = field(default_factory=list)
 
+    def sorted_late_covers(self) -> list[Placed]:
+        # NOT `cover_paint_order`. RE measured the COVER container; the
+        # interactive list is a different one and nobody has read its draw
+        # site. Keeping the isometric key here is not a claim that it is
+        # right -- it is a refusal to extend one measurement to two objects.
+        return sorted(self.late_covers, key=lambda p: p.depth())
+
     def sorted_scenes(self) -> list[Placed]:
-        return sorted(self.scenes, key=lambda p: p.depth())
+        return sorted(self.scenes, key=lambda p: p.depth())      # as above
 
     def sorted_covers(self) -> list[Placed]:
-        return sorted(self.covers, key=lambda p: p.depth())
+        return cover_paint_order(self.covers)
 
     def layer_tag(self, layer: str) -> Optional[int]:
         """The DMap tag the records in `layer` were actually read from.
@@ -347,14 +488,21 @@ class Scenery:
         return d
 
 
-def gather(layers: Iterable[dict], lib: SceneLibrary) -> Scenery:
+def gather(layers: Iterable[dict], lib: SceneLibrary,
+           late: Iterable[dict] = ()) -> Scenery:
     """DMap layer records (`core/dmap.py`) -> placed sprites.
 
     Accepts the `shape`-tagged dicts `dmap.parse()` produces, so the layer
     table is decoded in exactly one place.
+
+    `late` is v1006's second record list (`DMap.late_layers`). Its records are
+    the SAME SHAPE as the main table's -- `shape`, `path`, `key`, `origin`,
+    `offset`, `frame_interval` -- so they are gathered by the same code and
+    land in `Scenery.late_covers`. See that field for why they are separate
+    and for the 152/152 binding to `.OtherData`'s `InteractiveLayer`.
     """
     out = Scenery()
-    for L in layers:
+    for L in list(layers) + [dict(r, _late=True) for r in late]:
         shape = L.get("shape")
         idx = int(L.get("index", 0))
         if shape == "scene":
@@ -384,7 +532,8 @@ def gather(layers: Iterable[dict], lib: SceneLibrary) -> Scenery:
             ox, oy = L.get("origin", (0, 0))
             w, h = L.get("size", (1, 1))
             dx, dy = L.get("offset", (0, 0))
-            out.covers.append(Placed(
+            dest = out.late_covers if L.get("_late") else out.covers
+            dest.append(Placed(
                 kind="cover", ani=L.get("path", ""), title=L.get("key", ""),
                 anchor=(ox, oy), width=max(1, w), height=max(1, h),
                 pixel_offset=(-dx, -dy),
@@ -414,7 +563,7 @@ def for_map(name_or_dmap, *, root: Optional[Path] = None,
             if parsed is None:
                 return Scenery(str(d))
             d = parsed
-    sc = gather(d.layers, lib)
+    sc = gather(d.layers, lib, getattr(d, "late_layers", ()))
     sc.name = Path(str(getattr(d, "path", ""))).stem or str(name_or_dmap)
     return sc
 
@@ -733,14 +882,25 @@ def composite(pm, rect: tuple[int, int, int, int], rgb: bytes, placed_items,
 
     `rect` is the crop's pixel rectangle in the painted image, `rgb` the crop
     itself at `scale` decimation -- i.e. exactly what `PuzzleMap.render()`
-    returns. Sprites are drawn in painter's order (`Placed.depth()`).
+    returns.
+
+    **TWO PASSES, NOT ONE SORT.** A cover is defined by being drawn over
+    everything, and since 2026-09-16 covers carry a different order from
+    scenes -- `scene.cover_paint_order` has the measurement. A mixed list can
+    no longer be ordered by one key, and it never should have been: the client
+    draws the two containers in two passes. Scenes first on the isometric key,
+    then covers in `.DMap` list order.
     """
     x0, y0, x1, y1 = rect
     ow = max(1, (x1 - x0 + scale - 1) // scale)
     oh = max(1, (y1 - y0 + scale - 1) // scale)
     buf = bytearray(rgb)
     drawn = 0
-    for p in sorted(placed_items, key=lambda q: q.depth()):
+    _items = list(placed_items)
+    _order = (sorted((q for q in _items if q.kind != "cover"),
+                     key=lambda q: q.depth())
+              + cover_paint_order([q for q in _items if q.kind == "cover"]))
+    for p in _order:
         fr = cache.frames(p.ani, p.title)
         if not fr:
             continue
@@ -792,7 +952,8 @@ def frame_index(p, frame_count: int, time_ms: int) -> int:
     return 0
 
 
-def cover_frame_signature(covers, cache: SpriteCache, time_ms: int) -> tuple:
+def cover_frame_signature(covers, cache: SpriteCache, time_ms: int,
+                          *, key=None) -> tuple:
     """Everything `cover_layer`'s output takes from `time_ms`, and no more.
 
     A correct cache key for a rendered cover layer.  Placements do NOT share
@@ -801,21 +962,27 @@ def cover_frame_signature(covers, cache: SpriteCache, time_ms: int) -> tuple:
     be wrong for every placement that disagrees with it.
     """
     return tuple(frame_index(p, len(cache.frames(p.ani, p.title) or ()), time_ms)
-                 for p in sorted(covers, key=lambda q: q.depth()))
+                 for p in (key(covers) if key else cover_paint_order(covers)))
 
 
 def cover_layer(pm, rect: tuple[int, int, int, int], covers, cache: SpriteCache,
-                *, scale: int = 1, time_ms: int = 0) -> tuple[int, int, bytes]:
+                *, scale: int = 1, time_ms: int = 0,
+                key=None) -> tuple[int, int, bytes]:
     """The COVER sprites alone, as RGBA -- the layer that draws over the player.
 
     Kept separate from `composite()` on purpose: a cover is defined by being in
     front of everything, so it cannot be baked into the ground.
+
+    **`key` EXISTS BECAUSE THIS FUNCTION IS ALSO CALLED WITH SCENES**
+    (`coplay.py`), and scenes are NOT what RE measured. Default is
+    `cover_paint_order`; a caller drawing something other than covers passes
+    its own ordering and says so at the call site.
     """
     x0, y0, x1, y1 = rect
     ow = max(1, (x1 - x0 + scale - 1) // scale)
     oh = max(1, (y1 - y0 + scale - 1) // scale)
     buf = bytearray(ow * oh * 4)
-    for p in sorted(covers, key=lambda q: q.depth()):
+    for p in (key(covers) if key else cover_paint_order(covers)):
         fr = cache.frames(p.ani, p.title)
         if not fr:
             continue
@@ -955,7 +1122,7 @@ def survey(root: Optional[Path] = None) -> dict:
             rows.append({"map": name, "error": why[:80]})
             continue
         p = Path(name)
-        sc = gather(d.layers, lib)
+        sc = gather(d.layers, lib, getattr(d, "late_layers", ()))
         tot["maps"] += 1
         tot["sceneParts"] += len(sc.scenes)
         tot["covers"] += len(sc.covers)
@@ -1032,7 +1199,7 @@ def _cmd_map(a) -> int:
     if d is None:
         print(why, file=sys.stderr)
         return 1
-    sc = gather(d.layers, lib)
+    sc = gather(d.layers, lib, getattr(d, "late_layers", ()))
     sc.name = a.map
     print(f"{a.map}  {d.width}x{d.height}  {len(d.layers)} layers")
     print(f"  scene parts {len(sc.scenes)}   covers {len(sc.covers)}"

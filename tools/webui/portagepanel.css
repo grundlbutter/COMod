@@ -1,0 +1,258 @@
+/* portagepanel.css -- the Import/Export tools pop-out (backlog item 6).
+ *
+ * Tokens only (--panel, --line, --accent, --warn, --bad, --mut, --mono) so the
+ * pop-out is the same surface as every other page rather than a second theme.
+ *
+ * THE ONE RULE THIS STYLESHEET EXISTS TO ENFORCE
+ * ----------------------------------------------
+ * A SHARED FILE MUST NOT LOOK LIKE AN ORDINARY ROW. In a Builder composition
+ * two parts can reference the SAME texture; the two-tier grouping shows it
+ * twice, and a user who edits it under `body` has also changed it under
+ * `weapon`. The owner ruled that a footnote will not do -- the user has to see
+ * it at the moment they click Export. So `.pp-row.shared` carries an amber
+ * left rail, an amber "SHARED WITH" chip naming the OTHER asset, and the
+ * consequence sentence in the row itself. None of that is decoration: strip it
+ * and the grouping actively creates the misunderstanding it was drawn to
+ * prevent.
+ *
+ * The same reasoning gives `.pp-row.absent` its own look: a declared-but-
+ * absent satellite is SHOWN (7,462 of 30,539 appearance refs on the live
+ * install resolve to nothing), struck through and greyed, with no Export
+ * button -- never dropped, because a list of 6 hiding 3 is a trap the user
+ * cannot detect.
+ */
+
+#pp-overlay {
+  position: fixed; inset: 0; z-index: 3000;
+  background: rgba(0, 0, 0, .55);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+#pp-overlay[hidden] { display: none; }
+
+#pp-frame {
+  background: var(--panel, #1e2024); color: var(--fg, #e6e7ea);
+  border: 1px solid var(--line, #33363d); border-radius: 10px;
+  width: min(1100px, 100%); max-height: 100%;
+  display: flex; flex-direction: column;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .6);
+}
+
+.pp-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px 16px; border-bottom: 1px solid var(--line, #33363d);
+  background: var(--panel2, #24262b); border-radius: 10px 10px 0 0;
+}
+.pp-head h2 { margin: 0; font-size: 15px; }
+.pp-grow { flex: 1 1 auto; }
+
+.pp-body { overflow: auto; padding: 12px 16px 18px; }
+.pp-foot {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 16px; border-top: 1px solid var(--line, #33363d);
+  background: var(--panel2, #24262b); border-radius: 0 0 10px 10px;
+}
+
+.pp-btn {
+  background: var(--panel2, #24262b); color: var(--fg, #e6e7ea);
+  border: 1px solid var(--line, #33363d); border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; cursor: pointer;
+}
+.pp-btn:hover { border-color: var(--accent, #6aa9ff); color: #fff; }
+.pp-btn:disabled { opacity: .4; cursor: not-allowed; }
+/* BACKGROUND IS SET EXPLICITLY, not inherited. `style.css` already carries
+ * `button.primary { background: var(--accent) }`, and a `.pp-btn.primary` that
+ * only set a colour got accent-on-accent -- an unreadable "Export all to .zip"
+ * that looked like a solid blue rectangle. Caught by looking at the rendered
+ * page, not by reading the file: nothing about this rule is wrong on its own. */
+.pp-btn.primary {
+  background: var(--accent, #6aa9ff);
+  border-color: var(--accent, #6aa9ff);
+  color: #10131a; font-weight: 600;
+}
+.pp-btn.primary:hover { filter: brightness(1.1); color: #10131a; }
+.pp-btn.small { padding: 2px 8px; font-size: 11px; }
+
+.pp-mut { color: var(--mut, #9297a1); }
+.pp-mono { font-family: var(--mono, monospace); font-size: 11.5px; }
+
+/* ---- honesty banner: never a tidy list ---------------------------------- */
+.pp-honesty {
+  border: 1px solid var(--line, #33363d); border-left: 3px solid var(--warn, #e6b455);
+  border-radius: 6px; padding: 8px 12px; margin: 0 0 12px;
+  font-size: 12px; line-height: 1.5;
+}
+.pp-honesty b { color: var(--warn, #e6b455); }
+.pp-limits { margin: 6px 0 0; padding-left: 18px; color: var(--mut, #9297a1); }
+.pp-limits li { margin: 2px 0; }
+
+/* ---- tier 1 -------------------------------------------------------------- */
+.pp-asset {
+  border: 1px solid var(--line, #33363d); border-radius: 8px;
+  margin: 0 0 12px; overflow: hidden;
+}
+.pp-asset-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; background: var(--panel2, #24262b);
+  border-bottom: 1px solid var(--line, #33363d);
+}
+.pp-asset-head .name { font-weight: 600; }
+.pp-asset-head .path { font-family: var(--mono, monospace); font-size: 11px;
+                       color: var(--mut, #9297a1); }
+.pp-asset.err .pp-asset-head { border-left: 3px solid var(--bad, #e8695f); }
+
+/* ---- tier 2 -------------------------------------------------------------- */
+.pp-group { padding: 0; }
+.pp-group-title {
+  font-size: 11px; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--mut, #9297a1);
+  padding: 6px 12px 2px;
+}
+.pp-row {
+  display: grid;
+  grid-template-columns: 1fr minmax(120px, auto) auto;
+  gap: 10px; align-items: start;
+  padding: 5px 12px 6px; border-top: 1px solid rgba(255, 255, 255, .04);
+}
+.pp-row .file { font-family: var(--mono, monospace); font-size: 11.5px;
+                word-break: break-all; }
+.pp-row .label { font-size: 11px; color: var(--mut, #9297a1); }
+.pp-row .tool { font-size: 11.5px; color: var(--fg, #e6e7ea); white-space: nowrap; }
+.pp-row .tool.viewonly { color: var(--mut, #9297a1); font-style: italic; }
+.pp-row .zip { font-family: var(--mono, monospace); font-size: 10.5px;
+               color: var(--mut, #9297a1); word-break: break-all; }
+
+/* THE SHARED MARKING. See the header note: this is the feature, not a style. */
+.pp-row.shared {
+  border-left: 3px solid var(--warn, #e6b455);
+  background: rgba(230, 180, 85, .07);
+  padding-left: 9px;
+}
+.pp-shared-chip {
+  display: inline-block; margin-left: 6px;
+  border: 1px solid var(--warn, #e6b455); color: var(--warn, #e6b455);
+  border-radius: 4px; padding: 0 5px; font-size: 10px; letter-spacing: .4px;
+  vertical-align: 1px;
+}
+.pp-shared-why {
+  font-size: 11px; color: var(--warn, #e6b455); margin-top: 2px;
+  line-height: 1.45;
+}
+
+/* A declared-but-absent satellite is SHOWN. */
+.pp-row.absent { border-left: 3px solid var(--bad, #e8695f); padding-left: 9px; }
+.pp-row.absent .file { text-decoration: line-through; color: var(--mut, #9297a1); }
+.pp-absent-chip {
+  display: inline-block; margin-left: 6px;
+  border: 1px solid var(--bad, #e8695f); color: var(--bad, #e8695f);
+  border-radius: 4px; padding: 0 5px; font-size: 10px; letter-spacing: .4px;
+  vertical-align: 1px;
+}
+.pp-why { font-size: 11px; color: var(--mut, #9297a1); margin-top: 2px; line-height: 1.45; }
+
+.pp-row.note { opacity: .78; }
+
+/* THE DEFINITION ROW. A different colour from shared (amber = "read this
+ * before you click") and from absent (red = "this is not here"), because it
+ * is neither a warning nor a gap: it is the one row in the list that is NOT a
+ * file, and the whole point of drawing it is that a list of files invites the
+ * reader to assume the subject's definition is among them. Green rail, so it
+ * reads as "and this is included too" rather than as a problem. */
+.pp-row.definition {
+  border-left: 3px solid var(--good, #57c98a);
+  background: rgba(87, 201, 138, .06);
+  padding-left: 9px;
+}
+.pp-def-chip {
+  display: inline-block; margin-left: 6px;
+  border: 1px solid var(--good, #57c98a); color: var(--good, #57c98a);
+  border-radius: 4px; padding: 0 5px; font-size: 10px; letter-spacing: .4px;
+  vertical-align: 1px;
+}
+/* The banner line, drawn in BOTH states -- carried and not carried -- so its
+ * absence can never be what tells the reader the answer. */
+.pp-defline {
+  margin-top: 6px; font-size: 11.5px; line-height: 1.5;
+  border-left: 3px solid var(--mut, #9297a1); padding-left: 8px;
+  color: var(--mut, #9297a1);
+}
+.pp-defline.carried { border-left-color: var(--good, #57c98a); }
+.pp-defline.carried b { color: var(--good, #57c98a); }
+
+.pp-sel { margin-right: 2px; }
+.pp-log {
+  font-family: var(--mono, monospace); font-size: 11px; white-space: pre-wrap;
+  max-height: 220px; overflow: auto; margin: 10px 0 0;
+  border: 1px solid var(--line, #33363d); border-radius: 6px; padding: 8px 10px;
+}
+.pp-log .ok { color: var(--good, #57c98a); }
+.pp-log .warn { color: var(--warn, #e6b455); }
+.pp-log .bad { color: var(--bad, #e8695f); }
+
+#pp-open {
+  background: var(--panel2, #24262b); color: var(--fg, #e6e7ea);
+  border: 1px solid var(--line, #33363d); border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; cursor: pointer;
+}
+#pp-open:hover { border-color: var(--accent, #6aa9ff); }
+
+/* ---- naming the bundle --------------------------------------------------- *
+ * The Name field sits with the EXPORT buttons in the footer, not beside
+ * `#pp-bundle`. `#pp-bundle` is the list of bundles ALREADY ON DISK -- the
+ * reimport picker -- and the two controls point in opposite directions: one
+ * names a file about to be written, the other chooses a file about to be read.
+ * They are separated visually by `.pp-grow` for the same reason they are
+ * separate controls. */
+.pp-name {
+  background: var(--panel, #1b1d22); color: var(--fg, #e6e7ea);
+  border: 1px solid var(--line, #33363d); border-radius: 6px;
+  padding: 5px 8px; font-size: 12px;
+  font-family: var(--mono, monospace);
+  min-width: 16em; flex: 0 1 24em;
+}
+.pp-name:focus { outline: none; border-color: var(--accent, #6aa9ff); }
+.pp-name::placeholder { color: var(--mut, #9297a1); opacity: .8; }
+/* The extension is shown and is NOT editable: the server appends `.zip`, so a
+ * field that let the user type one would show `410039.zip.zip` on the next
+ * open, or invite them to type `.rar` and get a zip anyway. */
+.pp-foot .pp-ext { font-family: var(--mono, monospace); font-size: 11.5px;
+                   margin-left: -6px; }
+
+/* ---- where the bundles actually live ------------------------------------ *
+ * A row of its own UNDER the controls rather than a tooltip on them: the
+ * first thing anyone does with a path is copy it into a shell or Explorer,
+ * and you cannot select text out of a `title`. It stays visible when the
+ * bundle list is EMPTY, which is the case it matters most in -- "(no bundles
+ * yet)" beside a folder is an answer; on its own it reads as a fault.
+ *
+ * `user-select: all` so one click takes the whole path: a half-selected
+ * path pasted into a shell is worse than none, because it fails somewhere
+ * else. */
+.pp-where {
+  padding: 7px 16px 9px; border-top: 1px solid var(--line, #33363d);
+  background: var(--panel2, #24262b); border-radius: 0 0 10px 10px;
+  font-size: 11.5px; display: flex; align-items: baseline; gap: 8px;
+}
+.pp-foot { border-radius: 0; }
+.pp-dir {
+  font-family: var(--mono, monospace); color: var(--fg, #e6e7ea);
+  user-select: all; word-break: break-all;
+}
+.pp-dir.unknown { color: var(--warn, #d8a657); font-style: italic;
+                  user-select: auto; }
+
+/* ---- per-section select all / select none -------------------------------- *
+ * Drawn INSIDE the section title, so the control and the rows it governs are
+ * one visual unit -- a select-all floating above two sections is a control
+ * whose scope the user has to guess. Sections with nothing exportable get the
+ * muted sentence instead of the buttons: no control at all reads as a missing
+ * feature, and the user goes looking for a bug rather than for the reason. */
+.pp-group-title {
+  display: flex; align-items: center; gap: 8px;
+}
+.pp-group-sel { display: inline-flex; align-items: center; gap: 4px;
+                text-transform: none; letter-spacing: 0; }
+.pp-btn.tiny {
+  padding: 1px 6px; font-size: 10px; line-height: 1.5;
+  text-transform: none; letter-spacing: 0;
+}

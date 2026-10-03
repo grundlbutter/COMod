@@ -726,6 +726,21 @@ def audit(tables: Tables, exists: Callable[[str], bool]) -> dict:
                 out["motionMissingOnDisk"].append((plan.npc_type, role, p))
     # Shared art matters for a swap: replacing it changes every NPC using it,
     # which is a thing to be told before it happens rather than after.
+    # `len(v) > 1` DROPS single-user entries entirely, and that absence is
+    # load-bearing in a way `.get(mesh, [])` cannot express.  MEASURED
+    # 2026-08-18: CCO has 48 one-user geometries and 6609 has 88, and NONE of
+    # them appear here -- so `.get()` returns the same `[]` for "one NPC uses
+    # this, safe to touch" and "this mesh is not in the npc table at all".
+    # Opposite meanings; the empty list reads as the reassuring one.  By
+    # DISTINCT GEOMETRY, which is what a swap actually operates on, that is
+    # 48 of 86 on CCO -- the majority of the deployment target, not an edge.
+    #
+    # The maps are NOT widened: consumers depend on membership here meaning
+    # "shared", and quietly redefining it would be a worse defect than this
+    # one.  Establish membership separately -- `Tables.plan_for_mesh`, or
+    # `core/npcaltskin.Membership`, which answers in_table(N, including N==1)
+    # / not_in_table / undetermined as three values a caller cannot conflate.
+    # Absence from this map is not evidence of anything.
     out["sharedGeometry"] = {k: v for k, v in geom_users.items() if len(v) > 1}
     out["sharedTexture"] = {k: v for k, v in tex_users.items() if len(v) > 1}
     return out

@@ -291,7 +291,7 @@ class ClassicConquer(Plugin):
         """
         return "colourway (default, unverified on this base)", "inferred"
 
-    _FLAT_STEM = "c3/npc/999{g}.c3"
+    _FLAT_STEMS = ("c3/npc/999{g}.c3", "c3/npc/999{g}0.c3")
 
     def flat_family_base(self, group, paths, has_geometry):
         r"""The short-stem sibling is the family's one real body, here too.
@@ -300,20 +300,30 @@ class ClassicConquer(Plugin):
         archive fact, and the one place in this file where CCO and the
         official lineage genuinely agree on something worth declaring:
 
-            look 118   999118.c3  1,181 verts   999118100.c3  3 verts
-            look 256   999256.c3    838 verts   999256100.c3  4 verts
+            look 118   999118.c3   1,181 verts   999118100.c3  3 verts
+            look 256   999256.c3     838 verts   999256100.c3  4 verts
+            look 271   9992710.c3    981 verts   999271100.c3  3 verts
 
         The numbered files are motion sets whose embedded geometry is a
         shard; the app binds them over the short stem. Declared rather than
         inherited from `Patch6090` because a plugin's claim should rest on
         its own reading of its own install, and this one does.
 
-        `Patch6090` also tries ``999<g>0.c3``. That stem exists on **no**
-        install of the three, so it is not repeated here.
+        CORRECTED 2026-10-03: this docstring said the ``999<g>0.c3`` stem
+        "exists on no install of the three" and so tried only ``999<g>.c3``.
+        On the CCO snapshot of 2026-08-24 it exists for FOURTEEN looks,
+        264-277, every one inside the archives and none loose (742-1,007
+        vertices: Taoist Star, Alex, the Barber, Bruce, the Boxer, the
+        Pedlar, 270, Old General Yang, the Pharmacist, the Matchmaker and
+        274-277). Missing it posed ten of the 26 flat looks over a 3-4
+        vertex shard in the viewer -- the owner saw "placeholder geometry
+        only". Both stems are tried now, the short one first, as `Patch6090`
+        has always done.
         """
-        cand = self._FLAT_STEM.format(g=group)
-        if cand in paths and has_geometry(cand):
-            return cand
+        for pat in self._FLAT_STEMS:
+            cand = pat.format(g=group)
+            if cand in paths and has_geometry(cand):
+                return cand
         return None
 
     # -- attachment --------------------------------------------------------

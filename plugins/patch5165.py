@@ -77,10 +77,55 @@ from plugins.catalog import (                          # noqa: E402
 #: The filename is identical across all of them, so a spec that carried the
 #: name and not the codec would decode 5165's copy as raw bytes and produce a
 #: table of noise without raising.
+#: `levexp.dat` joins `MagicType.dat` in the filter for the same kind of
+#: reason: 5017 declares it too, and 5017's refusal carries 5017's
+#: MEASUREMENT -- three tab-separated fields. This build's file has
+#: FOUR. Inheriting it would have published one build's row shape as
+#: another's, and `test_censused` caught the duplicate first.
 SPECS_5165 = tuple(
-    s for s in SPECS_5017 if s.filename != "MagicType.dat"
+    s for s in SPECS_5017
+    if s.filename not in ("MagicType.dat", "levexp.dat")
 ) + (
-    TableSpec("magic", "MagicType.dat", KIND_SPACE_ROWS, "tq-stream"),
+    # **The NAME is column 2 on this build, MEASURED**, not column 1 as
+    # `ITEM_COLUMNS` assumes -- column 1 is a numeric group id and `browse
+    # magic` listed 742 rows labelled `1`. 5517 adds a leading id column and
+    # moves the same field to column 3; the two are declared separately
+    # rather than shared, because that shift is exactly the kind of thing a
+    # borrowed constant gets wrong.
+    TableSpec("magic", "MagicType.dat", KIND_SPACE_ROWS, "tq-stream",
+              columns={"id": 0, "name": 2}),
+    # **NAMED, MEASURED, AND NOT DECLARED.** An undeclared subject is
+    # not merely unread, it is INVISIBLE -- the tool's silence about
+    # levexp.dat read exactly like its silence about a file that is not
+    # there. The refusal carries the measurement instead.
+    # **The codec is `unknown` and that is `core/inidat.py`'s own word,
+    # not a shrug.** The classifier tries the lineage's seed 9527 and
+    # this file is the one table that takes 1234, so it recognises
+    # nothing -- MEASURED, `inidat.classify(...).family == "unknown"` on
+    # every tq-stream build that ships it. Declaring `tq-stream` here
+    # would be a claim the classifier contradicts, and
+    # `TheSpecsMatchTheDisk.test_the_declared_codec_is_what_inidat_
+    # classifies` says so out loud.
+    TableSpec("levexp", "levexp.dat", KIND_SPACE_ROWS,
+              "unknown", label_key=None, refusal=(
+        "levexp.dat OPENS on this install and its grammar is still not "
+        "declared, and those are different sentences. "
+        "core/tqdat.decrypt(raw, 1234) -- the one seed in the lineage that "
+        "is not 9527 -- returns 100.0% printable text from this build's OWN "
+        "bytes: 137 rows of 4 tab-separated fields, 2,803 B, every field "
+        "numeric. What is missing is not the cipher and not the row shape, "
+        "it is the COLUMNS: the file carries no header, every one of the 4 "
+        "fields is a bare number, "
+        "refs/conquer-online-wiki-mdbook/src/files/content/levexp.dat.md is "
+        "an empty stub, and no table on this install holds those values. "
+        "That is the Action.dat refusal word for word -- a settled row shape "
+        "whose row means nothing anything here can check -- so declaring it "
+        "would hand a user 137 rows of anonymous numbers to edit with no "
+        "control at all. Whoever settles the columns will also need a "
+        "per-spec seed: Plugin.load_table's tq-stream branch calls "
+        "tqdat.decrypt with the default 9527, and TableSpec has no seed "
+        "field. Four fields here against 5017's three and 5517's five: this "
+        "build sits on the middle step of a shape that changes twice.")),
     TableSpec("mount", "mounttype.dat", KIND_SECTIONS, "tq-stream"),
 )
 
@@ -105,6 +150,24 @@ class Patch5165(PlaintextFamily):
     #: reached neither of these two builds. The blank-label guard in
     #: tests/test_plugin_catalogs.py is what noticed.
     ROW_LABEL_KEY = MEASURED_SECTION_LABELS
+
+    #: Assigned here TOO, and for the same reason the line above says: this
+    #: class derives from `PlaintextFamily`, not from `Patch5017`.
+    #:
+    #:   region.ini         56 rows, THIRTEEN fields (14 from 5517). Column 6
+    #:                      is a place name on 56/56, 22 distinct; column 1 is
+    #:                      numeric on all 56.
+    #:   EventTypeName.ini  24 rows; column 2 non-numeric on 24/24; column 1
+    #:                      is the id (24 distinct against column 0's one).
+    #:   restrain.ini       5 rows; column 2 non-numeric on 5/5.
+    #:
+    #: `Dynarank.ini` arrives on this build and is NOT declared -- see
+    #: `PositionalLabelsAreMeasuredPerBuild.UNDECLARED`.
+    ROW_COLUMNS = {
+        "region": {"id": 0, "name": 6},
+        "eventtypename": {"id": 1, "name": 2},
+        "restrain": {"id": 0, "name": 2},
+    }
 
     def table_specs(self, root):
         # Curated specs plus every `.ini` the grammar census

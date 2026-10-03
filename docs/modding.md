@@ -437,6 +437,122 @@ Staging lives in `mods/stage/`, mirroring the install layout. `install` requires
 `--yes` and backs up any loose file it displaces, so `uninstall` reverts exactly
 what was added.
 
+### 7.1 Before you install: what does this change break?
+
+`diff` lists FILES. It does not say who is looking at them.
+
+```bash
+py -3 tools/comod.py impact c3/mesh/440140.c3     # or: impact 440140
+py -3 tools/comod.py diff --impact
+```
+
+`tools/depclose.py` resolves **every** appearance reference in the install and
+buckets it by the file it lands on, then reports, for one asset: which tables
+declare it and under which ids; which appearance rows reference it and through
+which ROLE PARTS (cross-checked against the compiled `ROPT` section of
+`ini/c3.wdb`, which also names the shared MOTION table for each part); which
+effect layers name it; its PHY/MOTI pairing and the `MotionBinding` verdict;
+and — for a staged `.c3` — whether the replacement breaks that pairing.
+
+Three things it is careful about, because a dependency report is trusted the
+moment it exists:
+
+* **Declared and present / declared but absent / present but undeclared are
+  three different answers.** `ini/c3.wdb` is shipped and outlives its art: 21
+  of 6609's first 4,001 `.c3` rows name a path the install does not ship. A
+  file existing does not mean a table names it either.
+* **Every report ends with a `NOT ENUMERATED` block** naming the reference
+  classes it did not look at — the packed executable, `itemtype` rows, npc /
+  monster / scene tables, and references buried in another asset's bytes.
+  There is no run that omits it.
+* **The dangling count is always printed.** On 7878 with the garment profile
+  off, 11,857 of 13,902 appearance cells resolve to no file at all, so a bare
+  "0 references" there would read as "safe to change" when it means "this
+  client ships almost none of its own role art".
+
+Attribution goes through `coassets.resolve_asset`, which is a MODEL of the
+client's rule and is marked INFERRED in the output. Where a table declares a
+path for an id and the model sends that id elsewhere, both are printed and the
+row is marked SHADOWED.
+
+The pass is slow on purpose — measured 13s on 5065, 28s on 6609, 31s on 7205 —
+because it resolves each reference rather than guessing which ids ought to name
+the target. See `tests/test_depclose.py` for why the cheap version is wrong in
+both directions.
+
+### 7.2 Effects — what plays, what it needs, and what a change breaks
+
+`impact` answers "who reaches this file". The other direction — "what does
+this effect need, before I touch anything" — is `comod effects`:
+
+```bash
+py -3 tools/comod.py effects --weapon 410009      # every effect one weapon plays
+py -3 tools/comod.py effects --effect Flash4102   # one effect, layer by layer
+py -3 tools/comod.py effects --action 410009 0401 # what one action plays
+py -3 tools/comod.py effects --list m-b0          # defined names, filtered
+py -3 tools/comod.py effects --tables             # which file answered
+```
+
+It walks `Action3DEffect` → `3DEffect` → layer → `3DEffectObj` / `3dtexture`
+→ the C3, and names the animation form each layer's mesh holds: **PHY+MOTI**
+(bone matrix track), **SHAP+SMOT** (a blade line smeared into a ribbon trail)
+or **PTCL/PTC3** (particle system). All three are observed on 5517 —
+`410009`, `Flash4102` and `m-b02` respectively.
+
+**Every run prints a `TABLES READ` block naming the file that actually
+answered**, because the answer changes with it. MEASURED across the baseline:
+
+| base | `3DEffect` | `3DEffectObj` | `3dtexture` |
+|------|-----------|---------------|-------------|
+| 5017 / 5065 / 5165 / 7878 | `.ini` | `.ini` | `.ini` |
+| 5517 / 6090 / 6609 / 7205 | `3DEffect.dbc` | `3DEffectobj.dbc` | `3DTexture.dbc` |
+
+Where a `.dbc` twin exists the client reads the twin and the `.ini` beside it
+is a decoy; where none exists the plaintext **is** the live table, which is
+the normal answer on four of the eight bases above. **No base ships a
+compiled twin of `Action3DEffect.ini`, `ActionMap3DEffect.ini` or
+`WeaponEffect.ini`** — those three are plaintext everywhere, and the row says
+`no compiled twin on this base` rather than being left blank.
+
+Four different empty answers, printed four different ways:
+
+| what happened | what it prints |
+|---|---|
+| the effect tables would not load | `UNMEASURED` |
+| a table **file** is absent (EffectDB reads it as an empty table) | `UNMEASURED` |
+| the tables were read and hold no such name | `NOT DEFINED` |
+| the record exists and declares no layers | `DECLARES NO LAYERS` |
+
+`horse_grid` is three of those four across the corpus: NOT DEFINED on
+5017/5165/7878, five layers on 5517, and **zero layers** from 6090 onward.
+
+`stage`, `stage-mesh` and `diff` now print an `EFFECT DEPENDENCIES` block by
+default — the warning that did not exist, and the reason `comod stage
+c3/effect/blade/410009.C3` used to be silent about the Blade aura layer
+pointing straight at it. It is on by default rather than behind a flag
+because it costs only the effect tables (measured 0.1s on 5017 to 1.6s on
+7205, against the 34s `diff --impact` pays); `--no-effect-check` turns it
+off and **says in the output that the question was not asked**.
+
+Two holes the reports name on every run:
+
+* 9 of 13,248 (6090) and 9 of 17,190 (6609, 7205) effect layers name an id
+  that neither `3DEffectObj` nor `3dtexture` resolves to a path.
+* **Unread sibling rule files.** `EffectDB` reads `ini/Action3DEffect.ini`
+  and nothing else of its family, and 6090/6609/7205 each ship six more
+  (`Action3DEffect1..5.ini`, `ActionLee3DEffect.ini`) while 7632/7878 ship
+  `ActionLee3DEffect.ini` and `ActionRole3DEffect.ini`. They are **reported,
+  not merged**: 463 of 7205's 490 sibling keys name a rule the read table
+  does not have at all, and 470 of 6609's carry a *different* effect for a
+  key it does have, so merging would overwrite 470 answers with no evidence
+  about which the client honours. Of the unpacked binaries, `GameData.dll`
+  names `Action3DEffect.ini`, `ActionMap3DEffect.ini` and (from 6090)
+  `ActionRole3DEffect.ini`, and no binary names any numbered sibling; 7632
+  and 7878 are packed and yield no strings, so nothing is concluded there.
+
+See `tests/test_effect_closure.py` for the measurements and `docs/effects.md`
+for the chain itself.
+
 ### One slot per install, because there is rarely one install
 
 `comod.py installs` prints the stage tree and every client something has been
@@ -462,9 +578,22 @@ first use rather than stranded.
 ### What counts as somewhere a mod can go
 
 Not `coroot.looks_like_root`. That answers whether the **viewer** can browse a
-baseline and demands `c3.wdf`, `data.wdf`, `ini/` and `bin/64/` — which the
-community clients this project exists to support do not have. Zephyr ships
-`c3.tpi`/`c3.tpd` and no `bin/64/`, so that gate refused to install into it.
+baseline, which is a stricter question than whether a mod can go there.
+
+> **Corrected 2026-09-09 — the premise below is superseded, the conclusion is
+> not.** This paragraph said `looks_like_root` *"demands `c3.wdf`, `data.wdf`,
+> `ini/` and `bin/64/` — which the community clients this project exists to
+> support do not have. Zephyr ships `c3.tpi`/`c3.tpd` and no `bin/64/`, so that
+> gate refused to install into it."* That was true when written and stopped
+> being true at `79e57660` (2026-08-11): `coroot.REQUIRED` dropped `bin/64/`
+> and gained the TPD alternatives, so it is now
+> `c3.wdf|c3.tpd+c3.tpi`, `data.wdf|data.tpd+data.tpi`, `ini`, and it accepts
+> Zephyr. **The separation of the two questions still stands** — `comod` needs
+> less than the viewer does, and `moddable_install` accepts a bare `c3/`
+> directory where `looks_like_root` still requires an archive or a TPD pair.
+> `tools/comod.py::moddable_install`'s own docstring still carries the stale
+> version of this paragraph; that is code, and is reported rather than edited
+> here.
 
 `comod.moddable_install` asks the weaker question the mechanism actually
 needs, since a swap is only a loose file read before the archive: the `ini/`
@@ -942,6 +1071,7 @@ identically since it simply adds the two.
 | `tests/test_blender_roundtrip.py` | the addon acceptance test |
 | `tests/c3_diagnose.py` | field-level diff when a round trip is not exact |
 | `comod.py stage-mesh` | validate an exported `.c3` and stage it as a mod |
+| `comod.py anim` | the follow-up: does the staged mesh still animate? |
 
 All of `c3phy` / `c3write` / `c3tex` are **pure stdlib and import no `bpy`**, so
 the corpus gate runs on bare system Python without Blender.
@@ -1062,6 +1192,31 @@ default refuses. On top of that:
   `MotionBinding.classify()` says `FREE`, or `--force` is given. It also
   rejects outright any staged file where `nPHY != nMOTI`.
 
+**`stage-mesh` cannot see the whole hazard, and `comod.py anim` is the half it
+misses.** `nPHY == nMOTI` is a statement about the container alone. The mesh is
+driven by a **shared external motion set** named by `ini/3dmotion.ini`, and
+`C3Mesh::SetMotion` (graphic.dll `0x277C0`) **rejects a set with fewer entries
+than the mesh has PHY** — it does not bind what it can and drop the rest. So a
+container that grows from 4 PHY / 4 MOTI to 5 / 5 is internally consistent,
+passes `stage-mesh` untouched, and still animates *not at all*, because the set
+is still four chunks long. Ask before you install:
+
+```
+py -3 tools/comod.py anim 002135000 --action 401 --weapon 410009
+```
+
+It prints which motion set the action resolves to and **which file answered**
+(on 5517/6609/7205 that is `3dmotion.dbc`, not the 2009 plaintext `.ini` beside
+it), the frame count, timing, loop model and root motion, which of the three
+animation forms — `PHY`+`MOTI`, `SHAP`+`SMOT`, `PTCL`/`PTC3` — the container
+carries, and one line per mesh saying whether it still binds. A staged file at
+`Installed/stage/<logical>` is reported beside the original. Given a logical
+path instead of an appearance id it reports the forms only, which is how to
+look at an effect container. Where the client ships no motion table, or names a
+motion file it does not ship (7878 names `c3/0002/410/401.c3` and ships no
+`c3/0002` tree at all), that is printed as a measured absence and the
+container half of the report still runs.
+
 ### 11.7 Tests
 
 `tests/test_structural.py` exercises every PHY-bearing container in the loose
@@ -1083,3 +1238,33 @@ never runs unless the mesh count actually changed.
 `tests/test_blender_roundtrip.py` adds an end-to-end case: import, delete a
 mesh object, export, re-import — `PHY` and `MOTI` both drop by one and the
 result re-imports cleanly.
+
+### 11.8 Retargeting a MOTI onto a donor — measured, and mostly refused
+
+§11.4 asks whether a container may *change its mesh count*. A different
+question is whether a donor mesh can be given the **original's** `MOTI`
+chunks. Measured 2026-09-06 in `docs/moti_retarget_2026-09-06.md`: **no, not in
+general.** The `MOTI` is not a function of the `PHY` — over `7205/c3/monster`,
+pairs of shipped containers whose `PHY` chunks are *byte-identical* slot for
+slot pose differently under each other's tracks in **169 of 219** chunk
+comparisons (77.2%), the worst by 1.85x the mesh's own bounding-box diagonal.
+The container carries no skeleton, so nothing computable from the geometry can
+decide it.
+
+The one sound case is the one where nothing is decided: a donor with **no**
+`MOTI` whose `PHY` chunks agree with the original's on every input the skinning
+path reads — vertex count, position, `bone0`, `bone1`, `weight0`/`weight1` and
+the chunk matrix. `c3write.restore_motion` implements exactly that and
+`comod.py stage-mesh --restore-motion` exposes it; both refuse everything else
+and name the ordinal that failed. The existing `REJECTED` path is unchanged
+without the flag. Gate: `tests/test_moti_restore.py`.
+
+Two numbers from that pass also extend §11.2 and §11.1 across generations,
+measured on the shipped 5517 / 6609 / 7205 / 7878 loose trees
+(`py -3 scratchpad/moti_m_pair.py`): **0 unpaired containers out of 75,664, and
+362,826 `PHY`/`MOTI` pairs** — so §11.2's "no exceptions" holds far beyond the
+one install it was measured on. The *covering* property has exactly one shipped
+counterexample in that corpus (`c3/effect/xiake/ui/xkjm_xunhuan2/7.c3` on 7878,
+`PHY[1]` needs 6 bones against a 1-bone track), and a fully **reversed** pairing
+still satisfies covering on 94–97% of chunks — which is why covering is not a
+safety gate, only a sanity check.

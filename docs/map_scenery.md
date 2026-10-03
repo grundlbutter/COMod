@@ -297,6 +297,92 @@ record whose path is not a `.pul` that exists is dropped rather than guessed at.
 > `core/dmap.py::parse_trailer`, `tools/test_viewer.py::DMapTrailingSection`
 > (7 tests, two of them controls), `docs/CORRECTIONS.md`
 > `C-2026-08-10-dmap-plane-groups`.
+
+> ── BOUNDED 2026-08-26 ─────────────────────────────────────────────────────
+>
+> **The `181 / 181, 0 misfits` above was measured on 5517 and on nothing else,
+> and the table did not say so.** Re-measured over every declared install,
+> each map loaded the way the client loads it (`dmap.parse_map` over
+> `dmap.map_names`):
+>
+> | install | parsed | v1005/v1006 | leave bytes unread | bytes unread |
+> |---|---:|---:|---:|---:|
+> | 5017 | 142 | 0 | 0 | 0 |
+> | 5065 | 144 | 0 | 0 | 0 |
+> | 5165 | 154 | 0 | 0 | 0 |
+> | 5517 | 192 | 1 | **0** | 0 |
+> | 6090 | 247 | 0 | 0 | 0 |
+> | CCO 2.0 | 136 | 7 | **7** | 134,908 |
+> | 6609 | 297 | 17 | **17** | 203,864 |
+> | Zephyr-1057 | 305 | 31 | **41** | 984,768 |
+> | 7878 | 470 | 163 | **164** | 11,579,752 |
+>
+> > **SUPERSEDED 2026-09-07 — this table is the PRE-`2ee16bfa` reading.**
+> > `dmap: the plane-group section at 1005/1006` (2026-08-29) taught `parse`
+> > the 1006 second counted list (`late_layers`), and the "leave bytes unread"
+> > column is now **0 on eight of the nine installs** — CCO 7 to 0, 6609 17 to
+> > 0, 7878 164 to 0 — with zephyr1057 at **16**, of which 10 are the same
+> > v1003/v1004 residue names as before. The live figures are the `GAP` table
+> > in `DMapTrailerModelRange` (`tools/test_viewer.py`), which is pinned per
+> > install and gated. The numbers above are left unedited because they record
+> > a run that happened; the differential that proves they were right when
+> > taken is in `C-2026-09-07-worktree-agent-a1b45eeb59c461193`
+> > (`docs/CORRECTIONS.md`).
+>
+> **The boundary is the map's VERSION.** 218 of the fleet's 219 v1005/v1006
+> maps leave their tail unread and the single exception is 5517's
+> `icecrypt-lev3`, which declares **`n_groups = 0`** — it ships no
+> background-plane section at all, so it ends at EOF with nothing to read
+> rather than with the section read correctly. (It is *not* "the one 1005 map
+> with no cover records": it carries two. Its **trailer** is empty.) Every v1003/v1004
+> map on all six official clients and on CCO still closes exactly at EOF. The
+> figure above is not wrong; it was **unbounded**, and a suite that resolved
+> its install ambiently could not tell a reader which half they were in.
+>
+> **`*_new` is not the unit, and the three `luckytree*_new` maps named earlier
+> in this section are the same phenomenon under a name that does not carry.**
+> The suffix holds on CCO (7 of 7) and 6609 (17 of 17), which is why it looked
+> like a family; **29 of Zephyr-1057's 41** gap maps carry no `_new` at all —
+> `canyon1`, `desert1`, `crystalcave02`, `Asgard`, `godes-church`, `magic`,
+> `southgate` — and 2 of 7878's 164 do.
+>
+> **It is a different SECTION, not a wrong stride** — the same shape of answer
+> this section already reached once for the star family, one version later.
+> Scanning all 229 gap maps for a group walk that lands on EOF recovers one in
+> **142** of them, and **140 of those need a 32-byte group header, not the
+> modelled 20**: the four `values` u32s, then three more (`160` on every
+> recovered group; the other two drawn from `{3,5}` and `{1,6}`), then
+> `n_planes`. The section ends either exactly at EOF or 8 zero bytes short,
+> and **302 of the 311 recovered paths are `.pul` files that exist on disk** —
+> a content check, not closure. The two that fit the modelled 20 are Zephyr's
+> `desert1` and `southgate`, both v1004 residue, where only the section's
+> START had moved. It also does not begin where the layer walk
+> ends: on CCO's `bp-flandlords-y_new` the group walk starts exactly
+> `4 + 135 × 424` bytes later — 135 being the u32 sitting there and 424 the
+> 1005/1006 cover record — so a **second counted list** separates the layers
+> from the backdrops, 43,696 bytes of it on `ninja01_new`. Its first record's
+> tag is **4**, the tag 1006 renumbered to **24** for the list `dmap.parse`
+> already walks (`COVER_TAG_1006`), naming `ani\mapscene-new.ani`. Recorded as
+> an observation and not modelled: two readings fitted 1006's first record
+> once already, and only a stride separated them.
+>
+> `parse_trailer` is deliberately **not** changed on that evidence. 87 of the
+> 229 fit no reading defensible today, and
+> `C-2026-08-11-claude-explorer-1005-tag0` is the standing record of what a
+> plausible wrong reading of an unmodelled 1005 structure costs. What changed
+> is that the gap is now named, bounded and audible:
+> `tools/test_viewer.py::DMapTrailerModelRange` holds each install to its own
+> figure and refuses to measure one it cannot identify, and
+> `DMapTrailingSection` — every number of which is 5517's — is PINNED to 5517
+> instead of taking whatever install the reader had configured. (The 08-26
+> repair resolved it by *declared kind*, and would have SKIPPED where the kind
+> was absent; what landed is `DeclaredInstall`, which names the install and
+> FAILS when it is missing, per the owner's ruling of 2026-08-28. The two
+> classes therefore differ on purpose: `DMapTrailingSection` asserts one
+> install's numbers and must not run anywhere else, while
+> `DMapTrailerModelRange` asks the *range* question over whatever is
+> configured and skips only a corpus it cannot identify.)
+> `docs/CORRECTIONS.md` `C-2026-08-26-claude-vibeco-dx-camera`.
 >
 > <details><summary>The original OPEN entry, kept because the reasoning in it
 > is what nearly bought the wrong fix</summary>

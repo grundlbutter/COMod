@@ -198,7 +198,86 @@ const LEGACY_DEFAULT_YAW = 0.9;
 const ISO_YAW = -Math.PI / 4;
 const ISO_PITCH = Math.asin(0.5);
 
+/** DXT bytes already fetched through /api/texbundle, KEYED BY CONTENT, shared
+ *  by every Viewer on the page and surviving `Viewer.clear()`.
+ *
+ *  WHY IT EXISTS: `clear()` deletes every GL texture, and the play page
+ *  rebuilds its scene often. Its old route survived that with a decoded-<img>
+ *  cache of TWELVE; a bundle per rebuild would re-download every texture.
+ *  This keeps the compressed bytes (a 256x256 DXT1 is 32 KB) so a rebuild
+ *  re-uploads from memory, IN THE SAME FRAME -- `applyTextureBundle` uploads
+ *  hits before its first await, which is what keeps a rebuild from flashing
+ *  untextured white.
+ *
+ *  BY CONTENT, NOT BY PATH (SD ruling, 2026-09-18). The server stamps each
+ *  entry with `key`, a hash of the exact bytes it shipped. `TEX_BYTES` is
+ *  key -> bytes; `TEX_PATHKEY` is only a remembered path -> key, and it is
+ *  valid for ONE server generation (`gen` = base id + a nonce drawn at
+ *  server start), so a restarted viewer never hands back a stale mapping.
+ *  What changes a path's bytes under a RUNNING server is an external install
+ *  write (`comod install` copies over the loose file); catching that is the
+ *  revalidation step, not this map.
+ *
+ *  THE CEILING IS JS-SIDE BYTES: TEXBUNDLE_BUDGET bounds the ArrayBuffers
+ *  held here, least-recently-used first. GPU texture memory is SEPARATE and
+ *  is not bounded by this number -- it is whatever the scene has uploaded --
+ *  so do not read 96 MB as the viewer's footprint. */
+const TEX_BYTES = new Map();      // key -> { e: manifest entry (off 0), buf }
+const TEX_PATHKEY = new Map();    // path -> key, valid for TEX_GEN only
+let TEX_GEN = null;
+const TEXBUNDLE_BUDGET = 96 * 1024 * 1024;
+let texBytesHeld = 0;
+
+/** Counters a test can read (`Viewer.texbundleStats()`): bundle REQUESTS
+ *  sent, uploads served from memory, and entries evicted. */
+const TEXBUNDLE_STATS = { requests: 0, hits: 0, evicted: 0 };
+
+function texRemember(e, whole, base) {
+  const key = e.key;
+  if (!key) return null;           // an old server: nothing to key by
+  let hit = TEX_BYTES.get(key);
+  if (hit) {                       // same content, maybe another path
+    TEX_BYTES.delete(key); TEX_BYTES.set(key, hit);
+    return hit;
+  }
+  const start = base + e.off;
+  hit = { e: Object.assign({}, e, { off: 0 }),
+          buf: whole.slice(start, start + e.size) };
+  TEX_BYTES.set(key, hit);
+  texBytesHeld += e.size;
+  while (texBytesHeld > TEXBUNDLE_BUDGET && TEX_BYTES.size > 1) {
+    const [k, v] = TEX_BYTES.entries().next().value;
+    TEX_BYTES.delete(k);
+    texBytesHeld -= v.e.size;
+    TEXBUNDLE_STATS.evicted++;
+  }
+  return hit;
+}
+
+function texLookup(path) {
+  const key = TEX_PATHKEY.get(path);
+  const hit = key && TEX_BYTES.get(key);
+  if (!hit) return null;
+  TEX_BYTES.delete(key); TEX_BYTES.set(key, hit);
+  return hit;
+}
+
+/** A manifest from a different server generation invalidates every
+ *  remembered path -> key; the bytes themselves stay, because content does
+ *  not go stale -- only the belief about which path holds it. */
+function texAdoptGen(gen) {
+  if (gen && gen !== TEX_GEN) { TEX_PATHKEY.clear(); TEX_GEN = gen; }
+}
+
 class Viewer {
+  /** The page-wide texture cache, for tests: requests sent, hits served
+   *  from memory, evictions, bytes held (JS-side only) and the generation. */
+  static texbundleStats() {
+    return Object.assign({ held: texBytesHeld, entries: TEX_BYTES.size,
+                           paths: TEX_PATHKEY.size, gen: TEX_GEN },
+                         TEXBUNDLE_STATS);
+  }
+
   /** `camScope` namespaces the stored camera.
    *
    *  Two viewers alive on one page in the same view mode otherwise share one
@@ -563,6 +642,67 @@ class Viewer {
     this._saveCam();
   }
 
+  /** Point the camera where the ARTIST pointed it -- a decoded `CAME` chunk.
+   *
+   *  WHAT THIS IS
+   *    An effect `.c3` can carry a `CAME` chunk: an authoring camera, one eye
+   *    and one target per animation frame. `effectplay._camera_json` hands it
+   *    over already converted to this renderer's space. Nothing in this
+   *    project had ever consumed one -- `effects.load_effect_object` used to
+   *    drop the chunk with the comment "authoring metadata; nothing to play"
+   *    -- so every effect preview was framed by fitting a box to the geometry.
+   *    That fit is not wrong; it is just OURS, and where the file states an
+   *    answer we should not be guessing one.
+   *
+   *  WHY IT IS AN ORBIT CONVERSION AND NOT A LOOKAT OVERRIDE
+   *    This camera is an ORBIT -- `{yaw, pitch, dist, pan}` about `center` --
+   *    and every control on the page (drag, wheel, lock, persistence) drives
+   *    those four. Writing a raw view matrix instead would frame the first
+   *    draw correctly and then fight the very next mouse move, because the
+   *    orbit state would still say something else. So the eye/target pair is
+   *    DECOMPOSED into the orbit the rest of the class already speaks:
+   *
+   *      v     = eye - target      (`_basis().dir` is exactly this, normalised)
+   *      dist  = |v|
+   *      pitch = asin(v.z / dist)      world is Z-up
+   *      yaw   = atan2(v.y, v.x)
+   *      pan   = target - center       so `center + pan` lands on the target
+   *
+   *    Round-tripping that back through `_basis()` reproduces `eye` to float
+   *    precision, which `tools/test_gl_exec.py` asserts rather than assuming.
+   *
+   *  WHAT IS NOT HONOURED, AND SAYS SO
+   *    The chunk's `fov` is IGNORED. This projection is hard-coded to 45
+   *    degrees (`screenToGround` and `draw` both spell it out) and the corpus
+   *    ranges 5.6-141.7 degrees, so honouring it would change the projection
+   *    for one page and desync picking. Returning the fov lets the caller
+   *    PRINT the divergence, which is what the preview does.
+   *
+   *  Returns what was applied, or null when the camera is unusable (eye and
+   *  target coincident -- there is no direction in that). Null is a real
+   *  answer: the caller falls back to the fitted framing and labels it.
+   */
+  applyAuthoredCamera(cam) {
+    if (!cam) return null;
+    const e = cam.eye0 || (cam.eye && cam.eye[0]);
+    const t = cam.target0 || (cam.target && cam.target[0]);
+    if (!e || !t) return null;
+    const v = [e[0] - t[0], e[1] - t[1], e[2] - t[2]];
+    const d = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (!(d > 1e-6)) return null;
+    this._framed = true;                 // an authored camera is a framing
+    this.cam.pitch = Math.max(-1.54, Math.min(1.54, Math.asin(v[2] / d)));
+    this.cam.yaw = Math.atan2(v[1], v[0]);
+    this.cam.dist = d;
+    this.cam.pan = [t[0] - this.center[0],
+                    t[1] - this.center[1],
+                    t[2] - this.center[2]];
+    this._saveCam();
+    return { yaw: this.cam.yaw, pitch: this.cam.pitch, dist: d,
+             pan: this.cam.pan.slice(),
+             fovIgnored: cam.fovDegrees || null, projectionFov: 45 };
+  }
+
   /** Back to a known-good view of whatever is currently loaded. Works even when
    *  locked -- this is the escape hatch from a frozen camera. */
   resetView() {
@@ -793,15 +933,104 @@ class Viewer {
       if (f.transient) keep.push(f); else f.dispose();
     }
     this.fx = keep;
+    // WHAT THE BUILD KEPT, per instance, per layer. The return value stays
+    // `this.fx.length` -- two callers read it as "did anything build at all"
+    // (`builder.js`, `effects.js`) and widening the return would change what
+    // they mean. This is a SEPARATE channel for a separate question, and it
+    // is filled from `EffectInstance.build`, which the builder writes.
+    // Backlog item 24: a page that re-derives the count from `def.layers`
+    // gets the DECLARED number back and cannot ever disagree with itself.
+    this.fxBuild = [];
     for (const d of defs || []) {
       if (!d || !d.def) continue;
       try {
-        this.fx.push(new EffectInstance(this.gl, d.def, d));
-      } catch (e) { /* a malformed layer must not take the viewport down */ }
+        const inst = new EffectInstance(this.gl, d.def, d);
+        // VIEW STATE, defaulted here rather than in the constructor: it must
+        // reset on every `setEffects`, and `setEffects` is what a subject
+        // change goes through. A flag that survived one would hide an effect
+        // of a skill the user never hid.
+        inst.visible = true;
+        this.fx.push(inst);
+        this.fxBuild.push({ name: (d.def && d.def.name) || null,
+                            role: d.role || null,
+                            layers: inst.build || [] });
+      } catch (e) {
+        // A malformed layer must not take the viewport down -- and must not
+        // vanish either. An instance that THREW is not the same as one that
+        // built empty, and the two were indistinguishable before this.
+        this.fxBuild.push({ name: (d && d.def && d.def.name) || null,
+                            role: (d && d.role) || null, layers: [],
+                            threw: String((e && e.message) || e) });
+      }
     }
     this.fxTime = 0;
     this.draw();
     return this.fx.length;
+  }
+
+  /** Show or hide ONE whole effect instance. Returns what it actually did.
+
+   *  The owner's words: *"toggle individual effects for multi effect
+   *  skills"*. MEASURED on the CONFIGURED INSTALL (`coroot.find()`):
+   *  (Naming the install, not its path: a drive-rooted path in a .js
+   *   file is a check-3 finding -- these are scanned whole.)
+   *  **2,209 of 5,384 weapon appearances play two or more DISTINCT named
+   *  effects**, and 508 play three. `setLayerVisible` below is a different
+   *  question -- 771 of 2,255 effects have two or more layers -- and neither
+   *  answers the other.
+   *
+   *  **Returns `false` for an instance that built nothing**, exactly as the
+   *  layer version does, so the UI can render it FAILED rather than as a
+   *  switch that shrugs. An instance whose every layer came back empty is on
+   *  the stage and contributes no pixels; hiding it would change nothing and
+   *  a control that appears to work and does not is worse than one that says
+   *  it cannot.
+   *
+   *  VIEW STATE. Set here, cleared by the next `setEffects`, never written. */
+  setEffectVisible(instIdx, on) {
+    const inst = (this.fx || [])[instIdx | 0];
+    if (!inst) return false;
+    const drawable = (inst.layers || []).some(l => l.parts.length);
+    if (!drawable) return false;
+    inst.visible = !!on;
+    this.draw();
+    return true;
+  }
+
+  /** Show or hide ONE built layer. Returns what it actually did.
+   *
+   *  BACKLOG 24, and the owner's question that raised it: *"when I play an
+   *  effect, is it showing me all of those pieces? Can I toggle their
+   *  visibility?"* Soloing a layer is how you find out whether you are
+   *  looking at it, so the toggle is the diagnostic as much as it is a
+   *  feature.
+   *
+   *  `layerIndex` is the layer's OWN declared index (`lay.src.index`), not
+   *  its position in `inst.layers` -- those differ the moment a declared
+   *  layer fails to parse, and a toggle that moved to a different layer than
+   *  the row you clicked would be worse than no toggle.
+   *
+   *  **Returns `false` for a layer that was never built, and that is not a
+   *  failure to report.** A layer whose every part was dropped has nothing
+   *  to show, so the UI must render it as FAILED rather than as a switch
+   *  that does nothing when flipped -- an unresponsive control reads as a
+   *  broken page, which is the same shape as the opt-out that could only
+   *  report absence (bugs_open.md #6).
+   *
+   *  VIEW STATE, never a write. It does not touch the definition, is not
+   *  persisted, and `_build` resets it on every subject change. */
+  setLayerVisible(instIdx, layerIndex, on) {
+    const inst = (this.fx || [])[instIdx | 0];
+    if (!inst) return false;
+    let hit = false;
+    for (const lay of inst.layers) {
+      if (String(lay.src && lay.src.index) !== String(layerIndex)) continue;
+      if (!lay.parts.length) return false;   // nothing to show; not a switch
+      lay.visible = !!on;
+      hit = true;
+    }
+    if (hit) this.draw();
+    return hit;
   }
 
   /** Add ONE instance without touching anything already playing.
@@ -937,7 +1166,30 @@ class Viewer {
       }
       this.expired = (this.expired || 0) + reap.length;
     }
-    this.draw();
+    /* NO DRAW HERE. This used to end `this.draw(); return alive;`, so every
+     * caller paid a full scene redraw whether or not it wanted one -- and a
+     * caller that DID want one could not suppress it.
+     *
+     * play.js then ran a 41 ms setInterval calling this BESIDE a rAF
+     * frameLoop that draws when something moved. The two run at different
+     * rates, so a MOVING second cost 60 + 24.4 = ~84 full scene renders where
+     * 60 are needed: 24 duplicates a second, ~29% of the total, and not one
+     * of them on the vsync cadence. play.js's own comment at the frameLoop
+     * already names "two loops calling viewer.draw() render the same frame
+     * twice" as the sliding-motion defect it fixed once; this is the same
+     * defect one layer down.
+     *
+     * builder.js paid the exact doubling, from the other direction: both of
+     * its playback loops called this and then `viewer.draw()` in the SAME rAF
+     * callback, so every frame of a weapon aura and of a model-effect preview
+     * rendered the whole scene twice for one visible frame.
+     *
+     * CORRECTED one commit after this line first landed: it said "drawn twice
+     * per moving frame", which is builder.js's number read onto play.js. 84
+     * is bad enough to fix and 120 was never measured.
+     *
+     * Ticking and drawing are now separate, and every caller says which it
+     * wants. `alive` is the return value it always was. */
     return alive;
   }
 
@@ -985,6 +1237,11 @@ class Viewer {
     const gl = this.gl;
     if (!this.fx.length) return;
     const cam = this._cameraBasis(view || M4.ident());
+    // CCFL kind 13's scroll counter is an ABSOLUTE, SHARED wall clock (RE, from
+    // the 7878 binary), so it is sampled ONCE per frame here and handed to every
+    // kind-13 part -- never re-read inside the draw loop, or two parts of one
+    // effect disagree (COMod's wall_counter caveat 1).
+    const wallMs = performance.now();
     gl.enable(gl.BLEND);
     gl.depthMask(false);          // effects never occlude each other
     gl.disable(gl.CULL_FACE);     // effect quads are viewed from both sides
@@ -993,11 +1250,31 @@ class Viewer {
     gl.uniform1i(this.uni.uUseVColor, 0);
 
     for (const inst of this.fx) {
+      // THE OWNER'S FEATURE: hide one whole EFFECT of a multi-effect subject.
+      //
+      // A level up from `lay.visible`, and a genuinely different question.
+      // A subject like appearance 410009 plays THREE named effects at once
+      // -- `410009`, `Flash4102`, `m-b02`, an aura and a flash and an impact
+      // spark -- and "which of these am I looking at" cannot be answered by
+      // hiding layers inside one of them.
+      //
+      // Skipped at draw time, not at build time, for the same reason as the
+      // layer flag: the instance keeps its buffers and its clock, so
+      // un-hiding is instant and it returns IN PHASE with everything else
+      // rather than restarting.
+      if (inst.visible === false) continue;
       if (inst.done && !inst.def.endless) continue;
       const st = inst.state || { frame: inst.frame, waiting: false, gap: false };
       if (st.waiting || st.gap) continue;
       const world = inst._world(inst.anchor);
       for (const lay of inst.layers) {
+        // BACKLOG 24: the per-layer solo/hide toggle. VIEW STATE ONLY --
+        // `visible` lives on the built layer, defaults true, and is rebuilt
+        // by `_build` on every subject change. Skipping here rather than in
+        // `_build` is deliberate: a hidden layer keeps its buffers and its
+        // clock, so un-hiding it is instant and it comes back in phase with
+        // everything else instead of restarting.
+        if (lay.visible === false) continue;
         // ASB / ADB are D3DBLEND (docs/effects.md §7) -- this is the effect's
         // own authored blend state, not the viewer's global alpha setting.
         gl.blendFunc(this._glBlend(lay.src.glSrcBlend),
@@ -1013,19 +1290,74 @@ class Viewer {
             if (st.frame >= eff) continue;
             const s = FX.samplePart(p.src, st.frame);
             if (!s.visible || s.alpha <= 0.002) continue;
-            const bone = (p.src.motion && p.src.motion.bones &&
-                          p.src.motion.bones[0]) || 0;
-            const M = FX.motionMatrix(p.src.motion, bone, st.frame);
-            const model = FX.mul(world, M);
+            // A multi-bone part is posed PER VERTEX -- `EffectInstance.poseSkin`
+            // says why, and why `model` must then be the placement alone.
+            const skin = inst.poseSkin(p, st.frame);
+            let model;
+            if (skin) {
+              model = world;
+            } else {
+              const bone = (p.src.motion && p.src.motion.bones &&
+                            p.src.motion.bones[0]) || 0;
+              model = FX.mul(world,
+                             FX.motionMatrix(p.src.motion, bone, st.frame));
+            }
             gl.uniform1f(this.uni.uMeshAlpha, s.alpha);
-            gl.uniform2f(this.uni.uUVOffset, s.uv[0], s.uv[1]);
+            // CCFL kind 13: if this mesh carries a period, its scroll counter is
+            // the wall clock / period (masked u32), NOT the per-effect frame
+            // index that samplePart used for s.uv. Take the integer from
+            // CoEffects.wallCounter (parity-gated; hand-copying `& 0xFFFFFFFF` is
+            // signed-wrong in JS). periodMs 0 -> null -> the default s.uv.
+            // CCFL kind 9: the mesh carries its OWN scroll rate, scrolled by
+            // the effect's own frame counter rather than the wall clock. The
+            // shipped DX9 shader is
+            //     PixelTexCoord0 = c3_TexCoord0 + c3_UVAnimStep
+            // (25 of its 30 uses add it to c3_TexCoord0, the PRIMARY UV), so
+            // this lands on the SAME uUVOffset channel as kind 13 and needs no
+            // second texcoord attribute and no second texture stage. The
+            // earlier plan to build `aUV1` rested on `uv1 -> TEXCOORD1`, which
+            // is bone index/weight data on skinned meshes -- see
+            // core/c3ccfl.KIND_UV_ANIM_STEP.
+            //
+            // `[]` means ABSENT; `[0,0]` is a real shipped value (two meshes
+            // carry a kind 9 whose rate is zero), so length is the test, not
+            // truthiness of the numbers.
+            const k9 = p.src.uvAnimStep;
+            const has9 = !!(k9 && k9.length === 2);
+            // Kind 9 and kind 13 never co-occur on the corpus (66 and 1,405
+            // over 212,992 CCFL bodies, zero overlap), so this order asserts
+            // no precedence -- there is nothing to order.
+            if (has9) {
+              // The per-effect counter. RE read kind 9's multiplier as
+              // `[ebp+0x1B0]`, the parent's DEFAULT counter -- the one kind 13
+              // REPLACES with timeGetTime(). Our per-effect equivalent is the
+              // frame index samplePart already uses for s.uv.
+              const ou = k9[0] * st.frame, ov = k9[1] * st.frame;
+              gl.uniform2f(this.uni.uUVOffset,
+                           ou - Math.floor(ou), ov - Math.floor(ov));
+            } else {
+            const kc = (window.CoEffects && p.src.periodMs)
+              ? window.CoEffects.wallCounter(wallMs, p.src.periodMs) : null;
+            if (kc != null) {
+              const step = p.src.uvStep || [0, 0];
+              // Multiply in double (the counter reaches ~1.3e8) and wrap to
+              // [0,1) HERE, so the float32 uniform keeps the sub-texel scroll --
+              // equivalent to the client's REPEAT-sampler wrap (RE: counter-space,
+              // no explicit modulus). The texture is already REPEAT when
+              // power-of-two; NPOT clamps in WebGL1.
+              const ou = step[0] * kc, ov = step[1] * kc;
+              gl.uniform2f(this.uni.uUVOffset, ou - Math.floor(ou), ov - Math.floor(ov));
+            } else {
+              gl.uniform2f(this.uni.uUVOffset, s.uv[0], s.uv[1]);
+            }
+            }
             gl.uniformMatrix4fv(this.uni.uModel, false, new Float32Array(model));
             gl.uniformMatrix4fv(this.uni.uMVP, false,
                                 M4.mul(mvp, new Float32Array(model)));
-            gl.bindBuffer(gl.ARRAY_BUFFER, p.vbo);
+            gl.bindBuffer(gl.ARRAY_BUFFER, skin ? skin.vbo : p.vbo);
             gl.enableVertexAttribArray(this.attr.pos);
             gl.vertexAttribPointer(this.attr.pos, 3, gl.FLOAT, false, 0, 0);
-            gl.bindBuffer(gl.ARRAY_BUFFER, p.nbo);
+            gl.bindBuffer(gl.ARRAY_BUFFER, skin ? skin.nbo : p.nbo);
             gl.enableVertexAttribArray(this.attr.nrm);
             gl.vertexAttribPointer(this.attr.nrm, 3, gl.FLOAT, false, 0, 0);
             gl.bindBuffer(gl.ARRAY_BUFFER, p.tbo);
@@ -1210,35 +1542,61 @@ class Viewer {
     const res = { uploaded: 0, fallback: [], missing: [] };
     if (!want.length) return res;
 
+    // Cache hits upload NOW, before the first await, so a rebuild that needs
+    // nothing new is textured in the same frame (see TEX_BYTES).
+    const needPng = [];
+    let rest = [];
+    const fromCache = [];
+    for (const p of want) {
+      const hit = texLookup(p.path);
+      if (hit && this.setCompressedTexture(p.key, hit.e, hit.buf)) {
+        res.uploaded++; res.cached = (res.cached || 0) + 1;
+        TEXBUNDLE_STATS.hits++;
+        fromCache.push(p);
+      } else {
+        rest.push(p);
+      }
+    }
+    // What was drawn from memory may be stale on DISK -- a `comod install`
+    // while the viewer is open is the tool's main use. Ask once, in the
+    // background, AFTER the same-frame upload; anything that moved is
+    // re-fetched and replaces its texture a moment later.
+    if (fromCache.length) this._texRevalidate(fromCache, opts);
+    if (!rest.length) { this.draw(); return res; }
+
     // One path may serve several slots (both hands holding 410005), and the
     // bundle dedups by path, so the manifest is indexed by path, not by slot.
-    const uniq = [...new Set(want.map(p => p.path))];
-    let man = null, buf = null;
+    const uniq = [...new Set(rest.map(p => p.path))];
+    const byPath = new Map();
     try {
       const url = '/api/texbundle?paths=' + encodeURIComponent(uniq.join('|'));
+      TEXBUNDLE_STATS.requests++;
       const r = await fetch(url);
       if (r.ok) {
-        buf = await r.arrayBuffer();
+        const buf = await r.arrayBuffer();
         const head = new Uint8Array(buf, 0, 4);
         if (String.fromCharCode(...head) === 'COTB') {
           const dv = new DataView(buf);
           const mlen = dv.getUint32(8, true);
-          man = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, mlen)));
-          man._base = 12 + mlen;
+          const man = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, mlen)));
+          texAdoptGen(man.gen);
+          // Offsets in the manifest are relative to the payload region; the
+          // cache stores each entry's own bytes at offset 0, by content key.
+          for (const e of man.entries || []) {
+            if (!e.path) continue;
+            const hit = texRemember(e, buf, 12 + mlen) ||
+              { e: Object.assign({}, e, { off: 12 + mlen + e.off }), buf };
+            if (e.key) TEX_PATHKEY.set(e.path, e.key);
+            byPath.set(e.path, hit);
+          }
         }
       }
-    } catch (e) { man = null; }
+    } catch (e) { /* every remaining path takes the PNG route below */ }
     if (!isCurrent()) return res;
 
-    const byPath = new Map();
-    if (man) for (const e of man.entries) if (e.path) byPath.set(e.path, e);
-
-    const needPng = [];
-    for (const p of want) {
-      const e = byPath.get(p.path);
-      // Offsets in the manifest are relative to the payload region, so shift
-      // them past the header before handing gl a view.
-      if (e && this.setCompressedTexture(p.key, { ...e, off: man._base + e.off }, buf)) {
+    for (const p of rest) {
+      const hit = byPath.get(p.path);
+      if (hit && this.setCompressedTexture(p.key, hit.e, hit.buf)) {
         res.uploaded++;
       } else {
         needPng.push(p);
@@ -1258,6 +1616,35 @@ class Viewer {
     }
     if (isCurrent()) this.draw();
     return res;
+  }
+
+  /** Ask the server whether textures just drawn FROM MEMORY still hold the
+   *  bytes the page remembers (`/api/texkeys` -- a stat per path, re-reading
+   *  only what moved). A path whose key changed, or every path if the server
+   *  restarted (a new `gen`), loses its path -> key mapping and is re-applied,
+   *  which fetches it fresh. Fire-and-forget: a failed check leaves the
+   *  drawn texture in place and says so on the console. */
+  async _texRevalidate(pairs, opts) {
+    TEXBUNDLE_STATS.revalidations = (TEXBUNDLE_STATS.revalidations || 0) + 1;
+    let j;
+    try {
+      const uniq = [...new Set(pairs.map(p => p.path))];
+      const r = await fetch('/api/texkeys?paths=' + encodeURIComponent(uniq.join('|')));
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      j = await r.json();
+    } catch (e) {
+      console.warn('[gl] texture revalidation failed; keeping what is drawn:', e);
+      return;
+    }
+    const restarted = j.gen && j.gen !== TEX_GEN;
+    texAdoptGen(j.gen);
+    const stale = pairs.filter(p => restarted ||
+      (j.keys && j.keys[p.path] !== TEX_PATHKEY.get(p.path)));
+    if (!stale.length) return;
+    for (const p of stale) TEX_PATHKEY.delete(p.path);
+    TEXBUNDLE_STATS.replaced = (TEXBUNDLE_STATS.replaced || 0) + stale.length;
+    const isCurrent = (opts && opts.isCurrent) || (() => true);
+    if (isCurrent()) await this.applyTextureBundle(stale, opts);
   }
 
   /** Upload an <img> as a texture under `key`. */

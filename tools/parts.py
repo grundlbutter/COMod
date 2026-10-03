@@ -70,6 +70,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import c3phy                                            # noqa: E402
 from coassets import DEFAULT_ROOT, parse_ini            # noqa: E402
+# `pad9` is imported HARD, not through the guarded `attachmod` further down:
+# a fallback that shrugged when attach.py failed to import would put the
+# seven-wide defect straight back (2026-09-25, tests/test_shape_width.py).
+from attach import pad9                                  # noqa: E402
 
 try:
     # task #13's workstream decoded MOTI. When it is importable we get the
@@ -149,15 +153,28 @@ HAIR_SERIES = {"119"}
 
 
 def head_kind(ident: str) -> str:
-    """"hair" or "headgear" for an entry of the head-covering slot."""
-    if ident.isdigit() and len(ident) == 9 and ident[3:6] in HAIR_SERIES:
+    """"hair" or "headgear" for an entry of the head-covering slot.
+
+    The id is read NINE WIDE (`attach.pad9`) before the series is sliced
+    out.  `armet.ini` is seven wide on 5017/5517/5065/7878/6609 and nine
+    wide only on CCO, so read raw this said "headgear" for every hairstyle
+    on those clients -- MEASURED 2026-09-25 on a 5017 BuilderIndex: armet
+    kind `Counter({'headgear': 1708})`, and `default_loadout('002')` picked
+    no armet because it asks this for "hair".  `builder.head_kind` is this
+    function, not a copy of it.
+    """
+    wide = pad9(ident)
+    if wide.isdigit() and len(wide) == 9 and wide[3:6] in HAIR_SERIES:
         return "hair"
     return "headgear"
 
 
 def hair_colour(ident: str) -> Optional[str]:
-    if ident.isdigit() and len(ident) == 9:
-        return HAIR_COLOURS.get(int(ident[6]))
+    """The colour digit's name, read nine wide for the same reason as
+    `head_kind`; None for a non-hair or non-numeric id."""
+    wide = pad9(ident)
+    if wide.isdigit() and len(wide) == 9:
+        return HAIR_COLOURS.get(int(wide[6]))
     return None
 
 

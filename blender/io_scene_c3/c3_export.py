@@ -12,12 +12,20 @@ edited it, and the edit wins.
 That is what makes "import, export, byte-identical" true without the exporter
 simply blitting back a cached copy of the file -- every field really is read
 back out of the Blender datablock.
+
+**Animation is the same rule one level up.**  Each armature that carries an
+imported `MOTI` track is re-serialized from its action, per bone key, reusing
+the on-disk floats wherever the pose Blender holds still matches what the
+importer recorded -- see `c3_anim` and `vendor/c3anim.py`.  An armature with no
+imported track contributes no override and its chunk is written back verbatim,
+so a user who never opened the animation cannot perturb it.
 """
 
 import os
 
 import bpy
 
+from . import c3_anim
 from . import c3_common as K
 from .vendor import c3phy, c3write
 from .vendor.c3phy import VARIANTS, C3Key, PhyMesh, Vertex, iter_chunks
@@ -188,15 +196,42 @@ def _skin(ob, me, nverts, warn):
             nb1, nw1 = groups[1]
         else:
             nb1, nw1 = nb0, 0.0
-        # The GPU derives weight1 as 255 - weight0 (RVA 0x5A869), so the pair
-        # is constrained to sum to 1.  Normalise rather than ship something
-        # the renderer will silently contradict.
+        # The pair is constrained to sum to 1, so normalise rather than ship
+        # something the renderer will silently contradict.
+        #
+        # WHY -- and this is TWO FACTS FORCED INTO AGREEMENT rather than one
+        # address.  `c3phy` records that the FILE's `weight1` at 0x24 is only
+        # ever tested against 0: its VALUE is never read.  The vertex shader
+        # in `Env_DX9/graphic.dll` consumes `.w` as a real independent lane
+        # (`fWeight2 = inVert.c3_BoneIndexWeight.w * 0.0039215686`, i.e.
+        # 1/255).  Both can only be true if the CPU SYNTHESISES that lane
+        # when packing the vertex -- which is `255 - weight0`.
+        #
+        # THIS REPLACES A CITATION OF `RVA 0x5A869`, and the replacement is
+        # the point.  That address family does not match 7878's
+        # `Env_DX9/graphic.dll` -- `0x5A774` there is a byte compare, not the
+        # store it was cited for -- so it named one of the four `graphic.dll`
+        # builds in this corpus and nobody recorded which.  **A reader who
+        # checked it found the wrong instruction and no way to tell whether
+        # the claim or the address was wrong.**  The conclusion was right and
+        # its provenance was unresolvable; the argument above is checkable
+        # from files anyone has.  (VibeCO, 2026-09-21, from the shipped HLSL.)
         s = nw0 + nw1
         if s > 0:
             nw0, nw1 = nw0 / s, nw1 / s
         else:
             nw0, nw1 = 1.0, 0.0
         out.append((nb0, nb1, nw0, nw1))
+
+    # THE PALETTE THIS EXPORT ACTUALLY SHIPS -- not the source `palette`
+    # above, which describes the file we started from.  A plain round trip
+    # cannot grow it, but a body mesh DECLARES 84 bones while its skin uses
+    # 25, and phase 1a named those spare bones and put them in collections so
+    # they could be found and painted.  That feature working as intended is
+    # also what makes a palette larger than anything shipped easy to produce.
+    over = K.palette_warning(len(K.exported_palette(out)))
+    if over:
+        warn[over] = 1
     return out
 
 
@@ -286,8 +321,12 @@ def object_to_phy(ob, warn) -> PhyMesh:
     m.frame_count = int(_prop(ob, "c3_frame_count", 0))
     m.keys = K.unpack_keys(K.unb64(_prop(ob, "c3_keys", "")), C3Key)
     if _prop(ob, "c3_has_step", False):
-        s = _prop(ob, "c3_step", [0, 0])
-        m.step = (K.as_unsigned32(int(s[0])), K.as_unsigned32(int(s[1])))
+        # TWO f32 since M8. This rebuilt u32 ints and handed them to the
+        # writer, which now packs f32 -- so a Blender round trip wrote
+        # 3163243414.0 where -0.017 was meant. `step_from_prop` also reads a
+        # PRE-M8 .blend, whose ints are bit patterns; the two ranges are
+        # disjoint by measurement, not by a tuned threshold.
+        m.step = K.step_from_prop(_prop(ob, "c3_step", [0.0, 0.0]))
     m.two_sided = bool(_prop(ob, "c3_two_sided", False))
     m.billboard = int(_prop(ob, "c3_billboard", 0))
     m.label_raw = K.unb64(_prop(ob, "c3_label_raw", ""))
@@ -345,6 +384,44 @@ def find_container(context, objects=None):
     return coll, obs
 
 
+def collect_motions(context, meshes, obs, warn, enabled=True):
+    """-> ``{source_index: moti_body}`` for the armatures that carry a track.
+
+    Keyed by the mesh's ORIGINAL chunk slot, because that is what `rebuild_c3`
+    pairs a MOTI with.  A mesh that has been duplicated has had its
+    `source_index` cleared by the caller and is a new mesh with a new
+    (synthesised) track, so it is skipped here rather than overwriting the slot
+    it was copied from.
+
+    Nothing is emitted for an armature the importer did not attach a track to,
+    and that is the safe direction: an absent key means "write the original
+    bytes", which is what every export before this feature existed did.
+    """
+    if not enabled:
+        return {}
+    out = {}
+    for m, ob in zip(meshes, obs):
+        if m.source_index is None:
+            continue
+        arm = ob.find_armature()
+        if arm is None or c3_anim.PROP_SRC not in arm:
+            continue
+        if m.source_index in out:
+            warn[f"two meshes share armature {arm.name}; only the first "
+                 f"motion track was written"] = 1
+            continue
+        try:
+            body = c3_anim.export_motion(context, arm, warn)
+        except Exception as e:                              # noqa: BLE001
+            raise ExportError(
+                f"{arm.name}: the motion track could not be written back "
+                f"({e}). Nothing was saved -- the original file is "
+                f"untouched.") from e
+        if body is not None:
+            out[m.source_index] = body
+    return out
+
+
 def export_c3(context, filepath, objects=None, **opts):
     """Write a .c3.  Returns (bytes_written, report_lines)."""
     coll, obs = find_container(context, objects)
@@ -395,12 +472,20 @@ def export_c3(context, filepath, objects=None, **opts):
                 f"shared external motion set that assumes the original "
                 f"layout. It is safe for self-animated meshes (effects), not "
                 f"for body/armour/weapon meshes.")
+        motions = collect_motions(context, meshes, obs, warn,
+                                  opts.get("export_animation", True))
         data = c3write.rebuild_c3(original, meshes,
-                                  allow_structural=structural)
+                                  allow_structural=structural,
+                                  moti_override=motions)
+        if motions:
+            report_motions = f"{len(motions)} motion track(s) rebuilt"
+        else:
+            report_motions = "motion tracks carried through verbatim"
         if n_phy != len(meshes):
             warn[f"mesh count changed {n_phy} -> {len(meshes)}; MOTI tracks "
                  f"were added/removed to match"] = 1
     else:
+        report_motions = "no source container: no motion tracks"
         data = build_c3([(m.tag, serialize_phy(m)) for m in meshes])
         warn["no source container: non-PHY chunks (MOTI etc.) are absent"] = 1
 
@@ -411,5 +496,6 @@ def export_c3(context, filepath, objects=None, **opts):
     if original is not None:
         report.append("byte-identical to source"
                       if data == original else "differs from source")
+    report.append(report_motions)
     report += [f"warning: {k}" for k in warn]
     return len(data), report

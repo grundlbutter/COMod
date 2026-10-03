@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Effects Viewer</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/effects.css">
+<link rel="stylesheet" href="/ui/fxview.css">
+<!-- THE MERGE'S LAYOUT OVERRIDES USED TO BE AN INLINE <style> HERE.
+     They were parked in the page on purpose while `effects.css` and
+     `fxview.css` were both moving under the merge. The merge has settled and
+     they are folded into `effects.css`, which is where the owner's two
+     2026-09-08 layout reports had to be fixed: a page whose geometry is half
+     in a stylesheet and half in the document cannot be reasoned about, and
+     the two bugs were one rule fighting another across that seam. -->
+</head>
+<!-- The EFFECTS VIEWER. One page, and it was two until 2026-09-08.
+
+     WHAT WAS MERGED, AND WHICH HALF SURVIVED
+       `/effects` was the Effect Preview PLAYER -- give it a name, watch it --
+       and `/fxview` was the Effects Viewer LIBRARY: what exists, which file
+       the definition came out of, what each one needs, and what REACHES it.
+       They were one subject seen twice. The owner asked for one page called
+       "Effects Viewer", keeping the PLAYER's screen layout, because it is the
+       toolkit's standard shape: nav left, content middle, options and info
+       right. So this shell is the player's and the library's panels moved
+       into its right column. `/fxview` forwards here.
+
+     TWO SYSTEMS, ONE PAGE, AND THEY ARE NOT THE SAME THING
+       * 2D  ini/effect.ini -> ani/effect.ani -> a list of whole images shown
+             one after another at a declared FrameInterval. Played HERE, on a
+             2D canvas, by effects.js. Nothing in this project had read this
+             table before 2026-09-06.
+       * 3D  ini/3DEffect.ini -> .c3 containers with PHY geometry, MOTI
+             animation, PTCL particles, SHAP ribbons and a CAME camera. Played
+             HERE, on #fx-gl, by the WebGL stage that already exists on the
+             Model Viewer (gl.js `Viewer` + fx.js `EffectInstance`). This page
+             constructs that stage; it does not reimplement one. Until
+             2026-09-07 it constructed nothing at all, and the tab drew an
+             empty checkerboard for every effect ever selected.
+
+       The library half is 3D ONLY -- an effect it can resolve is a row of
+       `3DEffect`, and the 2D flipbook table is a different file with a
+       different grammar. So the subject column says so when the 2D system is
+       selected rather than sitting empty, which would read as "this effect
+       has no connections".
+
+     TWO SCRIPTS, ONE PAGE, AND THE SPLIT IS DELIBERATE
+       `effects.js` owns the LIST, the FILTERS and the STAGE. `fxview.js` owns
+       the PROVENANCE STRIP, the CENSUS and the SUBJECT panels. They are not
+       merged into one file because neither is small and because the seam is a
+       real one: one is a player, one is a resolver's presentation. They talk
+       through two published objects, `window.CoEffects` and `window.CoFxView`,
+       and nothing else -- see the header of either file.
+
+     THE HONESTY RAIL IS PART OF THE TOOL
+       Anywhere this page departs from what the client does, it says so in the
+       panel next to the picture -- not in a doc, not in a tooltip. A preview
+       that silently diverges is worse than none, because someone will tune
+       against it and ship something that looks wrong in game. The library
+       half carries the same rule in a different currency: everything it could
+       not resolve is COUNTED and NAMED rather than dropped for being untidy.
+
+     THE TWIN TRAP IS ON SCREEN, NOT IN A DOC
+       Where a compiled `.dbc` twin exists the client reads the TWIN and the
+       `.ini` beside it is a DECOY -- an id resolving out of `3DEffectobj.dbc`
+       and the same id out of `3DEffectObj.ini` are DIFFERENT ANSWERS on one
+       base. The provenance strip names the file that ACTUALLY answered, per
+       table. It lives under Developer Notes now rather than at the top of the
+       page, which is a change of PLACE and not of status: it is still drawn
+       in full, still names the decoy, and the census still prints its own
+       provenance and the comparison against it. -->
+<body data-co-page="effects">
+
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
+
+<header>
+  <h1>Effects Viewer</h1>
+  <label id="path-label" class="hidden"
+         title="What this page is drawing from — an installed client, a private server's own client, or your COmmunity Library Collection. The parser plugin follows the path, so tables, id conventions and linkages all change with it.">
+    Path
+    <select id="path-select"></select>
+  </label>
+  <div id="statusline" class="mut">starting…</div>
+  <div class="spacer"></div>
+  <!-- DEVELOPER NOTES. The owner's words: "there is some top information that
+       I think needs to be toggled on and off with Developers Notes." That is
+       the whole facts-about-this-base band -- the tables-read strip, the
+       census with its three buckets, the referenced-but-undefined block and
+       the per-link layer table. None of it is deleted; it is measured content
+       and it stays one click away. It is off by default because it was
+       occupying the top of a page whose job is to show you an effect. -->
+  <button id="btn-devnotes" class="ghost" aria-expanded="false"
+          aria-controls="fx-devnotes"
+          title="The measured facts about THIS install: which file answered for each effect table, the whole/partial/broken census, the names a rule points at that nothing defines, and where each layer link breaks.">Developer Notes</button>
+  <button id="btn-share" class="ghost" title="A link that restores this exact effect">Copy link</button>
+</header>
+
+<!-- ------------------------------------------------ DEVELOPER NOTES, hidden.
+     `hidden` on the element itself, not a CSS class: the band must be closed
+     even on a page whose stylesheet did not load, and `[hidden]` is the one
+     mechanism that survives that. `fxview.js` renders into it whether it is
+     open or not -- a panel that only measured when you looked at it would
+     report a different install depending on when you clicked. -->
+<div id="fx-devnotes" hidden>
+<div class="fx-basefacts">
+
+<!-- THE PROVENANCE STRIP. -->
+<section id="provenance" class="fx-prov">
+  <h2>Tables read <span class="mut">— the file that ACTUALLY answered on this
+    base. Where a compiled <code>.dbc</code> twin exists the client reads the
+    twin and the <code>.ini</code> beside it is a decoy.</span></h2>
+  <div id="prov-rows" class="mut">reading…</div>
+</section>
+
+<!-- THE CENSUS. Directly under the strip ON PURPOSE: the census is computed
+     by a SECOND reader over the same root, and where a compiled `.dbc` twin
+     exists the two could in principle answer out of different files. The
+     census prints its OWN provenance and the comparison against the strip
+     above it, so a disagreement is visible at a glance instead of being an
+     assumption buried in a handler.
+
+     WHAT IT REFUSES TO DO
+       Classifying 3,391 effects means resolving 3,391 effects: 10.1 s on
+       5517 and 33.7 s on 6609, MEASURED. So it is a background build, and
+       until it says `ready` this panel renders UNMEASURED -- never zeroes.
+       "0 broken effects" and "I have not looked yet" are the same numbers,
+       and only one of them is a fact about the client.
+
+     THE FOURTH ROW IS A DIFFERENT POPULATION
+       `referenced-but-undefined` is a name a RULE points at that `3DEffect`
+       does not define. It is NOT a broken effect and it is not in the list:
+       a broken effect is bad ART, an undefined reference is a bad RULE, and
+       they are repaired in different files by different people. -->
+<section id="census" class="fx-census">
+  <h2>Census <span class="mut">— how whole every effect on THIS base is,
+    measured, with what it could not classify printed rather than dropped.</span></h2>
+  <div id="census-body" class="fx-bad">UNMEASURED — nothing has been
+    classified yet. This is not a count of zero.</div>
+</section>
+
+</div><!-- /.fx-basefacts -->
+<div id="fx-devnotes-note" class="mut small">These three buckets are the same
+  measurement the <b>state</b> filter on the left uses. Closing this panel
+  does not stop the census: it is built either way, so the filter is ready
+  when it is ready and not when you happen to look.</div>
+</div><!-- /#fx-devnotes -->
+
+<main id="fx-main">
+
+  <!-- ---------------------------------------------------- left: the picker -->
+  <aside id="fx-left">
+    <div class="pane">
+      <div class="fx-kindrow" id="fx-kinds">
+        <button id="fx-kind-2d" class="ghost" aria-pressed="true">2D flipbook</button>
+        <button id="fx-kind-3d" class="ghost" aria-pressed="false">3D scene</button>
+      </div>
+      <div id="fx-kind-note" class="small mut"></div>
+
+      <!-- 3D only: the three animation forms a C3 container can carry.
+           A container can carry MORE THAN ONE, so these are membership
+           toggles and an effect shows under every form it carries -- never
+           one bucket per effect. -->
+      <div id="fx-formrow" hidden>
+        <label style="margin-top:6px">Animation form</label>
+        <div class="fx-kindrow">
+          <button id="fx-form-phy" class="ghost" aria-pressed="false"
+                  title="PHY + MOTI: a node/bone matrix track">mesh</button>
+          <button id="fx-form-shap" class="ghost" aria-pressed="false"
+                  title="SHAP + SMOT: a blade line smeared into a ribbon trail">ribbon</button>
+          <button id="fx-form-ptcl" class="ghost" aria-pressed="false"
+                  title="PTCL / PTC3: a particle system">particles</button>
+        </div>
+        <div id="fx-form-note" class="small mut"></div>
+      </div>
+
+      <label style="margin-top:6px">Effect</label>
+      <input id="fx-search" type="search" placeholder="effect name…" autocomplete="off">
+
+      <!-- BREAKAGE STATE -- the Effects Viewer's census, as a filter on this
+           list. The owner asked for it by name: "add the Effects Viewer's
+           dropdown filter for whole, partially resolved, and broken".
+
+           DISABLED until the census build is ready, and that is the same rule
+           the form buttons above already follow: filtering on a
+           classification that does not exist yet hides effects that are
+           merely UNMEASURED and presents the remainder as an answer. The
+           options are populated from the census response, never written out
+           here, so a fourth state on the server appears here without an edit
+           and cannot be silently dropped. -->
+      <label style="margin-top:6px">State</label>
+      <select id="fx-state" title="filter by breakage state" disabled>
+        <option value="">any state</option>
+      </select>
+
+      <label class="fx-chk small" style="margin-top:6px">
+        <input type="checkbox" id="fx-tagged-only"> tagged only</label>
+
+      <!-- One control that puts every filter back to "everything". Four
+           filters act on this list (search, form, state, tagged-only) and
+           they are in four different places, so a list narrowed by a filter
+           the eye has stopped seeing looks like an install with very few
+           effects. The button reports what it cleared rather than clearing
+           silently -- see `resetFilters` in effects.js. -->
+      <button type="button" id="fx-reset" class="fx-reset" hidden>
+        Reset filters</button>
+
+      <div id="fx-list" class="list" tabindex="0"></div>
+      <div id="fx-count" class="mut small"></div>
+      <!-- Prev/Next for the effect list. Hidden while one page holds
+           everything; see `drawPager` in effects.js. -->
+      <div id="fx-pager" class="fx-pager" hidden></div>
+    </div>
+
+    <div class="pane">
+      <label>This install</label>
+      <div id="fx-census" class="small"></div>
+    </div>
+  </aside>
+
+  <!-- ---------------------------------------------------- centre: playback -->
+  <section id="fx-centre">
+    <div id="fx-stage">
+      <!-- 2D: frames composited here at the effect's own FrameInterval. -->
+      <canvas id="fx-canvas" width="512" height="512"></canvas>
+      <!-- 3D: the Model Viewer's OWN stage (gl.js `Viewer` + fx.js
+           `EffectInstance`), instantiated on this canvas. This is not a second
+           renderer -- it is the same class the Model Viewer constructs, on a
+           different canvas, and since the merge it is the ONLY stage on this
+           page: the library half used to build a second `Viewer` of its own on
+           a second canvas, with its own clock and its own camera code, and
+           that is exactly the duplication this project keeps paying for.
+           Before 2026-09-07 this element did not exist and the "3D scene" tab
+           drew the 2D canvas's checkerboard and nothing else, forever
+           (bugs_open.md #3). -->
+      <canvas id="fx-gl" width="512" height="512" hidden></canvas>
+      <div id="fx-msg">Pick an effect on the left.</div>
+    </div>
+
+    <!-- ONE ROW PER EFFECT WHEN A SUBJECT IS PLAYING (owner, 2026-09-10).
+         Hidden while a single effect is on the stage: a list of one is not a
+         list. Populated by `effects.js::renderStageList` from the viewer's
+         own `fxBuild`, never re-derived from the definitions -- the same rule
+         backlog 24 states one level down, and for the same reason: a count
+         re-derived from what was DECLARED agrees with itself by construction
+         and can never disagree. -->
+    <div id="fx-stagelist" hidden></div>
+
+    <div id="fx-transport">
+      <button id="fx-play" class="ghost" title="Play / pause (space)">▶</button>
+      <button id="fx-rewind" class="ghost" title="Back to the start">⏮</button>
+      <input id="fx-time" type="range" min="0" max="1000" value="0" step="1"
+             title="Scrub. The scale is MILLISECONDS on the effect's own clock.">
+      <span id="fx-clock" class="mono small">—</span>
+      <label class="small" title="Draw a checkerboard behind the frames so a transparent or dark effect is visible. Ours, not the game's.">
+        <input id="fx-checker" type="checkbox" checked> checker
+      </label>
+      <label class="small" title="Composite the frames additively instead of with straight alpha. NEITHER is declared by the table — this switch exists so you can see both.">
+        <input id="fx-additive" type="checkbox"> additive
+      </label>
+    </div>
+
+    <!-- THE RAIL. Everything this preview approximates, printed next to the
+         picture it affects. It is populated by effects.js from the server's
+         own notes, so the page cannot drift from what the reader believes. -->
+    <div id="fx-approx" class="approx">
+      <div class="approx-h">What is approximate here</div>
+      <ul id="fx-approx-list"></ul>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------- right: the facts + library
+       The owner's standard shape is nav left, content middle, options and
+       info right, so everything that DESCRIBES the selected effect lives in
+       this column: first what the player measured about it (declared numbers,
+       frames, and what the stage actually DID with the camera), then what the
+       resolver knows about it (tags, its satellites, what reaches it, how it
+       compares across installs, and what could not be resolved). -->
+  <!-- EVERY PANEL IN THIS COLUMN IS A `.card[data-card]` WITH A `.cardbody`,
+       which is the contract `cards.js` operates and the shape `builder.html`,
+       `models.html`, `mapedit.html` and `index.html` all use. That is the
+       owner's second report: "the right pane doesn't scroll or allow for
+       collapsing panels like every other page." The column scrolls because
+       `effects.css` makes it a scroll container; the panels collapse because
+       they now carry the three things `cards.js` needs -- `data-card`, an
+       `<h2>`, and somewhere to put the body. `cards.js` warns loudly on the
+       console about any card missing the third, so a panel added later
+       without one is not silently dead. -->
+  <aside id="fx-right">
+    <section class="card" data-card="fx-declared">
+      <h2>Declared</h2>
+      <div class="cardbody"><div id="fx-declared" class="small"></div></div>
+    </section>
+    <section class="card" data-card="fx-frames">
+      <h2>Frames</h2>
+      <div class="cardbody"><div id="fx-frames" class="small"></div></div>
+    </section>
+    <!-- `effects.js` hides this whole panel on the 2D path, where there is no
+         camera to report, by writing `style.display` on this element. -->
+    <section class="card" id="fx-camera-pane" data-card="fx-camera">
+      <h2>Camera</h2>
+      <div class="cardbody"><div id="fx-camera" class="small"></div></div>
+    </section>
+
+    <!-- ------------------------------------------------- the library half -->
+    <section class="fx-subject" aria-label="Selected effect">
+      <div id="fx-empty" class="fx-empty mut">
+        Pick an effect from the list.
+      </div>
+
+      <div id="fx-detail" hidden>
+        <div class="fx-head">
+          <h2 id="fx-name">—</h2>
+          <div id="fx-status" class="mut"></div>
+          <div id="fx-timing" class="mut"></div>
+        </div>
+
+        <!-- TAG AND NAME: core/tags.py, dual-keyed. A rename is an OVERLAY and
+             never a write to the install. -->
+        <section class="card fx-card" data-card="fx-tag">
+          <h2>Tag &amp; name</h2>
+          <div class="cardbody">
+          <div class="fx-tagrow">
+            <input id="fx-tag-input" type="text" placeholder="add a tag…">
+            <button id="fx-tag-add" type="button">Add</button>
+          </div>
+          <div id="fx-tags" class="fx-tags"></div>
+          <div class="fx-tagrow">
+            <input id="fx-rename" type="text" placeholder="your name for this effect…">
+            <button id="fx-rename-save" type="button">Save name</button>
+          </div>
+          <div class="mut fx-note">A name you give an effect is an OVERLAY held
+            beside the install. It is never written into the client's tables, so
+            the effect keeps the name the client knows it by.</div>
+          </div>
+        </section>
+
+        <!-- WHAT IT NEEDS: the forward closure. -->
+        <section class="card fx-card" data-card="fx-needs">
+          <h2>What it needs <span class="mut" id="fx-layers-sub"></span></h2>
+          <div class="cardbody"><div id="fx-layers"></div></div>
+        </section>
+
+        <!-- WHAT IT IS CONNECTED TO: the REVERSE walk. -->
+        <section class="card fx-card" data-card="fx-conn">
+          <h2>What it is connected to</h2>
+          <div class="cardbody"><div id="fx-conn"></div></div>
+        </section>
+
+        <!-- COMPARE ACROSS INSTALLS.
+             The twin trap is a PER-BASE fact, so this is the one screen where
+             "this base answered out of a .dbc and that one out of the .ini"
+             is visible -- and the one screen where getting the provenance
+             wrong silently produces a FAKE divergence, or erases a real one.
+             MEASURED: reading the decoy 3DEffect.ini instead of the live
+             3DEffect.dbc changes the answer for 18 names on 6090 and 19 on
+             6609/7205. So every column names its own file, always. -->
+        <section class="card fx-card fx-cmp-card" data-card="fx-cmp">
+          <h2>Compare across installs
+            <span class="mut">— the same effect, side by side. Every column
+              names the file that answered ON THAT BASE.</span></h2>
+          <div class="cardbody">
+          <div class="fx-cmp-bar">
+            <button id="fx-cmp-pick" type="button">Choose installs…</button>
+            <button id="fx-cmp-run" type="button">Compare</button>
+            <span id="fx-cmp-chosen" class="mut"></span>
+          </div>
+          <div id="fx-cmp-picker" class="fx-cmp-picker" hidden></div>
+          <div id="fx-cmp-out" class="fx-cmp-out">
+            <div class="mut">Not run. A dependency graph per install is a
+              7&ndash;34&nbsp;s cold walk in the worst case, so nothing is
+              opened until you ask for it.</div>
+          </div>
+          </div>
+        </section>
+
+        <!-- COLLECT + EXPORT/IMPORT, both existing subsystems. -->
+        <section class="card fx-card" data-card="fx-collect">
+          <h2>Collect &amp; export</h2>
+          <div class="cardbody"><div id="fx-collect"></div></div>
+        </section>
+
+        <!-- THE HONESTY RAIL. Always rendered, never conditional on being
+             non-empty: "nothing recorded" is itself a statement. -->
+        <section class="card fx-card fx-limits" data-card="fx-limits">
+          <h2>What this page could NOT resolve</h2>
+          <div class="cardbody"><div id="fx-limits"></div></div>
+        </section>
+      </div>
+    </section>
+  </aside>
+
+</main>
+
+<div id="toast" class="hidden"></div>
+
+<!-- Mod staging is on EVERY page and this one carries no drawer of its own:
+     nav.js injects the standard drawer where a page has none, and wires it
+     through the same `swap.js` the other pages use. `csrf.js` is what makes
+     the install POSTs out of that drawer acceptable to the server. Dropping
+     either leaves a "Mod staging" button in the bar that does nothing --
+     which `tools/test_nav_tabs.py` catches, and did. -->
+<script src="/ui/csrf.js"></script>
+<script src="/ui/swap.js"></script>
+<!-- THE ONE RENDERER. `gl.js` draws and `fx.js` times, exactly as on the
+     Model Viewer; effects.js constructs a `Viewer` on `#fx-gl` rather than
+     standing up a stage of its own. -->
+<script src="/ui/gl.js"></script>
+<script src="/ui/fx.js"></script>
+<!-- The collapsible right-hand panels, the same file `builder.html`,
+     `models.html`, `mapedit.html` and `index.html` load. `effects.js` calls
+     `CardPanels.init` from `boot()`, so this must come first. -->
+<script src="/ui/cards.js"></script>
+<script src="/ui/effects.js"></script>
+<!-- The Import/Export tools pop-out, wired into the Collect & export card
+     rather than into the header. Its header button opens on `window.B` --
+     the Builder's loadout -- and this page has no `B`: its subject is an
+     EFFECT, which is not a file and is in no loadout. So the auto-mount is
+     turned OFF here and `fxview.js` opens the panel itself, on the selected
+     effect. A header button that could only ever say "nothing is on the
+     stage" would read as "export is unavailable here".
+
+     WHERE THE FLAG IS SET, AND WHY IT IS NOT AN INLINE <script> HERE --
+     bugs_open.md #6, MEASURED AGAIN ON THIS PAGE 2026-09-08. The server
+     sends `script-src 'self'` with no `'unsafe-inline'`, so the inline
+     `<script>window.CO_PORTAGE_AUTOMOUNT = false;</script>` that used to sit
+     on this line never ran. Confirmed live before the fix, in headless
+     Chrome on this exact page: `'CO_PORTAGE_AUTOMOUNT' in window` was FALSE
+     and `#pp-open` was mounted in the header anyway -- the flag written to
+     prevent a control that can only report absence WAS a control that could
+     only report absence. `window.CO_PORTAGE_AUTOMOUNT = false` is now the
+     first statement of `effects.js`, which is an external file the CSP
+     allows and which loads above this line.
+
+     ORDER: the flag must be set BEFORE portagepanel.js, because `mount()`
+     runs from that file's own load; and portagepanel.js must load before
+     fxview.js, which calls `CoPortagePanel.open`. The runtime half is gated
+     by `tests/test_effect_preview.py::ThePopOutOptOutSurvivesTheCSP` --
+     which is the half a source gate is structurally unable to make, and the
+     reason bug 6 stood open with two passing guards.
+
+     ONE STALE GATE, NAMED HERE BECAUSE IT IS GREEN AND MEANS NOTHING.
+     `tests/test_portage_effect.py::test_the_page_turns_the_header_automount_
+     OFF_before_loading_the_popout` locates the flag by searching this file
+     for the string `CO_PORTAGE_AUTOMOUNT` and asserting it appears before
+     `/ui/portagepanel.js`. The only occurrence left in this file is THIS
+     COMMENT, so the case now passes by matching prose. It should be
+     re-pointed at the `<script src="/ui/effects.js">` line above, which is
+     where the assignment actually is and which carries the same ordering
+     claim. That file was outside the held set of the seat that made this
+     change; the note is here rather than only in a handover because a
+     correction nobody can grep for is one that does not exist. -->
+<script src="/ui/portagepanel.js"></script>
+<!-- fxview.js LAST: it publishes `window.CoFxView`, which effects.js consults
+     at select time rather than at load time, and it consults
+     `window.CoEffects` the same way. Neither reaches into the other during
+     its own load, so this order is for the pop-out above, not for them. -->
+<script src="/ui/fxview.js"></script>
+<!-- The active-path control, the same file index.html, builder.html,
+     models.html and mapedit.html load. This page has no `api()` of its
+     own; basepicker falls back to plain fetch, and its `#toast` is the
+     div above. -->
+<script src="/ui/basepicker.js"></script>
+</body>
+</html>

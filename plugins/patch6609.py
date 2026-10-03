@@ -107,8 +107,24 @@ SPECS_6609 = tuple(
     s for s in SPECS_6090
     if s.filename not in ("Monster.dat", "MagicType.dat")
 ) + (
+    # `levexp.dat` is NOT re-declared here. It comes through
+    # `SPECS_6090` unchanged, and that is a measurement rather than a
+    # convenience: this build's copy is byte-identical to 6090's
+    # (sha256 df41c576, 4,030 B, 203 rows of five numeric fields), so
+    # 6090's refusal is true of these bytes word for word. Declaring a
+    # second copy made the subject appear twice and `test_censused`
+    # refused it.
     TableSpec("monster", "monster.dat", KIND_SECTIONS, "tq-stream"),
-    TableSpec("magic", "magictype.dat", KIND_AT_ROWS, "tq-stream"),
+    # **The NAME is column 3, MEASURED, and the plugin-wide `ITEM_COLUMNS`
+    # puts it on column 1.** Column 1 is a numeric group id, so `browse magic`
+    # listed a column of numbers where the skill names are -- the same defect
+    # `MEASURED_SECTION_LABELS` exists to prevent, one grammar over. Column 3
+    # is the ONLY column of the 48-53 that is non-numeric on every row
+    # (`Thunder`, `Fire`, `Tornado`), which is what makes this a measurement
+    # rather than a preference. The 5165 file has one fewer leading id and
+    # puts the same field at column 2; see `patch5165`.
+    TableSpec("magic", "magictype.dat", KIND_AT_ROWS, "tq-stream",
+              columns={"id": 0, "name": 3}),
     TableSpec("item:refine", "item_refine_attr.dat", KIND_AT_ROWS,
               "tq-stream"),
     TableSpec("item:refine:cost", "item_refine_cost.dat", KIND_AT_ROWS,
@@ -134,10 +150,39 @@ def _version(root: Path) -> str:
 
 
 class Patch6609(Patch6090):
+    #: PER-TABLE encoding, MEASURED 2026-09-19 by a strict decode of the
+    #: whole file. Declared in full here (a dict does not merge with 6090's):
+    #:   OperateActivity.ini       44,869 B, 9,808 high, 2 x 0x85; strict GBK
+    #:                             OK, strict UTF-8 fails at byte 18 -> gbk
+    #:   TexasChatGUI.ini           2,733 B, 744 high, 17 x 0x85; strict UTF-8
+    #:                             OK, strict GBK fails at byte 2 -> utf-8
+    #:   TexasChatGUI800X600.ini    2,788 B, same shape -> utf-8
+    TABLE_ENCODING = {"operateactivity.ini": "gbk",
+                      "texaschatgui.ini": "utf-8",
+                      "texaschatgui800x600.ini": "utf-8"}
+
     name = "patch6609"
     label = "Official patch client 6609"
     origin = "official"
     aliases = ("6609",)
+
+    #: **Re-measured on 6609's own `ini/`, not inherited.** The four tables
+    #: 6090 declares are here too and the columns hold; `GoldenLeagueShop.ini`
+    #: is not shipped by this build, so it is absent rather than carried over
+    #: from the superclass.
+    #:
+    #:   region.ini         258 rows, 14 fields; column 6 non-numeric on
+    #:                      258/258, 78 distinct; column 1 numeric on all 258.
+    #:   EventTypeName.ini  24 rows; column 2 non-numeric on 24/24; column 0
+    #:                      is one distinct value, column 1 is 24.
+    #:   VipTrans.ini       31 rows; column 2 non-numeric on 31/31.
+    #:   restrain.ini       5 rows; column 2 non-numeric on 5/5.
+    ROW_COLUMNS = {
+        "region": {"id": 0, "name": 6},
+        "eventtypename": {"id": 1, "name": 2},
+        "viptrans": {"id": 0, "name": 2},
+        "restrain": {"id": 0, "name": 2},
+    }
 
     def table_specs(self, root):
         # Curated specs plus every `.ini` the grammar census

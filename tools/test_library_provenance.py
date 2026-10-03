@@ -69,11 +69,23 @@ SHARED = ["v_armet", "v_l_weapon", "v_r_weapon", "v_misc", "v_mount",
           "v_l_shield", "v_r_shield"]
 
 
+#: Roots built by `_root`, which returns its directory into the call under
+#: test. Module level, so there is no `self.addCleanup` to reach for.
+_TMP: list = []
+
+
+def tearDownModule():
+    for d in _TMP:
+        shutil.rmtree(d, ignore_errors=True)
+    _TMP.clear()
+
+
 def _root(names, ini_extra: str = "") -> Path:
     """A directory that `attach.dumy_names` and `coroot.base_fingerprint` can
     both read.  `ini_extra` perturbs the fingerprint without changing `[Dumy]`,
     which is how two roots get different `base_id`s here."""
     d = Path(tempfile.mkdtemp(prefix="libprov-"))
+    _TMP.append(d)
     (d / "ini").mkdir(parents=True)
     body = ["[Dumy]", "Count=%d" % len(names)]
     body += ["Dumy%d=%s" % (i, n) for i, n in enumerate(names)]

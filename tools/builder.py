@@ -77,8 +77,10 @@ series 119 median **+4.0** units (hair lies on the scalp) against 111's +18.1,
 113's +9.4 and 114's +11.0 (helmets sit proud).  Series 111 also carries
 `requiredProfession 21` -- Warrior -- which hair could not.
 
-So **hair is series 119**; 111-116 are helmets and hats.  `HAIR_SERIES` here is
-the authority the builder uses, and `parts.HAIR_SERIES` was corrected to match.
+So **hair is series 119**; 111-116 are helmets and hats.  `parts.HAIR_SERIES`
+is the authority; this module re-exports it and `head_kind` IS `parts.head_kind`
+(it used to carry a byte-identical copy, and both read the id raw -- see
+`attach.pad9` for what that cost on the seven-wide clients).
 Nothing is hidden either way: the head picker has a hair/headgear chip and both
 are always selectable.
 
@@ -105,6 +107,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import bodyfacets                                         # noqa: E402
 import parts as partsmod                                  # noqa: E402
+from attach import pad9                                   # noqa: E402
 from coassets import DEFAULT_ROOT, load_items             # noqa: E402
 
 try:                                                      # task #13, imported
@@ -122,24 +125,32 @@ except Exception:                                         # pragma: no cover
 #: of the 707 armet meshes, it resolves into `c3/hair/`, and it is the only one
 #: that sits flat on the skull.  VERIFIED against itemtype.json and against
 #: docs/attachment.md §8.3's measurements.
-HAIR_SERIES = {"119"}
+#: Re-exported from `parts`, which is the one authority (`coviewer` reads it
+#: from here as `builder_mod.HAIR_SERIES`).
+HAIR_SERIES = partsmod.HAIR_SERIES
 
 #: The seven hair colour digits, `Hairstyle Code = (Hair Colour x 100) + Style`.
 HAIR_COLOURS = dict(partsmod.HAIR_COLOURS)
 
-
-def head_kind(ident: str) -> str:
-    """"hair" or "headgear" for one `armet.ini` appearance id."""
-    if ident.isdigit() and len(ident) == 9 and ident[3:6] in HAIR_SERIES:
-        return "hair"
-    return "headgear"
+#: `parts.head_kind` itself, not a copy.  The two bodies were byte-identical
+#: and both read the id raw, so on every client but CCO (`armet.ini` seven
+#: wide) both said "headgear" for every hairstyle and `default_loadout`
+#: dressed the figure in no hair.  One body, padded once (`attach.pad9`),
+#: cannot drift from the other.
+head_kind = partsmod.head_kind
 
 
 def hair_style(ident: str) -> str:
-    """The style number inside a hair series ("01".."68"), best effort."""
-    if not (ident.isdigit() and len(ident) == 9):
+    """The style number inside a hair series ("01".."68"), best effort.
+
+    Read nine wide first (`attach.pad9`): raw, `hair_style('2119310')` was ""
+    -- unreachable through the picker only because `head_kind` had already
+    mis-filed every seven-wide row as headgear, and a public function still.
+    """
+    wide = pad9(ident)
+    if not (wide.isdigit() and len(wide) == 9):
         return ""
-    return ident[7:9]
+    return wide[7:9]
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +325,23 @@ class BuilderIndex:
     """
 
     def __init__(self, tables: dict, resolve: Callable[[str, str], Optional[str]],
-                 root: Path = DEFAULT_ROOT, facets=None, exists=None):
-        self.root = Path(root)
+                 root: Path = DEFAULT_ROOT, facets=None, exists=None, assets=None):
+        # `root` may be an `AssetRoot`. `Catalog` passes its own so this index
+        # does not build a SECOND one over the same install: constructing an
+        # AssetRoot opens every archive, and on 7878 that is four DatPkg pairs.
+        # MEASURED on a re-open of 7878: 2 AssetRoot constructions and 8 archive
+        # readers, 1.87s, for one install. `self.root` stays a plain Path either
+        # way because callers read it as one.
+        self._assets = assets if assets is not None else (
+            root if hasattr(root, "locate") else None)
+        # `pathlib.Path` HAS a `.root` -- the bare separator `'\'` -- so the
+        # obvious `getattr(root, "root", root)` silently collapses an install
+        # path to the filesystem root. Duck-type on `locate` instead, which is
+        # the discriminator `coroot.locate_table` uses and which `Path` does
+        # not answer to. `core/coassets.py:_load_items_block96` carries the
+        # same warning: it measured 0 rows on 6907 with the reader working
+        # perfectly one call below.
+        self.root = Path(root.root if hasattr(root, "locate") else root)
         self.tables = tables
         self._resolve = resolve
         self._exists = exists or (lambda p: True)
@@ -323,7 +349,7 @@ class BuilderIndex:
 
         self.items6: dict[str, dict] = {}
         self.items5: dict[str, dict] = {}
-        for it in load_items(self.root):
+        for it in load_items(self._assets if self._assets is not None else self.root):
             sid = str(it.get("id", ""))
             if len(sid) != 6:
                 continue
@@ -333,8 +359,14 @@ class BuilderIndex:
         self.weapon_type_names: dict[str, str] = {}
         if effectsmod is not None:
             try:
-                self.weapon_type_names = dict(
-                    effectsmod.EffectDB(self.root).weapon_type_names)
+                # `with`, because `self._assets` IS OFTEN None here -- and
+                # then this opens a whole install for one table and drops the
+                # only reference that could close it.  When it is NOT None the
+                # root is borrowed and `close()` leaves it alone, so the same
+                # spelling is right either way.
+                with effectsmod.EffectDB(self.root,
+                                         assets=self._assets) as _fxdb:
+                    self.weapon_type_names = dict(_fxdb.weapon_type_names)
             except Exception:                             # pragma: no cover
                 self.weapon_type_names = {}
 
@@ -412,14 +444,49 @@ class BuilderIndex:
                    mesh_id=pr.mesh, texture_id=pr.texture)
         raw_name = self.item_name(ident)
         nice = self._spaced(raw_name)
+        # ZERO-PAD BEFORE SLICING. An id is nine digits conceptually, but older
+        # clients write it unpadded: 5065's `armor.ini` ships `1000000` where
+        # 5517 ships `001000000` -- the same id, 7 characters instead of 9.
+        # Requiring len == 9 therefore dropped the body prefix on 640 of 838
+        # body rows and ALL 844 armet rows on that install, so `_body_specific`
+        # measured 0% everywhere and the pickers stopped filtering by body.
+        #
+        # `Catalog.resolve_id` has always probed `asset_id`, `asset_id.zfill(9)`
+        # and `asset_id.lstrip("0")` for exactly this reason; this is that same
+        # convention, applied where the id is READ rather than where it is
+        # resolved. Measured on 5065: body 0.00% -> 76.37%, armet 0.00% ->
+        # 100.00%, r_weapon 0.00% -> 0.00% (weapons carry no body prefix, so
+        # padding correctly changes nothing there).
+        # SCOPED TO `body_type` DELIBERATELY. Padding also changes what
+        # `series` slices out -- `1130000` gives series `113` unpadded and
+        # `130` padded -- and the first draft of this change took the padded
+        # slice for both. That looked more consistent and it broke
+        # `test_appearances_that_look_identical_are_shown_once` on 5065:
+        # `series` feeds the dedup, so re-slicing it silently regrouped the
+        # options. 8 failures became 9. Whether `series` should also be read
+        # from the padded id is a real question and it is NOT this fix.
+        padded = pad9(ident)
         if ident.isdigit() and len(ident) == 9:
             o.series = ident[3:6]
-            if ident[:3] in bodyfacets.BODY_TYPES:
-                o.body_type = ident[:3]
         elif len(ident) >= 3:
             o.series = ident[:3]
+        # NEVER FOR A WEAPON TABLE. The "0.00% -> 0.00%" above held only while
+        # no 7-digit weapon row was offered. CCO's `weapon.ini` has exactly 20
+        # (the arrows, `1050000`..`1051000`); their Texture0 ids resolve only
+        # through `ini/3dtexture.ini`, and once `texture_db` reached them the
+        # padding read `1050000` as `001050000` -- body type 001 -- and the
+        # picker would have hidden arrows from three of the four bodies.
+        if padded.isdigit() and len(padded) == 9 \
+                and slot not in ("l_weapon", "r_weapon"):
+            if padded[:3] in bodyfacets.BODY_TYPES:
+                o.body_type = padded[:3]
 
         if slot in ("body", "mix_body"):
+            # `records` is keyed by the spelling `armor.ini` uses, so a
+            # seven-wide client HITS it (5017: 2,368 hits, 0 misses) -- and
+            # `BodyFacets.build` filled it through the same `classify`, so
+            # the records were "other" on every axis until `classify` read
+            # nine wide itself (its docstring has the 5017 numbers).
             rec = self.facets.records.get(ident) or self.facets.classify(ident)
             o.axes = {"class": rec.klass, "gender": rec.gender, "size": rec.size,
                       "kind": rec.kind}
@@ -431,11 +498,16 @@ class BuilderIndex:
         elif slot.endswith("armet") or slot in ("armet", "armet_dx8",
                                                 "mix_armet", "mix_armet_dx8"):
             kind = head_kind(ident)
+            # `classify` reads nine wide itself (`attach.pad9`); fed the raw
+            # id it returned class unknown / gender other / size n/a for all
+            # 1,708 of 5017's armet rows.
             rec = self.facets.classify(ident)
             o.axes = {"class": rec.klass, "gender": rec.gender, "size": rec.size,
                       "kind": kind}
             if kind == "hair":
-                colour = HAIR_COLOURS.get(int(ident[6])) if len(ident) == 9 else None
+                # Read nine wide, like `head_kind` above; `ident` itself is
+                # left as the table spells it (see the `series` note).
+                colour = partsmod.hair_colour(ident)
                 o.name = f"Hairstyle {hair_style(ident)}"
                 o.detail = colour or "hair"
                 o.axes["quality"] = colour or ""
@@ -537,7 +609,25 @@ class BuilderIndex:
         if not opts:
             return False
         n = sum(1 for o in opts if o.body_type)
-        return n / len(opts) > 0.9
+        # MAJORITY, not 0.9 and not "any". The 94.6% in the docstring is
+        # `armor.ini` on ONE install; it was true there and it does not travel.
+        # Measured across four:
+        #
+        #     slot      5517     5065*    7878     > 0.9    any    > 0.5
+        #     body     89.08%   76.37%   1.85%     F F F    T T T   T T F
+        #     armet    99.64%  100.00%      --     T T      T T     T T
+        #     weapon    0.00%    0.00%   0.00%     F F F    F F F   F F F
+        #                                            (* once ids are padded)
+        #
+        # `> 0.9` reads `body` as NOT body-specific on 5517 AND 5065, which
+        # switches the filter off and offers another body's art. Plain "any"
+        # was my first replacement and it is wrong the other way: 7878's body
+        # slot is 1.85% prefixed -- 4 rows of 216 -- and "any" would filter
+        # 216 options down to those 4. A majority answers all four installs,
+        # and it is not a nudge: the measured values fall in two clusters with
+        # a 74-point gap between 1.85% and 76.37%, so 0.5 sits in a real
+        # valley rather than next to the data.
+        return n / len(opts) > 0.5
 
     # -- querying ----------------------------------------------------------
     def compatible(self, slot: str, body_type: str = "") -> list[Option]:
@@ -990,10 +1080,41 @@ def actions_for(db, body: str, weapon: str = "", off_hand: str = "") -> list[dic
     """
     if animmod is None or db is None:
         return []
+    shape = db.shape_of(body)
+    ws = db.weaponset(weapon, off_hand)
+
+    # THE CURATED TABLE IS NOT THE POPULATION. `anim.ACTIONS` names 75 codes;
+    # `ini/3dmotion.ini` DECLARES 198 for this loadout, so iterating ACTIONS
+    # alone left 131 actions with no row in the menu. MEASURED 2026-09-22 on
+    # body 003188490 + bow 500219 against source 7275: 82 of those 131 were
+    # precisely the motions the other client supplies, so the "+82" beside
+    # the source menu and the single `+` in the list were counting different
+    # things and the owner could not reach the additions at all.
+    #
+    # The union is taken in this order so a curated code keeps its metadata
+    # and its place, and anything the table declares beyond it is listed
+    # rather than silently dropped.
+    codes: list = list(animmod.ACTIONS)
+    try:
+        for c in db.index.declared_actions(shape, ws):
+            if c not in animmod.ACTIONS:
+                codes.append(c)
+    except Exception:                                     # pragma: no cover
+        pass                       # a table this cannot scan still lists ACTIONS
+
     out = []
-    for code, meta in animmod.ACTIONS.items():
-        path, how = db.resolve(db.shape_of(body),
-                               db.weaponset(weapon, off_hand), code)
+    for code in codes:
+        meta = animmod.ACTIONS.get(code)
+        if meta is None:
+            # Declared by the table, unknown to the curated list. Named as
+            # unidentified rather than given an invented label -- the code IS
+            # what is known about it, and the UI already renders that as
+            # "Action (315, unidentified)".
+            meta = animmod.Action(code, "action", "other", "unknown",
+                                  "declared by ini/3dmotion.ini for this "
+                                  "shape and weapon set; not in the curated "
+                                  "action table")
+        path, how = db.resolve(shape, ws, code)
         if not path:
             continue
         chain = meta.chain
@@ -1011,10 +1132,56 @@ def actions_for(db, body: str, weapon: str = "", off_hand: str = "") -> list[dic
             "chain": chain,
             "motion": path,
             "how": how,
+            # THE ROUTE'S VERDICT, beside its wording. `how` is prose, and an
+            # aliased hit reads `exact (weapon set 580 animates from set
+            # 560)`; the page compared that string to 'exact' and marked 40
+            # of 157 rows "no own motion" on a 580 loadout (5517, 2026-09-25).
+            # `anim.route_is_own` is the one predicate; nothing parses `how`.
+            "own": animmod.route_is_own(how),
             "named": named,
         })
     order = {g: i for i, g in enumerate(ACTION_GROUP_ORDER)}
     out.sort(key=lambda a: (not a["named"], order.get(a["group"], 99), a["code"]))
+    return out
+
+
+def weapon_type_summary(db, weapon: str = "", off_hand: str = "") -> dict:
+    """Which motion set a loadout keys, and how its type was reached.
+
+    Every field is empty only when there is no resolver; with nothing
+    equipped `weaponset` is `000` and `weaponTypeVia` is `id`, and only
+    `weaponType` and `weaponTypeNote` are empty.
+
+    The header beside the action menu. `actions_for` lists the actions; this
+    says which SET they came out of, because for a soul the two disagree
+    with the id on the slot: `804240` BowSoulLv130 keys set `500`, the type
+    of the bow mesh it puts in the hand (`anim.SOUL_TYPE_MIN` has the census
+    and the `3dmotion.ini` row). `weaponTypeVia` is `id` for every ordinary
+    weapon and `mesh` for a soul resolved that way; `weaponTypeNote` is the
+    sentence the page shows, composed here so the browser never derives it.
+
+    Empty strings when there is no resolver or nothing is equipped -- a
+    field a caller only sees when set cannot be told from one not sent.
+    """
+    out = {"weaponset": "", "weaponType": "", "weaponTypeVia": "",
+           "weaponTypeNote": ""}
+    if animmod is None or db is None:
+        return out
+    try:
+        ws = db.weaponset(weapon, off_hand)
+        wt, via = db.weapon_type_via(weapon)
+        deciding = weapon
+        if not wt:
+            wt, via = db.weapon_type_via(off_hand)
+            deciding = off_hand
+    except Exception:                                     # pragma: no cover
+        return out
+    out.update({"weaponset": ws, "weaponType": wt, "weaponTypeVia": via})
+    if via == animmod.WEAPON_TYPE_VIA_MESH:
+        out["weaponTypeNote"] = (
+            "soul %s animates as set %s, the weapon mesh it puts in your "
+            "hand (weapon.ini Mesh0), not as its own type %s"
+            % (deciding, wt, animmod.weapon_type_of_id(deciding)))
     return out
 
 

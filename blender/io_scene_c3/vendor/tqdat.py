@@ -19,6 +19,21 @@ four .dat files below, and every decryption yields the expected text).  A
 then per byte i:  decrypt = rotate-right(c ^ key[i % 128], i % 8)
                   encrypt = rotate-left(p, i % 8) ^ key[i % 128]
 
+THE SEED SPACE IS 2**24, NOT 2**32 (measured 2026-08-28,
+``docs/dat_residue_was_the_caller_2026-08-28.md``, gated by
+``tests/test_patch7878_residue_routes.py::TQSeedSpace``).  ``key[i]`` reads
+state bits 16..23; a seed difference of ``k * 2**24`` enters the state with its
+low 24 bits zero and the recurrence keeps them zero, so those bits never move::
+
+    key(s) == key(s + k*2**24)   for every s and every k     500/500 seeds
+    key(s) != key(s + 2**23)     -- the negative control        0/500
+
+**So a "full 2**32 TQ seed sweep" is the same sweep run 256 times, not a
+256x more thorough one.**  An exhaustive search costs 2**24 and about twenty
+seconds; cost it that way.  (Two other ways such a sweep silently refutes the
+right seed: demanding printable ASCII against binary or GBK plaintext, and
+running the keystream past 128 bytes instead of WRAPPING it.)
+
 Every TQ-cipher table in the wiki's 5517 manifest uses seed 9527 (0x2537)
 except levexp.dat (1234), and 9527 opens all four files verified here:
 
@@ -35,6 +50,11 @@ told apart by their separator:
 * ``@@``-separated with a trailing ``@@`` (5517+; the 6090 file): 66 fields
   on 24,269 of 24,270 rows.  The first 59 are the wiki's 5517 field list;
   the last 7 are a 6090 addition, meaning unestablished, preserved unnamed.
+  This layout ships in THREE widths across the installs here -- 59 (5517),
+  66 (5517's list plus 7) and **65** (6680, 6707, 6772, 6805, 6868), which
+  is 66 with index 11 dropped.  Width is measured per file and picks the
+  names (``FIELDS_AT`` / ``FIELDS_AT_NO_WEIGHT``); it does NOT track patch
+  level, since 6716 ships 66 after 6680 shipped 65.
 * space-separated under an ``Amount=N`` header line (classic; the 5065
   file): 39 fields on 6,864 of 6,865 rows, and N matches the row count
   exactly.  This layout has NO ``data`` column -- the magic block is one
@@ -203,6 +223,76 @@ FIELDS_AT = _FIELDS_COMMON + (
     "dragonsoulPhase", "dragonsoulReq", "cropQuality",
 )
 
+#: The @@ layout **one column narrower**, which is what the 6680..6868 clients
+#: ship: 65 fields against 6090's 66.  Selected by MEASURED WIDTH, exactly as
+#: ``FIELDS_SPACE_QC`` is -- not by patch level, because width does not track
+#: patch level here.  6652 ships 66 and 6680 ships 65, but **6716 ships 66
+#: again**, so any rule of the form "65 from 6680 onward" is already wrong on
+#: the installs in hand.  That is not a mislabelled directory: 6716's
+#: itemtype.dat is md5-IDENTICAL to 6609's (3d82c568..., 24,270 rows,
+#: malformed row and all), so 6716 simply shipped without the new table --
+#: just as 6772's is md5-identical to 6680's (b64c7201...).  The file's own
+#: width is the only thing that tracks the file's own layout.
+#:
+#: THE DROPPED COLUMN IS INDEX 11, the one ``FIELDS_AT`` names ``weight``.
+#: Measured 2026-08-30 by joining 6090 to 6868 on item id -- 24,269 ids shared
+#: at full width -- and scoring each index both ways over the rows where either
+#: side is non-zero (the same non-zero restriction ``FIELDS_SPACE``'s note
+#: explains: on the full set every near-constant-zero column agrees with every
+#: other at ~97% and the comparison says nothing)::
+#:
+#:     index    6868[i] == 6090[i]      6868[i] == 6090[i+1]
+#:      10          99.8% of 6,489            0.0% of 6,634
+#:      11           0.1% of 15,623         100.0% of 15,317
+#:      12           0.0% of 21,818          95.7% of 6,663
+#:      13           0.0% of 15,951         100.0% of 9,302
+#:
+#: The transition is at 11 and it is two-sided: the same-position hypothesis
+#: dies exactly where the shifted one starts.  Indices 6 and 7 score badly
+#: (4.6%, 79.3%) on the same-position reading and are NOT the drop -- their
+#: shifted reading scores 0.0%, and the rows show a patch-era rebalance at a
+#: fixed position (410043 Falchion requiredStrength 41 -> 36, 500023
+#: MulberryBow requiredAgility 46 -> 36), not a slide.
+#:
+#: CONFIRMED INDEPENDENTLY against CCO's ``ini/itemtype.json``, the witness the
+#: 66-column layout was verified with, over the ~5,7xx ids each build shares
+#: with it.  6090-under-``FIELDS_AT`` is the control; the point is that this
+#: tuple REPRODUCES that control column for column, while ``FIELDS_AT`` on a
+#: 65-column file scores zero on all of it::
+#:
+#:                    6090 FIELDS_AT   6868 FIELDS_AT   6868 this tuple
+#:     price               91.7%            0.0%             91.6%
+#:     attackMax           65.7%            0.4%             65.6%
+#:     attackSpeed         95.7%            0.0%             96.0%
+#:     dexterity           99.9%            0.0%             99.9%
+#:     magicAttack         78.9%            0.0%             78.9%
+#:     mana               100.0%            0.0%            100.0%
+#:
+#: (``magicDefense`` scores ~0.5% in the 6090 control too and is unchanged
+#: here; that is a pre-existing weakness of the 66-column naming, not something
+#: this tuple introduces.  Reproducing the control means reproducing its bad
+#: columns as well as its good ones.)
+#:
+#: **The name of the dropped position is the weakest part of this and is not
+#: load-bearing.**  ``weight`` at index 11 comes from the wiki's positional
+#: order, and the CCO join cannot confirm it: the column is ``0`` on 23,916 of
+#: 24,270 6090 rows, ``100`` on 344 and ``1`` on 9, and CCO's ``weight`` is 0
+#: for every one of those -- 0 of 9 informative rows agree.  It is absent from
+#: the module docstring's list of verified columns for that reason.  What is
+#: proven here is the POSITION the narrow layout drops; what that position
+#: MEANS is exactly as open as it was before.
+#:
+#: 58 names over 65 columns leaves 58..64 unnamed -- the SAME seven trailing
+#: columns ``FIELDS_AT`` leaves unnamed at 59..65, which is a consistency check
+#: the shift passes: 6868[58] == 6090[59] == 1220 on the row both share at id
+#: 50000.
+FIELDS_AT_NO_WEIGHT = FIELDS_AT[:11] + FIELDS_AT[12:]
+
+#: The width that selects ``FIELDS_AT_NO_WEIGHT``.  Named rather than inlined
+#: because it is a MEASUREMENT (of 6680, 6707, 6772, 6805, 6868), not the
+#: length of any tuple here -- 58 names cover 65 columns.
+AT_WIDTH_NO_WEIGHT = 65
+
 #: The classic space layout (5065): no ``data`` column.  The four columns after
 #: attackSpeed were long unestablished; they are now NAMED, by joining the 5065
 #: table to the 5517 one on item id (6,748 shared ids) and correlating each
@@ -335,6 +425,14 @@ def parse_itemtype(text: str) -> list[dict]:
     # exactly as before instead of mislabelling.
     if names is FIELDS_SPACE and mode == len(FIELDS_SPACE_QC):
         names = FIELDS_SPACE_QC
+    # 6680..6868 ship the @@ layout one column NARROWER: 65 against 6090's 66,
+    # dropping index 11. Same rule -- the width the file actually has, not the
+    # patch level, because 6716 ships 66 again after 6680 shipped 65. Without
+    # this every name from index 11 on is off by one and NOTHING RAISES: 6868's
+    # SpeedArrow reads price=0 weight=100 attackMax=10 against 6090's price=100
+    # weight=0 attackMax=110. See `FIELDS_AT_NO_WEIGHT`.
+    if names is FIELDS_AT and mode == AT_WIDTH_NO_WEIGHT:
+        names = FIELDS_AT_NO_WEIGHT
     return [_row(f, names if len(f) == mode else names[:2])
             for f in split_rows]
 

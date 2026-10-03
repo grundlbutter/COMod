@@ -74,17 +74,53 @@ LIMITATIONS, STATED
 * **Animated ground is frozen at frame 0**, as it is everywhere else in this
   project: a handful of `Puzzle<n>` keys name several frames. Scene and cover
   sprites *do* animate, driven by `?t=`.
-* **`EFFECT` and `SOUND` layers are not drawn.**  They are decoded
-  (`core/dmap.py`) and reported in the map summary, and there is nothing to
-  draw them as.
-* **`map/PuzzleSave/*.pux` (`TqTerrain`) is undecoded**, so the four maps that
-  use it have no ground art. Their grid, scenery and passability still draw.
+* **`EFFECT` LAYERS DO DRAW; `SOUND` LAYERS DO NOT.**  This line used to say
+  neither did and that "there is nothing to draw them as" -- stale on the
+  effect half.  `tools/mapfx.js` is a WebGL renderer wired into this page
+  (`MapFx.init/load`, a layer toggle, a glow option, an animation clock), and
+  `/api/mapedit/effects` resolves each tag-19 record to a definition and a
+  fractional cell.
+
+  **WHAT IT NEEDS, AND WHY IT IS BLANK ON SOME INSTALLS.**  The names resolve
+  through `ini/c3.wdb`'s EFFE section, which **41 of 45 installs ship** -- the
+  other four, INCLUDING the owner's live CCO, have no definitions, so the
+  endpoint answers `resolved: 0` and nothing draws.  That is reported, not
+  hidden.  Sizes come from `ini/C3DMapEffect.lua` (34 of 45); without it every
+  effect falls back to `DEFAULT_R`/`DEFAULT_DZ`, which the endpoint now says
+  in `sizesAreDefaults` -- a default radius and a measured one are
+  indistinguishable once they are numbers.
+
+  SOUND is still undrawn and there genuinely is nothing to draw it as; this
+  install ships 0 sound records in any case.
+
+  **Replacing a stale limitation with a fresh one is the same defect** -- this
+  paragraph has done it twice before -- so each half above is a measurement
+  with its population, taken 2026-09-22.
+* **`map/PuzzleSave/*.pux` (`TqTerrain`) DRAWS.** This line used to say it was
+  undecoded and that the four maps using it had no ground art; both halves
+  were stale. `dmap.read_pux_full` decodes the payload, `puzzle.py` builds the
+  ground from its terrain table, and 135 of 7878's 470 maps and 4 of CCO's are
+  `.pux` -- a population, not four.
+
+  **AND ITS OVERLAY STACKS DRAW TOO.** The sentence that stood here said they
+  did not -- "what a `.pux` still draws INCOMPLETELY is its overlay stack
+  beyond layer 0" -- and I wrote it in `9ccb1868` while removing the previous
+  stale claim from this same paragraph. It was already false when written:
+  `PuzzleMap.composite_rgba` composites every layer of a stack bottom-first
+  with the per-vertex 25-bit alpha mask (`dmap.pux_mask_field`, traced to the
+  client's own `AlphaAt` at RVA `0x872A68`), `render_layer` calls it for every
+  stacked index, and `tileset.py` ships the same stacks to the GPU path. Tiles
+  carry up to 21 layers and 22,778 of 56,748 sampled tiles carry two or more.
+  **Replacing a stale limitation with a fresh one is the same defect**, so
+  this paragraph now states only what was measured.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import struct
 import sys
 import threading
@@ -102,6 +138,7 @@ if str(_REPO) not in sys.path:
 
 import coroot                                            # noqa: E402
 import dmap as dmapmod                                   # noqa: E402
+import otherdata                                         # noqa: E402
 import puzzle as puzzlemod                               # noqa: E402
 import scene as scenemod                                 # noqa: E402
 
@@ -131,15 +168,110 @@ ZOOMS = (1, 2, 4, 8, 16, 32, 64)
 
 #: Draw order, furthest first. The page composites in exactly this order and
 #: `render_layer` refuses anything not in it.
-LAYERS = ("background", "ground", "terrain", "cover", "passability")
+#:
+#: **THESE ARE LAYER *KINDS*, NOT THE LAYERS A MAP HAS.**  A map's actual
+#: layer list is `MapArt.layers()` and it is derived per map, because this
+#: tuple is wrong in both directions on almost every map in the corpus.
+#: Measured over the 150 drawable maps of the 156 the registry lists here:
+#:
+#:     0 backdrop planes    89 maps   -- "background" was a dead toggle
+#:     2 or more planes     13 maps   -- one toggle drove up to 16 layers
+#:     0 TERRAIN scenes    121 maps
+#:     0 COVER sprites      22 maps
+#:     0 painted ground      1 map    (spirit01_new: two planes and nothing else)
+#:
+#: **15 of the 150 have exactly the five this tuple names.**  The other 135
+#: were shown controls that changed nothing, or one checkbox over sixteen
+#: separately-drawn planes.  625 real layers were rendered as 750 rows.
+LAYERS = ("background", "ground", "terrain", "cover", "interactive",
+          "passability")
 
+#: A `background` layer may name ONE plane: `background:3` is plane index 3.
+#: The bare name still means "every plane", which is what the whole-map
+#: renderer and the CLI use and what every existing caller passes.
+LAYER_SEP = ":"
+
+#: THE PUZZLE ROWS ARE NUMBERED, NOT NAMED, AND THE REASON IS MEASURED.
+#:
+#: These two titles used to read "Background planes" and "Base puzzle (painted
+#: ground)" and they were INVERTED. On `Clients/7878`, `sary02_new`:
+#:
+#:   * `background` draws the `.pul` planes and the FIRST -- `sary02.pul` --
+#:     is the map's MAIN GROUND. Rendered alone at cell (178,170) it is a
+#:     detailed stone plaza: paving, steps, a carved medallion, a monument.
+#:   * `ground` draws `sary02.pux`, magic `TqTe` (TqTerrain), an OVERLAY and a
+#:     sparse one: **median 51.6% of its tiles are empty across 136 maps, and
+#:     SEVEN are 100% empty** (`cho-room` 875/875, `waror_new` 504/504,
+#:     `climb` 168/168, `2024love01` 560/560). A map whose ground were the
+#:     `.pux` could not draw at all.
+#:
+#: The owner read the panel, concluded the tool had five layers ever, and went
+#: hunting missing ground in the wrong layer. So did I: two of my own
+#: measurements counted `.pux` absence as "no ground art" while the `.pul` was
+#: supplying it.
+#:
+#: A first fix renamed them "Painted ground planes" / "TqTerrain overlay". The
+#: owner rejected THAT too, from evidence I did not have -- they toggled the
+#: pair and watched: *"they are clearly 2 parts of the same puzzle, not
+#: separate parts."* So the rows are `part 1..N` in draw order and the FILE is
+#: carried in `path`. Ground and overlay are roles I inferred from one map; a
+#: number and a filename are what is known, and a wrong role name inverts
+#: silently -- which is this constant's entire history.
+#:
+#: The bare keys below remain for the whole-map renderer and the CLI.
 LAYER_TITLE = {
     "background": "Background planes",
     "ground": "Base puzzle (painted ground)",
     "terrain": "TERRAIN scene objects",
     "cover": "COVER sprites",
+    "interactive": "INTERACTIVE sprites",
     "passability": "Passability grid",
 }
+
+LAYER_HELP = {
+    "background": "A background puzzle plane from the .DMap's trailing "
+                  "section, with its own parallax. What turns the void around "
+                  "an island into sea and sky.",
+    "ground": "The painted ground: map/puzzle/*.pul cut into PuzzleGridSize "
+              "tiles, each one a .pux stack of terrain rows.",
+    "terrain": "TERRAIN layers -- map/Scene objects. These carry their own "
+               "passability and it REPLACES the cell grid underneath them.",
+    "cover": "COVER layers -- sprites the game draws in front of the player.",
+    "interactive": "The .DMap's SECOND record list (v1006 only), which "
+                   "nothing drew until 2026-09-15. It is the .OtherData "
+                   "InteractiveLayer: the declared count matches the tag-4 "
+                   "records here on 152 of 152 v1006 maps. 21,598 sprites "
+                   "across 118 maps. The owner found it as walkable "
+                   "platforms with no art on gsjx03_new.",
+    "passability": "Green: walkable in the .DMap's own grid. Cyan: walkable "
+                   "only because a TERRAIN layer says so. Red: the grid says "
+                   "yes and a TERRAIN says no.",
+}
+
+
+def layer_parts(layer: str) -> tuple[str, Optional[int]]:
+    """`"background:2"` -> `("background", 2)`; `"ground"` -> `("ground", None)`.
+
+    Returns `("", None)` for anything that is not a layer name at all, so a
+    caller can validate with one call and never has to parse the string
+    itself. The index is only meaningful for `background`; a suffix on any
+    other kind is rejected rather than ignored, because a silently ignored
+    selector renders the WRONG layer and looks like a render bug.
+    """
+    kind, sep, rest = layer.partition(LAYER_SEP)
+    if kind not in LAYERS:
+        return "", None
+    if not sep:
+        return kind, None
+    if kind != "background" or not rest.isdigit():
+        return "", None
+    return kind, int(rest)
+
+
+def valid_layer(layer: str) -> bool:
+    """Whether `render_layer` will accept this name. The HTTP route asks this
+    rather than `layer in LAYERS`, which would refuse every per-plane id."""
+    return layer_parts(layer)[0] != ""
 
 #: Passability overlay colours, RGBA. Deliberately not naturalistic -- this is
 #: a data view laid over art, and it has to read as data.
@@ -336,7 +468,20 @@ class MapArt:
         self._scenery_why = ""
         self._backdrops: Optional[list] = None
         self._items: Optional[dict[str, list[PlacedInfo]]] = None
+        #: `({dmap_index: (r,g,b,a)}, {id(placed): dmap_index})` from the
+        #: `.OtherData` sidecar -- see `cover_tints()`.
+        self._tints: Optional[tuple[dict, dict]] = None
+        #: `{late_record_index: (r,g,b,a)}` -- see `late_tints()`. A SECOND
+        #: index space; keeping it in its own cache is what stops the two
+        #: being confused.
+        self._late_tints: Optional[dict] = None
+        #: `(ground_tint, {plane: tint})` -- see `puzzle_tints()`.
+        self._puzzle_tints: Optional[tuple] = None
         self._walk: Optional[tuple[bytes, bytes, object]] = None
+        #: Which file answered the last parse -- "staged", "archive"
+        #: or "loose". Recorded rather than re-derived, because the
+        #: caller that most needs it is the one reporting to a person.
+        self._dmap_origin: Optional[str] = None
         self._tile_rgba: dict[int, Optional[bytes]] = {}
         self._sprite_cache: dict[tuple, tuple] = {}
         #: `(manifest, bundle)` from `tileset()`. Up to ~47 MB, so it is built
@@ -404,19 +549,68 @@ class MapArt:
         return f"map/map/{self.name}.DMap"
 
     def read_path(self) -> Optional[Path]:
-        """Which `.DMap` the editor reads.
+        """The staged-or-loose `.DMap` path.
 
-        **A staged copy wins**, exactly as a loose file wins over an archive
-        in the game itself (`tools/comod.py`). So once you stage a passability
-        edit the editor draws *your* grid, not the shipped one, and the
-        difference between "staged" and "installed" stays visible rather than
-        being something you have to remember.
+        **This is NOT necessarily the map the editor reads**, and the name
+        used to claim it was. Where an archive ships beside the loose file the
+        archive wins -- see `dmap_source`, which is what `header()` and
+        `cells()` actually ask.
+
+        The docstring this replaces said *"a staged copy wins, exactly as a
+        loose file wins over an archive in the game itself"*.
+        `docs/map_stage_precedence.md` established that the second clause is
+        false for maps: `TqFOpen`'s loose-over-archive rule is about one
+        logical path with two backings, and `map/map/x.DMap` is a different
+        filename from the `map/map/x.7z` the registry names, so the rule never
+        arises. A staged copy still wins, and that half stands.
         """
         p = self.dmap_path
         if p is None:
             return None
         staged = self.lib.stage / f"map/map/{p.name}"
         return staged if staged.is_file() else p
+
+    def dmap_source(self) -> tuple[Optional[Path], Optional[bytes], str]:
+        """`(path, data, origin)` for the `.DMap` the editor must parse.
+
+        Precedence is **staged > archive > loose**, and the middle term is the
+        correction. `header()`/`cells()` used to take the loose file whenever
+        one existed and reach for the archive only as a fallback, so every map
+        carrying a previous client's leftover was parsed, rendered and
+        inspected as that older map:
+
+            build  loose/archive pairs that DISAGREE
+            5165    0 (ships no archives)        5517   3
+            6090   74                            6271  75
+            6716   75                            7878   0 (archive-only)
+
+        Of 6090's 74, **51 differ in layer count and 19 in the cell grid** --
+        scenery placement and passability, the latter being the surface COMod
+        stages edits to. `boa` parsed to 0 layers from the leftover and 62
+        from the archive.
+
+        `origin` is returned rather than inferred so a caller can say which
+        file it is showing. `map_stage_precedence.md`'s second proposal asks
+        for exactly that, on every row, always: *a label that appears only on
+        disagreement is a label nobody learns to read.*
+        """
+        p = self.dmap_path
+        if p is not None:
+            staged = self.lib.stage / f"map/map/{p.name}"
+            if staged.is_file():
+                return staged, None, "staged"
+        if self.archive_path is not None:
+            raw = self._archive_dmap_bytes()
+            if raw is not None:
+                return self.archive_path, raw, "archive"
+            # An archive that will not decompress is not a reason to silently
+            # serve the leftover instead -- say which one answered.
+            if p is not None and p.is_file():
+                return p, None, "loose (archive would not decompress)"
+            return None, None, "archive unreadable"
+        if p is not None and p.is_file():
+            return p, None, "loose"
+        return None, None, "no .DMap"
 
     @property
     def staged(self) -> bool:
@@ -428,6 +622,7 @@ class MapArt:
         with self._lock:
             self._dmap_header = None
             self._dmap_cells = None
+            self._dmap_origin = None
             self._walk = None
             self._scenery = None
             self._items = None
@@ -451,17 +646,12 @@ class MapArt:
         """The `.DMap` without its cell grid -- cheap even on `Gulf`."""
         with self._lock:
             if self._dmap_header is None:
-                p = self.read_path()
+                p, raw, origin = self.dmap_source()
                 if p is None:
-                    # No loose .DMap: read it out of the .7z.
-                    raw = self._archive_dmap_bytes()
-                    if raw is None:
-                        return None
-                    self._dmap_header = dmapmod.parse(
-                        self.archive_path, want_cells=False,
-                        verify=False, data=raw)
-                    return self._dmap_header
-                self._dmap_header = dmapmod.parse(p, want_cells=False, verify=False)
+                    return None
+                self._dmap_origin = origin
+                self._dmap_header = dmapmod.parse(
+                    p, want_cells=False, verify=False, data=raw)
             return self._dmap_header
 
     def cells(self):
@@ -469,16 +659,12 @@ class MapArt:
         only ever reached by the passability layer and by an inspector click."""
         with self._lock:
             if self._dmap_cells is None:
-                p = self.read_path()
+                p, raw, origin = self.dmap_source()
                 if p is None:
-                    raw = self._archive_dmap_bytes()
-                    if raw is None:
-                        return None
-                    self._dmap_cells = dmapmod.parse(
-                        self.archive_path, want_cells=True,
-                        verify=False, data=raw)
-                    return self._dmap_cells
-                self._dmap_cells = dmapmod.parse(p, want_cells=True, verify=False)
+                    return None
+                self._dmap_origin = origin
+                self._dmap_cells = dmapmod.parse(
+                    p, want_cells=True, verify=False, data=raw)
             return self._dmap_cells
 
     # -- scenery -----------------------------------------------------------
@@ -491,7 +677,14 @@ class MapArt:
                     self._scenery_why = "no .DMap"
                     self._scenery = scenemod.Scenery(self.name)
                 else:
-                    self._scenery = scenemod.gather(d.layers, self.lib.scenes)
+                    # v1006's SECOND record list. `core/dmap.py` has parsed it
+                    # for months as `late_layers`; every consumer passed only
+                    # `d.layers`, so 21,598 cover sprites across 118 maps were
+                    # decoded and dropped on the floor. See
+                    # `scene.Scenery.late_covers`.
+                    self._scenery = scenemod.gather(
+                        d.layers, self.lib.scenes,
+                        getattr(d, "late_layers", ()) or ())
                     self._scenery.name = self.name
             return self._scenery
 
@@ -516,14 +709,126 @@ class MapArt:
         """
         with self._lock:
             if self._items is None:
-                self._items = {"scene": [], "cover": []}
+                self._items = {"scene": [], "cover": [], "late": []}
                 sc = self.scenery()
                 if self.pm is not None:
                     for k, seq in (("scene", sc.sorted_scenes()),
-                                   ("cover", sc.sorted_covers())):
+                                   ("cover", sc.sorted_covers()),
+                                   ("late", sc.sorted_late_covers())):
                         for i, p in enumerate(seq):
                             self._items[k].append(self._describe(p, i))
             return self._items.get(kind, [])
+
+    def cover_tints(self, enabled: bool = True) -> tuple[dict, dict]:
+        r"""`({dmap_index: (r,g,b,a)}, {id(placed): dmap_index})`.
+
+        The `.OtherData` sidecar carries a per-cover `Alpha/Red/Green/Blue`
+        that nothing in this project read until `tools/otherdata.py`, so every
+        cover was drawn at full brightness and full opacity. It is two
+        different effects on the two maps the owner was looking at -- colour
+        on `sary02_new`, real alpha on `2024thx_new`.
+
+        **NO SHIPPED CLIENT DRAWS THIS, AND THIS DOCSTRING USED TO IMPLY ONE
+        DID.** It called the tint the owner's *"almost like theres a
+        transparency effect thats not being utilised"*, which reads as a
+        client effect we were missing. The Director of RE checked all 38
+        installs, pinned by `version.dat`, 1064..7952: no standalone `Alpha%d`
+        / `Red%d` / `Green%d` / `Blue%d` in any of them, and no
+        `GetPrivateProfileSection` in any modern build to read them unnamed
+        (`docs/otherdata_percover_tint_inert_2026-09-16.md`, `09ad1411`). So
+        with `enabled` true this draws what the MAP declares, not what the
+        GAME shows. Keep that distinction in anything user-facing.
+
+        The binding below is NOT affected: `MapObjIndex%d` IS read, 7065+.
+
+        **THE SECOND DICT IS NOT OPTIONAL.** `MapObjIndexK` indexes the
+        `.DMap` cover order; `items("cover")` walks `sorted_covers()` and
+        `PlacedInfo.index` is the position in THAT list. Keying the tint by
+        `PlacedInfo.index` would hand covers the wrong tint and still render a
+        plausible picture.
+
+        **The two orders COINCIDE as of 2026-09-16** -- covers paint in `.DMap`
+        list order now (`scene.cover_paint_order`), where 265 of 268 sorted to
+        a different position on `sary02_new` before. The identity key stays:
+        their agreeing today is a property of the cover order, not of the
+        binding, and `tests/test_otherdata_cover_tint.py` holds the tripwire
+        for the day they diverge again.
+
+        Set `MAPEDIT_COVER_TINT=0` to render as we did before the sidecar was
+        read; the gate uses it to compare the two.
+        """
+        if not enabled:
+            return ({}, {})
+        with self._lock:
+            if self._tints is None:
+                tints: dict = {}
+                index: dict = {}
+                if os.environ.get("MAPEDIT_COVER_TINT", "1") != "0":
+                    p = (otherdata.sidecar_path(self.lib.root, self.name)
+                         if self.lib.root else None)
+                    if p is not None:
+                        tints = otherdata.cover_tints(p)
+                    if tints:
+                        sc = self.scenery()
+                        if sc is not None:
+                            index = otherdata.dmap_index_of(sc.covers)
+                self._tints = (tints, index)
+            return self._tints
+
+    def puzzle_tints(self, enabled: bool = True) -> tuple:
+        r"""`(ground_tint, {plane_index: tint})` for the painted surfaces.
+
+        TWO DIFFERENT SURFACES FROM TWO DIFFERENT SECTIONS, which is why this
+        returns a pair rather than one value:
+
+            TerrainLayer0.Puzzle*  ->  the MAIN GROUND  (.pul + .pux)
+            SceneLayerN.Puzzle*    ->  BACKDROP PLANE N
+
+        See `otherdata.ground_puzzle_tint` for the RVAs. The maps that looked
+        like they declared conflicting values were declaring values for
+        different surfaces all along.
+        """
+        if not enabled:
+            return (None, {})
+        with self._lock:
+            if getattr(self, "_puzzle_tints", None) is None:
+                g, pl = None, {}
+                if os.environ.get("MAPEDIT_COVER_TINT", "1") != "0":
+                    p = (otherdata.sidecar_path(self.lib.root, self.name)
+                         if self.lib.root else None)
+                    if p is not None:
+                        g = otherdata.ground_puzzle_tint(p)
+                        pl = otherdata.plane_puzzle_tints(p)
+                self._puzzle_tints = (g, pl)
+            return self._puzzle_tints
+
+    def late_tints(self, enabled: bool = True) -> dict:
+        r"""`{late_record_index: (r,g,b,a)}` for the INTERACTIVE layer.
+
+        SEPARATE FROM `cover_tints` BECAUSE THE INDEX SPACES OVERLAP.
+        `TerrainLayer*` indexes the main cover list by position (0..2969 on
+        gsjx03_new); `InteractiveLayer*` indexes the v1006 late record list by
+        the record's own `index` (14..487 on the same map). One dict keyed on
+        a bare integer would hand a main cover's tint to a late one and render
+        a plausible, wrong picture.
+
+        The key here is `Placed.layer_index`, which `scene.gather` copies
+        straight off the record. Verified identical to the record index set on
+        gsjx03_new (399 of 399), and every one of the 103 indices the sidecar
+        declares is present in it.
+        """
+        if not enabled:
+            return {}
+        with self._lock:
+            if getattr(self, "_late_tints", None) is None:
+                out: dict = {}
+                if os.environ.get("MAPEDIT_COVER_TINT", "1") != "0":
+                    p = (otherdata.sidecar_path(self.lib.root, self.name)
+                         if self.lib.root else None)
+                    if p is not None:
+                        out = otherdata.interactive_tints(p)
+                self._late_tints = out
+            return self._late_tints
 
     def _describe(self, p, index: int) -> PlacedInfo:
         cache = self.lib.sprites
@@ -600,7 +905,8 @@ class MapArt:
         self._tile_rgba[idx] = out
         return out
 
-    def render_ground(self, rect, scale: int) -> tuple[int, int, bytes]:
+    def render_ground(self, rect, scale: int, *,
+                      tint: bool = True) -> tuple[int, int, bytes]:
         """The painted ground over `rect`, as RGBA. Empty slots and off-image
         are transparent, not VOID."""
         x0, y0, x1, y1 = rect
@@ -643,14 +949,34 @@ class MapArt:
                                     buf[o + c:o + n * 4:4] = seg[c::stride4][:n]
                 ox += n
                 px += n * scale
+        # The `.OtherData` GROUND tint -- `TerrainLayer0.Puzzle*`, ONE section
+        # for the whole ground, traced to `ApplyPuzzleTint` (0x89E890) and its
+        # single caller. NOT `SceneLayer`, which tints the backdrop planes.
+        g, _ = self.puzzle_tints(tint)
+        if g is not None:
+            for i in range(0, len(buf), 4):
+                if not buf[i + 3]:
+                    continue
+                buf[i] = (buf[i] * g[0]) // 255
+                buf[i + 1] = (buf[i + 1] * g[1]) // 255
+                buf[i + 2] = (buf[i + 2] * g[2]) // 255
+                buf[i + 3] = (buf[i + 3] * g[3]) // 255
         return ow, oh, bytes(buf)
 
-    def render_background(self, rect, scale: int) -> tuple[int, int, bytes]:
+    def render_background(self, rect, scale: int, *,
+                          plane: Optional[int] = None,
+                          tint: bool = True) -> tuple[int, int, bytes]:
         """The background planes behind `rect`, furthest first, as RGBA.
 
         `puzzle.Backdrop.render_tiled` produces RGB over VOID; VOID is turned
         back into transparency here so a map with no background plane is a
         transparent layer rather than a black one.
+
+        `plane` selects ONE plane by index. `None` keeps the old behaviour --
+        every plane, in order -- which is what the whole-map renderer and the
+        CLI want. Per-plane exists because a map can carry sixteen of them
+        (`star10`) and "background" as a single toggle is then a control over
+        sixteen different pieces of art at once.
         """
         x0, y0, x1, y1 = rect
         scale = max(1, int(scale))
@@ -658,22 +984,44 @@ class MapArt:
         oh = max(1, (y1 - y0 + scale - 1) // scale)
         buf = _blank(ow, oh)
         void = bytes(puzzlemod.VOID)
-        for b in self.backdrops():
+        all_planes = self.backdrops()
+        # ENUMERATED so each plane keeps its OWN index: `SceneLayerN` tints
+        # backdrop plane N, and the values differ per plane -- `sdragon01_new`
+        # carries four. Collapsing them into one map-wide tint was the build
+        # this stopped one step short of. Selecting a single plane must not
+        # renumber it, so the index travels with the object.
+        idx_planes = list(enumerate(all_planes))
+        if plane is not None:
+            idx_planes = ([(plane, all_planes[plane])]
+                          if 0 <= plane < len(all_planes) else [])
+        _, plane_tints = self.puzzle_tints(tint)
+        for pidx, b in idx_planes:
             try:
                 bw, bh, brgb = b.render_tiled(tuple(rect), scale=scale)
             except Exception:                            # noqa: BLE001
                 continue
+            t = plane_tints.get(pidx)
             for i in range(0, min(bw * bh, ow * oh)):
                 s = i * 3
                 if brgb[s:s + 3] == void:
                     continue
                 d = i * 4
-                buf[d:d + 3] = brgb[s:s + 3]
+                if t is None:
+                    buf[d:d + 3] = brgb[s:s + 3]
+                else:
+                    # RGB only: a backdrop plane is opaque where it is not
+                    # VOID, and VOID is skipped above, so there is no source
+                    # alpha to multiply. `PuzzleAlpha` on a PLANE is therefore
+                    # recorded and NOT applied here -- see the gate.
+                    buf[d] = (brgb[s] * t[0]) // 255
+                    buf[d + 1] = (brgb[s + 1] * t[1]) // 255
+                    buf[d + 2] = (brgb[s + 2] * t[2]) // 255
                 buf[d + 3] = 255
         return ow, oh, bytes(buf)
 
     def render_sprites(self, kind: str, rect, scale: int, *,
-                       time_ms: int = 0) -> tuple[int, int, bytes]:
+                       time_ms: int = 0,
+                       tint: bool = True) -> tuple[int, int, bytes]:
         """TERRAIN or COVER sprites over `rect`, as RGBA.
 
         Only the sprites whose own rectangle intersects the tile are touched,
@@ -686,6 +1034,14 @@ class MapArt:
         buf = _blank(ow, oh)
         if self.pm is None:
             return ow, oh, bytes(buf)
+        # Covers carry the `.OtherData` tint; scene parts do not -- the
+        # sections that bind to the cover list are the only ones whose index
+        # space is settled. See `cover_tints()`.
+        tints, dmap_ix = (self.cover_tints(tint)
+                          if kind == "cover" else ({}, {}))
+        # The INTERACTIVE layer has its OWN sidecar sections and its own index
+        # space; `cover_tints` would be the wrong dict, not merely an empty one.
+        ltints = self.late_tints(tint) if kind == "late" else {}
         for it in self.items(kind):
             rx0, ry0, rx1, ry1 = it.rect
             if rx1 <= x0 or rx0 >= x1 or ry1 <= y0 or ry0 >= y1:
@@ -698,10 +1054,21 @@ class MapArt:
             if p.frame_interval > 0 and len(fr) > 1 and time_ms:
                 n = time_ms // p.frame_interval
             sw, sh, rgba = fr[n % len(fr)]
-            key = (p.ani, p.title, n % len(fr), scale)
+            # The `.OtherData` tint, bound by the .DMap index and NOT by
+            # `it.index` -- see `cover_tints()`. It is part of the cache key
+            # because two covers can share a sprite and differ only in tint;
+            # keying without it would serve the first one's colour to the
+            # second, which renders as a plausible picture and is wrong.
+            if kind == "late":
+                tint = ltints.get(p.layer_index) if ltints else None
+            else:
+                tint = tints.get(dmap_ix.get(id(p), -1)) if tints else None
+            key = (p.ani, p.title, n % len(fr), scale, tint)
             hit = self._sprite_cache.get(key)
             if hit is None:
                 hit = _decimate_rgba(rgba, sw, sh, scale)
+                if tint is not None:
+                    hit = (otherdata.apply_tint(hit[0], tint), hit[1], hit[2])
                 if len(self._sprite_cache) > 4096:
                     self._sprite_cache.clear()
                 self._sprite_cache[key] = hit
@@ -756,24 +1123,141 @@ class MapArt:
         return ow, oh, bytes(buf)
 
     def render_layer(self, layer: str, rect, scale: int, *,
-                     time_ms: int = 0) -> tuple[int, int, bytes]:
-        if layer not in LAYERS:
-            raise ValueError(f"unknown layer {layer!r}; have {', '.join(LAYERS)}")
-        if layer == "background":
-            return self.render_background(rect, scale)
+                     time_ms: int = 0,
+                     tint: bool = True) -> tuple[int, int, bytes]:
+        kind, plane = layer_parts(layer)
+        if not kind:
+            raise ValueError(f"unknown layer {layer!r}; have {', '.join(LAYERS)}"
+                             " (and background:N for one plane)")
+        if kind == "background":
+            return self.render_background(rect, scale, plane=plane, tint=tint)
+        layer = kind
         if layer == "ground":
-            return self.render_ground(rect, scale)
+            return self.render_ground(rect, scale, tint=tint)
         if layer == "terrain":
             return self.render_sprites("scene", rect, scale, time_ms=time_ms)
         if layer == "cover":
-            return self.render_sprites("cover", rect, scale, time_ms=time_ms)
+            return self.render_sprites("cover", rect, scale, time_ms=time_ms,
+                                       tint=tint)
+        if layer == "interactive":
+            return self.render_sprites("late", rect, scale, time_ms=time_ms,
+                                       tint=tint)
         return self.render_passability(rect, scale)
 
     def tile_png(self, layer: str, tx: int, ty: int, z: int, *,
-                 time_ms: int = 0, tile: int = TILE) -> bytes:
+                 time_ms: int = 0, tile: int = TILE,
+                 tint: bool = True) -> bytes:
+        rect = tile_rect(tx, ty, z, tile=tile)
+        w, h, rgba = self.render_layer(layer, rect, z, time_ms=time_ms,
+                                       tint=tint)
+        return encode_png_rgba(w, h, rgba)
+
+    # -- digests, for comparing one render against another -----------------
+
+    def tile_digest(self, layer: str, tx: int, ty: int, z: int, *,
+                    time_ms: int = 0, tile: int = TILE) -> dict:
+        r"""One tile's pixels, reduced to a comparable value.
+
+        Returns::
+
+            {layer, tx, ty, z, timeMs, w, h, bytes, digest, opaque, blank}
+
+        **THE DIGEST IS OVER THE RAW RGBA, NOT OVER THE PNG.**  `tile_png`
+        encodes the same pixels, and a PNG's bytes depend on the encoder's
+        filter choices and zlib level as well as on the image -- so two
+        identical pictures can encode to different files, and a comparison
+        built on `tile_png` would report differences that are not there.  The
+        buffer `render_layer` returns is the picture itself.
+
+        **`timeMs` IS PART OF THE ANSWER AND IS RECORDED.**  `terrain` and
+        `cover` are animated sprites (`render_sprites` takes the clock), so a
+        digest without the time it was taken at is not reproducible and two
+        digests taken at different times are not comparable.  It is in the
+        record rather than folded into the hash, so a caller can still ask
+        "are these the same pixels" across two different clocks and get a
+        true answer.
+
+        **`opaque` AND `blank` EXIST BECAUSE AN EMPTY TILE IS A REAL ANSWER.**
+        Most tiles of most layers draw nothing -- `cover` on open ground,
+        `terrain` away from scenery -- and a fully transparent tile hashes to
+        a perfectly good constant.  Without a count, a manifest of four
+        thousand identical digests reads exactly like a successful
+        comparison.  `opaque` is how many pixels have any alpha at all;
+        `blank` is `opaque == 0`.  **A digest set that is entirely blank is a
+        well-formed, complete, meaningless answer**, and the caller is given
+        what it needs to say so.
+
+        The coordinates are NOT hashed.  Keeping the digest purely a function
+        of the pixels is what lets a caller ask the two different questions a
+        comparison needs: *did this tile change* (same address, two builds)
+        and *did this art move* (same digest, two addresses).  Mixing the
+        address in would answer only the first.
+        """
         rect = tile_rect(tx, ty, z, tile=tile)
         w, h, rgba = self.render_layer(layer, rect, z, time_ms=time_ms)
-        return encode_png_rgba(w, h, rgba)
+        opaque = 0
+        for i in range(3, len(rgba), 4):
+            if rgba[i]:
+                opaque += 1
+        return {
+            "layer": layer, "tx": int(tx), "ty": int(ty), "z": int(z),
+            "timeMs": int(time_ms), "w": w, "h": h, "bytes": len(rgba),
+            "digest": hashlib.sha256(bytes(rgba)).hexdigest(),
+            "opaque": opaque, "blank": opaque == 0,
+        }
+
+    def layer_digests(self, layer: str, z: int, *, time_ms: int = 0,
+                      tile: int = TILE) -> dict:
+        r"""Every tile of one layer at one zoom, with the map's identity on it.
+
+        THE IDENTITY IS NOT DECORATION.  Two digest sets are only comparable
+        if they describe the same map at the same zoom with the same tiling,
+        and a set that carries only digests can be diffed against anything at
+        all -- including a different map, which would report every tile as
+        changed and look like a catastrophic finding.  So `map`, `pixels`,
+        `grid`, `tile`, `z` and the `.DMap` this was rendered from travel with
+        the digests.
+
+        `blank` and `drawn` are summed here for the same reason `tile_digest`
+        reports `opaque`: **a set that is 100% blank must not read as a clean
+        comparison**, and the only way to make that visible is to count it
+        where the caller cannot miss it.
+
+        **TWO SETS ARE ONLY COMPARABLE AT THE SAME `z` AND THE SAME `tile`,
+        and this is the property most likely to be got wrong.**  A tile
+        address is not a resolution of a fixed region -- it is an address into
+        a grid whose cells cover `tile * z` art pixels, so tile (1,1) is a
+        DIFFERENT PART OF THE MAP at every zoom.  Measured on `newbie`::
+
+            z=2  tile(1,1) -> art (512, 512)-(1024, 1024)
+            z=8  tile(1,1) -> art (2048, 2048)-(4096, 4096)
+
+        On that map `ground` tile (1,1) is blank at z=2 and draws 5,335
+        pixels at z=8 -- not because the zoom revealed anything, but because
+        the two addresses name different ground.  **A comparator that diffs a
+        z=2 set against a z=8 set reports every tile as changed**, which
+        looks like a catastrophic finding and is an addressing mistake.  That
+        is why `z` and `tile` travel with the digests rather than being the
+        caller's business to remember.
+        """
+        if self.pm is None:
+            return {"map": self.name, "ok": False, "why": self.reason,
+                    "layer": layer, "z": int(z), "tiles": []}
+        gx, gy = tile_grid(self.pm.px_w, self.pm.px_h, z, tile=tile)
+        tiles = []
+        for ty in range(gy):
+            for tx in range(gx):
+                tiles.append(self.tile_digest(layer, tx, ty, z,
+                                              time_ms=time_ms, tile=tile))
+        blank = sum(1 for t in tiles if t["blank"])
+        return {
+            "map": self.name, "ok": True, "layer": layer, "z": int(z),
+            "timeMs": int(time_ms), "tile": int(tile),
+            "pixels": [self.pm.px_w, self.pm.px_h], "grid": [gx, gy],
+            "dmap": self.dmap_logical,
+            "integrityChecked": self.lib.integrity.checked(self.dmap_logical),
+            "tiles": tiles, "blank": blank, "drawn": len(tiles) - blank,
+        }
 
     # -- the resident tile set ---------------------------------------------
 
@@ -797,8 +1281,26 @@ class MapArt:
             if getattr(self, "_tileset", None) is None:
                 import tileset as tilesetmod                 # noqa: PLC0415
                 sc = self.scenery()
+                # THE TINT HAS TO TRAVEL WITH THE BUNDLE. It used to be
+                # applied in `render_sprites` only -- the PNG path -- so a
+                # viewer on the GPU path got untinted covers while the feature
+                # was reported as shipped. Keyed by object identity, the same
+                # way `cover_tints` binds, because the .DMap index and the
+                # sorted position are different numbers.
+                tints, ix = self.cover_tints()
+                lt = self.late_tints()
+                by_obj = {}
+                for p_ in sc.covers:
+                    t = tints.get(ix.get(id(p_), -1)) if tints else None
+                    if t:
+                        by_obj[id(p_)] = t
+                for p_ in sc.late_covers:
+                    t = lt.get(p_.layer_index) if lt else None
+                    if t:
+                        by_obj[id(p_)] = t
                 manifest, bundle = tilesetmod.build_full(
-                    self.pm, sc, self.lib.sprites, self.backdrops())
+                    self.pm, sc, self.lib.sprites, self.backdrops(),
+                    tints=by_obj, puzzle_tints=self.puzzle_tints())
                 manifest["map"] = self.name
                 manifest["backdrops"] = len(self.backdrops())
                 manifest["sceneParts"] = len(sc.scenes) if sc else 0
@@ -928,6 +1430,95 @@ class MapArt:
 
     # -- reporting ---------------------------------------------------------
 
+    def layers(self) -> list[dict]:
+        r"""**The layers THIS map has**, in default draw order, furthest first.
+
+        `LAYERS` is a list of layer KINDS and the page used to render one
+        checkbox per kind, always five, on every map. That is wrong in both
+        directions and the corpus says so -- measured over the 150 drawable
+        maps of the 156 the registry lists, 625 real layers in all:
+
+            0 backdrop planes   89 maps    "Background" toggled nothing
+            1 plane             48 maps
+            2+ planes           13 maps    one checkbox, up to 16 layers
+                                           (star01..star10 carry 7..16)
+            0 TERRAIN scenes   121 maps    "TERRAIN" toggled nothing
+            0 COVER sprites     22 maps    "COVER" toggled nothing
+            0 painted ground     1 map     spirit01_new: planes and cells only
+
+        Panel sizes that result: 2 rows on 6 maps, 3 on 85, 4 on 33, 5 on 15,
+        and 6..19 on the remaining 11. **Only 15 of 150 maps have the five
+        the old panel always drew.**
+
+        So each backdrop plane is its own layer here (`background:0`,
+        `background:1`, ...), and **a layer with nothing in it is not
+        returned at all** rather than returned greyed: the panel is built
+        from this list, and a control that cannot change the picture is
+        noise in a panel whose whole job is telling you what the picture is
+        made of.
+
+        `count` is the MEASURED population of the layer, not a capacity --
+        non-empty slots for a plane and for the ground, placements for
+        TERRAIN and COVER, cells for passability -- because that count is
+        what "hide the empty ones" is decided on, and a count derived from
+        the grid dimensions would call a fully empty plane full.
+
+        `passability` is always present when there is a `.DMap`: it is a data
+        overlay over the cell grid rather than art, and its population is the
+        grid, which is never zero on a map that parses.
+        """
+        out: list[dict] = []
+        d = self.header()
+        # LIST POSITION, never `b.index`. `star01..star10` carry 7..16 planes
+        # and EVERY ONE of them reports `index == 0`, so an id built from
+        # `b.index` gave sixteen layers the same id and sixteen checkboxes
+        # one state. Position is also exactly what `render_background(plane=)`
+        # and `tilebake`'s `this.planes[]` address, so the id, the renderer
+        # and the manifest all mean the same plane.
+        for i, b in enumerate(self.backdrops()):
+            art = b.art
+            n = sum(1 for t in art.tiles if t != puzzlemod.EMPTY)
+            if not n:
+                continue
+            out.append({
+                "id": "background%s%d" % (LAYER_SEP, i),
+                "kind": "background", "plane": i,
+                "title": "part %d" % (i + 1),
+                "count": n, "detail": "%d×%d slots, parallax %d/%d"
+                                      % (art.pul_w, art.pul_h,
+                                         b.parallax[0], b.parallax[1]),
+                "help": LAYER_HELP["background"], "path": b.path,
+            })
+        if self.pm is not None:
+            n = sum(1 for t in self.pm.tiles if t != puzzlemod.EMPTY)
+            if n:
+                out.append({
+                    "id": "ground", "kind": "ground", "plane": None,
+                    "title": "part %d" % (len([r for r in out
+                                               if r["kind"] == "background"])
+                                          + 1), "count": n,
+                    "detail": "%d×%d slots" % (self.pm.pul_w, self.pm.pul_h),
+                    "help": LAYER_HELP["ground"], "path": self.pm.pul_path,
+                })
+        sc = self.scenery()
+        for kind, n in (("terrain", len(sc.scenes)), ("cover", len(sc.covers)),
+                        ("interactive", len(sc.late_covers))):
+            if not n:
+                continue
+            out.append({
+                "id": kind, "kind": kind, "plane": None,
+                "title": LAYER_TITLE[kind], "count": n,
+                "detail": "%d placed" % n, "help": LAYER_HELP[kind], "path": "",
+            })
+        if d is not None:
+            out.append({
+                "id": "passability", "kind": "passability", "plane": None,
+                "title": LAYER_TITLE["passability"], "count": d.width * d.height,
+                "detail": "%d×%d cells" % (d.width, d.height),
+                "help": LAYER_HELP["passability"], "path": self.dmap_logical,
+            })
+        return out
+
     def to_json(self) -> dict:
         pm = self.pm
         d = self.header()
@@ -943,11 +1534,16 @@ class MapArt:
             "version": (d.version_string or d.version) if d else "",
             "sceneParts": len(sc.scenes),
             "covers": len(sc.covers),
+            "lateCovers": len(sc.late_covers),
             "missingScenes": sc.missing_scenes,
             "backdrops": [b.to_json() for b in self.backdrops()] if pm else [],
             "tile": TILE,
             "zooms": list(ZOOMS),
-            "layers": [{"id": k, "title": LAYER_TITLE[k]} for k in LAYERS],
+            # DERIVED PER MAP, not the `LAYERS` constant -- see `layers()`
+            # for the corpus measurement that says why. Empty layers are
+            # absent from this list, so the page's panel is the map.
+            "layers": self.layers(),
+            "layerKinds": list(LAYERS),
             "integrity": self.lib.integrity.status(self.dmap_logical),
         }
         if pm is not None:
@@ -1303,16 +1899,53 @@ class MapEditor:
             # this picker: it parses, it has art, and it opens.  The row stays
             # usable -- refusing to list it would hide a map the user can see
             # in their own folder -- but it must not present as `ok`.
+            #
+            # `d` IS THE LEFTOVER. Every figure above this line was read from
+            # the loose file, and on 6090 74 of these disagree with the
+            # archive -- 2 in dimensions, 51 in layer count, 19 in the cell
+            # grid. `header()`/`cells()` now read the archive
+            # (`dmap_source`), so leaving the row on `d` would leave two
+            # surfaces of one tool reporting different maps.
+            #
+            # The dimensions and puzzle path come from the archive HEAD, the
+            # same 0.1s-for-470 read the `archive` branch above uses.
+            # `layerCount` is a u32 that sits AFTER the cell grid
+            # (`core/dmap.py:34`), so no head read reaches it and a full parse
+            # of these costs 7.9s against this whole call's 0.8s. It is
+            # therefore dropped rather than reported from the leftover --
+            # which is exactly what the `archive` branch already does for the
+            # 44 maps that ship with no loose file at all.
             row["state"] = "stale"
+            row.pop("layerCount", None)
+            arch = (self.root / "map" / "map" / f"{stem}.7z"
+                    if self.root else None)
+            read_from = "the leftover (the archive head did not read)"
+            if arch is not None and arch.is_file():
+                head = dmapmod.archive_head(arch, dmapmod.GRID_OFF)
+                if head and len(head) >= dmapmod.DIMS_OFF + 8:
+                    w, h = struct.unpack_from("<II", head, dmapmod.DIMS_OFF)
+                    if 0 < w <= 65536 and 0 < h <= 65536:
+                        row |= {"width": w, "height": h, "area": w * h,
+                                "puzzle": _norm(_cstr_head(head))}
+                        read_from = "the archive"
+            row["dimsFrom"] = read_from
             row["why"] = ("this loose .DMap is not the one inside the .7z "
                           "beside it; the archive is what the client reads, "
-                          "so this is a previous client's map")
+                          "so the loose file is a previous client's map. The "
+                          "editor reads the archive; the size and puzzle "
+                          "above came from " + read_from + ", and the layer "
+                          "count is not read here because it sits past the "
+                          "cell grid")
             return row
-        if row["puzzle"].endswith(".pux"):
-            row["state"] = "pux"
-            row["why"] = ("uses map/PuzzleSave/*.pux (TqTerrain), which is not "
-                          "decoded -- the grid and the layers still draw")
-            return row
+        # **THERE WAS A `.pux` BRANCH HERE AND IT LIED.** It gave the row
+        # `state = "pux"`, `why = "...which is not decoded"`, and returned
+        # EARLY -- so the four CCO maps that use one were marked as a special
+        # not-really-supported state and denied their `pixels`, `consistent`
+        # and real `state`, while `MapEditor.get()` opened all four with a
+        # full ground and up to three backdrop planes. `puzzle.py` has built
+        # pux grounds through `dmap.read_pux_full` since that reader landed;
+        # this row builder never learnt. A `.pux` now takes the same path as
+        # a `.pul`, which is what it has actually been doing all along.
         pm = self.puzzles.get(stem)
         if pm is None:
             row["state"] = "noart"
@@ -1505,6 +2138,231 @@ def stage_passability(art: MapArt, edits, *, ack: str = "",
     }
 
 
+#: Byte offset of a COVER record's `origin` inside its payload, and the two
+#: u32 it holds. `core/dmap.decode_layer` is the ONE home for this layout --
+#: `path[260] + key[128]` then `<IIIIiiI>` for origin / size / offset /
+#: frame_interval -- and this names the offset it reads rather than a second
+#: copy of the shape. A duplicated layout is how `mapindex` and `dmap` drifted
+#: until one of them silently reported a smaller map.
+COVER_ORIGIN_OFF = 388
+COVER_TAG = 4
+
+
+def _cover_records(raw: bytes, d):
+    """`[(span, record_bytes)]` for the COVER records only, in list order."""
+    out = []
+    for i, (a, b) in enumerate(dmapmod.late_layer_spans(raw, d)):
+        (tag,) = struct.unpack_from("<I", raw, a)
+        if tag == COVER_TAG:
+            out.append((i, a, b))
+    return out
+
+
+def apply_cover_edits(records, edits):
+    """Apply `edits` to a list of raw record bytes. PURE -- no file, no map.
+
+    Split out of `stage_covers` so the decisions can be tested without an
+    install: which edits are refused, what an `add` copies, where an origin
+    is written. `stage_covers` owns the gating, the base selection and the
+    verify-before-write; this owns what an edit MEANS.
+
+    Returns `(records, added, moved, removed, refused)` with `records` a NEW
+    list -- removals are applied here rather than deferred to the caller, so
+    the indices the caller reports and the list it writes cannot disagree.
+
+    **Indices name positions in the WHOLE late list**, as `late_layers`
+    reports them, so they match what an inspector shows. Edits are applied in
+    order and `add` appends, so an index is stable for the duration of one
+    call: a `remove` is recorded and applied at the end rather than shifting
+    the list under a later edit in the same batch.
+    """
+    records = [bytearray(r) for r in records]
+    added, moved, removed, refused = [], [], [], []
+    drop: set = set()
+
+    def tag_of(rec):
+        return struct.unpack_from("<I", bytes(rec), 0)[0]
+
+    for e in edits:
+        op = str(e.get("op") or "").lower()
+        if op == "add":
+            src = int(e.get("from", -1))
+            if not (0 <= src < len(records)):
+                refused.append({"op": op, "why": "no record %d" % src})
+                continue
+            if tag_of(records[src]) != COVER_TAG:
+                refused.append({"op": op, "index": src,
+                                "why": "record %d is not a cover (tag %d)"
+                                       % (src, tag_of(records[src]))})
+                continue
+            rec = bytearray(records[src])
+            struct.pack_into("<II", rec, 4 + COVER_ORIGIN_OFF,
+                             int(e["x"]), int(e["y"]))
+            records.append(rec)
+            added.append({"copiedFrom": src, "x": int(e["x"]),
+                          "y": int(e["y"]), "index": len(records) - 1})
+        elif op in ("move", "remove"):
+            i = int(e.get("index", -1))
+            if not (0 <= i < len(records)):
+                refused.append({"op": op, "why": "no record %d" % i})
+                continue
+            if tag_of(records[i]) != COVER_TAG:
+                # The origin offset is the COVER layout. Writing it into a
+                # scene / sound / effect record would corrupt a different
+                # shape at an offset that happens to exist.
+                refused.append({"op": op, "index": i,
+                                "why": "record %d is not a cover (tag %d)"
+                                       % (i, tag_of(records[i]))})
+                continue
+            if op == "move":
+                (ox, oy) = struct.unpack_from("<II", bytes(records[i]),
+                                              4 + COVER_ORIGIN_OFF)
+                struct.pack_into("<II", records[i], 4 + COVER_ORIGIN_OFF,
+                                 int(e["x"]), int(e["y"]))
+                moved.append({"index": i, "from": [ox, oy],
+                              "to": [int(e["x"]), int(e["y"])]})
+            else:
+                drop.add(i)
+                removed.append({"index": i})
+        else:
+            refused.append({"op": op or "(none)", "why": "unknown operation"})
+
+    kept = [r for i, r in enumerate(records) if i not in drop]
+    return kept, added, moved, removed, refused
+
+
+def stage_covers(art: MapArt, edits, *, ack: str = "",
+                 stage: Optional[Path] = None) -> dict:
+    r"""Add, move or remove COVER sprites on a map, and stage the result.
+
+    WHY THIS IS POSSIBLE AT ALL, AND WHY IT IS STILL GATED
+    -------------------------------------------------------
+    Cover sprites live in the `.DMap`'s v1006 second counted record list. The
+    edit is SURGICAL in exactly the sense `stage_passability` is: the record
+    list is spliced, the count is rewritten, and **every other byte of the
+    file is copied through untouched**. Measured before this was written --
+    396 of 396 v1006 maps across five installs splice byte-identically as a
+    no-op, grow by exactly one record's length, and the grown file re-parses
+    with `bytes_unconsumed == 0` (`scratchpad/late_splice_corpus.py`).
+
+    That does **not** make it free. `.DMap` is one of the 155 files
+    `integrity.json` lists, so like `stage_passability` this will not run
+    without `ack == ACK`.
+
+    WHAT AN EDIT MAY SAY
+
+        {"op": "add", "from": <i>, "x": <px>, "y": <px>}
+        {"op": "move", "index": <i>, "x": <px>, "y": <px>}
+        {"op": "remove", "index": <i>}
+
+    `add` COPIES an existing cover's record and gives the copy a new origin.
+    **It does not author one from scratch, deliberately.** A cover payload is
+    `path[260] + key[128]` plus six more fields, and while `decode_layer`
+    reads all of them, what makes a given `path`/`key` pair resolve on a given
+    install is the `.ani` index -- so a record invented here could name art
+    the client cannot find, and would look authored. Copying a record that
+    the map already draws means the art is known to resolve. Placing NEW art
+    is a bigger feature and needs the Asset Viewer (T4) in front of it.
+
+    `index` is the index within the WHOLE late list, as `late_layers` reports
+    it, so it matches what an inspector shows. Non-cover records are never
+    touched: an index naming one is refused rather than rewritten, because
+    the origin offset above is the COVER layout and writing it into a scene
+    or effect record would corrupt a different shape at a plausible offset.
+
+    Read-only with respect to the install: this writes `mods/stage/` and
+    nothing else.
+    """
+    if ack != ACK:
+        raise NotAcknowledged(
+            "map/map/*.DMap is listed in integrity.json. Editing it changes a "
+            "file the client verifies. Pass the acknowledgement to proceed.")
+    stage = Path(stage) if stage else art.lib.stage
+    logical = art.dmap_logical
+    staged = stage / logical
+    if staged.is_file():
+        raw = staged.read_bytes()
+        base_src = f"{logical} (staged)"
+    else:
+        # The REGISTRY's map, not the loose leftover beside it -- same reason
+        # `stage_passability` says so: 77 of 6609's 184 loose `.DMap` files
+        # disagree with their `.7z` twin and 7878 ships none at all.
+        raw, base_src = dmapmod.open_map(art.lib.root, art.name)
+        if raw is None:
+            raise FileNotFoundError(f"no readable map for {art.name}: {base_src}")
+
+    # `parse` takes the bytes directly. This used to probe
+    # `hasattr(dmapmod, "parse_bytes")` for a function that has never existed
+    # -- `grep "def parse_bytes" core/dmap.py` returns 0 against a control of
+    # `def parse` on its own line -- so the fallback ALWAYS ran, and the
+    # fallback wrote a NamedTemporaryFile and read it back. A probe for a name
+    # nobody ever wrote is a branch that reads as a choice and is not one.
+    d = dmapmod.parse(art.dmap_path or Path(art.name), want_cells=False,
+                      data=raw)
+    if d is None or d.late_layer_offset < 0:
+        # The limit is this editor's write path, not the map's format: a
+        # pre-1006 map keeps its covers in the FIRST layer table, which
+        # nothing here writes yet. Say that, not "it cannot carry a cover".
+        raise ValueError(
+            f"{art.name} has no v1006 second record list (version "
+            f"{getattr(d, 'version', '?')}), and this editor writes covers "
+            f"only there; the map may already hold covers in its first layer "
+            f"table. See docs/map_cover_support.md for which maps this editor "
+            f"can write.")
+
+    spans = dmapmod.late_layer_spans(raw, d)
+    if len(spans) != d.late_layer_count:
+        raise ValueError("the record list does not walk cleanly; refusing to "
+                         "edit (a splice at a wrong offset corrupts silently)")
+    records = [bytearray(raw[a:b]) for a, b in spans]
+
+    records, added, moved, removed, refused = apply_cover_edits(
+        records, edits)
+    final = [bytes(r) for r in records]
+    data = dmapmod.splice_late_layers(raw, d, final)
+
+    # PROVE IT BEFORE IT REACHES THE STAGE TREE, exactly as the cell-mask
+    # path does. A spliced file whose count and body disagree walks past the
+    # end or stops short, and this is the check that catches it.
+    tmp = stage / (logical + ".verify")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(data)
+    try:
+        check = dmapmod.parse(tmp, want_cells=False)
+        if check.late_layer_count != len(final):
+            raise ValueError("spliced count %d != %d records written"
+                             % (check.late_layer_count, len(final)))
+        if len(check.late_layers) != len(final):
+            raise ValueError("spliced file decodes %d records, wrote %d"
+                             % (len(check.late_layers), len(final)))
+        if check.bytes_unconsumed:
+            raise ValueError("spliced file leaves %d byte(s) unconsumed"
+                             % check.bytes_unconsumed)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:                                  # pragma: no cover
+            pass
+
+    dest = stage / logical
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return {
+        "logical": logical, "staged": str(dest), "bytes": len(data),
+        "recordsBefore": len(spans), "recordsAfter": len(final),
+        "added": added, "moved": moved, "removed": removed,
+        # Refusals are reported, never silently dropped: a refusal the caller
+        # cannot see is indistinguishable from an edit that worked.
+        "refused": refused, "refusedCount": len(refused),
+        "base": base_src,
+        "note": ("The original was copied byte for byte apart from the second "
+                 "record list and its count. Nothing has touched the game "
+                 "install: run comod.py install to do that, and comod.py "
+                 "uninstall to revert."),
+        "integrity": art.lib.integrity.status(logical),
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1524,6 +2382,14 @@ def main(argv=None) -> int:
     ap.add_argument("--png", type=Path, default=None,
                     help="render the whole map (all layers, or --layer) here")
     ap.add_argument("--z", type=int, default=8, help="integer decimation")
+    ap.add_argument("--digest", action="store_true",
+                   help="per-tile digests of --layer at --z, for comparing "
+                        "this render against another one (an oracle, another "
+                        "build, or this map before an edit). Hashes the RAW "
+                        "RGBA, never the PNG.")
+    ap.add_argument("--time-ms", type=int, default=0,
+                   help="the clock terrain/cover sprites are sampled at; part "
+                        "of the answer for those layers and recorded with it")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
@@ -1545,7 +2411,11 @@ def main(argv=None) -> int:
         return 0
 
     art = lib.get(a.map)
-    if a.json and not (a.pick or a.editable):
+    # `--digest` has its own JSON, so it must not be swallowed by the
+    # whole-map dump here. MEASURED as a defect: `--digest --json` printed
+    # `to_json()` and the caller got a map summary where it asked for tile
+    # digests -- valid JSON, wrong document, and nothing said so.
+    if a.json and not (a.pick or a.editable or a.digest):
         print(json.dumps(art.to_json(), indent=1))
         return 0
     if a.editable:
@@ -1570,7 +2440,9 @@ def main(argv=None) -> int:
         return 0
 
     j = art.to_json()
-    if a.info or not a.png:
+    # `--digest` prints its own header; the info block would put a map
+    # summary in front of it for no reason.
+    if a.info or not (a.png or a.digest):
         print(f"{art.name}  {j['mapSize'][0]}x{j['mapSize'][1]} cells   "
               f"{j['sceneParts']} scene parts, {j['covers']} covers")
         if not j["ok"]:
@@ -1584,6 +2456,38 @@ def main(argv=None) -> int:
             print(f"  backdrops: {[b['path'] for b in j['backdrops']] or 'none'}")
         print(f"  .DMap    : {j['dmap']}  integrity-checked="
               f"{j['integrity']['checked']}")
+    if a.digest:
+        if art.pm is None:
+            print(f"cannot render {art.name}: {art.reason}", file=sys.stderr)
+            return 1
+        z = max(1, a.z)
+        layers = (a.layer,) if a.layer else LAYERS
+        out = [art.layer_digests(name, z, time_ms=a.time_ms)
+               for name in layers]
+        if a.json:
+            print(json.dumps(out if len(out) > 1 else out[0], indent=2))
+        else:
+            d0 = out[0]
+            print(f"{art.name}  {d0['pixels'][0]}x{d0['pixels'][1]} px  "
+                  f"z={z}  tile={d0['tile']}  "
+                  f"grid={d0['grid'][0]}x{d0['grid'][1]}")
+            print(f"  .DMap {d0['dmap']}  integrity-checked="
+                  f"{d0['integrityChecked']}")
+            for d in out:
+                n = len(d["tiles"])
+                print(f"  {d['layer']:<12} {d['drawn']:>6} drawn, "
+                      f"{d['blank']:>6} blank, of {n}"
+                      + ("   <-- ENTIRELY BLANK: this layer draws nothing on "
+                         "this map at this zoom, so its digests compare "
+                         "equal to any other blank layer's"
+                         if d["drawn"] == 0 else ""))
+            # The digests themselves only on request: a 34,944x22,400 map at
+            # z=1 is 19,096 tiles per layer and nobody reads that at a
+            # terminal. `--json` is the machine path and is what a comparator
+            # consumes.
+            if not a.json:
+                print("  (--json for the digests themselves)")
+        return 0
     if a.png:
         if art.pm is None:
             print(f"cannot draw {art.name}: {art.reason}", file=sys.stderr)

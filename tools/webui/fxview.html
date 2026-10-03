@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Effects Viewer — moved</title>
+<link rel="stylesheet" href="/ui/style.css">
+<!-- THE FORWARD is `/ui/fxview-forward.js`, and it is a FILE because the
+     server sends `script-src 'self'` with no `'unsafe-inline'` on every
+     response. An inline <script> body here is dropped by the browser and
+     nothing says so -- which is exactly what shipped between 2026-09-08 and
+     2026-09-10, so /fxview never forwarded at all. bugs_open.md #6, second
+     instance. The file carries the rest of the reasoning. -->
+<script src="/ui/fxview-forward.js"></script>
+</head>
+<!-- `/fxview` IS NO LONGER A PAGE. It is kept as a forward, deliberately.
+
+     WHAT HAPPENED, 2026-09-08
+       The Effect Preview (`/effects`) and the Effects Viewer (`/fxview`) were
+       the same subject seen twice -- one played an effect, the other
+       catalogued it -- and the owner asked for one page called "Effects
+       Viewer". The Effect Preview's three-column shell survived, because it
+       is the toolkit's standard shape (nav left, content middle, options and
+       info right), and this page's panels moved into its right column. The
+       census and tables-read band moved behind a "Developer Notes" toggle.
+
+     WHY A FORWARD AND NOT A DELETION
+       `tools/coviewer.py` still routes `/fxview` here, and that route is
+       another seat's file this week. More to the point, the URL is in the
+       wild: it has been linked from reports, from the backlog and from at
+       least one branch report. A 404 tells someone the feature was removed.
+       It was not -- it is the page they land on. `fxview.js` is still a live
+       file and is still loaded, BY `effects.html`; only this shell retired.
+
+     WHAT IS NOT HERE ANY MORE, AND WHERE IT WENT
+       the provenance strip / census band   -> Developer Notes on /effects
+       the effect list and its filters      -> the left rail on /effects,
+                                               with the whole/partial/broken
+                                               dropdown the census feeds
+       Play / Pause / Restart               -> the /effects transport, which
+                                               is the stage that was repaired
+                                               on 2026-09-07
+       tags, what-it-needs, connected-to,
+       compare, collect & export, limits    -> the right column on /effects -->
+<body data-co-page="effects">
+<main style="padding:24px; max-width: 46em;">
+  <h1>The Effects Viewer moved</h1>
+  <p>The Effect Preview and the Effects Viewer are one page now, and it is
+    called the <b>Effects Viewer</b>. Everything that was here is there: the
+    library list and its filters on the left, the stage in the middle, and the
+    tags / satellites / connections / compare / export panels on the right.
+    The <i>Tables read</i> strip and the <i>Census</i> are behind the
+    <b>Developer Notes</b> button in the header.</p>
+  <p><a href="/effects">Go to the Effects Viewer</a></p>
+  <p class="mut">You are normally sent there automatically. If you are
+    reading this, script did not run — the link above is the same
+    destination, and it keeps working either way.</p>
+</main>
+</body>
+</html>

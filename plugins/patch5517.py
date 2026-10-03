@@ -92,6 +92,11 @@ def _version(root: Path, exists) -> str:
 
 
 class Patch5517(Patch6090):
+    #: NOT inherited from `Patch6090`: its `{"operateactivity.ini": "gbk"}`
+    #: was measured on 6090's file, not this build's (6907's is strict UTF-8
+    #: and fails GBK at byte 2). Empty = plugin-wide encoding, as before.
+    TABLE_ENCODING: dict = {}
+
     name = "patch5517"
     label = "Official patch client 5517"
     origin = "official"

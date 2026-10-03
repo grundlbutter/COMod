@@ -127,6 +127,60 @@ Three things in that table are traps rather than results, and each is
 documented where it bites: the **unique/present split** (`read_sections`),
 the **encoding** (`TEXT_ENCODING`), and the **column count**
 (`ITEM_COLUMNS`).
+
+TEXT ENCODING: `gbk`, MEASURED PER TABLE (owner ruling "fix lineage wide")
+------------------------------------------------------------------------
+THE MODULE CONSTANT SAID gbk AND THE CLASS DECODED latin1: `Patch7878`
+inherited the base `TEXT_ENCODING = "latin1"`, so the curated readers
+(`read_sections`/`read_at_rows`, gbk by default) served GBK while every
+censused subject (`load_table`, e.g. `terrainnpc`, `txtemotion`) served
+latin1 mojibake. The class now declares the measured value. 2026-09-19, branch
+`director/comod-gbk-lineage`. INSTRUMENT: every declared subject's
+`browse()` labels, plus every `Name=` value of every declared section
+table (`Name=:` below), read through THIS plugin with its encoding
+replaced by a probe codec: GBK with surrogateescape, so the parse is
+GBK's (latin1 splits a line on a 0x85 trail byte and strips a 0xA0 one)
+and any byte that is not strict GBK survives as a visible surrogate.
+PASS = strict GBK to CJK (U+3400-9FFF), full-width punctuation
+(U+3000-303F, U+FF00-FFEF) or GBK pinyin Latin (U+00C0-01DC).
+PROBE: strict GBK rejects `81 20`, `ff fe` and a lone `a1`. CONTROL:
+7205 by the same instrument, 21 tables with high-byte names, 0 failures.
+RESULT on 7878: **0 strict-GBK failures** in 270 subjects/name
+sources (0 refused, not read); 17 tables carry CJK.
+
+    table                        fields  high   CJK punct pinyin other FAIL
+    3dtexture                      8793     6     0     6      0     0    0
+    Name=:Monster.dat              5271    66    66     0      0     0    0
+    Name=:magiceffect              1915     4     4     0      0     0    0
+    Name=:mount                       1     1     1     0      0     0    0
+    Name=:npc                      4087    29     6    23      0     0    0
+    Name=:npc:NpcX.ini             1320    30    28     1      1     0    0
+    Name=:npc:npc.ini              4087    29     6    23      0     0    0
+    Name=:npc:terrainnpc.ini        183    51    48     3      0     0    0
+    Name=:npcx                     1320    30    28     1      1     0    0
+    Name=:terrainnpc                183    51    48     3      0     0    0
+    item                          55418     4     0     1      0     3    0
+    monster                        5234    55    55     0      0     0    0
+    npc                            4062     6     6     0      0     0    0
+    npc:NpcX.ini                   1320    30    28     1      1     0    0
+    npc:npc.ini                    4062     6     6     0      0     0    0
+    npc:terrainnpc.ini              181    48    48     0      0     0    0
+    npcx                           1320    30    28     1      1     0    0
+    terrainnpc                      181    48    48     0      0     0    0
+    txtemotion                        9     9     9     0      0     0    0
+
+EXAMPLES (hex, then GBK):
+    npc:terrainnpc.ini NpcType1: `b3 a4 b5 c6` = '长灯'
+    terrainnpc NpcType1: `b3 a4 b5 c6` = '长灯'
+    Name=:Monster.dat 207: `d0 e9 bf d5 c1 e9 ca de` = '虚空灵兽'
+    Name=:npc:npc.ini 681: `4c 61 6e 74 65 72 6e a1 a1` = 'Lantern\u3000'
+
+`other` is GBK row-A1 general punctuation (U+2019 `a1 af`, U+2026
+`a1 ad`) inside English text, e.g. "Texas Hold’em" -- strict GBK and
+only sensible as GBK (latin1 reads `¡¯`), so not a failure.
+Name fields only. A WHOLE-TABLE strict decode found files that are not
+GBK; they carry a per-table codec through `TABLE_ENCODING` (see the class)
+and `TableSpec.encoding`, added to the base the same day.
 """
 from __future__ import annotations
 
@@ -211,9 +265,101 @@ HELD_OUT = {"levexp.dat"}
 #: `levexp.dat` decrypted and we cannot attribute its key; these did not
 #: decrypt at all. Collapsing the two would make "we know what this is and
 #: will not use it" indistinguishable from "this is garbage".
+#: Tables the `ndac.dll` oracle did NOT decrypt. **The corpus README says
+#: "153 of 155 validated" and names TWO. Re-measured 2026-08-28 over all 1,655
+#: `.out` files in `derived/7878-dat-decrypted`, SIXTEEN carry the unambiguous
+#: ciphertext signature -- Shannon H >= 7.2 with under 45% printable -- and
+#: fourteen of them were undeclared.**
+#:
+#: This confirms `C-2026-08-14-claude-vibeco-content-2` on a corpus that has
+#: since grown from 168 `.out` files to 1,655: the finding held for two weeks
+#: while the guard did not. The README's own warning is the reason it matters --
+#: *"a failed decryption in here looks exactly like a successful one"* -- so a
+#: reader trusting this set served fourteen ciphertext tables as rows.
+#:
+#: The cluster is tight and self-similar: H 7.26-8.00, printable 35.9-40.3%.
+#: Nothing sits near the boundary, so the threshold is not doing delicate work.
+#: **CORRECTED 2026-08-28 (`docs/dat_residue_was_the_caller_2026-08-28.md`).**
+#: The SET above is right and stays: every `.out` listed here is ciphertext and
+#: must not be served. **The REASON was wrong for thirteen of the fourteen.**
+#: "did not decrypt" was measured over ONE route -- the `ndac.dll` block96
+#: oracle that wrote `derived/` -- and read back as though it meant *this
+#: repository cannot open this file*. It never did. `core/inidat.py` carries
+#: two more routes and they open thirteen of these fourteen:
+#:
+#:     RSA-2048, published 5517 modulus     10 files -> mysqldump XML
+#:     TQ File Cipher, seed 9527             2 files -> INI / GBK text
+#:     never encrypted at all                1 file  -> int32 array
+#:     STILL UNDECRYPTED                     1 file  -> ServerPlay.dat
+#:
+#: So each value below now names the route that DOES open the file. The guard
+#: is unchanged -- `_derived_file` still refuses the `.out` -- but a reader who
+#: hits this list is now pointed at `inidat.rsa_decrypt` / `tqdat.decrypt`
+#: instead of being told the table is unreadable.
+#:
+#: *`weaponactiondata.dat` is one of TWO new TQ-family members found by re-running
+#: the family test with a GBK-aware acceptance criterion instead of an ASCII
+#: printability one; the other is `WeaponMotionData.dat`, the residue of
+#: `docs/m9_weaponmotiondata_residue_2026-08-27.md`. Both were refused by every
+#: printability guard in the pipeline because their plaintext is Chinese.*
 NOT_CONTENT = {
-    "levelexp.dat": "did not decrypt -- 516 B at H=7.60, 35.9% printable",
-    "serverplay.dat": "did not decrypt -- 6,650 B at H=7.97, 37.6% printable",
+    # STILL UNDECRYPTED -- the only genuine residue in ini/
+    "serverplay.dat": "the ndac oracle's .out is ciphertext -- 6,650 B, and no "
+                      "route opens it yet: not RSA at any alignment, not TQ at "
+                      "seed 9527 or 1234, block96-candidate-refuted",
+    # NOT ENCRYPTED AT ALL -- read the raw file, not the .out
+    "levelexp.dat": "the .out is ciphertext, but the RAW file is PLAIN: 129 "
+                    "little-endian int32. Read <client>/ini/LevelExp.dat "
+                    "directly; do not decrypt it",
+    # TQ File Cipher, seed 9527 -- core/tqdat.py decrypt()
+    "userhelpinfo.ini.dat": "the .out is ciphertext; the file opens with "
+                            "tqdat.decrypt(data, 9527) -> 867-entry help INI. "
+                            "A DIFFERENT REVISION from ini/UserHelpInfo.ini "
+                            "beside it (268 differing hunks), not a duplicate",
+    "weaponactiondata.dat": "the .out is ciphertext; opens with "
+                            "tqdat.decrypt(data, 9527) -> GBK text, the "
+                            "dual-wield weapon-animation key into 3DMotion.ini",
+    # RSA-2048 under the published 5517 modulus -- core/inidat.py rsa_decrypt()
+    "showhandlayout.dat": "the .out is ciphertext; opens with "
+                          "inidat.rsa_decrypt() -> 77,389 B mysqldump XML",
+    "showhandlayout800x600.dat": "the .out is ciphertext; opens with "
+                                 "inidat.rsa_decrypt() -> 76,933 B XML",
+    "showhandtable.dat": "the .out is ciphertext; opens with "
+                         "inidat.rsa_decrypt() -> 249,876 B XML",
+    "shlayout.dat": "the .out is ciphertext; opens with inidat.rsa_decrypt() "
+                    "-> 61,417 B XML",
+    "shlayout800x600.dat": "the .out is ciphertext; opens with "
+                           "inidat.rsa_decrypt() -> 60,839 B XML",
+    "racetrackprop.dat": "the .out is ciphertext; opens with "
+                         "inidat.rsa_decrypt() -> 14,250 B XML",
+    "suittype.dat": "the .out is ciphertext; opens with inidat.rsa_decrypt() "
+                    "-> 41,576 B XML",
+    "myanimate.dat": "the .out is ciphertext; opens with inidat.rsa_decrypt() "
+                     "-> 6,901 B XML",
+    "myanimate800x600.dat": "the .out is ciphertext; opens with "
+                            "inidat.rsa_decrypt() -> 6,724 B XML",
+    "showhandtablerace.dat": "the .out is ciphertext; opens with "
+                             "inidat.rsa_decrypt() -> 6,914 B XML",
+}
+
+#: The thirteen of `NOT_CONTENT` that a caller CAN open, and how. Keyed the same
+#: way, so `NOT_CONTENT.keys() - OPENS_VIA.keys()` is exactly the real residue.
+#: Checked by `tests/test_patch7878_residue_routes.py` against the client on
+#: disk, so this cannot drift from the files the way the old reason strings did.
+OPENS_VIA = {
+    "levelexp.dat": "plain",
+    "userhelpinfo.ini.dat": "tq9527",
+    "weaponactiondata.dat": "tq9527",
+    "showhandlayout.dat": "rsa",
+    "showhandlayout800x600.dat": "rsa",
+    "showhandtable.dat": "rsa",
+    "shlayout.dat": "rsa",
+    "shlayout800x600.dat": "rsa",
+    "racetrackprop.dat": "rsa",
+    "suittype.dat": "rsa",
+    "myanimate.dat": "rsa",
+    "myanimate800x600.dat": "rsa",
+    "showhandtablerace.dat": "rsa",
 }
 
 #: The item columns this project can justify, and **only** those.
@@ -249,8 +395,10 @@ def _derived_file(base: Optional[Path], name: str) -> Optional[Path]:
     """`Monster.dat` -> the `.out` beside it, or None for the two refusals.
 
     Refuses `HELD_OUT` (decrypted, key group unattributable) and `NOT_CONTENT`
-    (never decrypted). Both are present on disk with a `.out` suffix, so
-    neither absence nor extension distinguishes them from real tables.
+    (the `ndac.dll` oracle's `.out` is ciphertext -- which is NOT the same as
+    the table being unreadable: see `OPENS_VIA`, which names another route for
+    thirteen of the fourteen). Both are present on disk with a `.out` suffix,
+    so neither absence nor extension distinguishes them from real tables.
     """
     if base is None or name.lower() in HELD_OUT or name.lower() in NOT_CONTENT:
         return None
@@ -274,10 +422,20 @@ def _why_no_derived(base: Optional[Path], fname: str) -> str:
                 f"cannot decide its key group. It decrypts; that is not the "
                 f"same as being attributable.")
     if fname.lower() in NOT_CONTENT:
+        route = OPENS_VIA.get(fname.lower())
+        how = {
+            "rsa": "core.inidat.rsa_decrypt(raw_bytes)",
+            "tq9527": "core.tqdat.decrypt(raw_bytes, 9527)",
+            "plain": "a plain read of the raw bytes -- it was never encrypted",
+        }.get(route)
+        tail = (f" THE TABLE IS READABLE, just not from `derived/`: open "
+                f"<client>/ini/{fname} with {how}."
+                if how else
+                " No route opens this one yet; it is the real residue.")
         return (f"{fname}: {NOT_CONTENT[fname.lower()]}. A `.out` file was "
-                f"written, so it looks like every other decrypted table; the "
+                f"written, so it looks like every other decrypted table; those "
                 f"bytes are still ciphertext. This is NOT the held-out case "
-                f"-- that one decrypted and cannot be attributed.")
+                f"-- that one decrypted and cannot be attributed.{tail}")
     return f"{fname}: not present in {base}"
 
 
@@ -321,6 +479,84 @@ def _control_at_row(path: Path, rows: list) -> Optional[str]:
 
 
 class Patch7878(PlaintextFamily):
+    #: GBK, MEASURED PER TABLE on this install 2026-09-19 (owner ruling
+    #: "fix lineage wide"); evidence in the module docstring. Declared
+    #: in THIS class body, not only inherited, so each build carries its
+    #: own proof (`tests/gbk_lineage.py`).
+    TEXT_ENCODING = TEXT_ENCODING
+    #: {table: (name fields, high-byte fields, CJK fields, strict-GBK
+    #: failures)} -- `Name=:` rows are every `Name=` of a section table.
+    GBK_BY_TABLE = {
+        '3dtexture': [8793, 6, 0, 0],
+        'Name=:Monster.dat': [5271, 66, 66, 0],
+        'Name=:magiceffect': [1915, 4, 4, 0],
+        'Name=:mount': [1, 1, 1, 0],
+        'Name=:npc': [4087, 29, 6, 0],
+        'Name=:npc:NpcX.ini': [1320, 30, 28, 0],
+        'Name=:npc:npc.ini': [4087, 29, 6, 0],
+        'Name=:npc:terrainnpc.ini': [183, 51, 48, 0],
+        'Name=:npcx': [1320, 30, 28, 0],
+        'Name=:terrainnpc': [183, 51, 48, 0],
+        'item': [55418, 4, 0, 0],
+        'monster': [5234, 55, 55, 0],
+        'npc': [4062, 6, 6, 0],
+        'npc:NpcX.ini': [1320, 30, 28, 0],
+        'npc:npc.ini': [4062, 6, 6, 0],
+        'npc:terrainnpc.ini': [181, 48, 48, 0],
+        'npcx': [1320, 30, 28, 0],
+        'terrainnpc': [181, 48, 48, 0],
+        'txtemotion': [9, 9, 9, 0],
+    }
+
+    #: PER-TABLE exceptions to GBK, MEASURED 2026-09-19 on this install by a
+    #: strict decode of each declared table's whole text:
+    #:   ChatFilter.ini  2 bytes, `ff fe` -- a UTF-16 BOM and NOTHING ELSE.
+    #:                   GBK rejects both bytes, so under gbk its one "row"
+    #:                   became U+FFFD and lost its control (caught by
+    #:                   test_patch7878_catalogs). latin1 keeps the pre-GBK
+    #:                   behaviour: one row reading `ÿþ`, which is a
+    #:                   BOM counted as a row, NOT content -- recorded, not fixed.
+    #:   Questinfo.ini   1,739,385 bytes, strict UTF-8 OK, strict GBK fails
+    #:                   at byte 17,213 (12 undecodable), UTF-8 CJK text.
+    #:
+    #: NINE MORE, strict UTF-8 (strict decode of the whole file, 2026-09-19,
+    #: bytes / high bytes / 0x85 bytes / strict GBK):
+    #:   Ar_Res.ini                    3,755 /   1,128 /    21 / decodes, but
+    #:                                 as GBK garbage; UTF-8 is 564 Arabic
+    #:   Cn_Res.ini                3,058,954 /   8,209 /    98 / fails @133,374
+    #:   Server_Cn_Res.ini         4,681,540 /  15,291 /    13 / fails @10,476
+    #:   OperateActivity.ini          39,873 /  14,253 /   195 / fails @22
+    #:   QuestinfoPassionServer.ini  714,950 / 312,634 / 3,809 / fails @228
+    #:   TexasChatGUI.ini              6,062 /   1,551 /    23 / fails @2 (BOM)
+    #:   TexasChatGUI800X600.ini       6,142 /   1,551 /    23 / fails @2 (BOM)
+    #:   Title.ini                     2,086 /      78 /     1 / fails @31
+    #:   WrapTypeData.ini             58,706 /     570 /     3 / fails @30
+    #: The census could not settle them under latin1 (each 0x85 byte was a
+    #: false line under `splitlines`); see tests/test_census_line_split.py.
+    TABLE_ENCODING = {
+        "chatfilter.ini": "latin1", "questinfo.ini": "utf-8",
+        "ar_res.ini": "utf-8", "cn_res.ini": "utf-8",
+        "server_cn_res.ini": "utf-8", "operateactivity.ini": "utf-8",
+        "questinfopassionserver.ini": "utf-8", "texaschatgui.ini": "utf-8",
+        "texaschatgui800x600.ini": "utf-8", "title.ini": "utf-8",
+        "wraptypedata.ini": "utf-8",
+    }
+
+    #: FOUR-wide action field, like 6090 -- not the family's three.
+    #: MEASURED 2026-09-19 over every keyed row of 7878's
+    #: `ini/Action3DEffect.ini`: 4,193 of 4,193 have a four-digit action
+    #: (shape.action.type.sub widths 3.4.3.3 x2,722, 4.4.3.3 x1,180,
+    #: 1.4.3.1 x262, 3.4.1.3 x24, 3.4.1.1 x5); 5017 is 3.3.3.3 on all
+    #: 8,685, which is why the family default stays three. The always-on
+    #: action code is spelled from this width, so three-wide here looks up
+    #: `999` against rows that say `9999` -- the defect C35 recorded on 6090.
+    #: The SHAPE field is not a fixed width on 7878 (3, 4 or 1), so it keeps
+    #: the family's declared 3; only the action width is a measured fact.
+    #: Found by the patch7320 plugin agent.
+    FIELD_WIDTHS = {
+        "Action3DEffect.ini": {"shape": 3, "action": 4, "type": 3, "sub": 3},
+    }
+
     name = "patch7878"
     label = "Official patch client 7878"
     origin = "official"
@@ -519,7 +755,7 @@ class Patch7878(PlaintextFamily):
         # with a generated row count would be a downgrade dressed as coverage.
         from .catalog import censused as _cens
         for subject, cat in build_catalogs(
-                _cens.specs_for(self.name),
+                self.apply_table_encoding(_cens.specs_for(self.name)),
                 lambda spec: self.load_table(spec, root),
                 encoding=self.TEXT_ENCODING,
                 columns=self.ITEM_COLUMNS).items():

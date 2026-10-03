@@ -48,7 +48,7 @@ WEBUI = PROJECT / "tools" / "webui"
 #: would be a bar of dead ends. `companion.html`, `play.html` and
 #: `showandtell.html` are separate surfaces with their own shells.
 PAGES = ("index.html", "builder.html", "models.html", "mapedit.html",
-         "settings.html", "swap.html")
+         "settings.html", "swap.html", "effects.html")
 
 #: The owner's list, in the owner's order. Written out longhand rather than
 #: derived from nav.js -- a test that reads the list it is checking cannot
@@ -60,7 +60,32 @@ WANT_TABS = [
     ("viewer",   "/index.html", "Asset Viewer"),
     ("builder",  "/builder",  "Character Builder"),
     ("models",   "/models",   "Model Viewer"),
+    # The Effects Viewer. Its own tab rather than a panel on the Model Viewer
+    # because it plays TWO systems, and one of them (ini/effect.ini ->
+    # ani/effect.ani flipbooks) has no mesh in it at all.
+    #
+    # ONE TAB, AND IT WAS TWO. Until 2026-09-08 there was an "Effect Preview"
+    # at /effects and an "Effects Viewer" at /fxview: the same subject seen
+    # twice, one playing an effect and one cataloguing it. The owner asked for
+    # one page called the Effects Viewer. The player's three-column shell
+    # survived (nav left, content middle, options and info right) and the
+    # library's panels moved into it, so the ROUTE is still /effects and only
+    # the label changed. /fxview forwards there and is deliberately NOT a tab:
+    # a redirect in the bar is a destination that moves under you.
+    ("effects",  "/effects",  "Effects Viewer"),
     ("mapedit",  "/mapedit",  "Map Editor"),
+    # The Map Asset Viewer. The owner asked for it by name -- "a Map Asset
+    # Viewer page that helps people find, and collect map satellite files" --
+    # so it is in the bar for the same reason every other entry is.
+    #
+    # A PEER OF THE MAP EDITOR RATHER THAN A PANEL ON IT, and the split is
+    # the subject, not the screen space. The Editor's subject is ONE MAP; this
+    # one's subject is a SATELLITE asked across every map at once -- which
+    # covers exist, which maps draw each, and which maps could. A corpus-wide
+    # catalogue hung off a page built around a single map's viewport is how
+    # the shared-art question stayed unaskable: you could see what a map uses
+    # and never what else uses it.
+    ("mapassets", "/mapassets", "Map Assets"),
     ("swap",     "/swap",     "Swap"),
     ("settings", "/settings", "Settings"),
 ]

@@ -423,6 +423,67 @@ nothing to play.
 That is why this is achievable: it is billboard/quad animation plus alpha and
 texture-cell keys, exactly as suspected.
 
+### 6.1a Asking for a form — the filter — MEASURED 2026-09-07
+
+The classification above is per *container*. The question a modder starts from
+is the other way round: **which effects are ribbon trails?**
+
+```bash
+py -3 tools/comod.py effects --list --form ribbon
+py -3 tools/comod.py effects --census
+py -3 tools/effects.py --list --form phy --form ribbon --form-mode all
+py -3 tools/effects.py --list --form particle --json
+```
+
+`--form` takes `phy`/`moti`/`PHY+MOTI`, `ribbon`/`trail`/`shap`/`smot`/
+`SHAP+SMOT`, or `particle`/`ptcl`/`ptc3`/`PTCL/PTC3`; it is repeatable, and
+`--form-mode` is `any` (the union, default), `all` or `none`. An unrecognised
+spelling is **refused**, never ignored — a filter that dropped a form it did
+not recognise would answer with the unfiltered list and read as "nothing
+matches that". In the web viewer the same filter is three toggles above the 3D
+effect picker, served by `/api/effect/forms`.
+
+**The filter is SET MEMBERSHIP, not a category**, and the row "both of the
+above / 63" in §6.1's table is why. A container carries however many forms it
+carries: 5517 `c3/effect/lance/560029.C3` holds 4 `PHY` + 4 `MOTI` **and**
+2 `SHAP` + 2 `SMOT`, and effect `560029` is returned by a query for either one.
+Anything that assigned one form per effect would hide a third of the table from
+the other filters.
+
+Per-base census (`comod effects --census`, MEASURED 2026-09-07). **The
+per-form columns overlap and do not sum to `effects`** — an effect carrying two
+forms is counted under both, which is what the `multi` column measures:
+
+| base | effects | `PHY+MOTI` | `SHAP+SMOT` | `PTCL`/`PTC3` | multi | no form |
+|---|---:|---:|---:|---:|---:|---:|
+| 5017 | 2,278 | 1,433 | 888 | 491 | 515 | 24 |
+| 5517 | 3,391 | 2,462 | 1,050 | 1,200 | 1,222 | 56 |
+| 6090 | 4,472 | 3,344 | 1,458 | 1,876 | 1,860 | 59 |
+| 6609 | 5,290 | 4,120 | 1,486 | 2,346 | 2,306 | 73 |
+| 7205 | 5,290 | 4,121 | 1,485 | 2,345 | 2,306 | 72 |
+| 7878 | 2,595 | 911 | 93 | 460 | 364 | 1,521 |
+
+**7878's 1,521 is not the client dropping animation.** `form_census` splits the
+no-form column into `bare` (the container was read and carries none of the
+three) and `unresolved` (the table names a container this install does not
+ship), and on 7878 it is **0 bare / 1,521 unresolved** — entirely the second.
+The two are different answers about different things and the census refuses to
+merge them; on 5517 the same split is 5 bare / 51 unresolved, on 6609
+7 / 66.
+
+Cost, cold, MEASURED the same day: one pass over every container the effect
+tables name — 5017 12.5 s / 1,791 containers, 5517 13.0 s / 4,584, 6090 25.7 s
+/ 7,350, 6609 107.5 s / 10,390, 7205 89.6 s / 10,390, 7878 16.9 s / 2,380.
+That is why it is its own command rather than a line in `comod catalogs`, and
+why the viewer builds it in the background and publishes a `building` state
+instead of holding the request open.
+
+`out/effects/linkage.json` carries the same answer as a `forms` list on every
+`effect_object_geometry` entry and on every effect, derived from the `kinds` it
+already computed.
+
+Gated by `tests/test_effect_forms.py`.
+
 ### 6.2 `MOTI` — VERIFIED, and newly decoded
 
 `docs/modding.md` §9.9 listed `MOTI` as undecoded. **It is not inside Themida.**
@@ -496,6 +557,24 @@ All four encodings occur in real data and every chunk is consumed to exactly its
 declared length. Independently: on 1,967 sampled meshes the `MOTI` `boneCount`
 covers the paired `PHY`'s bone palette in **every** case, zero counterexamples.
 
+**Writing it back — `effects.serialize_moti`, added 2026-09-05.** The inverse of
+`parse_moti`, in the shape `tools/c3write.py` uses for `PHY`: byte-exactness
+first, and `serialize_moti(parse_moti(body)) == body` over the whole corpus.
+Gate: `py -3 tests/test_moti_roundtrip.py` — **16,600 / 16,600 byte-exact on the
+default root, all four encodings exercised by real bytes** (KKEY 5,269 ·
+RAW 9,593 · ZKEY 1,393 · XKEY 345), 5,722/5,722 whole `.c3` containers exact.
+
+`parse_moti` had to be extended to make that possible, because it was **not**
+lossless. `MotionKey.matrices` is a derived view and for `ZKEY` a lossy one —
+`quat_to_matrix` normalises and `q`/`-q` give the same matrix, so MEASURED
+**686 of 1,393 ZKEY chunks (49.2 %)** carry at least one bone-key that cannot be
+recovered from the matrix. `MotionKey.source` now keeps the on-disk floats, and
+`Motion.extra_payload` / `Motion.trailing` keep the two blocks the reader used
+to skip. All three are new fields with defaults; no existing caller sees a
+different value. Full write-up, per-encoding coverage, what the corpus does
+**not** cover, and the five-mutant must-fire table:
+**`docs/moti_writer_2026-09-05.md`**.
+
 ### 6.3 `SHAP` + `SMOT` — the weapon trail — VERIFIED
 
 This is what makes a sword swing leave a streak. From `Shape_Load`
@@ -540,6 +619,26 @@ count, i.e. the shape's clock is its `SMOT`.
 
 `tools/effects.py` exposes this as `shape_ribbon(shape, smotion, world, frame,
 history)`, which mutates and returns the caller's rolling pair list.
+
+**Writing them back — `effects.serialize_shap` and `effects.serialize_smot`,
+added 2026-09-07.** The inverses of `parse_shap` and `parse_smot`, in the shape
+`serialize_moti` uses, gated by `py -3 tests/test_fx_roundtrip.py`. `SMOT` is a
+flat `u32 n; mat4x4[n]` and needed nothing but a count and a trailing block.
+`SHAP` was **not** losslessly parsed and had to be extended: `name` and `label`
+are `gbk`-decoded with `errors="replace"` (irreversible for any byte gbk cannot
+decode), and `segments` has an on-disk **0 normalised to 1** by the engine at
+`0x5D63A` and by the parser after it — so `segments == 1` is two different
+files. `Shape.name_raw` / `.label_raw` / `.segments_raw` / `.trailing` now carry
+the on-disk forms and the writer prefers them **only while the decoded view
+still agrees**, so an edit still reaches the bytes. Per-form counts, the
+must-fire table and what the corpus does not cover:
+**`docs/fx_writers_2026-09-07.md`**.
+
+`RIBB` : `RMOT` is the newer spelling of this pair and a **different format**
+with a different loader — `parse_shap` refuses all 71 `RIBB` bodies. Its writer
+is `effects.serialize_ribb`, gated by the same file; `serialize_rmot` **is**
+`serialize_smot`, aliased rather than duplicated because the two loaders are
+the same function.
 
 ### 6.4 `C3Key` — alpha, visibility, texture cell — VERIFIED
 
@@ -812,6 +911,26 @@ birth frame — the input does not exist; and `worldSpace` (+0x34), `billboard`
 every one of those 2,211 parts** — all declare `alpha = (1,1,1)` with
 `fadeFrame = (0, 0xFFFFFFFF)` — so a flat glow on this base is not evidence
 that it works, which is why the test reads the value back instead.
+
+**Writing it back — `effects.serialize_ptcl`, added 2026-09-07.** The inverse
+of `parse_ptcl` for all three generations, gated by
+`py -3 tests/test_fx_roundtrip.py`. Three things had to change on the read side
+first, all of them non-injective decodes: `name` / `label` (`gbk` with
+`errors="replace"`), `tex_grid` (an on-disk **0 normalised to 1**, as
+`Ptcl_Clear` does), and `PTC3`'s `billboard` (**100 subtracted when it is
+>= 100**, so billboard 4 is both an on-disk 4 and an on-disk 104).
+`Particle.name_raw` / `.label_raw` / `.tex_grid_raw`,
+`ParticleEnvelope.billboard_raw` and `Particle.trailing` carry the on-disk
+forms; the writer prefers them only while the decoded view still agrees.
+
+**The zero-count branch is the difficulty on the write side too**, and for the
+same reason it is on the read side: an empty frame carries no arrays *and no
+matrix*, and 47 % of patch5517's particle frames are empty, so emitting the
+0x40 matrix anyway is wrong on most files rather than a few. The writer takes
+`ParticleFrame.count` as the authority and **refuses** a frame whose arrays
+disagree with it rather than trimming — trimming would drop particles and
+still round-trip its own output. `stretch` is deliberately not written: it is
+not a field, it is `strstr`-ed back out of the object *name* at `0x60D75`.
 
 ---
 
@@ -1764,19 +1883,244 @@ rebuild it. Top-level keys:
 | `action_effect_rules` | every `Action3DEffect.ini` row, split into fields |
 | `action_map_rules` | every `ActionMap3DEffect.ini` row, with `show_time` / `dir_enable` |
 | `action_delay` | `ActionDelay.ini` verbatim |
-| `effects` | `"Flash4102" -> {frame_interval_ms, fps, loop_time, endless, delay_ms, loop_interval_ms, offset, frames, effective_frames, duration_ms, layers[...]}` |
+| `effects` | `"Flash4102" -> {frame_interval_ms, fps, loop_time, endless, delay_ms, loop_interval_ms, offset, frames, effective_frames, duration_ms, forms[...], layers[...]}` |
 | `flying_objects` | `"500009.1050000" -> {simple_obj_id, effect, flying_sound, hit_sound, target_effect}` — arrows, 192 rows |
 | `effect_objects` / `effect_textures` / `weapon_motion` | the raw id→path tables, normalised to forward slashes |
-| `effect_object_geometry` | `"4100" -> {path, kinds, frames, effective_frames, parts, playable, source}` — which animation form each object uses, and whether this build can play every chunk in it |
+| `effect_object_geometry` | `"4100" -> {path, kinds, forms, frames, effective_frames, parts, playable, source}` — which animation form each object uses, and whether this build can play every chunk in it |
 | `coverage` | §9, machine-readable, `root` and `base_id` first |
 
-`kinds` values are `phy_motion`, `shape_trail`, `particle`. `playable` is
+`kinds` values are `phy_motion`, `shape_trail`, `particle`; `forms` is the same
+fact in the vocabulary §6.1a filters on (`PHY+MOTI`, `SHAP+SMOT`, `PTCL/PTC3`).
+Both are **lists**: an object carrying two forms carries two entries, and the
+`forms` on an effect is the union over its layers. `playable` is
 `false` — with an `undecoded` list naming the parts — when the file holds a
 chunk this build has no reader for. It is **not** a synonym for "has
 particles": particles are playable, and the field exists so a future
 undecodable form shows up instead of being counted as geometry.
 
 ---
+
+## 11a. The COMod surface — `comod effects` and the stage warning — VERIFIED
+
+Everything above was reachable only from `tools/effects.py`. COMod knew none
+of it, so a modder could replace an effect mesh with `comod stage` and be
+told nothing. Two things closed that (`tools/depclose.py`, on this module's
+`EffectDB` — there is one effect walker, not two):
+
+```bash
+py -3 tools/comod.py effects --weapon 410009      # every effect one weapon plays
+py -3 tools/comod.py effects --effect Flash4102   # one effect, layer by layer
+py -3 tools/comod.py effects --action 410009 0401 # what one action plays
+py -3 tools/comod.py effects --list m-b0          # defined names, filtered
+py -3 tools/comod.py effects --tables             # which file answered
+py -3 tools/comod.py effects --effect m-b02 --json
+```
+
+and an `EFFECT DEPENDENCIES` block that `stage`, `stage-mesh` and `diff` now
+print **by default** (`--no-effect-check` turns it off and says so in the
+output). It is not behind a flag because it costs only the effect tables —
+MEASURED 0.1 s (5017) to 1.6 s (7205) to build `EffectDB`, against the 34 s
+`diff --impact` pays to resolve every appearance reference.
+
+**VERIFIED, 2026-09-06, on the read-only baseline.** The `.dbc`-twin split is
+per file and per base, and the report names the file behind every number:
+
+| base | `3DEffect` | `3DEffectObj` | `3dtexture` | `Action3DEffect` |
+|---|---|---|---|---|
+| 5017 / 5065 / 5165 / 7878 | `.ini` | `.ini` | `.ini` | `.ini` |
+| 5517 / 6090 / 6609 / 7205 | `.dbc` | `.dbc` | `.dbc` | `.ini` |
+
+**No base ships a compiled twin of `Action3DEffect.ini`,
+`ActionMap3DEffect.ini` or `WeaponEffect.ini`** — measured, and it corrects
+the loose statement that "the effect tables are read from `.dbc` twins on
+5517 and 6090". Three of them are; the rule tables are plaintext everywhere,
+and the row says `no compiled twin on this base` rather than being blank.
+
+Four empty answers, four different lines: `UNMEASURED` (the tables would not
+load, **or** a table file is absent and `EffectDB` read it as an empty one),
+`NOT DEFINED` (read, no such name), and `DECLARES NO LAYERS` (the record
+exists and is empty — `wssfs_dis` on 5517/6090/6609/7205, joined by
+`horse_grid` and `horse_grid800` from 6090). Anti-vacuity anchor: the reverse
+index holds 7,664 effect-layer references over 4,049 paths on 5017 up to
+34,358 over 20,479 on 6609/7205, and `c3/effect/blade/410009.c3` is named by
+**exactly one** layer on all eight bases.
+
+**NEW HOLE, and it is this module's, not COMod's.** `EffectDB` reads
+`ini/Action3DEffect.ini` and no other member of its family. 6090, 6609 and
+7205 each ship six more (`Action3DEffect1..5.ini` — `Action3Deffect2.ini` on
+6609/7205, differing only in case — plus `ActionLee3DEffect.ini`); 7632 and
+7878 ship `ActionLee3DEffect.ini` and `ActionRole3DEffect.ini`. Counting
+`key=value` lines and comparing key by key against the read table:
+
+| base | unread rule files | lines | keys absent from the read table | keys present but DISAGREEING |
+|---|---|---|---|---|
+| 5017 / 5065 / 5165 / 5517 | 0 | 0 | — | — |
+| 6090 | 6 | 674 | 20 | 340 |
+| 6609 | 6 | 1168 | 19 | 470 |
+| 7205 | 6 | 1168 | 463 | 27 |
+| 7632 | 2 | 135 | 23 | 0 |
+| 7878 | 2 | 140 | 28 | 0 |
+
+They are **reported, not merged**, and both columns say why: ignoring 7205's
+loses 463 rules the read table does not have, and merging 6609's would
+overwrite 470 answers with a different effect and no evidence about which
+spelling the client honours. **INFERRED, and deliberately not acted on:** of
+the unpacked binaries, `GameData.dll` names `ini/Action3DEffect.ini` and
+`ini/ActionMap3DEffect.ini` on 5017/5165/5517/6090/6609/7205 and adds
+`ini/ActionRole3DEffect.ini` from 6090; **no binary names any numbered
+sibling**, and 6090's `Conquer.exe` is the one that names
+`ActionLee3DEffect.ini`. 7632 and 7878 are Themida-packed and yield no
+strings, so nothing is concluded for them. `ActionRole3DEffect.ini` is the
+one an implementer should look at first: a binary names it, it ships on 7632
+and 7878, and nothing here reads it.
+
+Tests and the full measurement table: `tests/test_effect_closure.py`.
+
+## 11b. The Effects Viewer — an effect as a SUBJECT, and the reverse walk — VERIFIED
+
+`comod effects` answers the forward question from a terminal. The Effects
+Viewer is the same answer as a page, plus the one question nothing here
+answered before.
+
+**IT IS THE FOURTH PRESENTATION, NOT A FOURTH SUBSYSTEM.** Backlog section 6
+established that Model Viewer / Character Builder / Asset Root are ONE shape —
+a SUBJECT plus its SATELLITES — served by one resolver with different
+presentations. This tab is that resolver with the subject being an effect.
+Play is `gl.js` + `fx.js`, the Model Viewer's stage, unmodified; tag and
+rename are `core/tags.py`; collect is `core/collection.py`; export is
+`core/portage.py`. None of it is new.
+
+Two pieces ARE new, and both are server-side:
+
+| what | where | direction |
+|---|---|---|
+| `DepGraph.effect_users(name)` | `tools/depclose.py` | **REVERSE** — which rule rows NAME this effect |
+| `assetroot.resolve_effect(graph, name)` | `tools/assetroot.py` | an effect in the `Satellites` shape |
+
+`effect_users` is the reverse of `effect_closure`, and it is not something the
+file graph could have been asked. **A rule row names an effect by NAME, never
+by path**, so no amount of walking files reaches it — `DepGraph.impact()`
+inverts the FILE graph and the rule tables are simply not in it.
+
+    GET /api/fx/list              the names, WITH the table provenance
+    GET /api/fx/effect?name=m-b02 one effect: layers, forms, connections, holes
+
+### The three-link chain, and why the page shows all three
+
+`EFFECT_TABLES = ("3DEffect", "3DEffectObj", "3dtexture")` is a chain, and a
+break in each link is a DIFFERENT problem, so the page renders them apart
+rather than collapsing them into "this effect is broken":
+
+* **`3DEffect`** — the effect DEFINITION: a named effect and its layer list,
+  with the table's own `Amount` as `declared_layers`. 3,391 named effects on
+  5517. This is what the viewer LISTS.
+* **`3DEffectObj`** — layer id → its MESH. 6,268 rows on 5517.
+* **`3dtexture`** — layer id → its TEXTURE. 13,810 rows on 5517.
+
+Four states, four renderings: no `3DEffect` row (undefined), no `3DEffectObj`
+row (no mesh binding), no `3dtexture` row (no texture binding), and a bound
+path whose FILE this install does not ship. The last two are both
+`present=False` and only the first three are table faults.
+
+### The twin trap, on screen
+
+Where a compiled `.dbc` twin exists **the client reads the TWIN and the
+`.ini` beside it is a DECOY** — §7a measures how far apart they are, and
+`tools/depclose.py` states the consequence: *an id that resolves out of
+`3DEffectobj.dbc` and an id that resolves out of `3DEffectObj.ini` are
+DIFFERENT ANSWERS on the same base.*
+
+So `/api/fx/list` ships `DepGraph.effect_tables()` **in the same response as
+the list it produced**. That is deliberate: the page cannot render a list
+without the provenance that qualifies it, because there is no second call it
+could forget to make. The strip names the file that answered per table, and
+marks each present-and-not-read sibling as a DECOY. On 5517 that is four
+decoys — `3DEffect.ini`, `3DEffectObj.ini`, `3dtexture.ini`, `3dobj.ini`.
+
+**An unreadable provenance renders as UNKNOWN, never as "there is no twin".**
+The second is a claim, and a false one on 5517/6090/6609/7205.
+
+### The connection view, and the amount it is short by
+
+`READ_EFFECT_TABLES` is what `EffectDB` actually reads, and all three of the
+categories a modder asks for are backed:
+
+    WeaponEffect.ini        -> WEAPONS (the impact spark, by weapon type)
+    Action3DEffect.ini      -> SKILLS / ACTIONS, and weapon auras
+    ActionMap3DEffect.ini   -> MAP EFFECTS
+
+**THE WEAPON/ACTION SPLIT IS DERIVED, AND THE PAGE SAYS SO.**
+`Action3DEffect.ini` carries weapon auras and body-action effects in ONE
+table keyed identically — nothing in a row says which it is. A row is filed
+under WEAPONS when its appearance is a section in `ini/weapon.ini`, and under
+ACTIONS otherwise; an all-nines appearance pins no appearance at all and is
+never attributed to a weapon. That is a classification, not a reading of the
+file, and it is stated in `limits` so it cannot be mistaken for something the
+table said.
+
+**IT IS INCOMPLETE BY A MEASURED AMOUNT AND THAT IS ON SCREEN.**
+`unread_effect_tables()` reports sibling rule files each install ships that
+`EffectDB` does NOT read — 674 keys on 6090, 1,168 on 6609, 135 on 7632, 140
+on 7878, 11 on 5517 — and the page prints them beside the tables it DID read,
+where the comparison is visible. Per section 6: *a panel showing 6 companions
+and silently omitting 3 is worse than one showing 6 and saying "and 3 I could
+not resolve" — the second is usable, the first is a trap the user cannot
+detect.*
+
+**A SCOPE CORRECTION, because this section carried the error first.** The
+standing figure *"125 of 3,987 effect layers name an id that neither
+`3DEffectObj` nor `3dtexture` resolves"* was written here as if it were
+corpus-wide. **It is not.** §9's own tables give 3,987 as **CCO's**
+`effect_layers_total` and nothing else's — 5,099 on 5165/7878, 8,759 on
+5517, 13,248 on 6090 — so any rate derived from it describes one install.
+It also counts a *link* where the per-base unresolved counts in
+`tests/test_effect_closure.py` count a *layer*, and those are 0 on
+5017/5065/5165/5517/7878 and 9 on 6090/6609/7205. Three different
+measurements, and only the last is per-base and current.
+
+What the page therefore reports is the count IT measured on the install in
+front of it, never a corpus rate: `unresolvedCount`, with each unresolved
+satellite named. Which scope the 125 figure should carry is still open and
+is flagged rather than quietly re-anchored.
+
+### Write status, neither over- nor under-promised
+
+All seven chunk forms round-trip **BYTE-EXACT** (444,303 / 444,303): `SHAP`,
+`SMOT`, `PTCL`, `PTCX`, `PTC3`, `RIBB`, `RMOT`. **Effects are exportable AND
+writable** — an earlier "view only" reading was made against a base that
+predated the writers and is obsolete.
+
+Genuinely read-only, and the page says so: **`CCFL`** (cloth/flag, 541,869
+chunks on 13 installs, decoded exactly, no writer), **`CAME`** (camera, no
+writer), **`OMNI`** (2 chunks in the corpus, not parsed).
+
+**`MNEW` is in NEITHER list.** All 137,232 enumerated instances are the single
+byte `0x70`, zero variance, so it needs no writer — and calling it read-only
+would report a limitation that does not exist. Under-promising is a defect
+too.
+
+`RIBB`/`RMOT` ship on only 2 of 34 installs (7867, 7878); `SHAP`/`SMOT` are
+the same thing in the older spelling and are on all 34. Both are covered.
+
+### What is verified, and what is not
+
+`tests/test_fxview.py` — 29 cases, **no corpus at all**: every one builds its
+own synthetic install, so nothing there can pass or fail because of which
+clients happen to be on the box. Two must-fires, both run against a
+deliberately damaged tree and observed RED:
+
+* `_load_effects` forced down its `.ini` branch, so the DECOY answered — 4
+  cases failed and the no-twin control PASSED, which is the half that makes
+  it evidence rather than a check that cannot come back clean. The damaged
+  build did **not** error and did **not** warn; it produced a complete-looking
+  effect record with the wrong layer count and the wrong asset ids.
+* `resolve_effect` no longer recording unresolved satellites — 3 cases failed
+  and the clean-effect control PASSED.
+
+NOT verified: the page's JavaScript has no automated coverage — `tools/webui/`
+has none by design (`test_viewer.py` says so directly), so the rendering was
+checked by driving a browser against 5517 and reading the DOM, not by a gate.
+The playback path is the Model Viewer's stage and is covered where that is.
 
 ## 12. Reproducing
 
@@ -1789,6 +2133,8 @@ py -3 tools/effects.py --action-map 104 330 002 # -> Feather
 py -3 tools/effects.py --effect Health          # a pure particle burst
 py -3 tools/effects.py --validate               # the exact-length proof
 py -3 tools/effects.py --coverage
+py -3 tools/effects.py --list --form ribbon      # every ribbon-trail effect
+py -3 tools/effects.py --form-census             # how many carry each form
 py -3 tools/effects.py --linkage
 py -3 tools/ptclprove.py --all-bases            # the particle layout proof
 py -3 tools/effectplay.py --effect m-b02        # the renderable scene

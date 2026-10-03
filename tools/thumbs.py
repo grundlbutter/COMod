@@ -101,8 +101,13 @@ import coroot
 import provenance                                                   # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot                    # noqa: E402
 
+
 REPO = Path(__file__).resolve().parent.parent
-OUT_DIR = coroot.derived_path("out/thumbs")
+OUT_DIR = coroot.thumbs_dir()
+
+#: The install `_apply_output` was last pointed at; the manifests are
+#: stamped with it. None means the configured install, as before.
+_STAMP_ROOT = None
 
 #: (library, server) when rendering a COmmunity Library server view instead
 #: of the install; set once by main(), read by the worker initializer.
@@ -121,11 +126,85 @@ def _apply_output(server: str = "", root=None) -> None:
     rendered into the configured client's namespace. Same shape as C21; the
     server path was correct only because it happened to re-resolve. C55.
     """
-    global OUT_DIR, MANIFEST, MESH_MANIFEST
-    base = coroot.derived_path("out/thumbs", root)
-    OUT_DIR = (base / "servers" / server) if server else base
+    global OUT_DIR, MANIFEST, MESH_MANIFEST, _STAMP_ROOT
+    _STAMP_ROOT = root
+    # `coroot.thumbs_dir` owns the location: a folder shared by every
+    # checkout by default, overridable per process or per user.
+    OUT_DIR = coroot.thumbs_dir(root, server)
     MANIFEST = OUT_DIR / "manifest.json"
     MESH_MANIFEST = OUT_DIR / "manifest_meshes.json"
+
+class OutputBusy(RuntimeError):
+    """Another live run is already generating into this output folder."""
+
+
+class OutputLock:
+    """One generating run per output folder.
+
+    The folder is shared by every checkout now (`coroot.thumbs_dir`), so two
+    viewers can ask for thumbnails at once. Both would load the manifest,
+    render, and write it back whole; the last writer wins and silently drops
+    the other's entries. The second run is refused instead, with the holder's
+    pid.
+
+    A lock whose pid is PROVEN dead is reclaimed. One whose liveness cannot be
+    probed is not: `clientlock._pid_alive` is tri-state for exactly this
+    reason, and reclaiming on "don't know" would let two runs write at once.
+    """
+
+    NAME = ".generating.lock"
+
+    def __init__(self, folder: Path):
+        self.path = Path(folder) / self.NAME
+        self.held = False
+
+    def _holder(self) -> int:
+        try:
+            return int(self.path.read_text("utf-8").split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _attempt in range(2):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pid = self._holder()
+                from clientlock import _pid_alive       # noqa: PLC0415
+                if pid and _pid_alive(pid) is False:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                raise OutputBusy(
+                    f"another run (pid {pid or 'unknown'}) is generating "
+                    f"thumbnails into {self.path.parent}; wait for it, or use "
+                    f"a different folder (--thumbs-dir / COMOD_THUMBS_DIR). "
+                    f"If no such run exists, delete {self.path}.")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()} {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+            self.held = True
+            return
+        raise OutputBusy(f"could not take {self.path}")
+
+    def release(self) -> None:
+        if self.held and self._holder() == os.getpid():
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        self.held = False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
 
 #: Bump when a change alters pixels.  It is part of every cache key, so a bump
 #: makes `--resume` re-render everything instead of silently mixing versions.
@@ -901,7 +980,21 @@ def texture_universe(root=None) -> list[str]:
     """
     import meshtex
     with meshtex.MeshTextureIndex(root or DEFAULT_ROOT) as mi:
-        return sorted(mi.textures)
+        keep, why = mi.in_scope_textures()
+        dropped = sum(why.values())
+        if dropped:
+            # LOUD, not a silent skip. These used to be QUEUED and then fail
+            # one at a time inside the renderer -- 7,507 of 142,435 on 7878
+            # and 848 on CCO in the nine-client matrix -- which reads as "the
+            # renderer is broken on 5% of this client's art" when it means
+            # "5% of what we offered was never this client's art".
+            print(f"[thumbs] {dropped} offered texture path(s) are not in "
+                  f"this install and were not queued "
+                  f"({why['pooled_not_here']} recovered from another "
+                  f"client's archives, {why['table_named_absent']} named by "
+                  f"THIS install's own tables and not shipped)",
+                  file=sys.stderr, flush=True)
+        return sorted(keep)
 
 
 def server_worklist(view) -> tuple[list["Job"], list[str]]:
@@ -1253,7 +1346,15 @@ def write_manifest(doc: dict) -> None:
     # the stamp makes it safe on purpose.
     for path in (MANIFEST, MESH_MANIFEST):
         try:
-            provenance.stamp_file(path, tool="thumbs.py")
+            # THE INSTALL THIS RUN RENDERED, not the configured one. This
+            # passed no root, so `stamp` described the configured default
+            # install: the owner's 7878 viewer (configured default: Classic
+            # Conquer 2.0) wrote 7878 renders into the 7878 folder and
+            # stamped them `cco-e05e49cc7232`, and health reported them as
+            # "built from a different install" -- an error line over
+            # correct data. A 60-entry sample of that manifest re-keys
+            # 60/60 against 7878's bytes and 0/60 against CCO's.
+            provenance.stamp_file(path, _STAMP_ROOT, tool="thumbs.py")
         except Exception:                                # pragma: no cover
             pass
 
@@ -1468,7 +1569,25 @@ def selftest(root: str) -> int:
 # CLI
 # ===========================================================================
 
+#: The lock a generating `main` holds, released by `main` whatever happens.
+_OUTPUT_LOCK: Optional[OutputLock] = None
+
+
 def main(argv: list[str]) -> int:
+    global _OUTPUT_LOCK
+    try:
+        return _main(argv)
+    except OutputBusy as e:
+        print(f"thumbs: {e}", file=sys.stderr)
+        return 3
+    finally:
+        if _OUTPUT_LOCK is not None:
+            _OUTPUT_LOCK.release()
+            _OUTPUT_LOCK = None
+
+
+def _main(argv: list[str]) -> int:
+    global _OUTPUT_LOCK
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=str(DEFAULT_ROOT))
@@ -1557,6 +1676,13 @@ def main(argv: list[str]) -> int:
     if not (a.all or a.textures):
         ap.print_help()
         return 1
+
+    # Taken BEFORE the manifest is loaded: a run that loaded it while another
+    # was still writing would write back a copy missing the other's entries.
+    # A dry run writes nothing and takes no lock.
+    if not a.dry_run:
+        _OUTPUT_LOCK = OutputLock(OUT_DIR)
+        _OUTPUT_LOCK.acquire()
 
     jobs_n = a.jobs or max(1, (os.cpu_count() or 2) - 1)
     manifest = load_manifest()

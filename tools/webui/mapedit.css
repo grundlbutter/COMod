@@ -75,6 +75,53 @@
 
 /* -- left rail ---------------------------------------------------------- */
 
+/* A collapsible rail section. The header carries the caret and the whole
+   header is the hit target, which is what `.card h2` already promises on the
+   right-hand panels -- the rail used to promise nothing and do nothing. */
+.railsec { margin-bottom: 2px; }
+.railsec > label.railhead {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer; user-select: none;
+}
+/* The caret is the LITERAL character, not a CSS backslash escape: the
+   escape did not survive being written through the tool channel and
+   shipped as a control byte plus "be", which rendered as stray letters
+   beside every header. */
+.railsec > label.railhead::before {
+  content: "▾"; font-size: 10px; color: var(--mut);
+  transition: transform 0.12s ease;
+}
+.railsec.collapsed > label.railhead::before { transform: rotate(-90deg); }
+.railsec.collapsed > .railbody { display: none; }
+.railsec > label.railhead .railcount {
+  margin-left: auto; color: var(--mut); font: 11px var(--mono);
+}
+/* The body is the flex column the rail used to be, so `.list { flex: 1 }`
+   still has a parent that means it. Without this the map list -- 730 rows
+   -- grew to its own content height and pushed Layers and View off the
+   bottom entirely, which is the opposite of what collapsing is for. */
+.railsec > .railbody { display: flex; flex-direction: column; gap: 6px; }
+/* Sized so that MAP + LAYERS + VIEW all fit an 817 px rail with the two
+   long lists scrolling inside themselves. Measured, not guessed: at
+   34vh/46vh the View section started 78 px below the rail, which is the
+   bug this whole change is about. */
+.railsec[data-rail="maps"] > .railbody #map-list { max-height: 24vh; }
+.railsec[data-rail="layers"] > .railbody { max-height: 34vh; overflow-y: auto; }
+
+/* A row's trailing note must never push the label or the checkbox around.
+   `61 of 63 (2 undefined) (106 layers: no texture ships)` did exactly that:
+   it wrapped, grew the row to three lines and printed itself over the
+   control. It is capped, single-line and ellipsised here, and the full text
+   is on the row's `title`. */
+.layerbox .lrow span.lmeta {
+  flex: none; max-width: 42%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--mut); font: 11px var(--mono);
+}
+.layerbox .lrow span.name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 .layerbox { display: flex; flex-direction: column; gap: 3px; }
 .layerbox .lrow {
   display: flex; align-items: center; gap: 7px;
@@ -83,8 +130,40 @@
 }
 .layerbox .lrow:hover { background: var(--panel2); }
 .layerbox .lrow.on { border-color: var(--line); }
+/* A layer the MAP does not have, as distinct from one you switched off.
+   290 of 470 maps carry no animated effects, and the row used to look
+   live on every one of them. Muted and not hidden, so the feature is
+   visibly present and the map is visibly without it. */
+.layerbox .lrow.off { opacity: .45; }
+.layerbox .lrow.off label.ltoggle { cursor: default; }
 .layerbox .lrow span.name { flex: 1; }
 .layerbox .lrow span.count { color: var(--mut); font: 11px var(--mono); }
+/* The row is a flex container with a label, a count and two move buttons; the
+   label has to be the only click target for the checkbox, or clicking ▲ would
+   toggle the layer as well. */
+.layerbox .lrow label.ltoggle {
+  display: flex; align-items: center; gap: 7px;
+  flex: 1; min-width: 0; cursor: pointer;
+}
+.layerbox .lrow button.move {
+  padding: 0 4px; line-height: 16px; min-width: 18px;
+}
+.layerbox .lrow button.move:disabled { opacity: 0.3; cursor: default; }
+.layerbox .lorder {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin-top: 5px; padding-top: 5px; border-top: 1px solid var(--line);
+}
+/* `star10` has 19 layers, so this line is ~300 characters. Capped and
+   scrolled rather than allowed to grow: it would otherwise push the View
+   controls off the bottom of the rail on exactly the maps the reordering is
+   most interesting on. `user-select: all` keeps one click selecting the
+   whole order even when only part of it is showing. */
+.layerbox .lorder code.ordertext {
+  flex: 1; min-width: 0; font: 11px var(--mono); color: var(--mut);
+  word-break: break-all; user-select: all;
+  max-height: 4.5em; overflow-y: auto;
+}
+.layerbox .lorderbtns { display: flex; gap: 4px; flex: none; }
 
 .maprow {
   display: flex; align-items: baseline; gap: 6px;
@@ -96,6 +175,10 @@
 .maprow.undrawable { opacity: .62; }
 .maprow .nm { flex: 1; }
 .maprow .sz { color: var(--mut); font: 11px var(--mono); }
+/* Shown ONLY on rows whose name is duplicated. The registry reuses one map
+   under several DocumentIds, so the picker legitimately lists `gsjx03_new`
+   four times; without the id the four lines were indistinguishable. */
+.maprow .docid { color: var(--mut); font: 11px var(--mono); opacity: .75; }
 
 .zoomrow { display: flex; gap: 4px; align-items: center; }
 .zoomrow button { flex: 0 0 auto; }
@@ -139,4 +222,59 @@
 #collect-body .out, #export-body .out {
   max-height: 190px; overflow: auto; white-space: pre-wrap;
   font: 10px/1.45 var(--mono); color: var(--mut); margin-top: 6px;
+}
+
+/* ---------------------------------------------------------------- covers
+ * The cover palette (mapcovers.js). Two rules carry meaning rather than
+ * decoration:
+ *
+ *   .mc-no    a cover the OPEN MAP cannot take. Struck through and dimmed,
+ *             never removed -- a user who sees art on the Map Assets page
+ *             and cannot find it here needs the reason, not the silence.
+ *   .mc-warn  the integrity notice. `map/map/*.DMap` is one of the 155
+ *             files integrity.json lists, and both surfaces that write it
+ *             (this and Passability) say so in the same words.
+ */
+.mc-list { max-height: 340px; overflow-y: auto; margin-top: 6px; }
+
+.mc-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 2px;
+  border-bottom: 1px solid var(--line);
+}
+.mc-row:last-child { border-bottom: 0; }
+
+.mc-key { flex: 0 0 auto; }
+.mc-sz  { flex: 0 0 auto; font-size: .85em; }
+.mc-src { flex: 1 1 auto; font-size: .85em; text-align: right; }
+
+.mc-no { opacity: .55; }
+.mc-no .mc-key { text-decoration: line-through; }
+.mc-no .mc-why {
+  flex: 1 1 auto;
+  font-size: .82em;
+  line-height: 1.35;
+  color: var(--warn);
+}
+
+.mc-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: inherit;
+  border-radius: 3px;
+  padding: 1px 8px;
+  font: inherit;
+  font-size: .85em;
+  cursor: pointer;
+}
+.mc-btn:hover { border-color: var(--accent); }
+
+.mc-warn {
+  border-left: 3px solid var(--warn);
+  padding: 5px 9px;
+  margin: 6px 0;
+  font-size: .88em;
+  line-height: 1.45;
 }

@@ -1334,5 +1334,42 @@ def _load(root, install: str) -> Cohorts:
             install = coroot.base_id(getattr(assets, "root", root))
         except Exception:
             install = ""
-    tables = npcart.Tables(assets.read)
-    return Cohorts(tables, install, assets.exists)
+    return Cohorts(npcart.Tables(assets.read, _profile_for(assets)),
+                   install, assets.exists)
+
+
+def _profile_for(assets):
+    """The `npcart.Profile` for the thing whose assets are being READ.
+
+    **ASK THE CLIENT BEING SHOWN, NOT THE BASELINE.**  `npcart.Tables` with no
+    profile falls back to `npcart.detect_profile(read)`, and for a
+    `colibrary.ServerView` that is answered by the **baseline**: a `ServerView`
+    *is* an `AssetRoot` rooted at the baseline (`core/colibrary.py`,
+    `super().__init__(root)`), so probing through it never asks the community
+    client whose assets are on screen.  `docs/CORRECTIONS.md`
+    **C-2026-08-09-plugin-c-serverview-profile** -- *"a DatPkg `ServerView`
+    takes its parse profile from the BASELINE, not from the client whose assets
+    it shows -- and 25 of 397 NPCs silently lose their art"*.
+
+    `tools/assetdiff.table_profile_for` is the one definition of this rule and
+    is what a `tools/` caller must use.  This module is in COre and cannot
+    import it -- `test_no_core_module_imports_anything_outside_core` -- so it
+    carries the half of that rule COre can reach: **anything that can answer
+    for itself is asked first**.  The branch `assetdiff` adds on top is the
+    baseline *plugin* lookup, which lives in `tools/plugins` and is a strictly
+    better answer than the probe only for a bare install; for a view -- the
+    case this defect is about -- both functions take the same first branch and
+    return the same profile.
+
+    Returning `None` is deliberate rather than a failure: it hands `Tables` the
+    behaviour it had, for the roots that genuinely have no opinion to give.
+    """
+    ask = getattr(assets, "table_profile", None)
+    if callable(ask):
+        try:
+            prof = ask()
+        except Exception:                                # pragma: no cover
+            prof = None
+        if prof is not None:
+            return prof
+    return npcart.detect_profile(assets.read)

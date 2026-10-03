@@ -24,7 +24,7 @@
  *   and both are named after the asset they belong to. `Collection.stage`
  *   does that renaming; this panel decides what travels.
  *
- *   Nothing here touches the game. Staging writes to `mods/stage/`, and
+ *   Nothing here touches the game. Staging writes to `Installed/stage/`, and
  *   `comod.py install` -- the drawer's button, the CLI's command -- is the
  *   only thing that copies into the install, with its backups and its revert.
  */
@@ -307,7 +307,11 @@
     if (box) box.addEventListener('input', debounce(describeInstall, 300));
   }
 
-  const CUSTOM = ' custom';
+  /* Sentinel for the 'type your own path' row, kept out of the install
+   * namespace by a leading NUL. WRITTEN AS AN ESCAPE: a raw NUL here made
+   * `grep` report this file as a BINARY FILE, so every text audit skipped
+   * it unless the operator remembered -a. Identical at runtime. */
+  const CUSTOM = '\u0000custom';
   let INSTALLS = [];
 
   function debounce(fn, ms) {

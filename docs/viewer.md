@@ -37,10 +37,21 @@ action*, not one mesh with a track set, and has nothing to equip.
 
 | | |
 |---|---|
-| Python | 3.10+ (developed on 3.14.6) |
+| Python | **3.11+** (developed and verified on 3.14.6) |
 | Required package | **Pillow** — used to encode PNGs for the browser and to write DDS when you stage a swap |
 | Optional | numpy — speeds a few array paths up; everything works without it |
-| Browser | anything with WebGL 1: Edge, Chrome, Firefox |
+| Browser | **Chrome, or another Chromium-family browser — recommended.** Any WebGL 1 browser can *view* the pages, Firefox included. Chrome is recommended because `tools/cdp.py` drives a headless Chromium and is the only JavaScript engine this project has: eight gates over `tools/webui/*.js` run through it, and `cdp.find_chrome()` accepts Chrome or Edge and nothing else. See README §"Eight of the gates need Chrome". |
+
+> **Corrected 2026-09-09.**
+> * The Python row said **3.10+**. `tools/health.py` sets `MIN_PYTHON = (3, 11)`
+>   and the viewer's own health check fails below it, so 3.10 was never a
+>   version the viewer would start clean on. (`core/pyproject.toml` does say
+>   `requires-python = ">=3.10"` — that is COre alone, the stdlib-only subset,
+>   and it is not in conflict with this row.) README §Prerequisites already
+>   said 3.11+; this row is what disagreed.
+> * The Browser row read "anything with WebGL 1: Edge, Chrome, Firefox", which
+>   listed Firefox as an equal option. It is equal for *viewing* and cannot run
+>   any of the JS gates.
 
 ```bash
 py -3 tools/coviewer.py --port 9000       # different port
@@ -81,8 +92,19 @@ tell you:
    registers), then Steam library folders
 5. failure, listing everything it tried
 
-A candidate is accepted only when it actually contains `c3.wdf`, `data.wdf`,
-`ini/` and `bin/64/`. Validating the *contents* rather than the path string is
+A candidate is accepted only when it actually contains the three entries in
+`coroot.REQUIRED`: `c3.wdf` **or** the `c3.tpd`+`c3.tpi` pair, `data.wdf`
+**or** the `data.tpd`+`data.tpi` pair, and `ini/`.
+
+> **Corrected 2026-09-09.** This sentence said `c3.wdf`, `data.wdf`, `ini/`
+> **and `bin/64/`**. `bin/64/` was removed from `coroot.REQUIRED` at
+> `79e57660` (2026-08-11), when the `.tpd`+`.tpi` alternatives were added,
+> because the old rule refused a fully verified `Clients/7878` tree — 7878
+> ships no `.wdf` at all and no `bin/64/`. Print the live tuple rather than
+> trusting this paragraph:
+> `py -3 -c "import sys; sys.path.insert(0,'core'); import coroot; print(coroot.REQUIRED)"`
+
+Validating the *contents* rather than the path string is
 what makes a moved or half-deleted install fail loudly instead of producing
 empty lists three screens later.
 
@@ -94,7 +116,7 @@ with the tick box). Restart and it has a catalogue.
 
 ### 1.2 First-run health check
 
-On first launch — and any time from the **Health & thumbnails** button — the
+On first launch — and any time from **Settings → Health management** — the
 viewer reports:
 
 * where the install was found and **how** (registry / default path / `CO_ROOT` /
@@ -106,7 +128,10 @@ viewer reports:
   `tools/wdf_recover.py` has recovered the archived filenames the catalogue can
   only see the ~53,000 loose files, because the `.wdf` index stores a hash of
   each name rather than the name. One command builds the lot:
-  `py -3 tools/health.py --bootstrap` (~8 minutes, once);
+  `py -3 tools/health.py --bootstrap` (once — ask `--estimate` first; measured
+  at 28–38 min per install on this box, **not** the "~8 minutes" this line used
+  to claim, which was measured on an older tool. README §"Why the first row is
+  a command and not a number" has the figures);
 * the state of `out/thumbs/`;
 * anything missing, **with the exact command that fixes it**.
 
@@ -163,9 +188,10 @@ re-implement the renderer.
 ### What it will never do
 
 * **It never writes to the game install.** The server writes only into
-  `mods/stage/` and `out/viewer/`. The one action that touches the install —
+  `Installed/stage/` and `out/viewer/`. The one action that touches the install —
   *Install for real* — shells out to `comod.py install --yes`, which makes the
-  backups, writes `mods/manifest.json`, and gives you `uninstall`.
+  backups, writes that install's manifest under `Installed/installs/`, and
+  gives you `uninstall`.
 * **It makes no network connections.** Every asset is vendored; the page has a
   `connect-src 'self'` CSP so it cannot reach anywhere even if you asked it to.
 
@@ -515,7 +541,7 @@ against.
    size differs from the original, the format differs, or the image is not
    power-of-two.
 4. **Discard preview** puts it back. **Stage this swap** writes it into
-   `mods/stage/<logical path>`.
+   `Installed/stage/<logical path>`.
 5. The **Mod staging** drawer lists everything staged with its status
    (`NEW` / `MODIFIED` / `same`), and gives you *Install (dry run)*,
    *Install for real* and *Uninstall / revert*. All three run `comod.py`.
@@ -524,7 +550,7 @@ The encode defaults to the original's DXT format, so a 128×128 DXT3 texture
 comes back as a 128×128 DXT3 texture of exactly the same byte length. You can
 override the format in the dropdown.
 
-Nothing about this bypasses the CLI: `mods/stage/` is the same tree
+Nothing about this bypasses the CLI: `Installed/stage/` is the same tree
 `comod.py diff` reads, and the install is the same command with the same
 backups and the same `uninstall`.
 
@@ -2221,7 +2247,7 @@ and this page's centre is flat art rather than a 3D viewport.
   size, the frame interval, the resolved texture path, whether it opens or blocks
   cells, and its `map/ScenePart/*.Part` source. Sprites are alpha-tested, so a
   click through a gap in a tree selects what is behind it.
-* **Staging is the §3 flow.** The map reads through `mods/stage/` first, so a
+* **Staging is the §3 flow.** The map reads through `Installed/stage/` first, so a
   staged texture is on the map before anything is installed, and *Install* is
   `comod.py install --yes` exactly as everywhere else.
 

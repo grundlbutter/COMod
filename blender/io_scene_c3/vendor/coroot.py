@@ -41,7 +41,10 @@ worktree inherits the ``out/`` tree it cannot have yet instead of silently
 starting without it.
 
 *Which install does one belong to?*  A derived index is only valid for the
-client it was built from, and this machine holds eight.  ``base_id`` names
+client it was built from, and this box holds **33** (measured
+2026-08-29; the docstring said *eight* from 2026-08 until then, which is
+retest row 9 -- a count in the most-read docstring here, wrong on import).
+``base_id`` names
 that client and ``find_derived`` resolves per-base trees (`PER_BASE`) inside
 ``out/indexes/<base-id>/``, so pointing the tools at another install cannot
 serve the previous one's facts.  Nothing recorded this before, and it showed:
@@ -55,6 +58,9 @@ CLI::
     py -3 core/coroot.py --search         # show every candidate and its verdict
     py -3 core/coroot.py --set "D:\\Games\\Classic Conquer 2.0"
     py -3 core/coroot.py --forget
+    py -3 core/coroot.py --print WHAT     # ONE path, nothing else, for .cmd/.ps1:
+                                          # root|clients|assets|library|installs|export
+    py -3 core/coroot.py --print export --json   # {path, why} -- see `export_root`
 
 Pure stdlib but for two project modules, both vendored alongside it into the
 Blender addon by ``tools/build_addon.py``: ``core/verdict.py`` for the
@@ -167,6 +173,8 @@ __all__ = [
     "user_config_path", "repo_config_path", "config_root", "save_root",
     "forget_root", "primary_checkout", "find_derived", "DERIVED_FALLBACK_VAR",
     "installs_root", "set_installs_root",
+    "CLIENT_RELPATHS", "ClientBinary", "client_binaries",
+    "install_root_of",
     "derived_overrides", "derived_override", "set_derived_override",
     "broken_derived_overrides", "VERIFIED_DERIVED", "is_verifiable",
     "override_verdict", "refused_derived_overrides",
@@ -176,6 +184,7 @@ __all__ = [
     "PERMIT", "REFUSE",
     "PER_BASE", "GLOBAL", "GLOBAL_EXCEPTIONS", "UndeclaredDerived",
     "INDEX_ROOT", "base_fingerprint",
+    "DERIVED_ROOT_VAR", "derived_root", "derived_root_is_overridden",
     "base_id", "derived_rel", "derived_path", "declare_kind", "KINDS_KEY",
     "forget_kind", "declared_kinds",
     "iter_candidates", "discover", "search_report",
@@ -512,6 +521,63 @@ def user_config_path() -> Path:
     return Path.home() / ".config" / "co-client-re" / "config.json"
 
 
+#: The capture corpus home, as an owner ruling rather than a derivation.
+#: See `capture_home` for why this is a literal and why it is not under
+#: ``%LOCALAPPDATA%`` any more.
+_CAPTURE_HOME_DEFAULT = r"C:/Claude/capture"
+
+
+def capture_home() -> Path:
+    """The capture corpus HOME: ``C:/Claude/capture``.
+
+    **Owner ruling 2026-09-14**, replacing the 2026-09-10 ruling that put this
+    under ``%LOCALAPPDATA%/co-client-re/capture``. The requirement is unchanged
+    and is the reason this function exists at all: captured sessions are
+    CREDENTIAL-BEARING -- they hold whatever the client sent -- so they live
+    OUTSIDE the checkout, never in ``out/``. ``C:/Claude/capture`` satisfies
+    that: it sits BESIDE the checkout, not inside it.
+
+    WHY ``%LOCALAPPDATA%`` WAS ABANDONED, and it is worth stating because the
+    old form looks more portable and was strictly worse here. **The Claude
+    desktop app is MSIX-packaged**, so every process it starts -- which is
+    every seat -- gets ``%LOCALAPPDATA%`` REDIRECTED into
+    ``.../Packages/Claude_<id>/LocalCache/Local/``. Two consequences,
+    both measured on 2026-09-14:
+
+      * The owner could not see the corpus. Explorer, running unpackaged,
+        resolves the documented path to a directory that does not exist, while
+        a seat reading the same string reaches the redirected one. *Identical
+        NTFS file id at both paths proved it was one directory reached two
+        ways, not two copies.*
+      * **The corpus was inside a per-app cache.** An app reset or uninstall
+        clears ``LocalCache``. The whole point of moving captures out of
+        ``out/`` was durability, and the new home was less durable than the
+        old one.
+
+    **So an environment variable is not automatically the portable choice: it
+    is portable only if it means the same thing to every process that reads
+    it.** ``%LOCALAPPDATA%`` did not.
+
+    ``$CO_CAPTURE_HOME`` overrides, for a second machine or a test. It is read
+    at call time, never cached, so a test can set it and restore it.
+
+    This raises rather than falling back to a repo path if the home cannot be
+    created: a silent fallback would put credential-bearing captures back
+    inside the checkout, which is exactly what this exists to prevent.
+    """
+    override = os.environ.get("CO_CAPTURE_HOME")
+    home = Path(override) if override else Path(_CAPTURE_HOME_DEFAULT)
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "the capture corpus home (%s) cannot be created: %s. Refusing to "
+            "fall back to a repo path: captures are credential-bearing and "
+            "must stay outside the checkout. Set $CO_CAPTURE_HOME to place it "
+            "elsewhere." % (home, exc)) from exc
+    return home
+
+
 def _read_repo_config() -> Optional[str]:
     p = repo_config_path()
     try:
@@ -554,16 +620,41 @@ def read_settings() -> dict:
     return _read_user_config()
 
 
+def _save_user_config(doc: dict) -> Path:
+    """Write the per-user config ATOMICALLY.  The ONE writer of that file.
+
+    `forget_root` used to `write_text` straight onto it, and that file holds
+    every declared install kind, `installs_root`, `export_dir` and the UI
+    namespace: a crash between truncate and write loses all of them, not the
+    one key the caller meant to drop.  tmp-then-`replace` cannot leave a
+    half-written document.
+
+    THE TEMP NAME CARRIES THE PID BECAUSE THIS BOX IS SHARED.  A fixed
+    `config.json.tmp` is a race between any two processes saving settings at
+    once -- the viewer and a CLI, or two seats -- and the loser's `replace`
+    publishes the winner's partial bytes.  Per-pid names cannot collide.
+    """
+    p = user_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".%d.tmp" % os.getpid())
+    try:
+        tmp.write_text(json.dumps(doc, indent=1, sort_keys=True), "utf-8")
+        tmp.replace(p)
+    finally:
+        # A failed write leaves no litter beside the config on a shared box.
+        # After a successful `replace` there is nothing left to unlink.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return p
+
+
 def write_settings(**kw) -> Path:
     """Merge ``kw`` into the per-user config.  Returns the file written."""
-    p = user_config_path()
     doc = _read_user_config()
     doc.update(kw)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True), "utf-8")
-    tmp.replace(p)
-    return p
+    return _save_user_config(doc)
 
 
 def save_root(path, scope: str = "user") -> Path:
@@ -594,10 +685,9 @@ def forget_root(scope: str = "all") -> list[Path]:
         doc = _read_user_config()
         if "game_root" in doc:
             doc.pop("game_root")
-            p = user_config_path()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(doc, indent=1, sort_keys=True), "utf-8")
-            gone.append(p)
+            # Through the one atomic writer: this used to `write_text` onto
+            # the live file, so a crash mid-write dropped every OTHER key too.
+            gone.append(_save_user_config(doc))
     return gone
 
 
@@ -608,7 +698,75 @@ def forget_root(scope: str = "all") -> list[Path]:
 #: Environment kill switch: set to ``0`` (or ``off``/``no``) to make
 #: ``find_derived`` look only at this checkout.  Exists so tests can simulate
 #: a checkout with no derived data; never needed in normal use.
+#:
+#: **It is not isolation, and it was read as isolation.**  It suppresses the
+#: *primary-checkout* arm of `find_derived` only; the arm above it still reads
+#: ``<this checkout>/out/``, and `derived_path` still writes there.  See
+#: `derived_root` for the knob that actually moves the tree.
 DERIVED_FALLBACK_VAR = "CO_DERIVED_FALLBACK"
+
+#: Environment override for the DERIVED ROOT -- the directory ``out/`` lives
+#: in.  Process-scoped and inherited by children, which matters because
+#: several tools build artefacts in subprocesses (`thumbs.py`): an in-process
+#: patch of `_repo_dir` does not reach them and this does.
+DERIVED_ROOT_VAR = "COMOD_DERIVED_ROOT"
+
+
+def derived_root() -> Path:
+    """The directory ``out/`` lives in: this checkout, or an override.
+
+    Everything under ``out/`` is derived and gitignored, so WHERE it lives is
+    a policy, not a fact about the repo -- and until this existed the policy
+    was hardcoded to `_repo_dir`.  A test that wanted its own derived tree had
+    to patch `_repo_dir`, which also moves `repo_config_path`,
+    `primary_checkout` and the `profilecheck` import path, and which a
+    subprocess never sees.
+
+    THE FAILURE THIS CLOSES, MEASURED on master ``77a0dffa``: a synthetic
+    install with an empty ``ini/`` fingerprints to ``e3b0c44298fc`` -- *the
+    sha256 of the empty string* -- so every featureless synthetic install on
+    the box keys to one namespace, ``out/indexes/unknown-e3b0c44298fc/``.
+    Two unrelated installs, in two separate ``TemporaryDirectory`` trees,
+    were given one ``meshtex/mesh_index.json``: the second was served the
+    first's census, `provenance.verdict` said ``match`` (the stamps are
+    identical, because the ids are), and the file outlived both temp trees
+    because it was never in either.  A must-fire arm aimed at
+    `meshtex.all_meshes` reported GREEN off that cache -- failing open, in
+    the direction that says *your change is unnecessary*.
+
+    So: isolation means a derived root of one's own.  `tests/derivedroot.py`
+    is how a test asks for one, and that helper sets this variable.
+
+    **THE VARIABLE OUTRANKS A PATCHED `_repo_dir`, AND THAT ORDER BITES.**
+    Both idioms isolate a derived tree and they do not compose: the
+    environment is read first, so a process that sets this while some inner
+    scope has patched `_repo_dir` sends that scope's artefacts to the
+    environment's tree, and the scope then cannot find what it wrote.
+    MEASURED: an audit gate that set this variable in order to watch where
+    other gates write reddened `tests/test_coverage_one_writer.py`, whose
+    three tests are correct -- it patches `_repo_dir` and had its output
+    redirected out from under it.  Pick one per process.
+
+    Not validated and not resolved: a caller naming a derived root is naming
+    a place to build, which may not exist yet.  Unset or blank means this
+    checkout, exactly as before.
+    """
+    raw = os.environ.get(DERIVED_ROOT_VAR, "").strip()
+    if raw:
+        return Path(raw)
+    repo = _repo_dir()
+    return repo if repo is not None else Path.cwd()
+
+
+def derived_root_is_overridden() -> bool:
+    """True when `DERIVED_ROOT_VAR` names a derived root.
+
+    `find_derived` asks, because an *isolated* derived root must not fall
+    back to the primary checkout's: "my own tree" that reads someone else's
+    answers is the contamination this closes, one directory along.
+    """
+    return bool(os.environ.get(DERIVED_ROOT_VAR, "").strip())
+
 
 _PRIMARY_UNSET = object()
 _primary_checkout: object = _PRIMARY_UNSET
@@ -741,6 +899,19 @@ PER_BASE: tuple[str, ...] = (
     # archive), and a mismatch is a miss. This line is the outer lock and the
     # stamp is the inner one; neither is redundant.
     "out/weaponswap/",
+    # `tools/bonerig.py` -- the solved family rig for one bone-index space.
+    #
+    # PER-INSTALL, and the reason is the whole point of the artefact: a rig is
+    # solved FROM the clips a particular install ships, and those differ. On
+    # CCO shape 2 has 263 present clips and on 5517 it has 412; only 125 of
+    # the ones present on both are byte-identical, and the loose and archived
+    # copies of a single path can differ in ENCODING. The provenance block
+    # inside the file records which files and which shas it was solved from,
+    # so two rigs from two installs are genuinely different documents -- and
+    # writing both to `out/rig/p84.json` would be the `out/dll/rtti.md` bug
+    # again, one install's answer sitting under another's name with nothing
+    # recording which.
+    "out/rig/",
 )
 
 #: Derived paths that are **not about one install**, each with the reason it
@@ -783,9 +954,52 @@ GLOBAL: tuple[str, ...] = (
     # shatter one table into five partial copies, each missing the comparison
     # it exists to make. walkprobe.json is a server probe, not an install.
     "out/client/",
+    # The string-table index (`tools/strindex.py`) and the page rendered from
+    # it (`tools/strreport.py`). GLOBAL for the same reason as `out/client/`
+    # directly above, and it is the strong form of that reason rather than a
+    # borrowed one: the schema is `strings(build, file, key, value)` -- the
+    # build is a COLUMN. One file holds all 38 of them, and every question it
+    # exists to answer is a comparison BETWEEN builds: what text changed
+    # between A and B, which keys first appear at 7867, which keys move their
+    # printf slots across the lineage. Keying it per-base would shatter one
+    # table into 38 partial copies, each holding exactly one build and
+    # therefore unable to answer a single one of those.
+    #
+    # `strindex` prefers `<assets>/derived/strindex/` when that exists and
+    # only falls back to this path, so in practice this entry is the
+    # no-assets-configured case -- which is precisely when it must still
+    # resolve rather than raise.
+    "out/strindex/",
+    # The report is the same artefact one step further on: it renders the
+    # drift table across all 38 builds plus one target build's key search, so
+    # its content spans the lineage even though a reader picks a target.
+    #
+    # Declared because it is the `--out` DEFAULT literal in
+    # `tools/strreport.py`, which is what the declaration test walks for. A
+    # caller-supplied `--out` is written straight to disk and never passes
+    # through `derived_path`, so this entry governs the default and nothing
+    # else -- said plainly because a reader could otherwise assume the whole
+    # option is resolved here, and it is not.
+    "out/strings.html",
     # About a PAIR of installs, and it says which in its own body (`old`,
     # `new`). A pair has no single base_id.
     "out/clientdiff/",
+    # The garment survey and the materialised garment OVERLAYS
+    # (`tools/garment_missing_survey.py`, `tools/garment_overlay_build.py`).
+    #
+    # GLOBAL because each artefact already carries its own key IN ITS NAME and
+    # a second key would double-key it: `overlay-7878/` is 7878's missing art,
+    # `overlay-7878-armet/` the same install's headgear, and `survey.json` is a
+    # census ACROSS 33 installs, which has no single base_id at all. The
+    # builder writes the unkeyed literal, so keying the prefix here would move
+    # only the READER and `find_derived` would return None for a directory
+    # that is there.
+    #
+    # `core/coassets.py`'s `AssetProfile.overlay_dirs` reads through
+    # `find_derived("out/garment")`, which is what lets a fresh worktree
+    # inherit the primary checkout's 35 MB build instead of resolving a tenth
+    # of 7878's rows in silence.
+    "out/garment/",
     # About a named library measured against a baseline, both recorded inside.
     "out/zephyr/",
     # A running process, NOT the configured asset root -- heropath.json
@@ -795,6 +1009,14 @@ GLOBAL: tuple[str, ...] = (
     # and wrong. Its own key would be the target module's hash, not base_id.
     "out/recon/",
     # Runtime, per run rather than per install.
+    #
+    # NEW captures no longer land here: the corpus HOME moved OUTSIDE the repo
+    # to `capture_home()` (C:/Claude/capture) -- owner
+    # ruling confirmed directly to the General Manager and the Senior Director,
+    # 2026-09-10, because captures are
+    # credential-bearing and `out/` is inside the checkout. This entry stays
+    # only to classify the PRESERVED legacy copy that still sits in a checkout's
+    # out/sessions/ (gitignored) until the General Manager retires it.
     "out/sessions/",
     "out/companion-logs/",
     # Runtime, and it holds character names. `out/` is gitignored so
@@ -844,6 +1066,20 @@ GLOBAL: tuple[str, ...] = (
     # The keyed tree itself. Without this, resolving an already-keyed path
     # would raise, and a caller that round-trips one would key it twice.
     "out/indexes/",
+
+    # Action codes named by eye (`tools/actionnames.py`), and the strong form
+    # of the rule this list states: the sharing boundary is whatever the
+    # artefact is about, and this one is about ACTION CODES. The install is a
+    # COLUMN -- each observation carries its own `install` and the sha256 of
+    # the clip that was watched -- exactly as `out/client/` carries the patch
+    # inside the file and the string index carries `build`.
+    #
+    # And every question it exists to answer is a comparison BETWEEN installs:
+    # does 7878 play 290 the way 5517 does, and did the two people who named
+    # it watch the same bytes? Keying it would shatter one naming effort into
+    # 36 partial copies, each missing the comparison. The disagreement is the
+    # evidence, so it has to sit in one file.
+    "out/action_names.json",
 )
 
 #: Historical name.  `GLOBAL` is no longer a list of *exceptions* -- it is
@@ -1000,6 +1236,25 @@ def fingerprint_inputs(root=None) -> tuple[list[str], list[str]]:
             [n for n in names if fingerprint_skips(n)])
 
 
+#: `base_fingerprint`'s memo, keyed on the ini/ directory AND every
+#: non-skipped file's (name, size, mtime_ns). Consulted ONLY inside
+#: `stable_fingerprints()` -- see the comment in `base_fingerprint` for the
+#: measurement that says why a stat signature alone is not sufficient.
+#: Cleared by `invalidate_cache()`.
+_FINGERPRINT_MEMO: dict = {}
+
+#: True only inside `stable_fingerprints()`. Module-level rather than a
+#: parameter because the callers that benefit -- `health.collect` and the
+#: provenance audit -- reach `base_fingerprint` through four or five layers
+#: that have no business growing a flag.
+_FINGERPRINT_STABLE = False
+
+#: How many installs' fingerprints to keep. A viewer serving two bases plus
+#: the fx-compare views touches a handful; 64 is far past any real session
+#: and stops a long-lived process growing a listing per install forever.
+_FINGERPRINT_MEMO_MAX = 64
+
+
 def base_fingerprint(root=None) -> str:
     """A short content hash of the install's table layer, or ``""``.
 
@@ -1019,6 +1274,16 @@ def base_fingerprint(root=None) -> str:
     index namespace -- the cost of a collision is a shared index between two
     installs whose tables agree exactly, and the cost of hashing the loose
     layer instead would be minutes per call.
+
+    **An ``ini/`` with no hashable file returns ``""``, not a hash.**  It used
+    to fall through and come out ``e3b0c44298fc`` -- the sha256 of the empty
+    string -- which `base_id` then dressed up as ``unknown-e3b0c44298fc``, a
+    namespace shaped exactly like a measured one and shared by every
+    featureless directory anyone points the tools at.  That is NOT the trade
+    above: those two installs' tables do not "agree exactly", they have no
+    tables.  The branch below says what it cost.  A real install cannot reach
+    it -- `missing_parts` refuses a root whose ``ini/`` holds no tables -- so
+    this is about synthetic roots, which is where it bit.
 
     **What it deliberately ignores**, via `fingerprint_skips`:
 
@@ -1057,18 +1322,275 @@ def base_fingerprint(root=None) -> str:
     ini = Path(d) / "ini"
     if not ini.is_dir():
         return ""
+
+    # THE STAT SIGNATURE IS THE MEMO KEY -- AND IT IS NOT ENOUGH ON ITS OWN,
+    # WHICH IS WHY THE MEMO IS OPT-IN.
+    #
+    # The first version of this change memoised unconditionally on
+    # (name, size, mtime_ns) and argued that a rewrite moves the key. MEASURED:
+    # `test_a_sanctioned_tool_edit_does_not_re_key_the_install` went red one
+    # run in three. It rewrites a table to the SAME SIZE, and Windows updates
+    # a file's mtime on a ~15.6 ms system-clock tick, so two writes inside one
+    # tick are indistinguishable by stat. The tools the old docstring named --
+    # `clientsidecar`, `clientdisplay`, `datoracle` -- are exactly the ones
+    # that rewrite tables in place, so that is not a corner case for them.
+    #
+    # A stat signature therefore cannot decide this on its own, and the
+    # knowledge that nothing is rewriting an install lives at the CALL SITE,
+    # not here. `stable_fingerprints()` is how a caller says so: inside it the
+    # memo is consulted, outside it every call re-hashes exactly as before.
+    # `health.collect` takes 4-15 fingerprints of one unchanging install per
+    # report and is the case this exists for; `datoracle` must never use it.
+    #
+    # `os.scandir`, not `Path.iterdir` + `stat`: MEASURED 0.09-0.12 ms against
+    # 4.6-5.8 ms warm -- cheap enough to take on every call even when the memo
+    # is off, which keeps this one code path instead of two.
+    try:
+        sig = []
+        with os.scandir(ini) as it:
+            for e in it:
+                if not e.is_file() or fingerprint_skips(e.name):
+                    continue
+                st = e.stat()
+                sig.append((e.name.lower(), st.st_size, st.st_mtime_ns))
+        sig.sort()
+    except OSError:
+        return ""
+
+    # SHA256 OF NOTHING IS NOT AN IDENTITY, AND IT WAS BEING SERVED AS ONE.
+    #
+    # An `ini/` that exists and holds no hashable file used to fall through to
+    # the hash below and come out `e3b0c44298fc` -- the empty-string digest.
+    # `base_id` then read `unknown-e3b0c44298fc`, which is shaped exactly like
+    # a measured namespace (`unknown-7f17d552d4b2` is one) and is shared by
+    # EVERY featureless directory anyone ever points the tools at. MEASURED on
+    # master `77a0dffa`: two unrelated synthetic installs in two separate
+    # `TemporaryDirectory` trees were handed one `meshtex/mesh_index.json`,
+    # the second was served the first's census, and `provenance.verdict` said
+    # `match` -- because the stamps really were identical.
+    #
+    # `""` is what the rest of this function already returns for "no answer",
+    # and it is the honest one: no file, no content, no content hash. The
+    # consequences are already designed for -- `base_id` reads `unkeyed`,
+    # `provenance.verdict_for_stamp` downgrades that to UNKNOWN instead of
+    # MATCH, and `provenance.optional_stamp` refuses to embed it.
+    #
+    # This does NOT on its own stop two featureless roots sharing a directory
+    # (`out/indexes/unkeyed/` is one directory too). It stops them sharing one
+    # that LOOKS measured, which is what defeated every reader above. The
+    # sharing is closed by giving each test its own derived root --
+    # `coroot.derived_root`, `tests/derivedroot.py`.
+    #
+    # An install is not affected: `missing_parts` refuses a root whose `ini/`
+    # does not hold tables, so a real client never reaches this branch.
+    if not sig:
+        return ""
+
+    key = (str(ini).lower(), tuple(sig))
+    if _FINGERPRINT_STABLE:
+        hit = _FINGERPRINT_MEMO.get(key)
+        if hit is not None:
+            return hit
+
     import hashlib
     h = hashlib.sha256()
     try:
-        files = sorted((p for p in ini.iterdir()
-                        if p.is_file() and not fingerprint_skips(p.name)),
-                       key=lambda p: p.name.lower())
-        for p in files:
-            h.update(p.name.lower().encode("utf-8"))
-            h.update(p.read_bytes())
+        for name, _size, _mtime in sig:
+            h.update(name.encode("utf-8"))
+            h.update((ini / name).read_bytes())
     except OSError:
         return ""
-    return h.hexdigest()[:12]
+    out = h.hexdigest()[:12]
+    # Bounded, because a long-lived viewer can see many installs and each
+    # entry holds a whole directory listing. FIFO by insertion order: this
+    # is a cost cache, not a correctness one -- a miss re-hashes, which is
+    # exactly what happened before.
+    if _FINGERPRINT_STABLE:
+        if len(_FINGERPRINT_MEMO) >= _FINGERPRINT_MEMO_MAX:
+            for k in list(_FINGERPRINT_MEMO)[:len(_FINGERPRINT_MEMO) // 2]:
+                _FINGERPRINT_MEMO.pop(k, None)
+        _FINGERPRINT_MEMO[key] = out
+    return out
+
+
+def stable_fingerprints():
+    """Memoise `base_fingerprint` for the duration of this block.
+
+        with coroot.stable_fingerprints():
+            rep = health.collect(root)
+
+    **The caller is asserting that no install is being rewritten inside the
+    block**, and that assertion is the whole mechanism. A stat signature
+    cannot detect a same-size write inside one ~15.6 ms mtime tick, so
+    `base_fingerprint` cannot decide on its own whether caching is safe --
+    but a health report, a provenance audit or one HTTP request can, because
+    they do not write to installs.
+
+    MEASURED on the configured install: `base_fingerprint` is 31.8 ms cold
+    and 0.277 ms memoised, 115x. `health.collect` takes 4-15 of them per
+    report and the first-run card polls it every 1.5 s.
+
+    Re-entrant, and it does NOT clear the memo on exit: a nested block must
+    not switch caching off for the outer one, and the entries are keyed on a
+    stat signature so they stay usable for a later block until something
+    changes or `invalidate_cache()` runs.
+
+    Never wrap `clientsidecar`, `clientdisplay` or `datoracle` in this: they
+    rewrite tables in place, which is the exact case the memo cannot see.
+    """
+    import contextlib                                       # noqa: PLC0415
+
+    @contextlib.contextmanager
+    def _scope():
+        global _FINGERPRINT_STABLE
+        prev = _FINGERPRINT_STABLE
+        _FINGERPRINT_STABLE = True
+        try:
+            yield
+        finally:
+            _FINGERPRINT_STABLE = prev
+
+    return _scope()
+
+
+def cover_manifest(root, covers) -> list:
+    r"""``(relative posix path, size)`` lines under each name in ``covers``.
+
+    The SECOND half of `pin_fingerprint`, exposed for the same reason
+    `fingerprint_inputs` is: when a pin's digest moves, the first question is
+    *what moved*, and a twelve-character hash cannot answer it.
+
+    **Metadata, not contents, and that is the whole trade.**  ``ini/`` is
+    28-103 MB and hashing it whole costs 28-124 ms warm; ``map/map`` is
+    402 MB on 5517 and ``c3/`` is 5.7 GB on 7878, so the same treatment there
+    is minutes, not milliseconds.  A ``(path, size)`` manifest over those
+    trees costs 9-28 ms MEASURED and still moves when a file is **added,
+    removed, renamed, or resized** -- which is every shape of drift this
+    corpus has actually suffered: a mod dropping files in, a repack shipping
+    a shorter table, an extraction leaving half a tree behind.
+
+    **What it does NOT catch, stated rather than implied:** an edit that
+    changes bytes and keeps the byte COUNT.  A one-character hex tweak inside
+    a ``.DMap`` cell, a re-saved mesh of identical length, a patched opcode.
+    For a subject where that is the realistic threat, hash the contents --
+    put the table in ``ini/`` where `base_fingerprint` already does, or do not
+    claim the pin covers it.
+
+    A missing covered directory is a DIFFERENCE, recorded as ``MISSING``,
+    never a silent empty list: a pin whose subject tree has vanished must fail
+    on the same terms as one whose subject tree has changed.
+    """
+    out = []
+    for name in covers:
+        rel = str(name).replace("\\", "/").strip("/")
+        try:
+            d = Path(root) / rel
+        except Exception:
+            out.append(f"{rel.lower()}\tMISSING")
+            continue
+        if not d.is_dir():
+            out.append(f"{rel.lower()}\tMISSING")
+            continue
+        rows = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(d):
+                dirnames.sort()
+                for fn in filenames:
+                    # Our own tooling's backups, excluded here for exactly the
+                    # reason `TOOL_BACKUP_SUFFIXES` excludes them from
+                    # `base_fingerprint`: preparing a client for the rig must
+                    # not re-key it.  `VOLATILE_INI`/`TOOL_WRITTEN_INI` are
+                    # deliberately NOT applied -- those name files by their
+                    # bare `ini/` name, and a `map/` file that happens to share
+                    # one of those names is a different file.
+                    if fn.lower().endswith(TOOL_BACKUP_SUFFIXES):
+                        continue
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        size = os.path.getsize(p)
+                    except OSError:
+                        size = -1
+                    r = os.path.relpath(p, d).replace("\\", "/").lower()
+                    rows.append(f"{rel.lower()}/{r}\t{size}")
+        except OSError:
+            out.append(f"{rel.lower()}\tUNREADABLE")
+            continue
+        out.append(f"{rel.lower()}\t{len(rows)} file(s)")
+        out.extend(sorted(rows))
+    return out
+
+
+def pin_fingerprint(root, covers=()) -> str:
+    r"""Content identity of a PINNED install root, or ``""``.
+
+    **The defect this closes.**  `tools/test_viewer.py`'s `DeclaredInstall`
+    and `tests/test_npcaltskin.py`'s `_pinned` both resolved a pin by matching
+    a directory NAME.  A directory called ``5517`` whose CONTENT had drifted
+    satisfied both of them, while `routeb/corpus.py`'s `RECORDED_FINGERPRINT`
+    -- one directory away, over the same install -- would have refused it.
+    Two mechanisms disagreed and only one of them was checking anything.
+    Recorded as RESIDUAL in `MeshCopyEquivalence`'s docstring and in
+    CORRECTIONS ``C-2026-08-26-claude-vibeco-dx-camera-ambient-install``.
+
+    **Why the name is not enough, in one sentence:** *a pin exists to say the
+    numbers in this test are THIS install's, and a name is a label somebody
+    typed while the numbers are a fact about bytes.*
+
+    FORM
+    ----
+    With no ``covers``, this is `base_fingerprint` VERBATIM -- deliberately,
+    so a pin's recorded value and `routeb.corpus.RECORDED_FINGERPRINT` are
+    the same twelve characters for the same install and can be cross-checked
+    by eye and by test.  With ``covers``, a suffix is appended:
+
+        ``76c7f4499934-1a2b3c4d``     ini/ content digest + covers manifest
+
+    The base half stays legible, so "which client" is still readable off the
+    front of a compound pin.
+
+    WHAT IT COVERS, AND THE JUSTIFICATION
+    -------------------------------------
+    * ``ini/`` -- every byte, through `base_fingerprint`, with that function's
+      volatility exclusions inherited unchanged.  This is the table layer,
+      which is where the clients actually differ (91 of 176 shared ``ini/``
+      files differ between 5517 and 6090) and what most pinned numbers are
+      about.  MEASURED 28-124 ms warm, 0.5-3.6 s cold, per install.
+    * each name in ``covers`` -- a ``(path, size)`` manifest, NOT contents.
+      See `cover_manifest` for the cost measurements and for the one thing it
+      misses.
+
+    WHAT SLIPS PAST IT
+    ------------------
+    Say this out loud rather than discovering it: **an equal-size in-place
+    byte edit inside a ``covers`` tree, and ANY change to a subtree the pin
+    did not declare** -- loose art, archives (``c3.wdf``/``data.wdf``), and
+    anything under ``c3/`` unless a pin names it.  Hashing 5.7 GB of ``c3/``
+    per test run is not viable and pretending otherwise would buy a slower
+    suite and the same blind spot at a different boundary.  A pin whose
+    subject lives inside an archive is honestly only NAME-pinned for that
+    part, and `docs/pin_fingerprinting_2026-09-07.md` names which ones.
+
+    NOT MEMOISED HERE, and that is still true of THIS function.
+    `base_fingerprint` below IS memoised now, and the objection that used to
+    be recorded here -- that a cache would hand a stale identity to the
+    client-modifying tools (`clientsidecar`, `clientdisplay`, `datoracle`)
+    which legitimately rewrite an install mid-process -- is answered rather
+    than overruled: the memo is keyed on every non-skipped `ini/` file's
+    (name, size, mtime_ns), so a rewrite MOVES THE KEY and the hash is taken
+    again. A cache keyed on the root would indeed be wrong; that is not what
+    it is keyed on. `invalidate_cache()` clears it as well.
+    """
+    base = base_fingerprint(root)
+    if not base:
+        return ""
+    if not covers:
+        return base
+    import hashlib
+    h = hashlib.sha256()
+    for line in cover_manifest(root, covers):
+        h.update(line.encode("utf-8"))
+        h.update(b"\n")
+    return f"{base}-{h.hexdigest()[:8]}"
 
 
 def base_id(root=None) -> str:
@@ -1093,8 +1615,18 @@ def base_id(root=None) -> str:
 
     A missing directory means "build me", never "borrow another base's
     answers".  Falls back to ``unknown-<fingerprint>`` with no declaration,
-    and to ``unkeyed`` when even the fingerprint fails -- which keeps a
-    broken install from silently sharing whatever was built last.
+    and to ``unkeyed`` when there is no fingerprint to be had -- no ``ini/``,
+    an unreadable one, or one with nothing hashable in it.
+
+    **``unkeyed`` IS ONE DIRECTORY, SHARED, AND THAT IS NOT AN ACCIDENT TO
+    RELY ON.**  This docstring used to claim it "keeps a broken install from
+    silently sharing whatever was built last"; it does not -- every unkeyed
+    root resolves to ``out/indexes/unkeyed/``.  What it does buy is that the
+    sharing is LEGIBLE: `provenance.verdict_for_stamp` downgrades ``unkeyed``
+    to UNKNOWN instead of MATCH, and `provenance.optional_stamp` refuses to
+    embed it, neither of which an ``unknown-<12 hex>`` id ever triggered.
+    Anything that must not share -- a test, above all -- needs a derived root
+    of its own: `derived_root`, and `tests/derivedroot.py`.
     """
     fp = base_fingerprint(root)
     if not fp:
@@ -1241,7 +1773,8 @@ def kind_for_root(root=None) -> str:
     """The plugin name the user declared for ``root``, or ``""``.
 
     Ask this rather than reading ``game_kind`` directly.  ``game_kind`` is a
-    single value and this machine has eight installs, so it answers for
+    single value and this box has 33 installs (measured 2026-08-29), so it
+    answers for
     whichever root the config names and for no other: resolve a different one
     and it hands back a plugin for a client you are not looking at.  That is
     not theoretical -- running the suite with ``CO_ROOT`` pointed at 6090
@@ -1330,14 +1863,178 @@ def derived_rel(rel: str, root=None) -> str:
 
 
 def derived_path(rel: str, root=None) -> Path:
-    """Where a **writer** should put ``rel``, in this checkout, keyed.
+    """Where a **writer** should put ``rel``, in this derived root, keyed.
 
     Never falls back to another checkout: everything that builds an artefact
     builds it here.  Creates no directories -- the caller decides when.
+
+    "Here" is `derived_root`, which is this checkout unless something moved
+    it.  A test's own derived tree is the case that exists for.
     """
-    repo = _repo_dir()
-    base = repo if repo is not None else Path.cwd()
-    return base / derived_rel(rel, root)
+    return derived_root() / derived_rel(rel, root)
+
+
+#: Environment override for the thumbnail folder. Process-scoped, so a viewer
+#: started with ``--thumbs-dir`` hands it to the `thumbs.py` children it
+#: spawns. For trying a rendering branch without touching the shared renders.
+THUMBS_DIR_VAR = "COMOD_THUMBS_DIR"
+#: Settings key for a persistent thumbnail folder chosen by the user.
+THUMBS_DIR_KEY = "thumbs_dir"
+
+
+def thumbs_base() -> tuple:
+    """``(Path, source)`` -- the folder thumbnails are rendered into and read
+    from, and which rule chose it.
+
+    Thumbnails are expensive (tens of minutes per client) and change only when
+    the renderer does, so they are NOT a per-checkout artefact any more: every
+    worktree used to start from an empty ``out/thumbs/`` and regenerate. Most
+    specific first:
+
+    1. ``$COMOD_THUMBS_DIR`` -- ``"env"``. A throwaway folder for a branch that
+       changes pixels, so its renders never land in the shared set.
+    2. ``thumbs_dir`` in the per-user settings -- ``"setting"``.
+    3. ``<assets_dir()>/derived/thumbs`` -- ``"shared"``, the default, beside
+       the other expensive artefacts built from ``Clients/`` (never inside it).
+    4. this checkout's ``out/thumbs`` -- ``"checkout"``, the old behaviour, only
+       when there is no asset collection to hold a shared folder.
+
+    Invalidation does not depend on the folder: `thumbs.RENDERER_VERSION` is in
+    every cache key, so bumping it makes ``--resume`` re-render everything
+    wherever the folder is.
+    """
+    raw = os.environ.get(THUMBS_DIR_VAR, "").strip()
+    if raw:
+        return Path(raw), "env"
+    raw = str(read_settings().get(THUMBS_DIR_KEY) or "").strip()
+    if raw:
+        return Path(raw), "setting"
+    derived = assets_dir() / "derived"
+    if derived.is_dir():
+        return derived / "thumbs", "shared"
+    return derived_root() / "out" / "thumbs", "checkout"
+
+
+#: Plugin `origin` values whose installs are LIVE: patched by their own
+#: launcher, or edited by the owner, while we hold artefacts about them.
+LIVE_ORIGINS = ("server",)
+
+
+#: The declared kinds whose installs are LIVE -- patched by their own
+#: launcher or edited by the owner while we hold artefacts about them.
+#:
+#: **WHY A LITERAL IN COre, AND NOT ASKED OF `plugins` AT RUNTIME.** Three
+#: designs were tried in one night and the first two were both wrong:
+#:
+#: 1. `is_live_install` imported `plugins` -- `test_viewer.CoreBoundary`
+#:    red: `core/` must import only itself and the stdlib, or it stops
+#:    being extractable. A lazy import does not help; the gate reads source.
+#: 2. `plugins` registered the set with COre at discovery, cached in the
+#:    settings -- `SettingsDirectoryManagement.test_the_cost_read_computes_
+#:    and_writes_nothing` red: discovery happens inside READ paths, and a
+#:    read must leave the config byte-identical.
+#: 3. registration in memory only -- no gate caught it, and the SD named
+#:    the defect anyway: **the answer then depended on whether the process
+#:    had imported `plugins`.** `tools/health.py` and `tools/unify.py`
+#:    never import it, and `tools/coviewer.py` imports it only inside
+#:    functions. So the viewer could resolve a CONTENT-keyed folder while
+#:    `thumbs.py` wrote the LIVE-keyed one: one install, two folders, which
+#:    is the same class of bug as the orphaned 636 MB this feature exists
+#:    to prevent.
+#:
+#: A literal is import-order independent and readable at the point of use.
+#: The cost is drift -- a new private-server plugin would not appear here --
+#: and `tests/test_thumbs_dir.py` closes that: an arm asserts this set
+#: equals the plugin-derived one and names what to add when it does not.
+LIVE_KINDS = frozenset({"cco", "zephyr1057"})
+
+
+def live_kinds() -> frozenset:
+    """`LIVE_KINDS`. A function because callers and tests patch this, and
+    because the source of the answer has changed twice already."""
+    return LIVE_KINDS
+
+
+def is_live_install(root=None) -> bool:
+    """Is this install one that gets PATCHED under us?
+
+    True for a declared kind that `plugins` registered as live -- the
+    private-server clients (Classic Conquer 2.0, Zephyr), whose plugin
+    `origin` is in `LIVE_ORIGINS`. False for the official patch clients,
+    which are frozen copies, and false whenever the answer cannot be
+    established: the conservative direction is content keying, which is what
+    everything did before.
+    """
+    try:
+        return (_declared_kind(root) or "").strip().lower() in live_kinds()
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def thumbs_key(root=None) -> str:
+    """The thumbnail namespace for ``root``: STABLE for a live install.
+
+    `base_id` keys by the CONTENT of ``ini/``, which is right for an index:
+    a repack of 6090 that declares itself 6090 must not inherit the real
+    6090's answers. But a LIVE install is patched under us -- the owner's
+    Classic Conquer 2.0 went 1074 -> 1076 on 2026-09-17 and re-keyed -- and
+    every re-key orphans that client's whole thumbnail set.
+
+    **Thumbnails do not need content keying, because each entry is already
+    content-addressed**: `thumbs._key` hashes the mesh and texture bytes with
+    the render options, so an asset the patch changed re-renders and one it
+    did not is reused. Keying the FOLDER by content therefore throws away
+    renders that are still correct -- 636 MB of CCO renders for a patch that
+    changed four models.
+
+    So for a live install the folder is keyed by WHICH INSTALL it is
+    (declared kind + a hash of the resolved path) and not by what it
+    currently contains. Two live installs never collide; the same install
+    keeps its folder across patches; and a folder that is replaced by a
+    different client re-renders anyway, because every entry key changes.
+
+    Offline installs keep `base_id` unchanged.
+    """
+    if not is_live_install(root):
+        return base_id(root)
+    try:
+        p = str(Path(root).resolve() if root is not None else game_root())
+    except Exception:                                       # noqa: BLE001
+        return base_id(root)
+    import hashlib                                          # noqa: PLC0415
+    h = hashlib.sha256(p.lower().encode("utf-8")).hexdigest()[:12]
+    return f"{_declared_kind(root)}-live-{h}"
+
+
+def thumbs_dir(root=None, server: str = "") -> Path:
+    """Where the thumbnails for one install (or one library server) live.
+
+    The same folder for writing and reading: ``tools/thumbs.py`` renders into
+    it, and the viewer's index reads the manifest from it.
+
+    Keyed exactly as before under whichever base `thumbs_base` picks:
+    ``<base-id>/`` for an install, because two clients hold different bytes
+    under the same logical path, and ``servers/<name>/`` for a library server.
+    The ``"checkout"`` source keeps the old ``out/indexes/<base-id>/thumbs``
+    spelling so existing per-checkout renders are still found.
+    """
+    base, source = thumbs_base()
+    if source == "checkout":
+        if server:
+            return derived_root() / "out" / "thumbs" / "servers" / server
+        return derived_path("out/thumbs", root)
+    if server:
+        return base / "servers" / server
+    # `thumbs_key`, not `base_id`: a LIVE install keeps its folder across a
+    # patch, because every entry inside is content-addressed already.
+    return base / thumbs_key(root)
+
+
+def set_thumbs_dir(path) -> Path:
+    """Persist a thumbnail folder, or clear it (back to the shared default)
+    with ``None``."""
+    return write_settings(**{THUMBS_DIR_KEY: ("" if path is None
+                                              else str(Path(path).resolve()))})
 
 
 def installs_root() -> Optional[Path]:
@@ -1362,11 +2059,31 @@ def installs_root() -> Optional[Path]:
     guessing which checkout speaks for the machine. Unset -- which is the
     shipped case, where there is exactly one tree -- means the local one.
     """
+    return installs_root_why()[0]
+
+
+def installs_root_why() -> tuple[Optional[Path], str]:
+    """`(path_or_None, why)` -- and the three cases are NOT the same fact.
+
+    `installs_root()` collapses them all to `None`, and `comod` then falls
+    back to its own per-checkout tree. That is right for "unset" and WRONG
+    for "set but missing": a renamed or unmounted `C:/COMod` silently
+    re-homes every install record into whichever worktree is running, and
+    this module's own docstring above says what that costs -- `uninstall`
+    restoring a file to a state another install has since replaced.
+
+    A setting that names a folder which is not there is a thing the user
+    wants to hear about, not a thing to quietly route around. The `why` is
+    what a surface prints so the fallback stops being invisible.
+    """
     raw = _read_user_config().get("installs_root")
     if not raw:
-        return None
+        return None, "not set -- each checkout keeps its own records"
     p = Path(str(raw))
-    return p if p.is_dir() else None
+    if p.is_dir():
+        return p, "set in config.json (installs_root)"
+    return None, ("set in config.json to %s, which is NOT a directory -- "
+                  "records fall back to this checkout's own tree" % p)
 
 
 def set_installs_root(path) -> Path:
@@ -1438,6 +2155,66 @@ def clients_root() -> tuple:
     return (None, "no clients declared yet, and no folder set -- set one below")
 
 
+EXPORT_DIR_KEY = "export_dir"
+
+#: Where bundles land when the user has not said otherwise.  OWNER'S CHOICE,
+#: 2026-09-23: *"by default, I want C:\\COMod\\Export as the standard base"*.
+#:
+#: **A LITERAL, and this is one of the three files allowed to hold one**
+#: (`tests/test_sanitization.INSTALL_PATH_ALLOWED`).  That allowance is the
+#: whole reason this resolver lives here rather than in `comod` or the
+#: viewer: those are the callers, and a caller that spells the path itself is
+#: the defect the gate exists to catch.
+#:
+#: It is a DEFAULT, not a constant -- `EXPORT_DIR_KEY` in the per-user config
+#: outranks it, exactly as `clients_root` outranks its own derivation.
+_DEFAULT_EXPORT_DIR = r"C:\COMod\Export"
+
+
+def export_root() -> tuple:
+    """``(Path, why)`` -- where import/export bundles are kept.  Never None.
+
+    Two sources, most specific first, and the `why` is returned rather than
+    inferred because **the panel shows this path to a human** and "where did
+    it come from" is the question a path on screen immediately raises.
+
+    1. ``export_dir`` in the per-user config, if set.
+    2. The default above.
+
+    WHY THIS MOVED OUT OF `comod.WORK`.  It used to be
+    ``<repo>/Installed/work/export``, which put the user's bundles **inside a
+    git worktree** -- per-checkout, invisible from another clone, and removed
+    by anything that cleans the tree.  The bundles are the user's own work and
+    outlive any checkout, so they do not belong under one.
+
+    Both callers resolve through here -- `comod`'s CLI and the viewer's
+    pop-out -- because the viewer having its own bundle directory is exactly
+    how `comod import` comes to not see what the panel just wrote.  That
+    invariant predates this change and is preserved by it.
+    """
+    explicit = str(read_settings().get(EXPORT_DIR_KEY) or "").strip()
+    if explicit:
+        return (Path(explicit),
+                f"set in {user_config_path()} ({EXPORT_DIR_KEY})")
+    return (Path(_DEFAULT_EXPORT_DIR), "the default export folder")
+
+
+def export_dir() -> Path:
+    """`export_root()[0]`.  Never None, and **not created here.**
+
+    Creation belongs to whoever is about to write, so a read-only caller
+    asking where bundles live does not bring a directory into existence as a
+    side effect -- and a tool that only lists cannot make an empty folder
+    appear and report "no bundles" as though it had looked.
+    """
+    return export_root()[0]
+
+
+def save_export_dir(path) -> Path:
+    """Remember ``path`` as the export base.  Returns the config file."""
+    return write_settings(**{EXPORT_DIR_KEY: str(Path(path))})
+
+
 #: What `clients_dir` returns when nothing is configured.  A path *under a
 #: file* -- this module -- so it can never be a directory and can never be
 #: created by accident, on any platform.
@@ -1490,6 +2267,72 @@ def assets_dir() -> Path:
 _HISTORICAL_CLIENTS_DIRS = (
     r"C:\Claude\ConquerAssets\Clients",
 )
+
+
+#: The declared baseline set, beside this file. Data, not code: edited by a
+#: human recording an owner declaration, never by a tool.
+BASELINE_MEMBERS_PATH = Path(__file__).resolve().parent / "baseline_members.json"
+
+
+def baseline_members() -> list:
+    """The directory NAMES the owner has declared baseline members. Sorted.
+
+    **PRESENCE ON DISK IS NOT MEMBERSHIP.** `clients_dir()` is a WORKING
+    DIRECTORY -- the owner adds to it, patches in it, and replaces trees
+    inside it -- so a frozen population measured by walking it goes stale with
+    no signal. Membership is DECLARED, in `baseline_members.json`, and the
+    owner's rule is recorded there verbatim:
+
+        A baseline member is when the OWNER says it is.
+        ASK, NEVER DECIDE THE OWNER IS DONE WITH A DIRECTORY.
+
+    That second clause is the operative one for a program. A directory that
+    looks complete, settled, or finished patching is **still undeclared**, and
+    "it has stopped changing" is exactly the inference this forbids -- on
+    2026-09-15 an install sat apparently settled for nine hours and was then
+    replaced in place with its timestamps preserved from the source.
+
+    Returns names, not paths, because the question "is this one in scope" is
+    asked about a name far more often than a path. See `baseline_installs`
+    for the paths that actually exist.
+    """
+    doc = json.loads(BASELINE_MEMBERS_PATH.read_text("utf-8"))
+    return sorted(doc["members"])
+
+
+def baseline_installs(root=None) -> list:
+    """Declared baseline members that are present on disk, as paths. Sorted.
+
+    **THE ONE ENUMERATION A CORPUS-WIDE CLAIM MAY MEASURE.** A test that walks
+    `clients_dir()` directly is asserting over whatever the owner happens to
+    have on the box this minute, which is how five frozen populations went red
+    in one day without a commit: two installs arrived, and every "N of M"
+    quoted against the old M became false.
+
+    Undeclared directories are **out of scope, not rejected** -- they are not
+    an error, not a finding, and not something a program may promote. Use
+    `undeclared_installs` to surface them as an ASK.
+    """
+    base = Path(root) if root is not None else clients_dir()
+    return sorted(p for n in baseline_members()
+                  if (p := base / n).is_dir())
+
+
+def undeclared_installs(root=None) -> list:
+    """Directories present under `clients_dir()` that nobody has declared.
+
+    **THIS EXISTS SO AN ARRIVAL IS AN ASK RATHER THAN A SILENCE.** Excluding
+    undeclared trees from every population would otherwise make a new install
+    invisible, and invisible is the one outcome the owner's rule rules out:
+    the answer to "is this a member?" is theirs, so the tooling's job is to
+    put the question in front of them, not to answer it either way.
+    """
+    base = Path(root) if root is not None else clients_dir()
+    if not base.is_dir():
+        return []
+    declared = set(baseline_members())
+    return sorted(p for p in base.iterdir()
+                  if p.is_dir() and p.name not in declared)
 
 
 def clients_search_dirs() -> list:
@@ -1854,6 +2697,55 @@ def unverified_derived_overrides() -> dict:
     return dict(_unverified_overrides)
 
 
+def locate_table(root, logical: str) -> Optional[Path]:
+    """The real path of an install-relative table, honouring an overlay.
+
+    `root` is either a plain path -- joined directly, exactly as it always
+    was -- **or an `AssetRoot`**, in which case the lookup goes through its
+    `locate()` and obeys the install's real precedence: overlay, then loose,
+    then archives. Passing the AssetRoot is what lets a staged overlay reach a
+    table; passing a Path keeps every existing caller behaving identically.
+
+    Duck-typed on `locate` rather than imported, because `coassets` imports
+    THIS module -- naming `AssetRoot` here would be a cycle.
+
+    None means the table is not in this install, which several callers treat
+    as "no rows" rather than an error, and that leniency is preserved.
+
+    A table resolving INSIDE an archive raises instead. Every reader of these
+    tables takes a filesystem path (`json.loads(p.read_text())`,
+    `tqdat.read_itemtype(p)`, `read_gamemap_dat(p)`), so an archive hit cannot
+    be served, and returning None for it would report a table the install DOES
+    ship as absent. MEASURED 2026-08-29 across all 31 installs: itemtype and
+    GameMap are loose `.dat` on every one of them, archive-resident on none --
+    so this refusal guards a case no install has, loudly rather than silently.
+
+    RE-MEASURED 2026-09-07 across the **34** installs `clients_dir()` now
+    holds, because "all 31" is a denominator and a denominator rots when a
+    client is added. **Archive-resident on none: still 0**, which is the half
+    this refusal rests on. But "loose on every one of them" is now 33 of 34:
+    **CCO-snapshot-2026-08-24 ships NEITHER table** -- Classic Conquer 2.0 is
+    a different layout, and absent is a third answer the original binary
+    framing (loose / archive-resident) had no room for. It does not weaken the
+    guard, which is about the archive case; it does mean a caller that reads
+    "every install ships these loose" and skips its own existence check is
+    wrong on one install. See `docs/claim_enumeration_audit_2026-09-07.md`.
+    """
+    find = getattr(root, "locate", None)
+    if find is None:
+        p = Path(root) / logical
+        return p if p.is_file() else None
+    loc = find(logical)
+    if loc is None:
+        return None
+    if loc.real_path is None:
+        raise NotImplementedError(
+            f"table {logical!r} resolves inside {loc.source}; the readers for "
+            f"these tables take a filesystem path. No measured install ships "
+            f"one this way -- if you are seeing this, the layout changed.")
+    return loc.real_path
+
+
 def find_derived(rel: str, root=None) -> Optional[Path]:
     """Locate a derived artefact (an ``out/...`` path) for **reading**.
 
@@ -1902,10 +2794,24 @@ def find_derived(rel: str, root=None) -> Optional[Path]:
         # Fall through rather than return None: a refused override must not
         # also hide a copy this checkout legitimately holds. Same reason
         # `derived_override` falls through on a path that is not there.
-    repo = _repo_dir()
-    if repo is not None and (repo / rel).exists():
-        return repo / rel
+    # `_repo_dir() is not None or overridden`, and not just `derived_root()`:
+    # `derived_root` falls back to `Path.cwd()` when there is no checkout to
+    # find, which is right for a WRITER (that is what `derived_path` has
+    # always done) and wrong for a reader. In the vendored Blender copy
+    # `_repo_dir()` is None and this arm used to be skipped entirely; reading
+    # `<whatever Blender's cwd happens to be>/out/...` would be a new and
+    # unasked-for lookup. Keep the old answer where nothing says otherwise.
+    if derived_root_is_overridden() or _repo_dir() is not None:
+        here = derived_root()
+        if (here / rel).exists():
+            return here / rel
     if os.environ.get(DERIVED_FALLBACK_VAR, "").strip().lower() in ("0", "off", "no"):
+        return None
+    # An OVERRIDDEN derived root is an isolated one, and an isolated tree
+    # that reads the primary checkout's answers is the same contamination one
+    # directory along. The caller said where its derived data lives; there is
+    # no "and also over there".
+    if derived_root_is_overridden():
         return None
     primary = primary_checkout()
     if primary is not None and (primary / rel).exists():
@@ -2169,6 +3075,11 @@ def invalidate_cache() -> None:
     _refused_overrides.clear()
     _unverified_overrides.clear()
     _refusals_announced.clear()
+    # The fingerprint memo is keyed on a stat signature, so it self-
+    # invalidates when an install changes -- but a caller reaching for this
+    # function is saying "forget what you think you know", and leaving one
+    # cache behind would make that only mostly true.
+    _FINGERPRINT_MEMO.clear()
 
 
 def find(explicit=None, *, use_cache: bool = True) -> Optional[Found]:
@@ -2298,6 +3209,158 @@ def binaries(root=None) -> list:
                   key=lambda p: p.name.lower())
 
 
+#: Where the game client sits relative to an install root.  Used only to
+#: GENERATE candidates -- every one is validated as a real PE by
+#: `client_binaries`, which is the whole point (see its docstring: at the root
+#: of 22 installs this name is a 41-byte text file).  Same contract as
+#: `_INSTALL_DIR_NAMES` above.
+#:
+#: MEASURED 2026-08-29 over 36 directories under `clients_dir()`; the families
+#: and their counts are in `client_binaries`.
+CLIENT_RELPATHS: tuple[str, ...] = (
+    "Conquer.exe",              # official patch clients, 4274-6090 era (+6716)
+    "Env_DX8/Conquer.exe",      # the 6609+ renderer split -- TWO per install
+    "Env_DX9/Conquer.exe",
+    "bin/64/ImConquer.exe",     # Classic Conquer 2.0
+)
+
+
+@dataclass(frozen=True)
+class ClientBinary:
+    """One game-client PE inside one install.
+
+    `relpath` is POSIX-form and relative to the install root, so it is the same
+    string on every machine and can be recorded.  `renderer` is `"DX8"`,
+    `"DX9"` or `""` -- it is a real distinction and not cosmetic: the two
+    `Env_DX*` clients of a single install are DIFFERENT BUILDS with different
+    build keys, measured, not assumed.
+    """
+
+    path: Path
+    install: Path
+    relpath: str
+    renderer: str = ""
+
+    @property
+    def process(self) -> str:
+        return self.path.name
+
+
+def _is_pe(p: Path) -> bool:
+    """True if `p` starts `MZ` and its `e_lfanew` points at `PE\\0\\0`.
+
+    The header, not the extension.  This is the discriminator the whole
+    function turns on and it must be evidence: the thing being rejected is
+    named `Conquer.exe` and would pass any name test ever written.
+    """
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(0x40)
+            if len(head) < 0x40 or head[:2] != b"MZ":
+                return False
+            off = int.from_bytes(head[0x3C:0x40], "little")
+            fh.seek(off)
+            return fh.read(4) == b"PE\0\0"
+    except OSError:
+        return False
+
+
+def client_binaries(root=None) -> list:
+    """Every real game-client PE in this install.  **Validated, not named.**
+
+    Returns `ClientBinary` records, `relpath`-sorted.  Empty is a real answer:
+    two directories under `clients_dir()` hold no client at all.
+
+    WHY THIS EXISTS.  Ten tools and the build registry look for
+    ``<install>/Conquer.exe``.  MEASURED 2026-08-29 across 36 directories:
+
+    * **9** installs keep the client there -- 4274 5017 5065 5165 5517 6090
+      6256 6271 **6716**;
+    * **23** put it in ``Env_DX8/`` *and* ``Env_DX9/`` -- 6609 onwards, plus
+      Zephyr -- and **22 of those ship a 41-byte ASCII file at the old path**
+      reading *"Click on Player.exe to log into the game."*;
+    * **1** is Classic Conquer 2.0 at ``bin/64/ImConquer.exe``.
+
+    So the old lookup saw 9 of 33 installs and **56 client PEs collapse to 53
+    distinct build keys**, of which the registry knew 6.  The failure was
+    silent in the worst way: the path existed and opened, so nothing raised --
+    it just was not a program.  *The name is not the program.*
+
+    THE 41-BYTE FILE IS WHY `_is_pe` READS THE HEADER.  A suffix check, a size
+    check or any name rule accepts it; only asking whether it is a PE does not.
+    And the note it contains is itself wrong -- it says ``Player.exe`` and no
+    install has one -- so parsing the declaration would have been worse than
+    ignoring it.
+
+    TWO CLIENTS PER INSTALL IS THE NORMAL CASE HERE, not a duplicate to
+    de-duplicate: ``Env_DX8/Conquer.exe`` and ``Env_DX9/Conquer.exe`` have
+    different build keys in all 23 installs.  A caller that takes ``[0]`` and
+    calls it "the client" has silently picked the DX8 renderer.
+
+    **A DIRECTORY NAME IS NOT A PATCH NUMBER.**  ``6716`` looked like an
+    out-of-order anomaly -- first family, sitting between 6707 and 6772 which
+    are second family -- until its own ``version.dat`` was read: it says
+    **6271**, and its client is byte-identical to ``6271``'s
+    (md5 ``18c230409353847b4e9362e3c14ad189``, 79 root entries each).  It is
+    not a 6716-era install.  ``7632`` and ``7682`` both declare **7622** and
+    likewise ship one identical client.  Two independent pairs, so this is the
+    rule and not an accident: resolve the patch by reading
+    ``<install>/version.dat`` -- which is what
+    `coprofile.identity.read_patch_marker` does -- and never by parsing the
+    folder name.  A build keyed on a directory name would have recorded three
+    patches that do not exist.
+    """
+    base = Path(root) if root else default_root()
+    out = []
+    for rel in CLIENT_RELPATHS:
+        p = base / rel
+        if not p.is_file() or not _is_pe(p):
+            continue
+        parent = PurePath(rel).parent.name
+        out.append(ClientBinary(
+            path=p, install=base, relpath=rel,
+            renderer=parent[4:] if parent.startswith("Env_") else ""))
+    return sorted(out, key=lambda c: c.relpath)
+
+
+def install_root_of(exe) -> Optional[Path]:
+    """The install `exe` is the client of, or None.  **Verified, not guessed.**
+
+    Walks up at most as far as `CLIENT_RELPATHS` is deep and returns the first
+    ancestor that `client_binaries` **agrees** owns this exact file.  That
+    agreement is the whole point and it is why this is not the upward search
+    `coprofile.identity.identify_path` refuses to do internally: it does not
+    look for the nearest ``version.dat`` and hope, it asks the resolver whether
+    the candidate root really resolves to this path.  A directory that merely
+    sits above the file, or one that has a ``version.dat`` of its own for some
+    other install, is not accepted.
+
+    **Both conditions are load-bearing, and the second was added because the
+    first alone got it wrong.**  Agreement from `client_binaries` is not enough
+    on its own: ``Env_DX9/`` *contains* a file called ``Conquer.exe``, so it
+    answers to the flat-family candidate and the nearest ancestor of
+    ``7878/Env_DX9/Conquer.exe`` resolved to ``7878/Env_DX9`` -- which has no
+    ``ini/`` and no archive and is not an install.  So the candidate must also
+    satisfy `looks_like_root`, which is this module's existing answer to "is
+    this an install" and was already right about it.
+
+    None is a real answer: a client outside the corpus layout has no install
+    root that can be established, and a caller must then leave the patch
+    unread rather than substitute a plausible one.
+    """
+    p = Path(exe).resolve()
+    depth = max(len(PurePath(r).parts) for r in CLIENT_RELPATHS)
+    for up in range(1, depth + 1):
+        if up >= len(p.parts):
+            break
+        cand = p.parents[up - 1]
+        if not looks_like_root(cand):
+            continue
+        if any(c.path.resolve() == p for c in client_binaries(cand)):
+            return cand
+    return None
+
+
 # ---------------------------------------------------------------------------
 # argparse glue
 # ---------------------------------------------------------------------------
@@ -2358,11 +3421,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="show every candidate considered and its verdict")
     ap.add_argument("--print", dest="print_what", metavar="WHAT",
                     choices=("root", "clients", "assets", "library",
-                             "installs"),
+                             "installs", "export"),
                     help="print one resolved path and nothing else, for shell "
                          "scripts: root | clients | assets | library | "
-                         "installs. Exit 3 and print nothing if it is not "
-                         "configured, so `if not defined` is a real answer")
+                         "installs | export. Exit 3 and print nothing if it is "
+                         "not configured, so `if not defined` is a real answer "
+                         "(export always resolves -- it has a default). With "
+                         "--json, export prints {path, why} instead, so a "
+                         "script can also say where the folder came from")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
@@ -2372,6 +3438,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # stop, and telling somebody "resolve it through coroot" is empty if
     # coroot only speaks Python.
     if a.print_what:
+        why = None
         if a.print_what == "clients":
             p, _why = clients_root()
         elif a.print_what == "assets":
@@ -2381,12 +3448,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             p = community_library()
         elif a.print_what == "installs":
             p = installs_root()
+        elif a.print_what == "export":
+            # Never None: `export_root` falls back to the one default this
+            # file is allowed to spell, so there is no exit-3 branch here.
+            # The `why` rides along for --json because this is the path a
+            # human is SHOWN and asked to trust (see `export_root`), and a
+            # .ps1 relaying it has no other way to say where it came from.
+            p, why = export_root()
         else:
             got = find()
             p = got.path if got else None
         if p is None:
             return 3
-        print(p)
+        if a.json and why is not None:
+            print(json.dumps({"path": str(p), "why": why}))
+        else:
+            print(p)
         return 0
 
     if a.forget:
@@ -2426,3 +3503,24 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# BASELINE RE-SCOPE, 2026-09-19. The owner removed 6609.cn, CCO and Installers
+# from core/baseline_members.json -- "remove the three from baseline members,
+# then land the windows" -- so the baseline is 33 members. The dated figures
+# above were measured over the earlier population and stand as records of that
+# measurement. Over the 33, as re-derived by tests/test_claim_enumeration.py:
+#   itemtype.dat and GameMap.dat ship loose on 32 of the 33;
+#   archive-resident on none, still 0 over the 33
+#
+# BASELINE RE-SCOPE (2), 2026-09-19. Later the same day the owner deleted 6716
+# and 7682 (byte-level copies of 6271 and 7632), renamed 7632 to 7622 (its
+# build stamp), and declared 7217 7250 7275 7280 7320 7336 7373 7387 7506 7535
+# 7562 7589 baseline members, so core/baseline_members.json holds 43. The
+# 33-member block above is kept as the record of that measurement. Over the
+# 43, re-measured per install by tests/test_claim_enumeration.py (7622 measures
+# exactly what 7632 recorded; the twelve new members were walked, not assumed):
+#   itemtype.dat and GameMap.dat ship loose on 42 of the 43;
+#   CCO-snapshot-2026-08-24 still ships neither. Archive-resident on none,
+#   still 0 over the 43 -- AssetRoot.in_archives() on both tables for every
+#   member, an instrument shown to fire on both the TPD and WDF containers.

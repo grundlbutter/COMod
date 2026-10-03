@@ -73,8 +73,10 @@ Pure stdlib, and imports nothing outside COre.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,6 +104,17 @@ KEY = "provenance"
 MATCH = "match"
 FOREIGN = "foreign"
 UNSTAMPED = "unstamped"
+#: Stamped BY THE BACKLOG SWEEP, not by the tool that built the artefact.
+#: A distinct state on purpose. Writing a stamp onto a file built weeks ago
+#: records the install configured NOW, a `generated` of now, and the sweeping
+#: tool's name -- three claims about provenance that were never measured.
+#: Folding that into `MATCH` would convert 119 honest "cannot be vouched for"
+#: into 119 confident ones, joining the 15 stale artefacts that already report
+#: `MATCH`, which is the defect this module exists to end.
+#: `docs/provenance_staleness.md` section 4 states the rule this obeys:
+#: **"stamped but not datable must be its own state and must never be folded
+#: into fresh"**. This is that rule applied to the migration itself.
+MIGRATED = "migrated"
 UNKNOWN = "unknown"
 
 
@@ -127,7 +140,8 @@ def _install_name(root=None) -> str:
         return ""
 
 
-def stamp(root=None, tool: str = "", base: str = "") -> dict:
+def stamp(root=None, tool: str = "", base: str = "", *,
+          migrated: bool = False, base_source: str = "") -> dict:
     """A provenance record for an artefact derived from ``root``.
 
     ``base`` lets a caller that already computed `coroot.base_id` pass it in;
@@ -136,7 +150,7 @@ def stamp(root=None, tool: str = "", base: str = "") -> dict:
     """
     bid = base or coroot.base_id(root)
     kind, _, fp = bid.partition("-")
-    return {
+    out = {
         "schema": SCHEMA,
         "base_id": bid,
         "kind": kind,
@@ -145,6 +159,18 @@ def stamp(root=None, tool: str = "", base: str = "") -> dict:
         "generated": _now(),
         "tool": _tool_name(tool),
     }
+    if migrated:
+        # `generated` and `tool` now describe the SWEEP, not the build. Kept
+        # rather than omitted so a reader can see when the backlog was swept;
+        # `migrated` is what stops either being read as the artefact's own age.
+        out["migrated"] = True
+        # WHERE THE INSTALL CAME FROM, because the two are not equal evidence.
+        # An artefact under `out/indexes/<base-id>/` is filed under a namespace
+        # that NAMES its install -- evidence. Anything else gets the configured
+        # install, which is an ASSUMPTION. Saying which is the difference
+        # between a record and a guess.
+        out["base_source"] = base_source or "assumed"
+    return out
 
 
 def wrap(data: Any, root=None, tool: str = "", base: str = "") -> dict:
@@ -185,6 +211,29 @@ def unwrap(doc: Any) -> tuple[Optional[dict], Any]:
     return None, doc
 
 
+def verdict_for_stamp(st: Optional[dict], expect: str) -> str:
+    """The one place a stamp becomes a verdict.
+
+    **Extracted because there were two.** `audit` carried its own inline copy
+    of this decision, so folding `MIGRATED` into `MATCH` in `verdict` left the
+    audit reporting the old answer -- caught by a mutation that reddened one
+    of the two arms aimed at it and not the other. Two implementations of one
+    decision is the divergence this module exists to prevent, appearing inside
+    the module itself.
+    """
+    if st is None:
+        return UNSTAMPED
+    if st.get("schema", 0) > SCHEMA:
+        return FOREIGN
+    if not expect or expect == "unkeyed":
+        return UNKNOWN
+    if st.get("base_id") != expect:
+        return FOREIGN
+    # FOREIGN outranks MIGRATED deliberately: a swept stamp naming another
+    # install is still PROVEN wrong, and proven beats unestablished.
+    return MIGRATED if st.get("migrated") else MATCH
+
+
 def verdict(doc: Any, root=None, base: str = "") -> str:
     """`MATCH`, `FOREIGN`, `UNSTAMPED` or `UNKNOWN` for a loaded document.
 
@@ -196,12 +245,7 @@ def verdict(doc: Any, root=None, base: str = "") -> str:
     st, _ = unwrap(doc)
     if st is None:
         return UNSTAMPED
-    if st.get("schema", 0) > SCHEMA:
-        return FOREIGN
-    mine = base or coroot.base_id(root)
-    if not mine or mine == "unkeyed":
-        return UNKNOWN
-    return MATCH if st.get("base_id") == mine else FOREIGN
+    return verdict_for_stamp(st, base or coroot.base_id(root))
 
 
 def describe(doc: Any) -> str:
@@ -303,23 +347,145 @@ def sidecar_path(path) -> Path:
     return p.with_name(p.name + ".provenance.json")
 
 
-def stamp_file(path, root=None, *, tool: str = "", base: str = "") -> Path:
-    """Write a sidecar stamp beside an existing artefact."""
-    sc = sidecar_path(path)
+def _sha256_file(path: Path) -> str:
+    """sha256 of a file's bytes, streamed. Counted, so the cost arm can assert
+    how many files a second audit re-hashes (it must be zero)."""
+    global _HASH_CALLS
+    _HASH_CALLS += 1
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+#: Data-file hashes computed, process-wide. The cost arm reads it.
+_HASH_CALLS = 0
+
+
+def stamp_file(path, root=None, *, tool: str = "", base: str = "",
+               migrated: bool = False, base_source: str = "") -> Path:
+    """Write a sidecar stamp beside an existing artefact -- LAST.
+
+    **THE SIDECAR NOW RECORDS THE sha256 OF THE BYTES IT DESCRIBES**, and the
+    ordering is the contract: a caller writes its data first and calls this
+    after, so a completed write always ends with a fresh sidecar.
+
+    Why the hash, and the honest size of what it buys. The sidecar recorded
+    base, tool, install and time -- and nothing about the bytes -- so a torn
+    pair was UNDETECTABLE: new data beside the previous sidecar, or a
+    hand-copied artefact carrying some other build's stamp, read exactly like
+    a consistent pair. **Cross-base trust was never at risk**: each base owns
+    its own `out/indexes/<base-id>/` directory, so both halves of any pair
+    claim the same base and the verdict is the same either way. What the
+    hash fixes is MISATTRIBUTION -- an old tool and time presented as
+    describing new bytes -- which becomes detectable instead of silent.
+
+    Written through a temp file and `os.replace`, so a reader never sees a
+    half-written sidecar. That is atomic per FILE, not per data+sidecar PAIR
+    -- which is exactly why the hash exists: the pair is verified by content
+    when it is read, not assumed consistent because it was written in order.
+    """
+    p = Path(path)
+    sc = sidecar_path(p)
     sc.parent.mkdir(parents=True, exist_ok=True)
-    sc.write_text(json.dumps(stamp(root, tool, base), indent=2), encoding="utf-8")
+    rec = stamp(root, tool, base, migrated=migrated,
+                base_source=base_source)
+    if p.is_file():
+        rec["sha256"] = _sha256_file(p)
+    tmp = sc.with_name(sc.name + ".tmp")
+    tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    os.replace(tmp, sc)
     return sc
 
 
+def _creation_ns(st: os.stat_result) -> int:
+    """CREATION time -- named, not inferred.
+
+    MEASURED on this box, CPython 3.14.6 on Windows 11, with `os.stat`:
+
+        case                                  ctime    mtime    birthtime
+        shutil.copy2: the COPY vs its SOURCE  CHANGED  same     CHANGED
+        temp file + os.replace onto target    CHANGED  CHANGED  CHANGED
+        in-place same-size overwrite          same     CHANGED  same
+        st_ctime_ns == st_birthtime_ns on an untouched file: True
+
+    So on this interpreter st_ctime IS creation time today. It is named here
+    as `st_birthtime_ns` anyway, because Python documents st_ctime as moving
+    toward METADATA-CHANGE time on Windows: a key justified by "ctime is
+    creation" would silently stop being justified the day that lands.
+    `st_birthtime_ns` names the property actually relied on. Fallback to
+    st_ctime_ns only where birthtime is absent (older Pythons).
+    """
+    return getattr(st, "st_birthtime_ns", None) or st.st_ctime_ns
+
+
+#: (path, size, creation_ns, mtime_ns, sha256 of the sidecar's bytes) ->
+#: "does the recorded sha256 match the data?"  Per process.
+_VERIFIED: dict[tuple, bool] = {}
+
+
+def _data_matches(p: Path, sc_bytes: bytes, recorded: str) -> bool:
+    """Does `p` still hash to `recorded`? Cached, because `audit()` walks ALL
+    of out/ and `firstrun.js` polls it every 1.5 s while a first-run job is
+    busy -- which is exactly when artefacts are being written. Re-hashing
+    every stamped file per poll is the cost this cache removes.
+
+    WHAT EACH KEY TERM CATCHES, from the measurement in `_creation_ns`:
+      * creation_ns  -- a COPY (a copy cannot preserve it) and a temp-then-
+                        replace write. Both produce a new file.
+      * mtime_ns     -- an IN-PLACE overwrite, which does NOT change creation
+                        time. That is how `meshtex --coverage` writes today,
+                        so this term is doing real work, not decoration.
+      * size         -- cheap, and catches most rewrites on its own.
+      * sidecar sha  -- any rewrite of the stamp itself; `_now()` makes every
+                        completed build's sidecar bytes different.
+    NOT CAUGHT, and out of scope: a same-size in-place rewrite that ALSO
+    forges mtime back with os.utime. That is deliberate tampering, which a
+    provenance stamp does not defend against.
+
+    "Verify once per process" was rejected: the torn state forms WHILE the
+    viewer runs -- a bootstrap writing beside a polling page.
+    """
+    try:
+        st = p.stat()
+    except OSError:
+        return False
+    key = (str(p), st.st_size, _creation_ns(st), st.st_mtime_ns,
+           hashlib.sha256(sc_bytes).hexdigest())
+    hit = _VERIFIED.get(key)
+    if hit is None:
+        try:
+            hit = _sha256_file(p) == recorded
+        except OSError:
+            hit = False
+        _VERIFIED[key] = hit
+    return hit
+
+
 def read_stamp(path) -> Optional[dict]:
-    """The stamp for ``path`` -- from its envelope if JSON, else its sidecar."""
+    """The stamp for ``path`` -- from its envelope if JSON, else its sidecar.
+
+    A sidecar carrying a `sha256` is trusted only if the data still hashes to
+    it. A MISMATCH returns None -- i.e. UNSTAMPED -- which every caller
+    already handles for same-base use, so a torn or hand-copied pair adds no
+    new state and no new branch anywhere. A sidecar with NO `sha256` (every
+    one written before this change) reads exactly as it always did: that is
+    the compatibility control, and it is what stops this from quietly
+    invalidating every existing sidecar on the box.
+    """
     p = Path(path)
     sc = sidecar_path(p)
     if sc.is_file():
         try:
-            return json.loads(sc.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = sc.read_bytes()
+            rec = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
+        recorded = rec.get("sha256") if isinstance(rec, dict) else None
+        if recorded and not _data_matches(p, raw, recorded):
+            return None
+        return rec
     if p.suffix.lower() == ".json":
         try:
             return unwrap(json.loads(p.read_text(encoding="utf-8")))[0]
@@ -347,6 +513,14 @@ GLOBAL_OK = {
     "out/opcodes.json": "a protocol table, built from refs/, not from an install",
     "out/offsets_cache.json": "self-guarding: keyed on the sha256 of the module bytes",
     "out/health.json": "a report about this checkout, rewritten on every run",
+    # A log of action codes named by eye. Every row carries its own `install`
+    # and the sha256 of the clip that was watched, so the install is a COLUMN
+    # and the file is about action codes rather than about one client. Twinned
+    # with the `coroot.GLOBAL` entry: that one decides where the path
+    # resolves, this one keeps the audit from reporting it unclassified.
+    "out/action_names.json": (
+        "a log of action codes named by eye; each row carries its own install "
+        "and the sha256 of the clip, so the install is a column"),
 }
 
 
@@ -481,6 +655,104 @@ def migration_plan(repo=None) -> list[dict]:
     return out
 
 
+#: `<kind>-<12 hex>` -- the shape `coroot.base_id` produces. Matched against a
+#: FILENAME so an artefact that names its own install (`viewer_verdict_<base>`)
+#: is filed on evidence rather than on the configured install.
+_BASE_IN_NAME = re.compile(r"[a-z][a-z0-9]*-[0-9a-f]{12}")
+
+
+def expected_base(rel: str, configured: str) -> tuple[str, str]:
+    """``(base_id, evidence)`` -- which install an artefact CLAIMS, and how.
+
+    **The one place this is decided**, because deciding it twice is how the
+    12-false-FOREIGN incident happened during this module's own migration:
+    the sweep read an install out of a FILENAME
+    (``viewer_verdict_<base-id>.json``) and filed it on that evidence, while
+    `audit` still recognised only the ``out/indexes/<base-id>/`` namespace and
+    therefore compared those twelve against whichever install was configured.
+    Twelve correctly-filed verdict records reported FOREIGN -- the same false
+    positive the keyed-artefact comment in `audit` already describes, arriving
+    through a second route because there were two implementations of "what
+    does this artefact claim".
+
+    `evidence` is ``namespace`` | ``filename`` | ``assumed``, and the caller
+    is expected to keep them distinct: the first two are evidence, the third
+    is the configured install standing in for one.
+    """
+    prefix = f"{coroot.INDEX_ROOT}/"
+    if rel.startswith(prefix):
+        tail = rel[len(prefix):].split("/", 1)
+        if tail and tail[0]:
+            return tail[0], "namespace"
+    m = _BASE_IN_NAME.search(rel.rsplit("/", 1)[-1])
+    if m:
+        return m.group(0), "filename"
+    return configured, "assumed"
+
+
+def migrate(repo=None, root=None, *, apply: bool = False,
+            tool: str = "provenance --migrate") -> dict:
+    """Stamp every UNSTAMPED artefact under ``out/`` as `MIGRATED`.
+
+    **A PLAN BY DEFAULT.** ``apply=True`` writes sidecars; nothing else here
+    touches a file, and a sidecar is deletable, so the sweep is reversible.
+
+    WHAT THIS DOES AND DOES NOT CLAIM
+    ---------------------------------
+    It does not establish provenance -- it cannot. It records that the
+    artefact was present in this tree when the sweep ran, and under which
+    namespace. **That is worth doing because the unstamped population is
+    invisible to every comparand in `docs/provenance_staleness.md` section 6**:
+    `out/wdf/`'s files are the shared global inputs whose staleness poisons
+    `meshtex`, and they have no stamp to date. Stamping them puts them in the
+    checkable population; `MIGRATED` is what stops that being mistaken for
+    having checked them.
+
+    The install is taken from the artefact's own ``out/indexes/<base-id>/``
+    namespace where it has one -- evidence -- and from the configured install
+    otherwise -- an assumption. `base_source` records which, per artefact,
+    because a sweep that presented both as the same thing would be making the
+    error it exists to avoid.
+    """
+    repo = Path(repo) if repo is not None else Path(__file__).resolve().parent.parent
+    rep = audit(repo, root)
+    prefix = f"{coroot.INDEX_ROOT}/"
+    plan, skipped = [], []
+    for rel in rep["unstamped"]:
+        # GLOBAL_OK artefacts are DECLARED install-independent, with a reason
+        # each. Stamping one with a base_id would assert it belongs to an
+        # install -- the opposite of what the declaration says, and a claim
+        # the sweep has no business making. Skipped and reported, not stamped.
+        if rel in GLOBAL_OK:
+            skipped.append({"rel": rel, "why": GLOBAL_OK[rel]})
+            continue
+        bid, src = expected_base(rel, rep["base_id"])
+        plan.append({"rel": rel, "base_id": bid, "base_source": src})
+    written, failed = [], []
+    if apply:
+        for e in plan:
+            p = repo / e["rel"].replace("/", os.sep)
+            if not p.is_file():
+                continue
+            try:
+                stamp_file(p, root, tool=tool, base=e["base_id"],
+                           migrated=True, base_source=e["base_source"])
+                written.append(e["rel"])
+            except OSError as exc:                       # noqa: PERF203
+                failed.append({"rel": e["rel"], "error": str(exc)})
+    return {
+        "applied": apply,
+        "planned": len(plan),
+        "written": len(written),
+        "failed": failed,
+        "from_namespace": sum(1 for e in plan if e["base_source"] == "namespace"),
+        "from_filename": sum(1 for e in plan if e["base_source"] == "filename"),
+        "assumed": sum(1 for e in plan if e["base_source"] == "assumed"),
+        "skipped_global": skipped,
+        "plan": plan,
+    }
+
+
 def audit(repo=None, root=None) -> dict:
     """Walk ``out/`` and report what can and cannot be vouched for.
 
@@ -503,23 +775,19 @@ def audit(repo=None, root=None) -> dict:
             # selected -- a false positive, and the worst possible kind: it
             # is the exact word this audit uses for a real fault, so it would
             # have taught people to disbelieve it.
-            expect = base
-            if keyed:
-                tail = rel[len(prefix):].split("/", 1)
-                if tail and tail[0]:
-                    expect = tail[0]
-            st = read_stamp(p)
-            if st is None:
-                v = UNSTAMPED
-            elif not expect or expect == "unkeyed":
-                v = UNKNOWN
-            else:
-                v = MATCH if st.get("base_id") == expect else FOREIGN
-            items.append(Artefact(rel, keyed, v, st, p.stat().st_size))
+            expect, _evidence = expected_base(rel, base)
+            # Swept artefacts count apart from MATCH so the backlog stays
+            # visible after a sweep -- one that drove the number to zero would
+            # hide the thing it was run to expose. Through the SHARED decision
+            # rather than a second copy of it.
+            v = verdict_for_stamp(read_stamp(p), expect)
+            items.append(Artefact(rel, keyed, v, read_stamp(p),
+                                  p.stat().st_size))
 
     foreign = [a for a in items if a.verdict == FOREIGN]
     unclassified = [a for a in items if a.unclassified]
     unstamped = [a for a in items if a.verdict == UNSTAMPED]
+    migrated = [a for a in items if a.verdict == MIGRATED]
     return {
         "base_id": base,
         "scanned": len(items),
@@ -527,6 +795,7 @@ def audit(repo=None, root=None) -> dict:
         "foreign": [a.rel for a in foreign],
         "unclassified": [a.rel for a in unclassified],
         "unstamped": [a.rel for a in unstamped],
+        "migrated": [a.rel for a in migrated],
         "orphaned": orphaned_namespaces(repo, base),
         # Foreign is the only *proven* fault. Unstamped is the migration
         # backlog, and unclassified is the fail-open namespace -- both are
@@ -545,6 +814,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     coroot.add_root_argument(ap)
     ap.add_argument("--json", action="store_true", help="machine-readable")
+    ap.add_argument("--repo", default=None,
+                    help="the checkout whose out/ to walk. Defaults to this "
+                         "one -- and out/ is gitignored and PER-TREE, so from "
+                         "a linked worktree the default walks nothing and "
+                         "reports a confident zero")
+    ap.add_argument("--migrate", action="store_true",
+                    help="stamp every UNSTAMPED artefact as migrated. Plans "
+                         "only unless --apply is given")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --migrate, actually write the sidecars")
     a = ap.parse_args(argv)
     try:
         root = coroot.root_from_args(a)
@@ -552,7 +831,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise
     except Exception:
         root = None
-    rep = audit(root=root)
+    if a.migrate:
+        m = migrate(a.repo, root, apply=a.apply)
+        if a.json:
+            print(json.dumps(m, indent=2))
+            return 0
+        head = "WROTE" if m["applied"] else "would stamp (plan only -- pass --apply)"
+        print(f"{head}: {m['written'] if m['applied'] else m['planned']} "
+              f"artefact(s) as MIGRATED")
+        print(f"  install from its own namespace : {m['from_namespace']}"
+              "   <- evidence")
+        print(f"  install ASSUMED from the config: {m['assumed']}"
+              "   <- not evidence")
+        for e in m["plan"][:25]:
+            print(f"    {e['base_source']:9} {e['base_id']:24} {e['rel']}")
+        if len(m["plan"]) > 25:
+            print(f"    ... and {len(m['plan']) - 25} more")
+        for f in m["failed"]:
+            print(f"    FAILED {f['rel']}: {f['error']}")
+        return 1 if m["failed"] else 0
+
+    rep = audit(a.repo, root)
     if a.json:
         print(json.dumps(rep, indent=2))
         return 0 if rep["ok"] else 1
@@ -560,6 +859,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"scanned    : {rep['scanned']} derived artefact(s) under out/")
     print(f"foreign    : {len(rep['foreign'])}   (built from another install)")
     print(f"unstamped  : {len(rep['unstamped'])}   (cannot be vouched for)")
+    print(f"migrated   : {len(rep.get('migrated', []))}   (swept, provenance "
+          "NOT established -- deliberately not counted as match)")
     print(f"unclassified: {len(rep['unclassified'])}  (unkeyed namespace)")
     for rel in rep["foreign"]:
         print(f"  FOREIGN      {rel}")

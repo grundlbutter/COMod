@@ -1,0 +1,105 @@
+/* mapassets.css -- the Map Asset Viewer.
+ *
+ * Follows style.css's tokens; this file only adds what the table and the
+ * honesty carries need. The two colour decisions here are load-bearing
+ * rather than decorative:
+ *
+ *   .ma-gain    the "+N more maps than use it today" badge. The gap between
+ *               where a cover IS and where it CAN go is the whole feature,
+ *               so it is marked rather than left to arithmetic.
+ *   .ma-unknown a placeable count whose index could not be identified. It
+ *               must not read like the measured ones beside it -- a bare
+ *               number there is an answer to a question nobody could answer.
+ */
+
+.ma-main { max-width: 1180px; margin: 0 auto; padding: 0 16px 48px; }
+
+.ma-note {
+  border-left: 3px solid var(--warn);
+  background: var(--panel);
+  padding: 10px 14px;
+  margin: 16px 0;
+  line-height: 1.5;
+}
+
+.ma-refuse {
+  border-left: 3px solid var(--bad);
+  background: var(--panel);
+  padding: 10px 14px;
+  margin: 12px 0;
+}
+
+.ma-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 10px;
+  flex-wrap: wrap;
+}
+
+.ma-tab {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: inherit;
+  padding: 5px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+}
+.ma-tab.on { border-color: var(--accent); background: var(--panel2); }
+.ma-tab:hover { border-color: var(--accent); }
+
+.ma-tabs input[type="search"] {
+  flex: 1 1 220px;
+  min-width: 180px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: inherit;
+  padding: 5px 9px;
+  border-radius: 3px;
+  font: inherit;
+}
+
+.ma-wrap { overflow-x: auto; }
+
+table.ma { width: 100%; border-collapse: collapse; }
+table.ma th, table.ma td {
+  text-align: left;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+table.ma th { font-weight: 600; white-space: nowrap; }
+/* Digits line up so a column of counts can be scanned rather than read. */
+table.ma td.n, table.ma th.n {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+table.ma tbody tr:hover { background: var(--panel); }
+table.ma code { font-size: .95em; }
+
+.ma-gain {
+  color: var(--good);
+  font-weight: 600;
+  font-size: .9em;
+}
+
+.ma-unknown {
+  color: var(--warn);
+  cursor: help;
+  border-bottom: 1px dotted currentColor;
+}
+
+.ma-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: inherit;
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+}
+.ma-btn.tiny { padding: 1px 7px; font-size: .85em; margin-left: 6px; }
+.ma-btn:hover { border-color: var(--accent); }
+
+.ma-foot { margin-top: 14px; line-height: 1.5; }

@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -47,7 +48,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import coroot                     # noqa: E402
 import cosettings                 # noqa: E402
+import portage                    # noqa: E402
 import safepath                   # noqa: E402
+import tags as tagstore           # noqa: E402
 from coassets import (            # noqa: E402
     DEFAULT_ROOT, AssetRoot, C3File, DMap, dds_info, find_items,
 )
@@ -89,13 +92,44 @@ def _installs_root() -> Path:
     is no checkout the code can infer speaks for the machine. A shipped tree
     has exactly one checkout and never sets it.
     """
-    shared = coroot.installs_root()
+    shared, _why = coroot.installs_root_why()
     if shared is not None:
         return shared
     return PROJECT / "Installed" / "installs"
 
 
+def installs_why() -> str:
+    """Why the record root is where it is -- for a surface to PRINT.
+
+    `coroot.installs_root_why` distinguishes "not set" from "set to a folder
+    that is not there", and the second silently re-homes every install record
+    into whichever checkout is running. `cmd_installs` prints this so the
+    fallback stops being invisible.
+    """
+    _p, why = coroot.installs_root_why()
+    return why
+
+
 INSTALLS = _installs_root()
+
+#: What `_installs_root()` answered at import. Three test files rebind
+#: `INSTALLS` directly (tests/test_comod_amend.py, tests/test_swap_npclist.py,
+#: tools/test_viewer.py) because a module constant was the only hook they
+#: had; `installs_dir()` honours that rebind rather than breaking them, and
+#: re-resolves when nobody has chosen.
+_INSTALLS_AT_IMPORT = INSTALLS
+
+
+def installs_dir():
+    """The record root, resolved per call unless a caller pinned `INSTALLS`.
+
+    The constant was frozen at import, so `coroot.set_installs_root()` had no
+    effect in the same process -- a setting that does nothing until you
+    restart is a setting that reads as broken.
+    """
+    if INSTALLS != _INSTALLS_AT_IMPORT:
+        return INSTALLS
+    return _installs_root()
 
 #: Where the single-install layout kept them. Read once, to migrate.
 LEGACY_BACKUP = PROJECT / "mods" / "backup"
@@ -116,7 +150,7 @@ def install_slug(root) -> str:
 
 
 def install_dir(root) -> Path:
-    return INSTALLS / install_slug(root)
+    return installs_dir() / install_slug(root)
 
 
 def backup_dir(root) -> Path:
@@ -316,9 +350,10 @@ def _prune_install_dir(root) -> None:
 def installed_roots() -> list[dict]:
     """Every install this workbench has something recorded against."""
     out = []
-    if not INSTALLS.is_dir():
+    root_dir = installs_dir()
+    if not root_dir.is_dir():
         return out
-    for d in sorted(INSTALLS.iterdir()):
+    for d in sorted(root_dir.iterdir()):
         mp = d / "manifest.json"
         if not mp.is_file():
             continue
@@ -326,9 +361,22 @@ def installed_roots() -> list[dict]:
             man = json.loads(mp.read_text("utf-8"))
         except (OSError, ValueError):
             continue
+        # Read through the v1 -> v2 normaliser. This read the v1 keys
+        # (`files`, `installed_utc`) straight off the JSON, so every record
+        # written since amendments existed -- all of them v2, with `entries`
+        # -- listed as "0 file(s)" with no date, in `installs`, in
+        # uninstall's "name one", and in the viewer's install picker.
+        man = normalise_manifest(man, man.get("root", ""))
+        entries = man.get("entries", [])
+        # Distinct paths, because an amendment that re-installs a file an
+        # earlier entry put there is one file on disk, not two.
+        logicals = {f.get("logical") for e in entries
+                    for f in e.get("files", [])}
         out.append({"root": man.get("root", ""), "slug": d.name,
-                    "files": len(man.get("files", [])),
-                    "installedUtc": man.get("installed_utc", ""),
+                    "files": len(logicals),
+                    "entries": len(entries),
+                    # The NEWEST entry: when this install was last written to.
+                    "installedUtc": entries[-1].get("at", "") if entries else "",
                     "manifest": str(mp)})
     return out
 
@@ -903,6 +951,518 @@ def cmd_map(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# animation
+# ---------------------------------------------------------------------------
+
+#: The PHY chunk tags. Spelled here rather than imported at module scope so
+#: `comod --help` does not pay for `c3phy`; `_c3_forms` imports the real
+#: `c3phy.VARIANTS` and asserts against this, so the copy cannot drift.
+_PHY_TAGS = (b"PHY ", b"PHY2", b"PHY3", b"PHY4", b"PHY5")
+
+#: The particle-system generations, oldest first (effects.PTCL_TAGS).
+_PTCL_TAGS = (b"PTCL", b"PTCX", b"PTC3")
+
+#: How far bone 0 may travel, and how far the silhouette may rise, before the
+#: clip is reported as carrying root motion. Both thresholds are lifted from
+#: `tools/anim.py` rather than invented here: `validate()` section 5 states
+#: "walk and run translate the root by less than a unit", and section 6 tests
+#: a jump arc with `rise > 5`. MEASURED on 5517 body 002135000, bone-0 net
+#: displacement over the whole clip: walk 110 = 0.00, run 120 = 0.00,
+#: run 121 = 0.00, idle 100 = 0.07, swing 401 = 1.28, jump 130 = 8.45;
+#: silhouette centroid rise: walk 0.89, run 4.31, jump 130 = 22.81,
+#: jump 131 = 70.58, death 330 = 101.04. **INFERRED** -- the client's own
+#: rule for advancing a character is in the packed exe and is not readable
+#: from the assets, so this classifies the DATA, not the engine.
+ROOT_MOTION_UNITS = 1.0
+ROOT_MOTION_RISE = 5.0
+
+
+def _c3_forms(data: bytes) -> dict:
+    r"""Which of the three animation forms one C3 container carries.
+
+    `tools/effects.py`'s module docstring names them: ``PHY``+``MOTI`` (a
+    node/bone matrix track), ``SHAP``+``SMOT`` (a two-point blade line smeared
+    into a ribbon trail) and ``PTCL``/``PTCX``/``PTC3`` (a particle system).
+
+    Counted, never paired by adjacency. `attach.PartMesh.parse` is explicit
+    that the reader builds **two independent ordinal lists**: `MeshCreate`
+    (graphic.dll 0x28360) walks the file for PHY chunks and then walks it
+    again for MOTI chunks, so `c3/mount/850/8500000.c3` -- eight PHY followed
+    by eight MOTI -- pairs ordinal-to-ordinal and not neighbour-to-neighbour.
+    A reader that paired neighbours would report that file as unanimated.
+    """
+    from c3phy import VARIANTS, iter_chunks
+    # `raise`, not `assert`: `python -O` strips an assert, and a drift guard
+    # that the interpreter can delete is a guard that cannot fire.
+    if set(_PHY_TAGS) != set(VARIANTS):
+        raise RuntimeError(
+            "the PHY tag list in comod.py has drifted from c3phy.VARIANTS: "
+            f"{sorted(_PHY_TAGS)} vs {sorted(VARIANTS)}")
+    tags = [t for t, _ in iter_chunks(data)]
+    n = {t: tags.count(t) for t in set(tags)}
+    phy = sum(n.get(t, 0) for t in _PHY_TAGS)
+    ptcl = {t.decode("latin-1"): n.get(t, 0) for t in _PTCL_TAGS if n.get(t)}
+    out = {
+        "tags": [t.decode("latin-1") for t in tags],
+        "phy": phy,
+        "moti": n.get(b"MOTI", 0),
+        "shap": n.get(b"SHAP", 0),
+        "smot": n.get(b"SMOT", 0),
+        "ptcl": ptcl,
+        "forms": [],
+    }
+    if phy or out["moti"]:
+        out["forms"].append("PHY+MOTI")
+    if out["shap"] or out["smot"]:
+        out["forms"].append("SHAP+SMOT")
+    if ptcl:
+        out["forms"].append("/".join(sorted(ptcl)))
+    return out
+
+
+def _pairing_verdict(f: dict) -> tuple[str, str]:
+    """`(verdict, why)` for the PHY/MOTI pairing INSIDE one container.
+
+    This is the half `stage-mesh` already gates on: "Every shipped container
+    pairs them one-to-one (5,083 of 5,083); the engine binds them by ordinal,
+    so an unpaired mesh has no animation."  It answers only the container's
+    own question -- whether an EXTERNAL motion set can drive it is a separate
+    verdict, computed against that set's chunk count.
+    """
+    phy, moti = f["phy"], f["moti"]
+    if not phy and not moti:
+        return "none", "no PHY and no MOTI chunk -- nothing to animate"
+    if phy and not moti:
+        return "unpaired", (f"{phy} PHY, 0 MOTI -- no embedded track; this "
+                            f"mesh animates only if an external motion set "
+                            f"covers all {phy} ordinals")
+    if moti and not phy:
+        return "unpaired", (f"0 PHY, {moti} MOTI -- a motion-only container "
+                            f"(this is what a motion set looks like)")
+    if phy == moti:
+        return "paired", f"{phy} PHY : {moti} MOTI, one-to-one by ordinal"
+    return "unpaired", (f"{phy} PHY but {moti} MOTI -- ordinals "
+                        f"{min(phy, moti)}..{max(phy, moti) - 1} have no "
+                        f"partner, so those meshes do not animate")
+
+
+def _forms_lines(f: dict, indent: str = "  ") -> list[str]:
+    """The three-form block, always all three rows: an absent form is a
+    measured 'none', not a missing line."""
+    ptcl = ", ".join(f"{k} x{v}" for k, v in sorted(f["ptcl"].items()))
+    verdict, why = _pairing_verdict(f)
+    return [
+        f"{indent}PHY + MOTI    {f['phy']} PHY, {f['moti']} MOTI"
+        f"{'' if not (f['phy'] or f['moti']) else '   -> ' + verdict}",
+        f"{indent}              {why}",
+        f"{indent}SHAP + SMOT   " + (f"{f['shap']} SHAP, {f['smot']} SMOT "
+                                     f"(ribbon trail)" if f["shap"] or f["smot"]
+                                     else "none"),
+        f"{indent}PTCL / PTC3   " + (ptcl if ptcl else "none"),
+    ]
+
+
+def _padded9(ident: str) -> str:
+    r"""An appearance id in the nine-wide spelling `anim.AnimDB.shape_of`
+    needs, or the id unchanged when it is not a bare number.
+
+    `shape_of` takes `s[:3]` and strips leading zeros, and it guards on
+    `len(s) >= 9`.  Half this corpus does not spell ids that wide: 5517,
+    6609 and 7205 write `002135000` in `armor.ini` while 5017, 5065 and
+    7878 write `2135000` for the SAME appearance.  Fed the seven-wide form,
+    `shape_of` falls through to `str(int(s))` and returns the whole id as
+    the shape -- MEASURED on 7878 id `1000000`, key `1000000410401`,
+    "UNRESOLVED".  Not a crash, and not a right answer either: a reader who
+    saw that line would conclude 7878 ships no motion for the body, when
+    what it ships is `c3/0002/410/401.c3` under a shape it was never asked
+    for.  Padding first gives shape `1`, which is the same answer the
+    nine-wide spelling gives on 5517.
+
+    Only digits are padded, and only upward: a nine-or-wider id is returned
+    untouched, so no base that already works can change.
+
+    Since 2026-09-25 this is a name for `attach.pad9`, the rule's one home
+    (the armet readers and `Catalogue.idle_motion` had grown the same defect
+    with no copy of the guard at all).  Kept under this name because
+    `tests/test_comod_anim.py` pins it and its mutation control -- `_padded9`
+    made the identity function -- still bites through the delegation.
+    """
+    import attach as attachmod        # noqa: PLC0415 -- lazy, like anim below
+    return attachmod.pad9(ident)
+
+
+def _staged_path(logical: str) -> Optional[Path]:
+    p = STAGE / logical
+    return p if p.is_file() else None
+
+
+def cmd_anim(args) -> int:
+    r"""Report how one appearance -- or one .c3 -- animates in THIS install.
+
+    The question this exists to answer is `stage-mesh`'s follow-up: a modder
+    stages a mesh, and until now had to install it and log in to find out
+    whether it still moves.  Three things decide that and all three are
+    readable off disk:
+
+      1. the motion set the action resolves to, and whether the file is even
+         present in this install (1,100 of 3,260 named motions are absent on
+         some bases -- docs/animation.md 2.1);
+      2. the container's own PHY/MOTI pairing, by ordinal;
+      3. whether that external motion set has at least as many chunks as the
+         mesh has PHY.  `C3Mesh::SetMotion` (graphic.dll 0x277C0) REJECTS a
+         short set outright, so one extra PHY does not cost you one limb --
+         it costs the whole animation.
+    """
+    if getattr(args, "server", None):
+        print("`anim` reads this install's own ini/3dmotion table and c3 "
+              "tree, which a --server view does not provide.")
+        print("Run it with --root <install> instead.")
+        return 1
+
+    import anim as animmod
+
+    ident = args.ident
+    looks_like_path = ("/" in ident or "\\" in ident
+                       or ident.lower().endswith(".c3"))
+
+    with AssetRoot(args.root) as R:
+        # -- a bare container: forms only, no action to resolve -----------
+        if looks_like_path:
+            logical = ident.replace("\\", "/")
+            loc = R.locate(logical)
+            if not loc:
+                print(f"not found: {logical}")
+                return 1
+            print(f"{loc}")
+            print("\nanimation forms carried by this container")
+            for line in _forms_lines(_c3_forms(R.read_located(loc))):
+                print(line)
+            st = _staged_path(loc.logical)
+            if st:
+                print(f"\nSTAGED copy at {st}")
+                for line in _forms_lines(_c3_forms(st.read_bytes())):
+                    print(line)
+            return 0
+
+        res = R.resolve_appearance(ident, args.table)
+        if not res:
+            print(f"appearance {ident!r} not found in any part table.")
+            print("try: py -3 tools/comod.py tables")
+            return 1
+        # Deduplicated by logical path, NOT by row: on 7878 appearance
+        # 2135000 matches armor.ini twice (part `body` and part `mix_body`)
+        # and both rows name the same file. Reporting one container twice
+        # reads as two meshes to check.
+        meshes: list[tuple[str, str, object]] = []
+        seen_logical: set[str] = set()
+        for r in res:
+            for p in r["parts"]:
+                loc = p["mesh"]
+                if loc is None or loc.logical in seen_logical:
+                    continue
+                seen_logical.add(loc.logical)
+                meshes.append((r["part"], p["mesh_id"], loc))
+        print(f"[{res[0]['ident']}] in " +
+              ", ".join(f"{r['ini']} (part: {r['part']})" for r in res))
+        for part, mid, loc in meshes:
+            print(f"  mesh  {mid:>10}  -> {loc}")
+        if not meshes:
+            print("  no mesh reference in any matching row -- nothing to "
+                  "animate")
+
+        # -- the motion set -----------------------------------------------
+        interval = (args.interval if getattr(args, "interval", None)
+                    else animmod.DEFAULT_FRAME_INTERVAL_MS)
+        db = animmod.AnimDB(args.root, interval)
+        try:
+            return _anim_motion(args, db, ident, meshes, R)
+        finally:
+            # `AnimDB` holds an `AssetRoot` of its own (through
+            # `attach.Catalogue`) and has no close, so every invocation left
+            # this install's .wdf handles open. Harmless in a one-shot CLI
+            # run, not harmless in a suite that calls this thirty times.
+            try:
+                db.cat.assets.close()
+            except Exception:
+                pass
+
+
+def _anim_motion(args, db, ident: str, meshes: list, R) -> int:
+    """The motion half of `cmd_anim`, split out only so the AssetRoot that
+    `AnimDB` opens is closed on every exit path."""
+    import anim as animmod
+    idx = db.index
+    act = animmod.action_of(args.action)
+    shape = args.as_shape or db.shape_of(_padded9(ident))
+    ws = db.weaponset(args.weapon, args.off_hand)
+
+    print("\nmotion table")
+    print(f"  ini/3dmotion.ini   " +
+          ("present" if idx.ini_file.is_file() else "ABSENT"))
+    print(f"  compiled twin      " +
+          (idx.dbc_file.name if idx.dbc_file is not None
+           else "none (the .ini is the live table on this client)"))
+    print(f"  keys indexed       {len(idx.raw)}")
+    if not idx.raw:
+        print("  this client ships no motion table -- no action can be "
+              "resolved here.")
+        _forms_only(R, meshes, None, args.root)
+        return 0
+
+    asked = idx.key(shape, ws, act, args.distance)
+    path, how = db.resolve(shape, ws, act, args.distance)
+    a = animmod.ACTIONS.get(act)
+    print("\nmotion set")
+    print(f"  shape {shape}  weaponset {ws}"
+          + (f" (weapon {args.weapon})" if args.weapon else " (unarmed)")
+          + f"  action {act}" + (f"  ({a.name})" if a else ""))
+    print(f"  key asked {asked}")
+    if not path:
+        print("  UNRESOLVED -- no row for this shape/weaponset/action, and "
+              "no fallback reached one.")
+        _forms_only(R, meshes, None, args.root)
+        return 0
+    print(f"  resolves  {path}   [{how}]")
+    # The key that ANSWERED, not the one that was asked. `AnimDB.resolve`
+    # walks a fallback chain (jump-distance key -> exact -> unarmed set ->
+    # that set's idle -> the universal idle) and reports the path and a
+    # description, but not which key it landed on. Printing the asked-for
+    # key beside a provenance read off a DIFFERENT key is the kind of
+    # juxtaposition that manufactures a claim: `--distance 60` asks
+    # `602000130`, which is not in the table, and `2000130` is what answers.
+    # Re-walking the same chain here is the only way to name it.
+    answered = None
+    for k in (asked, idx.key(shape, ws, act),
+              idx.key(shape, animmod.WEAPONSET_UNARMED, act),
+              idx.key(shape, ws, "100"),
+              idx.key(shape, animmod.WEAPONSET_UNARMED, "100")):
+        if k in idx.raw and idx.raw[k] == path:
+            answered = k
+            break
+    if answered and answered != asked:
+        print(f"  key used  {answered}")
+    print(f"  from      "
+          f"{idx.source.get(answered or asked) or 'unknown'}")
+
+    # `shape=shape`, not `shape=args.as_shape`: the shape is already derived
+    # above from the PADDED id, and `ident` is left in the table's own
+    # spelling because that is what `clip` looks the body mesh up with.
+    clip = db.clip(ident, act, weapon=args.weapon, off_hand=args.off_hand,
+                   distance=args.distance, shape=shape)
+    if clip is None:
+        print(f"  NOT IN THIS INSTALL -- the table names {path} but the file "
+              "is absent")
+        print("  (docs/animation.md 2.1: named motions that do not ship are "
+              "normal on some bases)")
+        _forms_only(R, meshes, None, args.root)
+        return 0
+
+    kind, wrap, step = clip.classify()
+    print(f"  frames    {clip.frame_count}   motion-set chunks "
+          f"{clip.chunk_count}")
+    print(f"  timing    {clip.interval_ms} ms/frame = "
+          f"{1000.0 / clip.interval_ms:.1f} fps   play {clip.play_length} "
+          f"frames = {clip.duration_ms:.0f} ms")
+    print(f"  loop      {clip.loop}   (measured {kind}: wrap {wrap:.2f} vs "
+          f"max step {step:.2f})")
+    if clip.chain_next:
+        print(f"  chains to action {clip.chain_next}")
+    if clip.ctrl:
+        print(f"  ActionCtrl {clip.ctrl.shape}{clip.ctrl.weaponset}"
+              f"{clip.ctrl.action}  points {clip.ctrl.points}")
+
+    # -- root motion ------------------------------------------------------
+    root = clip.root_track()
+    if not root:
+        print("  root motion  unknown -- the motion set has no readable "
+              "bone track")
+    else:
+        import math as _math
+        net = _math.dist(root[0][:2], root[-1][:2])
+        span = max(_math.dist(p[:2], root[0][:2]) for p in root)
+        sil = clip.silhouette_track()
+        rise = (max(s[2] for s in sil) - min(s[2] for s in sil)) if sil else 0.0
+        moves = net > ROOT_MOTION_UNITS
+        arcs = rise > ROOT_MOTION_RISE
+        print(f"  root motion  bone-0 travel: net {net:.2f} units end to "
+              f"end, furthest {span:.2f}")
+        print(f"               silhouette centroid rise {rise:.2f} units"
+              + ("" if sil else "   (no body mesh to pose)"))
+        if not moves and not arcs:
+            print(f"               NONE: an in-place cycle. Both readings "
+                  f"are under the thresholds ({ROOT_MOTION_UNITS} units, "
+                  f"{ROOT_MOTION_RISE} rise), which is what every walk and "
+                  f"run in this data measures -- the client moves the "
+                  f"character externally.")
+        else:
+            # No word for the vertical case that fits both a jump and a
+            # death: 331's silhouette drops 101 units and "leaves the
+            # ground" reads as the opposite of what happened. The neutral
+            # phrasing is the honest one, and the sign is in the numbers
+            # two lines up.
+            print("               PRESENT: the clip does not stay put -- "
+                  + ("it travels horizontally; " if moves else "")
+                  + ("its height changes; " if arcs else "")
+                  + "a renderer that pins the model to one spot will "
+                    "misplace it.")
+            print("               Bone 0 is the pelvis, NOT a root locator, "
+                  "so a swing or a death leans it without moving the "
+                  "character. Read the negative as strong and the positive "
+                  "as 'not a flat cycle' -- INFERRED, the client's own "
+                  "advance rule is in the packed exe.")
+
+    # -- does it still animate? -------------------------------------------
+    print("\ndoes this mesh still animate?")
+    print(f"  the motion set {path} carries {clip.chunk_count} chunks;")
+    print(f"  C3Mesh::SetMotion (graphic.dll 0x277C0) refuses a set with "
+          f"fewer entries than the mesh has PHY, then assigns "
+          f"phy[i]->motion = set[i].")
+    for part, mid, loc in meshes:
+        _report_binding(R, part, mid, loc, clip.chunk_count, args.root)
+    return 0
+
+
+def _forms_only(R, meshes, set_chunks: Optional[int], root) -> None:
+    """The container half of the report when no motion set could be loaded.
+
+    A client that ships no motion table, or names a motion file it does not
+    ship, still has a mesh whose PHY/MOTI pairing a modder can check. Cutting
+    the report off at the missing table would answer "does my swap still
+    animate?" with silence on exactly the bases where the answer is hardest
+    to get any other way.
+    """
+    if not meshes:
+        return
+    print("\nanimation forms carried by the mesh (no motion set to bind)")
+    for part, mid, loc in meshes:
+        _report_binding(R, part, mid, loc, set_chunks, root)
+
+
+def _report_binding(R, part: str, mid: str, loc, set_chunks: Optional[int],
+                    root) -> None:
+    """One mesh's verdict, original and staged, against one motion set.
+
+    `read_located`, NOT `read(loc.logical)`. On 7878 appearance `1000000`
+    resolves to `c3/mesh/001000000.c3` **out of the 6090 fallback install**
+    -- `Located.origin_root` says so -- and re-resolving that logical path
+    against 7878 raises `FileNotFoundError` for a file that plainly exists.
+    The first draft did exactly that and the sweep across generations is
+    what caught it.
+    """
+    try:
+        orig = _c3_forms(R.read_located(loc))
+    except Exception as e:
+        print(f"\n  {part} mesh {mid}  {loc.logical}")
+        print(f"    cannot be read from this install: {e}")
+        return
+    print(f"\n  {part} mesh {mid}  {loc}")
+    for line in _forms_lines(orig, indent="    "):
+        print(line)
+    print("    " + _animates_line(orig, set_chunks))
+
+    st = _staged_path(loc.logical)
+    if st is None:
+        print(f"    nothing staged at Installed/stage/{loc.logical}")
+        return
+    try:
+        staged = _c3_forms(st.read_bytes())
+    except Exception as e:
+        print(f"    STAGED {st} -- will not parse as a C3 container: {e}")
+        return
+    print(f"    STAGED  {st}")
+    for line in _forms_lines(staged, indent="      "):
+        print(line)
+    print("      " + _animates_line(staged, set_chunks))
+    if staged["phy"] != orig["phy"] or staged["moti"] != orig["moti"]:
+        print(f"      CHANGED from the original: PHY {orig['phy']} -> "
+              f"{staged['phy']}, MOTI {orig['moti']} -> {staged['moti']}")
+        from c3tex import MotionBinding
+        with MotionBinding(root, assets=R) as MB:
+            cls, why = MB.classify(loc.logical)
+        print(f"      motion binding: {cls.upper()} -- {why}")
+
+
+def _animates_line(f: dict, set_chunks: Optional[int]) -> str:
+    """The one line the modder came for."""
+    verdict, _ = _pairing_verdict(f)
+    if f["phy"] == 0:
+        return ("ANIMATES: no  -- no PHY chunk for a motion set to bind to"
+                if not f["moti"] else
+                "ANIMATES: n/a -- motion-only container, nothing to skin")
+    if set_chunks is None:
+        # Not "yes" and not "no": the external set is the half that decides,
+        # and on this base there is no set to measure. Saying "yes" off the
+        # container alone is the confident-wrong answer this report exists
+        # to avoid.
+        if verdict == "paired":
+            return (f"ANIMATES: UNKNOWN -- {f['phy']} PHY paired 1:1 with its "
+                    f"own MOTI, so it animates from the container; whether an "
+                    f"external set would also bind cannot be checked here")
+        return (f"ANIMATES: NO on its own -- {_pairing_verdict(f)[1]}; and no "
+                f"external motion set is available on this client to supply "
+                f"the missing tracks")
+    if set_chunks < f["phy"]:
+        return (f"ANIMATES: NO  -- {f['phy']} PHY against a {set_chunks}-chunk "
+                f"motion set; SetMotion rejects the whole set, so NOTHING on "
+                f"this mesh moves")
+    tail = "" if verdict == "paired" else \
+        "  (its own MOTI chunks are unpaired, but the external set overrides)"
+    return (f"ANIMATES: yes -- {f['phy']} PHY <= {set_chunks} motion-set "
+            f"chunks, bound ordinal by ordinal{tail}")
+
+
+# ---------------------------------------------------------------------------
+# effects -- filtering by animation form
+# ---------------------------------------------------------------------------
+
+def _cmd_effects_forms(args) -> int:
+    r"""List this install's effects, filtered by which animation form they use.
+
+    `comod anim` answers the form question for ONE container.  This answers it
+    for the whole install and the other way round: *which effects are ribbon
+    trails?*  That is the question a modder actually starts from, and until now
+    the classification existed everywhere and was queryable nowhere.
+
+    The filter is SET MEMBERSHIP.  A container can carry more than one form --
+    MEASURED on 5517, `c3/effect/lance/560029.C3` holds 4 PHY + 4 MOTI **and**
+    2 SHAP + 2 SMOT, and effect `560029` is returned by `--form phy` and by
+    `--form ribbon` both.  1,222 of that install's 3,391 effects are
+    multi-form, so a single-value category would misfile a third of the table.
+
+    Everything here is `tools/effects.py`'s; this is the CLI surface, not a
+    second implementation.
+
+    The index costs one pass over every container the effect tables name (13 s
+    on 5517, 108 s on 6609, MEASURED 2026-09-07 cold).  That is why it is this
+    command and not a line in `comod catalogs`.
+    """
+    import effects as fx
+    try:
+        want = [fx.parse_form(f) for f in (args.form or [])]
+    except fx.UnknownForm as exc:
+        print(str(exc))
+        return 2
+    # `with`, and the THREE `return`s below are the reason: this opens its own
+    # install and every way out of here used to drop it still open.
+    with fx.EffectDB(args.root) as db:
+        if args.census:
+            print(json.dumps(fx.form_census(db), indent=2, ensure_ascii=False))
+            return 0
+        rows = fx.filter_effects(db, forms=want, mode=args.form_mode,
+                                 match=args.match)
+        if args.json:
+            print(json.dumps({"root": str(db.root), "total": len(rows),
+                              "filter": {"forms": want,
+                                         "mode": args.form_mode,
+                                         "match": args.match},
+                              "effects": rows}, indent=2, ensure_ascii=False))
+            return 0
+        fx._print_effect_list(db, rows, want, args.form_mode, args.match,
+                              args.limit)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # extract / convert
 # ---------------------------------------------------------------------------
 
@@ -969,6 +1529,171 @@ def cmd_import_png(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# export / import -- the item-5 foundation (core/portage.py is the machinery)
+# ---------------------------------------------------------------------------
+
+def _provenance(args) -> dict:
+    """The batch record's provenance for the current install.
+
+    The client family/version is the parser plugin's identity, which is the
+    only client fingerprint the app trusts (see `_plugin_for`). It doubles as
+    the compatibility key on import.
+    """
+    plug = _plugin_for(args.root)
+    family = getattr(plug, "name", "") if plug else ""
+    version = portage._client_version(family)
+    return {
+        "source_install": install_slug(args.root),
+        "client_family": family,
+        "client_version": version if version is not None else family,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def cmd_export(args) -> int:
+    r"""`comod export <asset> [<asset>...] --for <tool>` -- the item-5 export verb.
+
+    Dispatches by asset TYPE to the right transform (`.c3` copied for Blender,
+    `.dds` decoded to PNG, a table to CSV, an `.ani` to its ordered frame set)
+    and writes the two-tier `<asset>/<type>/<file>` layout plus a diffable
+    `comod-manifest.json` array and a README. `--zip` packs it; otherwise it
+    lands in a directory. `--for` only validates that the named tool opens the
+    kind of file being exported -- the transform is chosen by the file.
+    """
+    items: list = []
+    shared = set(getattr(args, "shared", None) or [])
+    for logical in args.asset:
+        atype = portage.classify(logical)
+        if args.for_tool:
+            why = portage.tool_mismatch(args.for_tool, atype)
+            if why:
+                print(f"REFUSED {logical}: {why}")
+                return 1
+        items.append(portage.ExportItem(logical, shared=logical in shared))
+
+    prov = _provenance(args)
+    with AssetRoot(args.root) as R:
+        manifest, files = portage.build_manifest(R, items, prov)
+
+    absent = [r for r in manifest if r.get("record") == "file" and r["absent"]]
+    if args.zip:
+        dest = Path(args.zip)
+        portage.write_batch_zip(dest, manifest, files)
+    else:
+        # `coroot.export_dir()`, not `WORK / "export"`: the old default put
+        # the user's bundles INSIDE A GIT WORKTREE -- per-checkout, invisible
+        # from another clone, removed by anything that cleans the tree. The
+        # viewer's pop-out resolves through the same function, because the
+        # two having separate bundle directories is exactly how `comod
+        # import` comes to not see what the panel just wrote.
+        dest = Path(args.out) if args.out else coroot.export_dir()
+        dest.mkdir(parents=True, exist_ok=True)
+        portage.write_batch_dir(dest, manifest, files)
+    print(f"exported {len(files)} file(s) -> {dest}")
+    for r in manifest:
+        if r.get("record") != "file" or r["absent"]:
+            continue
+        tag = "  [SHARED -- edits it under every asset it appears in]" \
+            if r["shared"] else ""
+        tool = portage.default_tool(r["type"])
+        print(f"  {r['export']}   ({r['type']} -> {tool}){tag}")
+    for r in absent:
+        print(f"  (absent) {r['dest']} -- declared but not in this install, "
+              f"recorded as absent")
+    print(f"\nreimport with:  py -3 tools/comod.py import {dest}")
+    return 0
+
+
+def cmd_import(args) -> int:
+    r"""`comod import <workdir-or-zip>` -- the item-5 import verb.
+
+    Reads the manifest, ENFORCES the per-format rules, and lands results in the
+    stage tree so `diff` / `impact` / `install` still apply:
+
+      * an untouched texture is SKIPPED, never re-encoded (lossy DDS rule);
+      * a `.dat` row that changes byte length on a 6907-7878 client is REFUSED;
+      * an `.ani` whose frame order contradicts its FrameAmount is REFUSED.
+
+    Provenance is a compatibility check: a batch from another client family is
+    refused, and a target whose original does not hash to the manifest's is
+    flagged as already-modified before anything is overwritten.
+    """
+    plug = _plugin_for(args.root)
+    target_family = getattr(plug, "name", "") if plug else ""
+    with AssetRoot(args.root) as R:
+        res = portage.import_batch(
+            args.src, R, STAGE, target_family=target_family,
+            png_to_dds=lambda png, fourcc, size: _encode_png_bytes(png, fourcc))
+    for line in res.staged:
+        print(f"  STAGED   {line}")
+    for line in res.skipped:
+        print(f"  skip     {line}")
+    for line in res.absent:
+        print(f"  absent   {line}")
+    for line in res.warnings:
+        print(f"  WARNING  {line}")
+    for line in res.refused:
+        print(f"  REFUSED  {line}")
+    print(f"\n{len(res.staged)} staged, {len(res.skipped)} skipped, "
+          f"{len(res.refused)} refused, into {STAGE}")
+    if res.staged:
+        print("review with `comod.py diff`, apply with `comod.py install`.")
+    if not res.ok:
+        print("one or more files were refused by a format rule; nothing "
+              "refused was staged.")
+        return 1
+    return 0
+
+
+def _encode_png_bytes(png: bytes, fourcc: str) -> bytes:
+    """PIL PNG-bytes -> DDS-bytes, injected into portage so it stays PIL-free."""
+    import io as _io
+    Image = _pil()
+    im = Image.open(_io.BytesIO(png)).convert("RGBA")
+    out = _io.BytesIO()
+    im.save(out, format="DDS", pixel_format=fourcc)
+    return out.getvalue()
+
+
+def _restore_motion(orig: bytes, data: bytes, logical: str,
+                    source: str) -> tuple[int, bytes]:
+    r"""`--restore-motion`: give a motion-less donor the original's MOTI.
+
+    Returns `(0, spliced)` on success and `(1, data)` on a refusal, having
+    printed the whole per-ordinal verdict either way.
+
+    THIS IS NOT A GENERAL RETARGET AND MUST NOT BECOME ONE. A `.c3` carries no
+    skeleton -- no bone names, no parent indices, no inverse-bind matrices --
+    so nothing computable from a donor's geometry says which motion track
+    belongs to it. MEASURED on `7205/c3/monster`: over pairs of shipped
+    containers whose PHY chunks are BYTE-IDENTICAL slot for slot, swapping the
+    MOTI moves the median vertex by more than 1% of the mesh's own bounding-box
+    diagonal in 169 of 219 chunk comparisons (77.2%), worst 1.85x the diagonal.
+    `c3write.motion_restore_report` therefore accepts only the case where the
+    donor agrees with the original on every input the skinning path reads, so
+    the posed result is bit-identical and nothing is being decided. The full
+    evidence, including the two weaker rules that measured wrong, is
+    `docs/moti_retarget_2026-09-06.md`.
+    """
+    from c3phy import iter_chunks
+    from c3write import motion_restore_report, restore_motion
+    ok, lines = motion_restore_report(orig, data)
+    print(f"  --restore-motion against the {source} copy of {logical}:")
+    for ln in lines:
+        print(f"  {ln}")
+    if not ok:
+        print("  REJECTED: the donor cannot inherit this motion. Nothing "
+              "staged. A mesh that animates wrongly is worse than one that "
+              "does not install.")
+        return 1, data
+    spliced = restore_motion(orig, data)
+    print(f"  restored {sum(1 for t, _ in iter_chunks(orig) if t == b'MOTI')} "
+          f"MOTI chunk(s), each immediately after its own PHY "
+          f"({len(data)} -> {len(spliced)} bytes)")
+    return 0, spliced
+
+
 def cmd_stage_mesh(args) -> int:
     """Stage a .c3 exported from the Blender addon.
 
@@ -1021,7 +1746,17 @@ def cmd_stage_mesh(args) -> int:
                 return 1
             logical = loc.logical
             print(f"inferred logical path: {logical}")
-        orig = R.read(logical) if R.exists(logical) else None
+        # WHICH COPY the original came from is recorded, not just its bytes.
+        # `locate` resolves overlay -> loose -> archive, and on the shipped
+        # clients those copies are NOT interchangeable: on 7205, 622 loose
+        # `c3/**.c3` paths are also present in `c3.wdf`, 360 of them differ,
+        # and 277 have the SAME chunk-tag sequence with DIFFERENT MOTI content
+        # (5517: 18 of 18; 6609: 20 of 20). So "the original's motion" is a
+        # different set depending on which copy answered, and a restore that
+        # does not say which one it used cannot be reproduced.
+        o_loc = R.locate(logical)
+        orig = R.read(logical) if o_loc is not None else None
+        R_src = o_loc.source if o_loc is not None else "?"
 
     if orig is not None:
         if orig == data:
@@ -1037,14 +1772,38 @@ def cmd_stage_mesh(args) -> int:
             o_moti = o_tags.count(b"MOTI")
             n_moti = n_tags.count(b"MOTI")
 
-            if n_phy != o_phy or n_moti != o_moti:
+            # `--restore-motion` runs BEFORE the count checks and, when it
+            # succeeds, satisfies them by construction: it only ever emits one
+            # MOTI per PHY and it refuses any donor whose PHY count differs
+            # from the original's. It is not a way around either check, so it
+            # short-circuits both rather than being tested against them again.
+            restored = False
+            if (getattr(args, "restore_motion", False)
+                    and n_moti == 0 and o_moti):
+                rc, data = _restore_motion(orig, data, logical, R_src)
+                if rc:
+                    return rc
+                chunks = list(iter_chunks(data))
+                n_tags = [t for t, _ in chunks]
+                n_moti = n_tags.count(b"MOTI")
+                restored = True
+
+            if restored:
+                pass
+            elif n_phy != o_phy or n_moti != o_moti:
                 # A PHY is bound to a MOTI by position (docs/modding.md 11).
                 # Both halves must move together...
                 if n_phy != n_moti and o_moti:
-                    print(f"  REJECTED: {n_phy} PHY but {n_moti} MOTI chunks. "
-                          f"Every shipped container pairs them one-to-one "
-                          f"(5,083 of 5,083); the engine binds them by "
-                          f"ordinal, so an unpaired mesh has no animation.")
+                    print(f"  REJECTED: {n_phy} PHY but {n_moti} MOTI "
+                          f"chunks. Every shipped container pairs them "
+                          f"one-to-one (5,083 of 5,083); the engine binds "
+                          f"them by ordinal, so an unpaired mesh has no "
+                          f"animation.")
+                    if n_moti == 0 and n_phy == o_phy:
+                        print("  A donor with NO motion at all can borrow "
+                              "the original's with --restore-motion, but "
+                              "only where that is provable; see "
+                              "docs/moti_retarget_2026-09-06.md.")
                     return 1
                 # ...and the container must not be driven by a SHARED external
                 # motion set, which a mod cannot re-cut.
@@ -1075,7 +1834,170 @@ def cmd_stage_mesh(args) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     print(f"\nstaged: {dest}")
+    _warn_effects(args, [logical])
     print("run `comod.py diff` to review, `comod.py install --dry-run` to preview.")
+    return 0
+
+
+def _warn_effects(args, logicals: list) -> None:
+    r"""Say whether an effect layer points at what was just staged.
+
+    THE WARNING THAT DID NOT EXIST. `stage` and `stage-mesh` validated the
+    container and said nothing about consequences, so replacing
+    `c3/effect/blade/410009.C3` -- a file a weapon's aura layer names -- was
+    indistinguishable from replacing a file nothing draws.
+
+    It is on by DEFAULT here, unlike `diff --impact`, because it costs only
+    the effect tables: MEASURED 0.1s (5017) to 1.6s (7205) to build
+    `EffectDB`, against the 34s `diff --impact` pays to resolve every
+    appearance reference in the install. `--no-effect-check` turns it off,
+    and turning it off PRINTS A LINE saying the question was not asked --
+    silence would read as "no effect uses this".
+    """
+    if getattr(args, "no_effect_check", False):
+        print("")
+        print("EFFECT DEPENDENCIES   NOT CHECKED (--no-effect-check). "
+              "Whether an effect layer names")
+        print("   the staged file(s) is UNKNOWN, not 'no'.")
+        return
+    import depclose
+    print("")
+    try:
+        depclose.effect_warning(args.root, logicals)
+    except Exception as e:                                 # noqa: BLE001
+        # A failure here must not read as "nothing found", and must not stop
+        # a stage that has already succeeded.
+        print("EFFECT DEPENDENCIES")
+        print(f"   UNMEASURED -- the effect walk raised "
+              f"{e.__class__.__name__}: {e}")
+        print("   Whether an effect layer names the staged file(s) is "
+              "UNKNOWN, not 'no'.")
+def _map_archive(root: Path, target: str) -> tuple:
+    """`(relpath, absolute path)` for a map archive named loosely.
+
+    Accepts ``desert``, ``desert.7z`` or ``map/map/desert.7z``.  The registry
+    is consulted where it parses, so the path this returns is the one
+    ``ini/GameMap.dat`` actually names rather than one this function guessed --
+    that distinction is the entire reason maps are hard to mod, and a
+    stage-map that wrote to a plausible-looking path the client never opens
+    would reproduce the original blocker with a green message on top.
+    """
+    from dmap import load_gamemap
+    t = target.replace("\\", "/").strip("/")
+    stem = Path(t).stem
+    rel = None
+    _, rows = load_gamemap(root)
+    named = [r.get("FileName", "").replace("\\", "/") for r in rows]
+    for fn in named:
+        if fn.lower().endswith(".7z") and Path(fn).stem.lower() == stem.lower():
+            rel = fn
+            break
+    if rel is None:
+        rel = t if "/" in t else f"map/map/{stem}.7z"
+        if not rel.lower().endswith(".7z"):
+            rel += ".7z"
+    return rel, (Path(root) / rel)
+
+
+def cmd_stage_map(args) -> int:
+    r"""Put a modified `.DMap` back INSIDE the `.7z` the map registry names.
+
+    This is the one asset class loose-file override does not reach.  From 5517
+    the registry names ``.7z`` on 100% of rows on every install, so dropping a
+    ``.DMap`` next to the archive produces a file the client never opens --
+    which is why `docs/capability_matrix_2026-09-06.md` grades the map grid
+    modifiable NOWHERE.  The archive is rebuilt with `tools/sz7zwrite.py` and
+    written into the SAME stage tree `install` and `uninstall` already drive,
+    so this adds no second install mechanism and inherits the backups.
+
+    Two ways to say what to change:
+
+        --dmap FILE          use these bytes as the new payload
+        --set X,Y,MASK       flip one cell's walkability (repeatable)
+
+    `--set` patches the shipped `.DMap` in place -- the grid is fixed-stride,
+    so every header, portal, layer and trailer byte this repo has not fully
+    decoded survives by construction, and only the edited rows' checksums are
+    recomputed.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import sz7z
+    import sz7zwrite
+    import dmap as dm
+
+    root = Path(args.root).resolve()
+    rel, src = _map_archive(root, args.map)
+    if not src.is_file():
+        loose = src.with_suffix(".DMap")
+        if loose.is_file():
+            print(f"{rel} is not present, but {loose.name} is.\n"
+                  f"This install ships the map LOOSE, so it can be modified "
+                  f"the ordinary way:\n"
+                  f"  py -3 tools/comod.py stage "
+                  f"{loose.relative_to(root).as_posix()}")
+            return 1
+        print(f"not found: {src}")
+        return 1
+
+    try:
+        m = sz7z.read_archive(src)
+        raw = sz7z.extract(src)
+    except ValueError as e:
+        print(f"{rel}: {e}")
+        return 1
+    inner = [f["name"] for f in sz7zwrite.decode_files(m)]
+    print(f"source: {src}\n  registry path: {rel}\n  holds: {inner}")
+
+    if args.dmap:
+        payload = Path(args.dmap).read_bytes()
+        print(f"  payload: {args.dmap} ({len(payload)} bytes)")
+    elif args.set:
+        edits = []
+        for s in args.set:
+            parts = [p.strip() for p in s.split(",")]
+            if len(parts) < 3:
+                print(f"--set wants X,Y,MASK (got {s!r})")
+                return 1
+            edits.append((int(parts[0]), int(parts[1]), int(parts[2]),
+                          int(parts[3]) if len(parts) > 3 and parts[3] else None,
+                          int(parts[4]) if len(parts) > 4 and parts[4] else None))
+        before = dm.parse(src, data=raw, want_cells=True, verify=True)
+        if before.checksum_ok != before.height:
+            print(f"  REFUSED: {before.checksum_ok}/{before.height} row "
+                  f"checksums verify on the SHIPPED map, so a rewritten "
+                  f"checksum cannot be told from a broken one.")
+            return 1
+        payload = sz7zwrite.patch_dmap_cells(raw, edits)
+        after = dm.parse(src, data=payload, want_cells=True, verify=True)
+        print(f"  {before.width}x{before.height}, {len(edits)} cell(s) edited; "
+              f"row checksums {after.checksum_ok}/{after.height}")
+        if after.checksum_ok != after.height:
+            print("  REFUSED: the patched map's checksums do not verify.")
+            return 1
+    else:
+        print("nothing to change: pass --dmap FILE or --set X,Y,MASK")
+        return 1
+
+    new = sz7zwrite.replace_payload(m, payload)
+    dest = STAGE / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    blob = sz7zwrite.serialize_archive(new)
+    dest.write_bytes(blob)
+    # READ IT BACK. The archive is only useful if it decompresses to what we
+    # meant, and this is the last point at which anything here can check that
+    # -- the client cannot be run from this seat.
+    back = sz7z.extract(dest)
+    ok = back == payload
+    print(f"staged: {dest}\n  {len(blob)} bytes "
+          f"({sum(m['packsizes'])} -> {sum(new['packsizes'])} packed), "
+          f"re-extracts to the intended payload: {ok}")
+    if not ok:
+        dest.unlink()
+        print("  REFUSED and removed: the staged archive does not read back.")
+        return 1
+    print("\nreview:  py -3 tools/comod.py diff")
+    print(f"install: py -3 tools/comod.py --root \"{root}\" install --yes")
+    print(f"revert:  py -3 tools/comod.py --root \"{root}\" uninstall --yes")
     return 0
 
 
@@ -1090,6 +2012,7 @@ def cmd_stage(args) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(R.read(args.logical))
         print(f"staged unchanged copy: {loc}  ->  {dest}")
+    _warn_effects(args, [args.logical])
     return 0
 
 
@@ -1124,6 +2047,7 @@ def cmd_diff(args) -> int:
     if not files:
         print(f"nothing staged. stage tree: {STAGE}")
         return 0
+    changed: list[str] = []
     with AssetRoot(args.root) as R:
         for p in files:
             logical = p.relative_to(STAGE).as_posix()
@@ -1131,6 +2055,7 @@ def cmd_diff(args) -> int:
             new = p.read_bytes()
             if loc is None:
                 print(f"  NEW      {logical}  ({len(new)} bytes) -- no original, pure addition")
+                changed.append(logical)
                 continue
             old = R.read(logical)
             if old == new:
@@ -1138,8 +2063,212 @@ def cmd_diff(args) -> int:
             else:
                 print(f"  MODIFIED {logical}  {len(old)} -> {len(new)} bytes "
                       f"(original in {loc.source})")
+                changed.append(logical)
     print(f"\n{len(files)} staged file(s) in {STAGE}")
+    # THE EFFECT PASS IS NOT OPT-IN, and that is deliberate. `--impact` is a
+    # flag because it resolves every appearance reference in the install (34s
+    # on 7878); the effect walk needs only the effect tables (0.1-1.6s
+    # measured across the corpus), so there is no reason for a modder to have
+    # to know to ask for it. See `_warn_effects`.
+    if changed:
+        _warn_effects(args, changed)
+    if getattr(args, "impact", False):
+        # THE DEPENDENCY PASS IS OPT-IN AND SAYS SO WHEN IT IS OFF.
+        #
+        # `diff` answers "what files does this change"; it has never answered
+        # "what does that BREAK". The pass costs one resolution per distinct
+        # appearance reference in the install -- MEASURED 34s on 7878, 40s on
+        # 7205 -- which is the wrong default for a command people run to see
+        # a file list. So it is a flag, and the line below is printed when
+        # the flag is absent so nobody reads a plain `diff` as a safety check.
+        print("")
+        _diff_impact(args, changed)
+    elif changed:
+        print("`diff` lists FILES, not consequences. `comod.py diff --impact` "
+              "adds who references them.")
     return 0
+
+
+def _diff_impact(args, changed: list) -> int:
+    """The dependency closure of every staged file that actually changes."""
+    import depclose
+
+    if not changed:
+        print("no staged file differs from the install, so nothing to check.")
+        return 0
+    with depclose.DepGraph(args.root, progress=True) as g:
+        for logical in changed:
+            imp = g.impact(logical)
+            src = STAGE / logical
+            if logical.lower().endswith(".c3"):
+                try:
+                    imp.staged = g.staged_change(logical, src.read_bytes())
+                except OSError as e:
+                    imp.staged = {"error": f"could not read {src}: {e}"}
+            print("=" * 72)
+            depclose.render(imp, limit=args.limit)
+            print("")
+    return 0
+
+
+def cmd_impact(args) -> int:
+    """`comod impact <path-or-id>` -- who references this asset?"""
+    import depclose
+
+    with depclose.DepGraph(args.root, progress=True) as g:
+        path, note = depclose.resolve_target(g, args.target)
+        if note:
+            print(f"({note})")
+        if not path:
+            return 1
+        imp = g.impact(path)
+        staged = STAGE / path
+        if staged.is_file() and path.lower().endswith(".c3"):
+            imp.staged = g.staged_change(path, staged.read_bytes())
+        depclose.render(imp, limit=args.limit)
+    return 0
+
+
+def cmd_asset_root(args) -> int:
+    r"""`comod asset-root <path-or-id>` -- everything that goes with an asset.
+
+    The UNFILTERED view of the one companion-set resolver (`tools/assetroot.py`):
+    `impact` answers "who references this file"; this groups the same closure
+    into the satellite types the panel shows -- geometry, textures including
+    alternatives, animation binding, effect layers with their form, the binding
+    rows, materials -- and it filters NOTHING, so a declared-but-absent
+    companion prints AS absent and the closure's blind spots print on every run.
+    That is the difference from the Model Viewer view, which hides absent
+    satellites; `--json --view model` prints that projection instead.
+    """
+    import depclose
+    import assetroot
+
+    with depclose.DepGraph(args.root, progress=True) as g:
+        path, note = depclose.resolve_target(g, args.target)
+        if note:
+            # stderr so `--json` stays a clean document on stdout.
+            print(f"({note})", file=sys.stderr)
+        if not path:
+            return 1
+        sat = assetroot.resolve(g, path)
+        if args.json:
+            print(json.dumps(assetroot.to_json(sat, view=args.view), indent=2))
+        else:
+            assetroot.render(sat, limit=args.limit)
+    return 0
+
+
+def cmd_effects(args) -> int:
+    r"""`comod effects` -- what plays, and what it needs.
+
+    The forward half of `comod impact`. `impact` answers "who reaches this
+    file"; this answers "what does this effect need", which is the question a
+    modder asks BEFORE editing a weapon rather than after.
+
+    Every mode prints the TABLES READ block first, because the answer changes
+    with the file that produced it: on 5517/6090/6609/7205 the effect
+    definitions, the mesh id table and the texture id table are all read from
+    compiled `.dbc` twins and the `.ini` beside each is a decoy, while on
+    5017/5165/7878 (and CCO) there are no twins and the plaintext IS the live
+    table. Both are normal; which one happened is not guessable from the
+    numbers, so it is printed.
+    """
+    # --census, and --list with any form filtering, are answered by the
+    # form index rather than the dependency graph. --list's optional
+    # SUBSTRING and --match are the same slot; refuse rather than pick.
+    if args.match and isinstance(args.list, str) and args.list:
+        print("give the substring to --list OR to --match, not both")
+        return 2
+    if args.census or args.form or args.limit or args.match:
+        if not args.match and isinstance(args.list, str):
+            args.match = args.list
+        return _cmd_effects_forms(args)
+
+    import depclose
+
+    with depclose.DepGraph(args.root, progress=True) as g:
+        geometry = not args.no_geometry
+        if args.tables:
+            rows = g.effect_tables()
+            if args.json:
+                print(json.dumps({"root": str(g.root), "tables": rows,
+                                  "limits": g.effect_table_limits()},
+                                 indent=2, ensure_ascii=False))
+                return 0
+            print(f"install    {g.root}")
+            print("")
+            depclose.render_effect_tables(rows)
+            print("")
+            print("NOT ENUMERATED -- rule classes outside this report")
+            for line in g.effect_table_limits():
+                print(f"   * {line}")
+            return 0 if rows else 1
+
+        if args.list is not None:
+            db = g.effect_db()
+            if db is None:
+                print("UNMEASURED -- the effect tables were not read on this "
+                      "install; this is NOT 'no effects are defined'.")
+                for line in g.build_limits:
+                    print(f"   * {line}")
+                return 1
+            sub = args.list.lower()
+            names = sorted(n for n in db.effects if sub in n.lower())
+            if args.json:
+                print(json.dumps(names, indent=2, ensure_ascii=False))
+                return 0
+            depclose.render_effect_tables(g.effect_tables())
+            print("")
+            for n in names:
+                print(f"   {n}   ({len(db.effects[n].layers)} layer(s))")
+            print(f"\n{len(names)} of {len(db.effects)} defined effect name(s)"
+                  + (f" match {args.list!r}" if sub else ""))
+            return 0
+
+        if args.action:
+            db = g.effect_db()
+            if db is None:
+                print("UNMEASURED -- the effect tables were not read on this "
+                      "install; whether this action plays an effect is "
+                      "UNKNOWN, not 'no'.")
+                for line in g.build_limits:
+                    print(f"   * {line}")
+                return 1
+            app, act = args.action
+            name = db.lookup_action_effect(app, act)
+            depclose.render_effect_tables(g.effect_tables())
+            print("")
+            if not name:
+                print(f"no Action3DEffect row matches appearance {app} "
+                      f"action {act}. The table WAS read "
+                      f"({len(db.action_rules)} rows), so this is 'no rule', "
+                      f"not 'unknown'.")
+                for line in g.effect_table_limits():
+                    print(f"   * {line}")
+                return 1
+            print(f"appearance {app} action {act} -> {name}")
+            print("")
+            depclose.render_effect(g.effect_closure(name, geometry=geometry),
+                                   tables=False)
+            return 0
+
+        if args.weapon:
+            w = g.weapon_effects(args.weapon, geometry=geometry)
+            if args.json:
+                print(json.dumps(asdict(w), indent=2, ensure_ascii=False,
+                                 default=str))
+            else:
+                depclose.render_weapon(w)
+            return 0 if w.measured else 1
+
+        c = g.effect_closure(args.effect, geometry=geometry)
+        if args.json:
+            print(json.dumps(asdict(c), indent=2, ensure_ascii=False,
+                             default=str))
+        else:
+            depclose.render_effect(c)
+        return 0 if (c.measured and c.found) else 1
 
 
 def cmd_install(args) -> int:
@@ -1159,10 +2288,10 @@ def cmd_install(args) -> int:
         if not getattr(args, "amend", False):
             sys.exit(
                 f"{root} already has an install recorded ({mpath}).\n"
-                f"Either add to it:   py -3 tools/comod.py install --amend "
-                f"--root \"{root}\" --yes\n"
-                f"or revert it first: py -3 tools/comod.py uninstall "
-                f"--root \"{root}\" --yes\n"
+                f"Either add to it:   py -3 tools/comod.py --root \"{root}\" "
+                f"install --amend --yes\n"
+                f"or revert it first: py -3 tools/comod.py --root \"{root}\" "
+                f"uninstall --yes\n"
                 "An amendment is recorded as its own dated entry with its own "
                 "backups, so it can be peeled back on its own.")
     print(f"target install root: {root}")
@@ -1244,10 +2373,15 @@ def cmd_install(args) -> int:
           f"as entry {len(manifest['entries'])} of {len(manifest['entries'])}"
           f" ({entry['at']}). manifest: {mpath}")
     print(f"originals that were displaced are backed up under {backup}")
-    print(f"revert everything:  py -3 tools/comod.py uninstall "
-          f"--root \"{root}\" --yes")
-    print(f"revert just this:   py -3 tools/comod.py uninstall "
-          f"--root \"{root}\" --last --yes")
+    # `--root` is a TOP-LEVEL option: it goes before the subcommand, or
+    # argparse answers "unrecognized arguments". The owner typed the old form
+    # of this line on 2026-09-29 and got exactly that, with a game that would
+    # not launch behind it. `tests/test_comod_amend.TheRevertHintParses`
+    # feeds these two lines back through `build_parser()`.
+    print(f"revert everything:  py -3 tools/comod.py --root \"{root}\" "
+          f"uninstall --yes")
+    print(f"revert just this:   py -3 tools/comod.py --root \"{root}\" "
+          f"uninstall --last --yes")
     return 0
 
 
@@ -1365,11 +2499,19 @@ def cmd_uninstall(args) -> int:
 #: weak claim and reads identically through `plugins.detect`. Declaring on it
 #: silently is how a repack of 6090 gets filed as vanilla and every table is
 #: then read through the wrong profile.
+#:
+#: ONE HOME, in `plugins`: this constant and the viewer's `DETECT_CONFIDENT`
+#: were the same number written twice, and the tie test beside it was written
+#: twice with DIFFERENT boundaries (`<` here, `<=` there), so a gap of exactly
+#: 0.05 was a tie on the picker and a clean identification at `clients add`.
 CONFIDENT = 0.9
 
 #: Two candidates within this of each other are a tie, and a tie is not an
 #: answer. `detect` breaks it by score then name, which is dictionary order
 #: wearing the clothes of evidence.
+#:
+#: The comparison is `<=`, from `plugins.verdict` -- see `plugins.TIE` for
+#: why that boundary and not this file's old `<`.
 TIE = 0.05
 
 
@@ -1515,7 +2657,7 @@ def cmd_clients(args) -> int:
         print("  picks the parse profile, so a wrong one misreads every table")
         print("  without raising. Confirm with --kind " + best.name)
         return 1
-    if len(ranked) > 1 and (score - ranked[1][1]) < TIE:
+    if len(ranked) > 1 and (score - ranked[1][1]) <= TIE:
         print(f"\n  REFUSED: {best.name} and {ranked[1][0].name} are within "
               f"{TIE} of each other.")
         print("  A tie broken by name order is not evidence. Pick with --kind.")
@@ -1535,6 +2677,12 @@ def cmd_installs(args) -> int:
     print(f"stage tree:  {STAGE}")
     n = len(_staged_files())
     print(f"             {n} file(s) staged and not yet installed")
+    # WHERE the records live and WHY, always -- a reader who sees only the
+    # records cannot tell a configured shared root from a silent fallback
+    # into this checkout, and those differ by whether `uninstall` run from
+    # another worktree can restore the wrong file.
+    print(f"records:     {installs_dir()}")
+    print(f"             {installs_why()}")
     known = installed_roots()
     if not known:
         print("\nno install has anything recorded.")
@@ -1548,8 +2696,184 @@ def cmd_installs(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# .ani frame sequences
+# ---------------------------------------------------------------------------
+#
+# An `.ani` is a plain-text INI naming an ORDERED set of separate `.dds` frames
+# per section. These four verbs exist so a user meets the set as one unit --
+# see it in order, take it out together, put it back together -- rather than as
+# N unrelated textures whose relationship lives only in a text file they were
+# never shown.
+#
+# THE ORDER IS THE ANIMATION. An export that lost it, or an import that
+# renumbered `Frame0..N` inconsistently with `FrameAmount`, would produce a
+# manifest the client reads as a DIFFERENT animation rather than a broken one:
+# no crash, no dialog, no log line. The mechanics and every refusal live in
+# `tools/aniset.py`; these are the surface.
 
-def main(argv=None) -> int:
+def _aniset():
+    import aniset  # noqa: PLC0415
+    return aniset
+
+
+def cmd_ani_list(args) -> int:
+    return _aniset().list_files(Path(args.root))
+
+
+def _ani_run(args, fn) -> int:
+    a = _aniset()
+    try:
+        with open_view(args) as R:
+            return fn(a, R)
+    except a.SequenceError as e:
+        print(f"REFUSED: {e}")
+        return 1
+
+
+def cmd_ani_show(args) -> int:
+    return _ani_run(args, lambda a, R: a.show(R, args.ani, args.section,
+                                              args.limit))
+
+
+def cmd_ani_export(args) -> int:
+    def go(a, R):
+        d = a.export(R, args.ani, args.section, args.out, args.png)
+        rows = json.loads((d / a.MANIFEST).read_text("utf-8"))["frames"]
+        absent = sum(1 for r in rows if not r["present"])
+        print(f"exported {len(rows)} ordinal(s) -> {d}")
+        if absent:
+            print(f"  {absent} of them are DECLARED BUT ABSENT on this "
+                  f"install and are marked with a zero-byte .absent file at "
+                  f"their own ordinal, not omitted")
+        print(f"  the NNN_ prefix is the frame order and the only thing "
+              f"`ani-import` reads it from")
+        print(f"  re-import with:  py -3 tools/comod.py ani-import {d}")
+        return 0
+    return _ani_run(args, go)
+
+
+def cmd_ani_import(args) -> int:
+    def go(a, R):
+        code, lines = a.import_set(Path(args.workdir), R, args.drop_missing,
+                                   args.dry_run)
+        for ln in lines:
+            print(ln)
+        return code
+    return _ani_run(args, go)
+# tag / bookmark / rename overlay (core/tags.py)
+# ---------------------------------------------------------------------------
+
+def _tag_store(args) -> "tagstore.TagStore":
+    """The overlay store this invocation writes to: `--store` if given, else
+    the per-user default beside the config file."""
+    return tagstore.TagStore(getattr(args, "store", None) or None)
+
+
+def _tag_key(args) -> tuple:
+    """Resolve the asset named on the command line to its ``(path, hash)`` key.
+
+    The path is the logical path as typed (normalised by the store); the hash
+    is computed from the asset's CURRENT bytes in the active view. Recording
+    both is the whole point -- a later patch or re-encode is then surfaced as
+    MOVED / CHANGED rather than lost.
+    """
+    logical = args.logical
+    with open_view(args) as R:
+        if not R.locate(logical):
+            print(f"not found: {logical}")
+            return None
+        blob = R.read(logical)
+    return tagstore.norm_path(logical), tagstore.hash_bytes(blob)
+
+
+def _print_record(r: dict) -> None:
+    name = f"  \"{r['name']}\"" if r.get("name") else ""
+    mark = " *" if r.get("bookmark") else "  "
+    tags = ("  [" + ", ".join(r["tags"]) + "]") if r["tags"] else ""
+    print(f"{mark}{r['path']}{name}{tags}")
+    print(f"     hash {r['hash']}"
+          + (f"   note: {r['note']}" if r.get("note") else ""))
+
+
+def cmd_tag(args) -> int:
+    store = _tag_store(args)
+    verb = args.tagverb
+
+    if verb == "list":
+        recs = store.list(tag=getattr(args, "tag", None),
+                          bookmarked=True if getattr(args, "bookmarked", False)
+                          else None)
+        if getattr(args, "json", False):
+            print(json.dumps(recs, indent=1))
+            return 0
+        if not recs:
+            print("no tags recorded"
+                  + (f" for tag {args.tag!r}" if getattr(args, "tag", None)
+                     else "") + f"  (store: {store.path})")
+            return 0
+        counts = store.all_tags()
+        if counts and not getattr(args, "tag", None):
+            print("tags in use: "
+                  + ", ".join(f"{t} ({n})" for t, n in counts.items()))
+        for r in recs:
+            _print_record(r)
+        return 0
+
+    if verb == "export":
+        data = store.export()
+        Path(args.file).write_text(json.dumps(data, indent=1), "utf-8")
+        print(f"exported {len(data)} record(s) to {args.file}")
+        return 0
+
+    if verb == "import":
+        try:
+            data = json.loads(Path(args.file).read_text("utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"cannot read {args.file}: {e}")
+            return 1
+        if isinstance(data, dict):
+            data = data.get("records", [])
+        if not isinstance(data, list):
+            print(f"{args.file} is not a tag array")
+            return 1
+        stats = store.import_records(data, replace=getattr(args, "replace", False))
+        store.save()
+        print(f"imported: {stats['added']} added, {stats['merged']} merged, "
+              f"{stats['skipped']} skipped  (store: {store.path})")
+        return 0
+
+    # The mutating verbs all key on a resolved asset.
+    key = _tag_key(args)
+    if key is None:
+        return 1
+    path, h = key
+
+    if verb == "add":
+        r = store.add_tag(path, h, *args.tag)
+    elif verb == "remove":
+        r = store.remove_tag(path, h, args.tag)
+        if r is None:
+            print(f"no overlay for {path} at this content hash")
+            return 1
+    elif verb == "rename":
+        r = store.set_name(path, h, args.name)
+    elif verb == "bookmark":
+        r = store.bookmark(path, h, on=not getattr(args, "off", False))
+    else:                                                    # pragma: no cover
+        print(f"unknown tag verb {verb!r}")
+        return 2
+    store.save()
+    _print_record(r)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, as an object -- so a test can feed a printed command back
+    through it. Split out of `main` on 2026-09-29 after `install`'s revert
+    hint turned out to be unparseable (`--root` after the subcommand, where
+    it is a top-level option) and nothing had ever tried to type it."""
     ap = argparse.ArgumentParser(
         description="Graphics modding workbench for Classic Conquer 2.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1612,6 +2936,30 @@ def main(argv=None) -> int:
     p.add_argument("logical")
     p.set_defaults(func=cmd_info)
 
+    p = sub.add_parser("anim",
+                       help="how one appearance animates: motion set, timing, "
+                            "loop, root motion, and whether a staged mesh "
+                            "still binds")
+    p.add_argument("ident", help="an appearance ID, or a logical .c3 path "
+                                 "(then only the animation forms are shown)")
+    p.add_argument("--action", default="100",
+                   help="3-digit action code or alias "
+                        "(idle/walk/run/jump/swing/cast/die; default 100)")
+    p.add_argument("--weapon", default="",
+                   help="right-hand weapon appearance, e.g. 410009")
+    p.add_argument("--off-hand", dest="off_hand", default="")
+    p.add_argument("--distance", type=int,
+                   help="jump distance tier (10..120), for the 12/13-wide keys")
+    p.add_argument("--as-shape", dest="as_shape",
+                   help="override the shape derived from the appearance")
+    # No literal default: 41 lives in `anim.DEFAULT_FRAME_INTERVAL_MS` with
+    # its evidence and its two rejected candidates attached, and a second
+    # copy here is how the two drift apart. `cmd_anim` fills it in.
+    p.add_argument("--interval", type=int, default=None,
+                   help="ms per frame (default: anim.py's measured 41)")
+    p.add_argument("--table")
+    p.set_defaults(func=cmd_anim)
+
     p = sub.add_parser("map", help="inspect a .DMap world map")
     p.add_argument("path"); p.add_argument("--ascii", type=int, metavar="COLS",
                                            help="print a walkability sketch this many columns wide")
@@ -1629,9 +2977,50 @@ def main(argv=None) -> int:
     p.add_argument("--force", action="store_true", help="allow a size mismatch")
     p.set_defaults(func=cmd_import_png)
 
+    p = sub.add_parser("export",
+                       help="export an asset to the right tool's format, with "
+                            "a manifest (item 5: .c3 for Blender, .dds as PNG, "
+                            "table as CSV, .ani as its frame set)")
+    p.add_argument("asset", nargs="+",
+                   help="one or more logical asset paths, e.g. "
+                        "c3/body/7130030.c3")
+    p.add_argument("--for", dest="for_tool", metavar="TOOL",
+                   help="the tool you will open these in (blender/gimp/calc/"
+                        "audacity/text); validated against the asset type")
+    p.add_argument("--zip", metavar="FILE",
+                   help="pack the bundle into this .zip instead of a folder")
+    p.add_argument("--out", metavar="DIR",
+                   help="write the bundle folder here (default: work/export)")
+    p.add_argument("--shared", action="append", metavar="LOGICAL",
+                   help="mark this asset as SHARED (appears under more than "
+                        "one item; editing it edits both); repeatable")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("import",
+                       help="reimport an export bundle (folder or .zip): "
+                            "enforce the format rules and land it in the stage "
+                            "tree (item 5). Distinct from `import-png`.")
+    p.add_argument("src", help="the export folder or .zip")
+    p.set_defaults(func=cmd_import)
+
     p = sub.add_parser("stage", help="copy an original asset into the stage tree unchanged")
     p.add_argument("logical")
+    p.add_argument("--no-effect-check", action="store_true",
+                   help="skip the effect-dependency warning; the "
+                        "report then SAYS the question was not asked "
+                        "rather than going silent")
     p.set_defaults(func=cmd_stage)
+
+    p = sub.add_parser("stage-map",
+                       help="rebuild a map .7z around a modified .DMap and "
+                            "stage it (the ONE asset loose-file override "
+                            "cannot reach)")
+    p.add_argument("map", help="a map name (desert), or the registry path "
+                               "(map/map/desert.7z)")
+    p.add_argument("--dmap", help="use this file as the new .DMap payload")
+    p.add_argument("--set", action="append", metavar="X,Y,MASK[,SURF[,ELEV]]",
+                   help="edit one cell of the shipped map; repeatable")
+    p.set_defaults(func=cmd_stage_map)
 
     p = sub.add_parser("stage-mesh",
                        help="validate and stage a .c3 exported from Blender")
@@ -1641,10 +3030,94 @@ def main(argv=None) -> int:
                         "(inferred from the filename when omitted)")
     p.add_argument("--force", action="store_true",
                    help="stage even if the chunk layout changed")
+    p.add_argument("--restore-motion", action="store_true",
+                   help="give a donor that carries NO MOTI the original's "
+                        "motion tracks, but only where that is provable -- "
+                        "same PHY count and every position and bone binding "
+                        "unchanged. Refuses otherwise; see "
+                        "docs/moti_retarget_2026-09-06.md")
+    p.add_argument("--no-effect-check", action="store_true",
+                   help="skip the effect-dependency warning; the "
+                        "report then SAYS the question was not asked "
+                        "rather than going silent")
     p.set_defaults(func=cmd_stage_mesh)
 
     p = sub.add_parser("diff", help="show what the stage tree changes")
+    p.add_argument("--impact", action="store_true",
+                   help="also report who references each changed file "
+                        "(slow: it resolves every appearance reference in "
+                        "the install)")
+    p.add_argument("--limit", type=int, default=12,
+                   help="how many references to list per group")
+    p.add_argument("--no-effect-check", action="store_true",
+                   help="skip the effect-dependency warning; the "
+                        "report then SAYS the question was not asked "
+                        "rather than going silent")
     p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser("impact",
+                       help="who references this asset, and what a change "
+                            "to it would break")
+    p.add_argument("target", help="a logical path (c3/mesh/440140.c3) or a "
+                                  "bare asset id (440140)")
+    p.add_argument("--limit", type=int, default=12,
+                   help="how many references to list per group")
+    p.set_defaults(func=cmd_impact)
+
+    p = sub.add_parser("asset-root",
+                       help="everything that goes with an asset -- the "
+                            "unfiltered companion-set view")
+    p.add_argument("target", help="a logical path (c3/mesh/440140.c3) or a "
+                                  "bare asset id (440140)")
+    p.add_argument("--limit", type=int, default=24,
+                   help="how many satellites to list per group")
+    p.add_argument("--json", action="store_true",
+                   help="emit the resolver's JSON instead of the text view")
+    p.add_argument("--view", choices=("asset-root", "model"),
+                   default="asset-root",
+                   help="asset-root = unfiltered (default); model = the "
+                        "present-only projection the Model Viewer would show")
+    p.set_defaults(func=cmd_asset_root)
+
+    p = sub.add_parser("effects",
+                       help="what effect plays for a weapon or action, and "
+                            "what assets it needs")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--weapon", metavar="APPEARANCE",
+                   help="weapon appearance id, e.g. 410009")
+    g.add_argument("--effect", metavar="NAME",
+                   help="effect name, e.g. Flash4102")
+    g.add_argument("--action", nargs=2, metavar=("APPEARANCE", "ACTION"),
+                   help="the effect one action of one appearance plays")
+    g.add_argument("--list", nargs="?", const="", metavar="SUBSTRING",
+                   help="list defined effect names, optionally filtered")
+    g.add_argument("--tables", action="store_true",
+                   help="which file answered for each effect table")
+    g.add_argument("--census", action="store_true",
+                   help="how many effects carry each animation form "
+                        "(all three rows always printed, so an absent "
+                        "form is a measured 0)")
+    p.add_argument("--no-geometry", action="store_true",
+                   help="skip reading each layer's C3; the animation form "
+                        "is then reported UNKNOWN rather than guessed")
+    p.add_argument("--form", action="append", default=[], metavar="FORM",
+                   help="with --list, keep only effects carrying this "
+                        "form. Repeatable. phy|moti|PHY+MOTI, "
+                        "ribbon|trail|shap|smot|SHAP+SMOT, "
+                        "particle|ptcl|ptc3|PTCL/PTC3. An effect carrying "
+                        "two forms is listed under BOTH.")
+    p.add_argument("--form-mode", dest="form_mode",
+                   choices=("any", "all", "none"), default="any",
+                   help="with several --form: any (union, default), all "
+                        "(carries every one), none")
+    p.add_argument("--match", default="",
+                   help="substring of the effect name, case-insensitive; "
+                        "the same thing as the argument to --list")
+    p.add_argument("--limit", type=int, default=0,
+                   help="print at most N rows (0 = all); the total is "
+                        "printed either way")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_effects)
 
     p = sub.add_parser("install", help="copy the stage tree into the game install")
     p.add_argument("--amend", action="store_true",
@@ -1675,6 +3148,99 @@ def main(argv=None) -> int:
                             "something installed from it")
     p.set_defaults(func=cmd_installs)
 
+    # -- .ani frame sequences -------------------------------------------------
+    # Named `ani-*` and not `ani`: `anim` above is a DIFFERENT thing (how one
+    # appearance's 3D motion set plays), and two commands whose first three
+    # letters agree is how a user runs the wrong one. See tools/aniset.py.
+    p = sub.add_parser("ani-list",
+                       help="every .ani frame manifest on this install, with "
+                            "its section, frame and finding counts")
+    p.set_defaults(func=cmd_ani_list)
+
+    p = sub.add_parser("ani-show",
+                       help="one .ani sequence AS a sequence: its frames in "
+                            "order, and which of them the install does not ship")
+    p.add_argument("ani", help="e.g. ani/cartoon.ani")
+    p.add_argument("section", nargs="?",
+                   help="omit to list the multi-frame sections in the file")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(func=cmd_ani_show)
+
+    p = sub.add_parser("ani-export",
+                       help="write a sequence's whole ordered frame set to "
+                            "Installed/work, ordinal-prefixed")
+    p.add_argument("ani")
+    p.add_argument("section")
+    p.add_argument("--out")
+    p.add_argument("--png", action="store_true",
+                   help="also decode each frame to PNG for an image editor")
+    p.set_defaults(func=cmd_ani_export)
+
+    p = sub.add_parser("ani-import",
+                       help="re-import an edited frame set and stage it, "
+                            "rewriting Frame0..N and FrameAmount together")
+    p.add_argument("workdir", help="the directory `ani-export` wrote")
+    p.add_argument("--drop-missing", dest="drop_missing", action="store_true",
+                   help="remove ordinals whose art this install does not "
+                        "ship, renumbering the rest; the report says exactly "
+                        "what moved. Without it they keep their slot and "
+                        "their declared path.")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true")
+    p.set_defaults(func=cmd_ani_import)
+    # tag: the local overlay layer -- tag / bookmark / rename any asset, keyed
+    # on BOTH path and content hash (core/tags.py). Rename is an overlay, never
+    # a write to the asset.
+    p = sub.add_parser("tag",
+                       help="tag, bookmark or locally rename an asset "
+                            "(a local overlay -- nothing is written to the "
+                            "asset itself); export/import the tag set")
+    p.add_argument("--store", metavar="FILE",
+                   help="the overlay store JSON (default: beside your config)")
+    tsub = p.add_subparsers(dest="tagverb", required=True)
+
+    tp = tsub.add_parser("add", help="add one or more tags to an asset")
+    tp.add_argument("logical", help="the logical asset path, e.g. "
+                                    "c3/weapon/410009.dds")
+    tp.add_argument("tag", nargs="+", help="one or more tags")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("remove", help="remove one tag from an asset")
+    tp.add_argument("logical"); tp.add_argument("tag")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("rename",
+                         help="set a local display name (overlay only -- the "
+                              "file on disk is NOT renamed); empty clears it")
+    tp.add_argument("logical"); tp.add_argument("name")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("bookmark", help="bookmark an asset (or --off)")
+    tp.add_argument("logical")
+    tp.add_argument("--off", action="store_true", help="clear the bookmark")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("list", help="list overlay records")
+    tp.add_argument("--tag", help="only records carrying this tag")
+    tp.add_argument("--bookmarked", action="store_true",
+                    help="only bookmarked records")
+    tp.add_argument("--json", action="store_true")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("export", help="write the tag set to a JSON array")
+    tp.add_argument("file")
+    tp.set_defaults(func=cmd_tag)
+
+    tp = tsub.add_parser("import",
+                         help="restore a tag set (merges by default)")
+    tp.add_argument("file")
+    tp.add_argument("--replace", action="store_true",
+                    help="wipe the store first instead of merging")
+    tp.set_defaults(func=cmd_tag)
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
     args.root_explicit = args.root is not None
     if args.root is None:

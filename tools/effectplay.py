@@ -43,7 +43,10 @@ to read.
 
 from __future__ import annotations
 
+import math
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -229,6 +232,70 @@ def _keys_json(frames) -> list:
              "b": k.b_param, "n": k.n_param} for k in frames]
 
 
+#: What a `CAME` is and is not, said once so every surface says the same thing.
+CAMERA_NOTE = (
+    "This is the effect's OWN camera, baked into the .c3 by whoever authored "
+    "it (a CAME chunk), not a framing we fitted. Eye and target are converted "
+    "to render space with the project-wide (x, y, -z); the fov is the chunk's "
+    "own, in radians. MEASURED over 13,935 CAME bodies -- the six installs "
+    "4274/5065/5517/6090/6805/7632, NOT the corpus, which holds 79,522 on "
+    "all 34 (corrected 2026-09-07): the eye track is constant in 13,935 of "
+    "13,935 and the target track moves in 42, so a still camera is what "
+    "those six installs ship. The other 65,587 bodies are unmeasured on "
+    "this question."
+)
+
+#: An effect with no CAME gets a camera fitted to its bounds instead, and the
+#: player must say which it is showing.
+FITTED_NOTE = (
+    "No layer of this effect carries a CAME chunk, so the view is FITTED to "
+    "the geometry's bounding box. That framing is OURS. It is not wrong, but "
+    "it is not what the artist chose either."
+)
+
+
+def _camera_json(cam, *, mesh: str, layer: int) -> dict:
+    r"""One decoded `effects.Camera` in the render space the viewer uses.
+
+    The whole conversion is the project-wide position rule `(x, y, -z)`
+    (docs/modding.md §9.7) applied to both tracks. There is no matrix here to
+    conjugate -- `render_matrix` exists because a *matrix* has to be
+    `S . M^T . S` and a *point* does not, and using the matrix rule on a point
+    is the mistake this function is written out longhand to avoid.
+
+    `static` is the file's own answer, not a tolerance we picked: `Camera.static`
+    is exact set equality over the tracks.
+    """
+    eye = [[x, y, -z] for (x, y, z) in cam.eye]
+    tgt = [[x, y, -z] for (x, y, z) in cam.target]
+    # A still camera's tracks are 101 copies of one point. Sending them would
+    # add ~5 KB to every scene response to say nothing, so a static camera
+    # sends `eye0`/`target0` only and `eye`/`target` come back null -- the
+    # consumer reads `static` and does not index. This is a TRANSPORT choice,
+    # not a decode one: `Camera.static` is exact set equality over the decoded
+    # tracks, so nothing that varies can take this branch.
+    still = cam.static
+    return {
+        "name": cam.name,
+        "mesh": mesh,
+        "layer": layer,
+        "fov": cam.fov,
+        "fovDegrees": round(cam.fov_degrees, 4),
+        "frameCount": cam.frame_count,
+        "static": cam.static,
+        "exact": cam.exact,
+        # The whole track, so a scrubber can follow a panning camera -- but
+        # only for the 42 of 13,935 that actually move.
+        "eye": None if still else eye,
+        "target": None if still else tgt,
+        # The single sample a still camera reduces to, so the common consumer
+        # never has to index a track.
+        "eye0": eye[0] if eye else None,
+        "target0": tgt[0] if tgt else None,
+        "note": CAMERA_NOTE,
+    }
+
+
 class EffectPlayer:
     """Resolves effect names to playable scenes. One instance per server.
 
@@ -243,9 +310,220 @@ class EffectPlayer:
         self._assets = assets
         self._db = None
         self._db_error = ""
-        self._cache: dict[str, EffectScene] = {}
+        # Keyed on (name, map_fx): the same name resolves DIFFERENTLY under
+        # the two populations -- `horse_grid` is absent from `3DEffect.ini`
+        # on 7878 and present-with-0-layers in `c3.wdb` -- so a name-only
+        # key would serve whichever was asked for first.
+        self._cache: dict[tuple[str, bool], EffectScene] = {}
         self._mesh_to_json = mesh_to_json
         self._weapon_motion: Optional[dict[str, str]] = None
+        # -- the animation-form index (see `form_index_now`) ---------------
+        self._forms: Optional[dict[str, list[str]]] = None
+        self._forms_lock = threading.Lock()
+        self._forms_thread: Optional[threading.Thread] = None
+        self._forms_started: float = 0.0
+        self._forms_finished: float = 0.0
+        self._forms_progress: dict = {"done": 0, "total": 0}
+        self._forms_error: str = ""
+        # -- the breakage census (see `census_now`) -------------------------
+        self._census: Optional[dict] = None
+        self._census_states: Optional[dict[str, str]] = None
+        self._census_lock = threading.Lock()
+        self._census_thread: Optional[threading.Thread] = None
+        self._census_started: float = 0.0
+        self._census_finished: float = 0.0
+        self._census_progress: dict = {"done": 0, "total": 0}
+        self._census_error: str = ""
+
+    # -- which of the three animation forms each effect carries -------------
+    #
+    # The classification is `tools/effects.py`'s and is not repeated here.
+    # What is here is the only thing the web UI needs that the CLI does not:
+    # a way to have the answer WITHOUT blocking the page for it.
+    #
+    # The index costs one read of every container the effect tables name.
+    # MEASURED 2026-09-07, cold: 5017 12.5 s / 1,791 containers, 5517 13.0 s /
+    # 4,584, 6090 25.7 s / 7,350, 6609 107.5 s / 10,390, 7205 89.6 s /
+    # 10,390, 7878 16.9 s / 2,380.  A synchronous endpoint would hold a
+    # request open for a minute and a half on 6609, so this follows the same
+    # background-build shape `coviewer.Catalog.unified_now` already uses:
+    # start it, serve what exists, and report the state so a page can say
+    # *building* rather than *this client has no ribbons*.
+
+    def _build_form_index(self) -> None:
+        db = self.db
+        out: dict[str, list[str]] = {}
+        try:
+            if db is None:
+                raise RuntimeError(self._db_error or "no effect table")
+            names = sorted(db.effects)
+            self._forms_progress = {"done": 0, "total": len(names)}
+            for i, n in enumerate(names, 1):
+                rec = db.forms_for(n)
+                out[n] = list(rec["forms"]) if rec else []
+                if i % 50 == 0 or i == len(names):
+                    self._forms_progress = {"done": i, "total": len(names)}
+        except Exception as exc:                           # pragma: no cover
+            # A failed build must publish SOMETHING, or every later reader
+            # waits on a state that will never change. Same rule as
+            # `Catalog._build_unified`.
+            self._forms_error = f"{type(exc).__name__}: {exc}"
+            out = {}
+        with self._forms_lock:
+            self._forms = out
+            self._forms_finished = time.time()
+
+    def _start_form_index(self) -> None:
+        """Ensure exactly one build is running or finished. Idempotent."""
+        with self._forms_lock:
+            if self._forms is not None or self._forms_thread is not None:
+                return
+            self._forms_started = time.time()
+            self._forms_thread = threading.Thread(
+                target=self._build_form_index, daemon=True,
+                name="effect-form-index")
+            self._forms_thread.start()
+
+    def form_index_now(self) -> dict[str, list[str]]:
+        """effect name -> its form list, or ``{}`` while the build is in
+        flight.  **Never blocks.**
+
+        Empty is not "no effect carries a form": pair every use with
+        `form_index_status`, whose ``state`` distinguishes *building* from
+        *ready* from *failed*.  A page that cannot tell those apart shows an
+        empty filter and reads as a fact about the client.
+        """
+        self._start_form_index()
+        return self._forms if self._forms is not None else {}
+
+    def form_index_status(self) -> dict:
+        """``state`` is cold / building / ready / failed, with progress."""
+        f = self._forms
+        if f is not None:
+            state = "failed" if self._forms_error else "ready"
+        elif self._forms_thread is not None:
+            state = "building"
+        else:
+            state = "cold"
+        el = ((self._forms_finished or time.time()) - self._forms_started
+              if self._forms_started else 0.0)
+        counts = {}
+        if effectsmod is not None:
+            counts = {form: 0 for form in effectsmod.FORMS}
+            for got in (f or {}).values():
+                for form in got:
+                    if form in counts:
+                        counts[form] += 1
+        return {
+            "state": state,
+            "error": self._forms_error,
+            "effects": len(f) if f is not None else 0,
+            # All three rows, always: an absent form is a measured zero.
+            "byForm": counts,
+            "multiForm": sum(1 for v in (f or {}).values() if len(v) > 1),
+            "elapsedSeconds": round(el, 1),
+            "progress": dict(self._forms_progress),
+        }
+
+    # -- how whole every effect on this base is, and the census that sums it -
+    #
+    # Same shape as the form index above and for the same reason: classifying
+    # every effect means RESOLVING every effect, and that is a pass, not a
+    # lookup.  MEASURED 2026-09-07, cold, this seat: **5517 10.1 s over 3,391
+    # effects; 6609 33.7 s over 5,290** (plus the `EffectDB` build itself,
+    # 1.3 s and 4.9 s).  Cheaper than the form index because it never opens a
+    # container -- it is table lookups and an `assets.exists` per layer path
+    # -- and still far too slow to serve inline.
+    #
+    # The classification is `effects.effect_state_index` and is not repeated
+    # here; this adds only the background-build wrapper.  `coverage()` calls
+    # the same classifier, so the census a page renders and the numbers
+    # docs/effects.md quotes cannot drift apart.
+
+    def _build_census(self) -> None:
+        db = self.db
+        got: Optional[dict] = None
+        try:
+            if db is None:
+                raise RuntimeError(self._db_error or "no effect table")
+            if effectsmod is None:                         # pragma: no cover
+                raise RuntimeError("tools/effects.py is not importable")
+
+            def report(done: int, total: int) -> None:
+                self._census_progress = {"done": done, "total": total}
+
+            got = effectsmod.effect_state_index(db, progress=report)
+        except Exception as exc:                           # pragma: no cover
+            # A failed build must publish SOMETHING or every later reader
+            # waits on a state that never changes -- but what it publishes
+            # must be distinguishable from a real answer, which is what
+            # `_census_error` is for. `census_status` reports `failed` and
+            # the states map stays EMPTY rather than becoming "nothing is
+            # broken on this install".
+            self._census_error = f"{type(exc).__name__}: {exc}"
+            got = {"states": {}, "census": {}}
+        with self._census_lock:
+            self._census_states = dict(got.get("states") or {})
+            self._census = dict(got.get("census") or {})
+            self._census_finished = time.time()
+
+    def _start_census(self) -> None:
+        """Ensure exactly one census build is running or finished. Idempotent."""
+        with self._census_lock:
+            if self._census is not None or self._census_thread is not None:
+                return
+            self._census_started = time.time()
+            self._census_thread = threading.Thread(
+                target=self._build_census, daemon=True, name="effect-census")
+            self._census_thread.start()
+
+    def census_now(self) -> dict:
+        """``{"states": {name: state}, "census": {...}}``, or empty while the
+        build is in flight.  **Never blocks.**
+
+        Empty is NOT "this client ships no broken effects" and it is NOT "no
+        rule names an undefined effect".  Pair every use with
+        `census_status`, whose ``state`` distinguishes *building* from *ready*
+        from *failed*.  A consumer that renders this without checking that
+        state publishes an unmeasured install as a clean one, which is the
+        single worst thing this panel can do -- it is a claim of completeness
+        made out of an absence of data.
+        """
+        self._start_census()
+        with self._census_lock:
+            return {"states": dict(self._census_states or {}),
+                    "census": dict(self._census or {})}
+
+    def census_status(self) -> dict:
+        """``state`` is cold / building / ready / failed, with progress.
+
+        **STARTS THE BUILD**, exactly as `census_now` does. A status call that
+        only observed would let a caller which reads the state first and the
+        data second -- the natural order, and the one the endpoint uses --
+        poll a `cold` that nothing ever moves off. That is not a hang: it is a
+        page saying "still building" forever with nothing building, which
+        reads as slow rather than as broken. Measured here on 5517 before it
+        shipped: the build never started and the poller never terminated.
+        """
+        self._start_census()
+        c = self._census
+        if c is not None:
+            state = "failed" if self._census_error else "ready"
+        elif self._census_thread is not None:
+            state = "building"
+        else:
+            state = "cold"
+        el = ((self._census_finished or time.time()) - self._census_started
+              if self._census_started else 0.0)
+        return {
+            "state": state,
+            "error": self._census_error,
+            "classified": len(self._census_states or {}),
+            "allStates": (list(effectsmod.EFFECT_STATES)
+                          if effectsmod is not None else []),
+            "elapsedSeconds": round(el, 1),
+            "progress": dict(self._census_progress),
+        }
 
     # -- the database ------------------------------------------------------
     @property
@@ -269,22 +547,30 @@ class EffectPlayer:
         return sorted(db.effects) if db else []
 
     # -- name -> scene -----------------------------------------------------
-    def scene(self, name: str) -> EffectScene:
+    def scene(self, name: str, *, map_fx: bool = False) -> EffectScene:
+        """One effect name resolved to playable geometry.
+
+        `map_fx` opts in to the MAP effect population -- `c3.wdb`'s EFFE
+        section -- and defaults OFF so every existing caller keeps the
+        `3DEffect.ini` population it was measured against.  See
+        `EffectDB.resolve` for the corpus measurement behind that default.
+        """
         if not name:
             return EffectScene("", False, "no effect name given")
-        hit = self._cache.get(name)
+        key = (name, bool(map_fx))
+        hit = self._cache.get(key)
         if hit is not None:
             return hit
-        sc = self._build(name)
-        self._cache[name] = sc
+        sc = self._build(name, map_fx=bool(map_fx))
+        self._cache[key] = sc
         return sc
 
-    def _build(self, name: str) -> EffectScene:
+    def _build(self, name: str, *, map_fx: bool = False) -> EffectScene:
         db = self.db
         if db is None:
             return EffectScene(name, False, self._db_error)
         try:
-            eff = db.resolve(name)
+            eff = db.resolve(name, map_fx=map_fx)
         except Exception as exc:                           # pragma: no cover
             return EffectScene(name, False, f"resolve failed: {exc}")
         if eff is None:
@@ -294,6 +580,10 @@ class EffectPlayer:
             # send the reader to a file the client ignores (C47).
             src = getattr(db.sources.get("3DEffect"), "path", None)
             where = f"ini/{src.name}" if src is not None else "ini/3DEffect.ini"
+            if map_fx:
+                # Two files were consulted, so naming one of them would send
+                # the reader to look in a place that was already checked.
+                where += " or ini/c3.wdb:EFFE"
             return EffectScene(name, False,
                                f"{name!r} is not defined in {where}")
 
@@ -303,6 +593,7 @@ class EffectPlayer:
         undecoded_parts = 0
         max_eff_frames = 0
         max_frames = 0
+        cameras: list[dict] = []
         for lay in eff.layers:
             obj = None
             load_error = ""
@@ -316,6 +607,10 @@ class EffectPlayer:
                 load_error = f"EffectId {lay.effect_id!r} is not in 3DEffectObj.ini"
             parts = []
             if obj is not None:
+                for cam in getattr(obj, "cameras", ()):
+                    cameras.append(_camera_json(
+                        cam, mesh=(lay.mesh_path or "").replace("\\", "/"),
+                        layer=lay.index))
                 for p in obj.parts:
                     j = self._part_json(p)
                     if j is None:
@@ -374,6 +669,19 @@ class EffectPlayer:
             # separate number from `particleParts` on purpose: particles are no
             # longer a gap, so counting them as one would misreport the scene.
             "undecodedParts": undecoded_parts,
+            # The authoring cameras this effect's own containers carry. Empty
+            # is the honest answer for a bit under half the corpus and the
+            # player says "fitted" rather than pretending otherwise --
+            # MEASURED per install (effects whose layer meshes read):
+            # 5165 1,807/2,569 (70.3%), 5517 1,890/3,339 (56.6%),
+            # 6090 1,964/4,417 (44.5%). The trend is real: newer content ships
+            # fewer cameras, which is consistent with nothing having consumed
+            # one since 5165.
+            "cameras": cameras,
+            "cameraCount": len(cameras),
+            "camera": cameras[0] if cameras else None,
+            "cameraSource": "CAME" if cameras else "fitted",
+            "cameraNote": CAMERA_NOTE if cameras else FITTED_NOTE,
             "layers": layers,
             "timingNote": (
                 "Length comes from the alpha envelope, not from the declared "
@@ -419,15 +727,30 @@ class EffectPlayer:
                 "decoded": True,
                 "frameCount": q.frame_count,
                 "effectiveFrames": q.effective_frames,
-                "atlas": q.tex_grid,               # an atlas x atlas flipbook
+                "atlas": q.tex_grid,               # ROWS, and the default cols
+                # CCFL KIND 3: the atlas COLUMN count. 0 means square, which
+                # is what `atlas` alone used to mean everywhere. `totalCells`
+                # becomes cols*atlas, the modulus becomes cols, u steps by
+                # 1/cols and V STILL STEPS BY 1/atlas -- a consumer that uses
+                # one number for both axes is the defect this field exists to
+                # remove. See `effects.Particle.cell`.
+                "atlasCols": p.atlas_cols or 0,
+                # CCFL kind 10: (off_u, off_v, ext_u, ext_v), [] when absent.
+                # `particle_quads` and `fx.js particleQuads` apply it as the
+                # traced hybrid (offset added to the cell origin, extent
+                # multiplied into the cell size);
+                # `tests/test_ccfl_kind10_applied.py` gates both.
+                "uvRect": list(p.uv_rect) if p.uv_rect else [],
                 "maxParticles": q.max_particles,
                 "peakParticles": q.peak_particles,
                 "vertsPerParticle": effectsmod.PTCL_VERTS_PER_PARTICLE,
                 "frames": frames,
                 "note": "Baked simulation: frames[i] is the solved particle "
                         "set for frame i (docs/effects.md §6.6). Draw one "
-                        "camera-facing quad of half-size s per particle, UV "
-                        "cell (floor(c*atlas^2) % atlas, // atlas).",
+                        "camera-facing quad of half-size s per particle. UV "
+                        "cell: K = atlasCols or atlas; "
+                        "i = floor(c*K*atlas); col = i % K, row = i // K; "
+                        "u steps 1/K and v steps 1/atlas.",
             }
             if q.envelope is not None:
                 e = q.envelope
@@ -477,7 +800,13 @@ class EffectPlayer:
             return None
         if self._mesh_to_json is None:                     # pragma: no cover
             return None
-        geo = self._mesh_to_json(p.mesh, 0)
+        # `include_skin` -- a PHY part is posed by its MOTI, and a
+        # multi-bone part cannot be posed by one matrix. See
+        # `mesh_to_json`; the flag is why this is the only caller.
+        try:
+            geo = self._mesh_to_json(p.mesh, 0, include_skin=True)
+        except TypeError:                                  # pragma: no cover
+            geo = self._mesh_to_json(p.mesh, 0)   # an older injected fn
         bones_used = {v.bone0 for v in p.mesh.vertices}
         bones_used |= {v.bone1 for v in p.mesh.vertices if v.weight1}
         step = p.uv_step
@@ -490,6 +819,20 @@ class EffectPlayer:
             # is the cell index, row-major.
             "uvGrid": p.uv_grid,
             "uvStep": list(step) if step else [0.0, 0.0],
+            # CCFL kind 13. 0 means NO kind 13, which means drive the scroll
+            # from `frame_at` exactly as before; a renderer must not read this
+            # as a period of zero. See `wall_counter`.
+            "periodMs": int(getattr(p, "period_ms", 0) or 0),
+            # CCFL kind 9: the `(rate_u, rate_v)` UV-animation step. `[]` means
+            # NO kind 9 -- distinct from `[0, 0]`, which two shipped meshes
+            # actually carry (a kind-9 annotation whose rate IS zero), so a
+            # renderer must not read absent and zero as the same thing.
+            #
+            # Added to the PRIMARY UV as `rate * per-effect-counter`: the
+            # shipped shader is `PixelTexCoord0 = c3_TexCoord0 +
+            # c3_UVAnimStep`. NOT a second UV set -- see
+            # `core/c3ccfl.KIND_UV_ANIM_STEP`.
+            "uvAnimStep": list(getattr(p, "uv_anim_step", ()) or ()),
             "frameCount": p.frame_count,
             "effectiveFrames": p.effective_frames,
             "alphaEnd": p.alpha_end,
@@ -689,6 +1032,63 @@ def sample_part(part: dict, frame: int) -> dict:
     return {"visible": visible, "alpha": alpha, "cell": cell, "uv": uv}
 
 
+def wall_counter(wall_ms, period_ms) -> Optional[int]:
+    r"""The kind-13 scroll counter: **`(wall_ms & 0xFFFFFFFF) // period_ms`**.
+
+    THE REFERENCE IMPLEMENTATION. `tools/webui/gl.js` and Route B's
+    `render.cpp` must produce this integer EXACTLY, and the parity gate
+    compares the INTEGER rather than the pixels -- two renderers can disagree
+    by a counter tick and both still look like a scrolling texture.
+
+    **WHAT THE CLIENT DOES.** CCFL kind 13 is an i32 period in ms at the CCFL
+    object's ``+0x6C``, and the client drives the PRECEDING mesh's scrolling
+    UVs as ``timeGetTime() / period`` -- an unsigned division of a DWORD.
+    `timeGetTime` counts milliseconds since system start, so that clock is
+    **absolute and shared by every effect on screen**, where `frame_at` is
+    per-instance and restarts when an effect spawns. Those are different
+    animations, not different constants, which is why this is a decision for
+    a renderer rather than a tuning value.
+
+    **THREE THINGS DECIDE PARITY, and each is a way two renderers disagree
+    while both look right:**
+
+    1. **`wall_ms` IS SUPPLIED, NEVER READ HERE.** Every consumer takes one
+       number from one place per frame. A renderer that calls its own clock
+       inside the draw loop disagrees with itself between two parts of one
+       effect, and with this gate always.
+    2. **THE MASK IS SEMANTIC, NOT HYGIENE.** The client divides a DWORD, so
+       the wrap at 2^32 is part of the answer rather than an artefact.
+       `Date.now()` is ~1.76e12 and Route B's clock has its own epoch; the
+       mask is what makes three different epochs agree on one integer. The
+       absolute PHASE is unknowable anyway -- the client's epoch is boot.
+    3. **MULTIPLY IN DOUBLE, NEVER IN FLOAT.** The counter reaches ~1.3e8
+       (2^32 / 33), so `counter * step` lands near 1e6 with the FRACTION --
+       the whole visible quantity -- in the low bits. A float32 multiply
+       throws that away and the two renderers diverge exactly where the
+       animation lives. The counter itself is safe in a JS double: 1.3e8 is
+       far under 2^53.
+
+    **AND THE STEP DELTAS MUST BE THE FLOAT READING.** What this multiplies is
+    ``+0x1B4``/``+0x1B8``, the mesh's ``STEP`` -- two dwords that ARE two f32.
+    `EffectPart.uv_step` reinterprets them; `PhyMesh.step` does not. A
+    renderer multiplying this counter by the RAW dwords gets a number near
+    1e9 where 0.01 was meant, and `_wrap11` folds it into noise that looks
+    like nothing in particular rather than like a bug. That is M8 in the
+    charter, and it sits one file away from every consumer that has it wrong.
+
+    Returns `None` when there is no kind 13 -- absent, `NO_PERIOD`, or
+    non-positive -- which means **use `frame_at`**. The default path is
+    unchanged and must stay byte-identical for every mesh without a kind 13;
+    that is the cheapest regression check this change has.
+    """
+    if period_ms is None:
+        return None
+    period = int(period_ms)
+    if period <= 0:
+        return None
+    return (int(math.floor(wall_ms)) & 0xFFFFFFFF) // period
+
+
 def _wrap11(v: float) -> float:
     import math
     while v > 1.1:
@@ -779,7 +1179,8 @@ def _xform(glm, p):
 #     M      = frame.matrix x world              premultiply, then transform
 #     p      = M * frame.position[i]             D3DXVec3TransformCoordArray
 #     s      = frame.size[i] * scale_of(M)       half-extent
-#     c      = int(frame.cellPhase[i] * N*N)     N = the atlas side, `texGrid`
+#     K      = atlasCols or N                   CCFL kind 3, 0 = square
+#     c      = int(frame.cellPhase[i] * K*N)     N = `texGrid` (ROWS)
 #     uv0    = (c % N / N, c // N / N)           cell size 1/N
 #
 # The one thing this file decides that graphic.dll does not hand over is WHICH
@@ -887,9 +1288,38 @@ def particle_quads(part: dict, frame: int, world, right, up) -> dict:
     fm = f.get("m") or GL_IDENTITY
     m = mat_mul_gl(list(world), list(fm))
     scale = particle_scale(m)
+    # ROWS and COLUMNS, and they are only equal when there is no kind 3.
     n = int(max(1, part.get("atlas") or 1))
-    cell = 1.0 / n
-    last = n * n - 1
+    k = int(part.get("atlasCols") or 0) or n
+    k = max(1, k)
+    cell_u, cell_v = 1.0 / k, 1.0 / n
+    last = k * n - 1
+    # CCFL KIND 10, AND IT IS A HYBRID: the offset pair is ADDED to the cell
+    # UV and the extent pair is MULTIPLIED into the cell SIZE. Traced end to
+    # end by the Director of RE in 7878/Env_DX9/graphic.dll --
+    # `docs/ccfl_kind10_consumer_2026-09-16.md`:
+    #
+    #   offset  0x14DCA9  fld [eax+0x5C]; fadd [esp+0xC0]   (and +0x60)
+    #   extent  0x14F554  fld [edi+0x64]; fmul [esp+0x14]   (and +0x68)
+    #
+    # and both sites load the annotation from `PTC3+0x6C` (0x14DC9B, 0x14F4AD),
+    # which is what makes them provably the same record the reader populated
+    # rather than a coincidental same-layout struct.
+    #
+    # **I ENUMERATED THREE READINGS AND THE ANSWER WAS A FOURTH.** REPLACE,
+    # MULTIPLY-into-cell and OFFSET-within-cell were the candidates; the truth
+    # takes the origin from one and the size from another. Enumerating the
+    # candidates is itself a guess, and a gate asserting "one of these three"
+    # would have been wrong in a way running it could never have shown.
+    #
+    # The engine gates this on a flag at +0x58 that the reader SETS whenever a
+    # type-10 entry exists, and a clear flag draws the UNMODIFIED cell rect --
+    # still drawn, not dormant. An absent `uvRect` here is exactly that case.
+    rect = part.get("uvRect") or ()
+    off_u, off_v = (float(rect[0]), float(rect[1])) if len(rect) == 4 else (0.0, 0.0)
+    if len(rect) == 4:
+        cell_u *= float(rect[2])
+        cell_v *= float(rect[3])
     sa = part.get("systemAlpha") or []
     if sa:
         out["alpha"] = float(sa[min(int(frame), len(sa) - 1)])
@@ -905,14 +1335,19 @@ def particle_quads(part: dict, frame: int, world, right, up) -> dict:
         s = float(sizes[i]) * scale
         # int() truncates exactly as `Particle.cell` does; the clamp is for a
         # phase of exactly 1.0, which would index one cell past the atlas.
-        c = min(int(float(cells[i]) * n * n), last)
-        u0, v0 = (c % n) * cell, (c // n) * cell
+        c = min(int(float(cells[i]) * k * n), last)
+        # The cell ORIGIN uses the unscaled cell pitch; only the SIZE is
+        # scaled by the extent. Scaling the origin too would move every cell
+        # but the first, which is the mistake the fixture's non-multiple
+        # values were chosen to expose.
+        u0 = (c % k) / k + off_u
+        v0 = (c // k) / n + off_v
         for (dr, du, cu, cv) in _QUAD:
             vpos.append(px + right[0] * dr * s + up[0] * du * s)
             vpos.append(py + right[1] * dr * s + up[1] * du * s)
             vpos.append(pz + right[2] * dr * s + up[2] * du * s)
-            vuv.append(u0 + cu * cell)
-            vuv.append(v0 + cv * cell)
+            vuv.append(u0 + cu * cell_u)
+            vuv.append(v0 + cv * cell_v)
     out["n"] = count
     out["pos"] = vpos
     out["uv"] = vuv
@@ -1008,7 +1443,8 @@ def _cli(argv) -> int:
                     print(f"     ptcl  {p['name']:<10} gen {p['generation']}  "
                           f"frames {p['frameCount']}  peak {p['peakParticles']}"
                           f"/{p['maxParticles']}  atlas "
-                          f"{p['atlas']}x{p['atlas']}")
+                          f"{p.get('atlasCols') or p['atlas']}x{p['atlas']}"
+                          + ("  (CCFL kind 3)" if p.get("atlasCols") else ""))
                 else:
                     print(f"     {p['kind']} {p['name']} ({p['rawSize']} bytes, not decoded)")
         return 0

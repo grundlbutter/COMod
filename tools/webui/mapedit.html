@@ -13,6 +13,11 @@
 
 <header>
   <h1>Map Editor</h1>
+  <label id="path-label" class="hidden"
+         title="What this page is drawing from — an installed client, a private server's own client, or your COmmunity Library Collection. The parser plugin follows the path, so tables, id conventions and linkages all change with it.">
+    Path
+    <select id="path-select"></select>
+  </label>
   <div id="statusline" class="mut">starting…</div>
   <div class="spacer"></div>
   <!-- Going anywhere is the site bar's job (nav.js) and staging is its
@@ -25,15 +30,30 @@
   <!-- ------------------------------------------------ left: maps + layers -->
   <aside id="left">
     <div class="pane">
-      <label>Map</label>
-      <input id="map-search" type="search" placeholder="map name or DocumentId…">
-      <div id="map-list" class="list" tabindex="0"></div>
-      <div id="map-more" class="mut small"></div>
+      <!-- Each rail section collapses on its own header. The rail fills up
+           on a map with many layers -- `star10` has 19 -- and the View
+           controls were being pushed off the bottom on exactly the maps
+           where the layer list is most worth reading. `railSections()` in
+           mapedit.js binds these and remembers each one. -->
+      <div class="railsec" data-rail="maps">
+        <label class="railhead">Map</label>
+        <div class="railbody">
+          <input id="map-search" type="search" placeholder="map name or DocumentId…">
+          <div id="map-list" class="list" tabindex="0"></div>
+          <div id="map-more" class="mut small"></div>
+        </div>
+      </div>
 
-      <label style="margin-top:6px">Layers</label>
-      <div id="layers" class="layerbox"></div>
+      <div class="railsec" data-rail="layers">
+        <label class="railhead">Layers</label>
+        <div class="railbody">
+          <div id="layers" class="layerbox"></div>
+        </div>
+      </div>
 
-      <label style="margin-top:6px">View</label>
+      <div class="railsec" data-rail="view">
+        <label class="railhead">View</label>
+        <div class="railbody">
       <div class="zoomrow">
         <button id="btn-zoom-out" class="ghost tiny" title="Zoom out (−)">−</button>
         <span class="z" id="zoom-label">—</span>
@@ -44,6 +64,8 @@
         drag to pan · wheel to zoom · click to inspect · <b>F</b> fit · <b>P</b> passability
       </div>
       <button id="btn-shot" class="ghost tiny">Save PNG</button>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -88,6 +110,25 @@
     <section class="card" id="card-pass" data-card="mapedit-pass">
       <h2>Passability — integrity-checked</h2>
       <div id="pass-body" class="cardbody mut"></div>
+    </section>
+
+    <!--
+      THE COVER PALETTE. The owner's third ask: use collected assets in the
+      editor. It is a peer of the Passability card and carries the same
+      warning for the same reason -- both write map/map/*.DMap, which
+      integrity.json lists.
+
+      NOTHING IS HIDDEN FROM THIS LIST. A cover the open map cannot take is
+      shown struck through with the reason attached, because the alternative
+      is a user seeing art on the Map Assets page, not finding it here, and
+      having nothing to explain the difference. The honest explanation is one
+      sentence and worth reading: a cover's key is resolved through an index
+      the map loads, and a map that loads no resolving index produces a valid
+      record the client draws nothing from.
+    -->
+    <section class="card" id="card-covers" data-card="mapedit-covers">
+      <h2>Covers — integrity-checked</h2>
+      <div id="covers-body" class="cardbody mut">nothing loaded</div>
     </section>
 
     <section class="card" id="card-editable" data-card="mapedit-editable">
@@ -146,7 +187,16 @@
 <script src="/ui/cards.js"></script>
 <script src="/ui/mapmodel.js"></script>
 <script src="/ui/tilebake.js"></script>
+<script src="/ui/fx.js"></script>
+<script src="/ui/mapfx.js"></script>
+<script src="/ui/mapcovers.js"></script>
 <script src="/ui/mapedit.js"></script>
+<!-- The active-path control, the same file index.html, builder.html and
+     models.html load. It needs only `#path-label` / `#path-select` in the
+     header above; it uses this page's `api()` and `toast()` and falls
+     back to plain fetch where a page has neither. Loaded LAST so the
+     page is already wired when the switch reloads it. -->
+<script src="/ui/basepicker.js"></script>
 <script src="/ui/pageshot.js"></script>
 </body>
 </html>

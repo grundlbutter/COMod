@@ -769,6 +769,8 @@ CENSUSED = {
          "positional rows: label is a column, not a key", 52),
         ("neigonginfo", "NeiGongInfo.ini", "ini-sections", "Name",
          "Name on 90% of 10 sections", 116),
+        ("operateactivity", "OperateActivity.ini", "ini-sections", "Title",
+         "Title on 97% of 38 sections", 306),
         ("operateweb", "OperateWeb.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 5 sections; commonest keys id(4), BGTitle(4), AniSection(4)", 22),
         ("pkvisiblecontrol", "PKVisibleControl.ini", "single-column", None,
@@ -1033,6 +1035,8 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 200 sections; commonest keys Type(199), Num(199), Item1(199)", 1274),
         ("noviceguide", "NoviceGuide.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 24 sections; commonest keys ActivityID(23), BgAmount(23), BgAni1(23)", 108),
+        ("operateactivity", "OperateActivity.ini", "ini-sections", "Title",
+         "Title on 99% of 79 sections", 661),
         ("operateweb", "OperateWeb.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 5 sections; commonest keys id(4), BGTitle(4), NewBGTitle(4)", 30),
         ("pkvisiblecontrol", "PKVisibleControl.ini", "single-column", None,
@@ -1073,6 +1077,10 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 20 sections; commonest keys x(20), y(20), w(20)", 140),
         ("terrian", "Terrian.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 1 sections; commonest keys ÃèÊö(1), ±êÖ¾(1)", 3),
+        ("texaschatgui", "TexasChatGUI.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 13 sections; commonest keys x(13), y(13), w(13)", 139),
+        ("texaschatgui800x600", "TexasChatGUI800X600.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 4 sections; commonest keys x(4), y(4), w(4)", 140),
         ("texasholdem", "TexasHoldEm.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 281 sections; commonest keys TotalSeats(280), TheSysdealerLook(280), ChairOffset1(280)", 3806),
         ("title", "Title.ini", "ini-sections", "title",
@@ -1219,6 +1227,8 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 45 sections; commonest keys AdditiveSize(44), Jump(44), Look(44)", 266),
         ("appqdkey", "Appqdkey.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 1 sections; commonest keys values(1)", 2),
+        ("ar_res", "Ar_Res.ini", "flat-keys", None,
+         "flat map: the VALUE is the label", 90),
         ("bindaccountgui", "BindAccountGUI.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 34 sections; commonest keys x(34), y(34), w(34)", 204),
         ("chatgui", "CHATGUI.ini", "ini-sections", None,
@@ -1229,6 +1239,8 @@ CENSUSED = {
          "bare list: no label exists to show", 1),
         ("chattips", "ChatTips.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 71 sections; commonest keys mete(71), profession(71), sex(71); has a key=value preamble before the first header", 570),
+        ("cn_res", "Cn_Res.ini", "flat-keys", None,
+         "flat map: the VALUE is the label", 37840),
         ("common", "Common.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 10 sections; commonest keys 3DMotionLife(3), 3DTextureLife(3), 3DEffectLife(3)", 118),
         ("compatible", "Compatible.ini", "ini-sections", None,
@@ -1317,6 +1329,8 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 96 sections; commonest keys ActivityID(95), BgAmount(95), BgAni1(95)", 510),
         ("npcx", "NpcX.ini", "ini-sections", "Name",
          "Name on 100% of 1320 sections", 35620),
+        ("operateactivity", "OperateActivity.ini", "ini-sections", "Title",
+         "Title on 99% of 71 sections", 626),
         ("operateweb", "OperateWeb.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 25 sections; commonest keys id(24), BGTitle(24), NewBGTitle(24)", 170),
         ("operateweben", "OperateWeben.ini", "ini-sections", None,
@@ -1337,6 +1351,8 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 3 sections; commonest keys BtnText(2), WebImage(2), Param(2)", 12),
         ("questinfo", "Questinfo.ini", "ini-sections", "Name",
          "Name on 99% of 2175 sections", 60945),
+        ("questinfopassionserver", "QuestinfoPassionServer.ini", "ini-sections", "Name",
+         "Name on 100% of 931 sections", 23249),
         ("raiderconfig", "RaiderConfig.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 10 sections; commonest keys Type2(2), Type3(2), Type4(2)", 111),
         ("raiderholdem", "RaiderHoldEm.ini", "ini-sections", None,
@@ -1345,6 +1361,8 @@ CENSUSED = {
          "no label key: none of Name/name/NAME/Title fills 90% of 2 sections; commonest keys Count(2), Part0(1), MeshIni0(1)", 98),
         ("runedesc", "RuneDesc.ini", "ini-sections", "Desc",
          "Desc on 100% of 1447 sections", 2952),
+        ("server_cn_res", "Server_Cn_Res.ini", "flat-keys", None,
+         "flat map: the VALUE is the label", 58327),
         ("slotmachine", "SlotMachine.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 5 sections; commonest keys Name(4), Data(4), DragonPearlOdds1(4)", 44),
         ("slotnpc", "SlotNpc.ini", "ini-sections", None,
@@ -1366,9 +1384,15 @@ CENSUSED = {
         ("teampkfinaleffect", "TeamPKFinalEffect.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 20 sections; commonest keys x(20), y(20), w(20)", 140),
         ("terrian", "Terrian.ini", "ini-sections", None,
-         "no label key: none of Name/name/NAME/Title fills 90% of 1 sections; commonest keys ÃèÊö(1), ±êÖ¾(1)", 3),
+         "no label key: none of Name/name/NAME/Title fills 90% of 1 sections; commonest keys 描述(1), 标志(1)", 3),
+        ("texaschatgui", "TexasChatGUI.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 37 sections; commonest keys x(37), y(37), w(37)", 304),
+        ("texaschatgui800x600", "TexasChatGUI800X600.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 37 sections; commonest keys x(37), y(37), w(37)", 309),
         ("texasholdem", "TexasHoldEm.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 1069 sections; commonest keys TotalSeats(1068), TheSysdealerLook(1068), ChairOffset1(1068)", 14628),
+        ("title", "Title.ini", "ini-sections", "title",
+         "title on 93% of 15 sections", 102),
         ("trainingvitality", "TrainingVitality.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 9 sections; commonest keys Amount(4), OpenLimit0(1), OpenLimit1(1)", 107),
         ("transform", "TransForm.ini", "ini-sections", None,
@@ -1397,6 +1421,8 @@ CENSUSED = {
          "positional rows: label is a column, not a key", 21),
         ("weaponskillname", "WeaponSkillName.ini", "csv-rows", None,
          "positional rows: label is a column, not a key", 67),
+        ("wraptypedata", "WrapTypeData.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 760 sections; commonest keys WrapType(739), WrapID(737), ItemType(737)", 3746),
         ("armet", "armet.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 1168 sections; commonest keys Part(1168), Mesh0(1168), Texture0(1168)", 10512),
         ("armor", "armor.ini", "ini-sections", None,
@@ -1440,7 +1466,7 @@ CENSUSED = {
         ("nameres", "nameRes.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 4 sections; commonest keys host(4), port(4)", 13),
         ("npc", "npc.ini", "ini-sections", "Name",
-         "Name on 100% of 4084 sections", 51767),
+         "Name on 99% of 4084 sections", 51767),
         ("npcex", "npcex.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 7 sections; commonest keys Amount(7), Var0(7), Look0(7)", 70),
         ("numres", "numRes.ini", "ini-sections", None,
@@ -1472,7 +1498,7 @@ CENSUSED = {
         ("task_reward_type", "task_reward_type.ini", "space-rows", None,
          "positional rows: label is a column, not a key", 6),
         ("terrainnpc", "terrainnpc.ini", "ini-sections", "Name",
-         "Name on 100% of 183 sections", 1691),
+         "Name on 99% of 183 sections", 1691),
         ("totempole", "totempole.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 4 sections; commonest keys 1(3), 2(3), 3(2)", 28),
         ("tqgpt", "tqgpt.ini", "single-column", None,
@@ -1625,6 +1651,10 @@ CENSUSED = {
          "title on 100% of 70 sections", 1070),
         ("teammemberstatus", "TeamMemberStatus.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 8 sections; commonest keys icon(8)", 16),
+        ("texaschatgui", "TexasChatGUI.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 13 sections; commonest keys x(13), y(13), w(13)", 139),
+        ("texaschatgui800x600", "TexasChatGUI800X600.ini", "ini-sections", None,
+         "no label key: none of Name/name/NAME/Title fills 90% of 4 sections; commonest keys x(4), y(4), w(4)", 140),
         ("texasholdem", "TexasHoldEm.ini", "ini-sections", None,
          "no label key: none of Name/name/NAME/Title fills 90% of 281 sections; commonest keys TotalSeats(280), TheSysdealerLook(280), ChairOffset1(280)", 3806),
         ("title-empty", "Title-Empty.ini", "ini-sections", None,
@@ -1706,9 +1736,17 @@ CENSUSED = {
 
 
 def specs_for(plugin_name: str) -> tuple:
-    """The censused `TableSpec`s for one plugin, or an empty tuple."""
+    """The censused `TableSpec`s for one plugin, or an empty tuple.
+
+    **Every spec carries `generated=True`, and that flag is what makes the
+    generator idempotent.** Without it `gen_ini_specs.collect()` cannot tell
+    its own previous output from a hand-written spec, sees all 820 subjects as
+    already declared, and emits nothing -- so `--write` blanks the file it
+    wrote. See `TableSpec.generated`.
+    """
     return tuple(
-        TableSpec(subject, filename, _K[kind], "plaintext", label_key=label)
+        TableSpec(subject, filename, _K[kind], "plaintext", label_key=label,
+                  generated=True)
         for subject, filename, kind, label, _note, _lines
         in CENSUSED.get(plugin_name, ()))
 

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Asset Viewer — build diff</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/builddiff.css">
+</head>
+<body data-co-page="builddiff">
+
+<!-- Routed at `coviewer.py` (`/builddiff`) since it was written, in the bar
+     nowhere and linked from nowhere: reachable only by typing the URL, and
+     once here there was no way out but the back button. `nav.js` maps it
+     UNDER `settings`, so the bar lights the section it belongs to rather
+     than lighting nothing -- which reads as broken. -->
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
+
+<header>
+  <h1>Build diff</h1>
+  <div class="mut" id="sub">what changed between one client build and the next</div>
+</header>
+
+<main class="bd-main">
+
+<p class="bd-note" id="ranking-note">
+  <b>Sorted by build order, not by event count.</b> The largest step in this
+  corpus by raw events is a <i>repackaging</i> — the same content moved between
+  archives — and sorting by total would put it above the biggest real content
+  drop. Steps where <code>moved</code> exceeds <code>added</code> are marked.
+</p>
+
+<div id="unavailable" class="bd-refuse" hidden>
+  <b>No change dictionary on this box.</b>
+  <span id="why"></span>
+  This page reads <code>&lt;assets&gt;/derived/patchdict/</code> and never
+  re-scans an install, so there is nothing for it to fall back to.
+</div>
+
+<div class="bd-grid">
+  <section>
+    <h2>Steps</h2>
+    <table class="bd" id="steps">
+      <thead><tr>
+        <th>step</th><th class="n">events</th><th class="n">added</th>
+        <th class="n">moved</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2 id="evh">Events</h2>
+    <div class="bd-controls">
+      <label>kind
+        <select id="kind">
+          <option value="">all</option>
+          <option value="added">added</option>
+          <option value="changed">changed</option>
+          <option value="removed">removed</option>
+          <option value="moved">moved</option>
+        </select>
+      </label>
+      <label>section
+        <select id="section">
+          <option value="">all</option>
+          <option value="archive">archive</option>
+          <option value="file">file</option>
+          <option value="maps">maps</option>
+        </select>
+      </label>
+      <button id="prev" type="button">‹ prev</button>
+      <button id="next" type="button">next ›</button>
+      <span class="mut" id="page"></span>
+    </div>
+    <table class="bd" id="events">
+      <thead><tr>
+        <th>name</th><th>section</th><th>kind</th><th>container</th>
+        <th class="n">size</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="mut" id="empty" hidden>Pick a step on the left.</p>
+  </section>
+</div>
+</main>
+
+<script src="/ui/builddiff.js"></script>
+</body>
+</html>

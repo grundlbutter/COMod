@@ -374,6 +374,32 @@ WDF_RECOVER_MEASUREMENTS: dict = {
                           notpi_seconds=571),
     "Clients/6090":  dict(dirs=2803,  files=54217,  gb=2.62, scrape_gb=1.80,
                           ns_dirs=9274, candidates=247_315_820, seconds=None),
+    # files=110,526 is KNOWN to disagree with the live tree by +2, and the gap
+    # is EVIDENCE, not staleness: Clients/6609 was launched IN PLACE on
+    # 2026-08-31 15:15 (client debug log debug/2026_8_31.log + ini/GameSetup.Ini,
+    # both written two days AFTER the 2026-08-29 17:39 bulk lay-down; the debug
+    # log carries the game client's own C++ class names and its compiled-in
+    # build path -- named in the 2026-09-11 mail thread, NOT quoted here:
+    # that path is vendor source material recovered from the client's
+    # asserts, and check 4 refuses it in an extractable file. The evidence
+    # does not need the string; its existence and date are the finding).
+    #
+    # OWNER ANSWERED 2026-09-14, AND THE ANSWER IS WIDER THAN THIS ENTRY.
+    # The launch was theirs. And the ruling they gave with it RETIRES THE
+    # PREMISE THIS NOTE WAS WRITTEN ON: the clients under Clients/ are local,
+    # uncommitted and PURPOSE-BUILT FOR OUR USES, so minor changes to their
+    # folders DO NOT MATTER. They are working directories, not pristine
+    # controls, and nothing should treat them as pristine. If a bug report ever
+    # needs a pristine client, the answer is to get one -- not to defend these.
+    #
+    # WHAT THAT CHANGES, AND WHAT IT DOES NOT.  files=110,526 STAYS as written
+    # and is still +2 below the live tree; the number is a record of what was
+    # measured on 2026-08-29, not a claim that the tree is frozen at it. Do not
+    # re-record it to chase the tree -- a working directory drifts, so chasing
+    # it is endless and each re-record silences the only instrument that would
+    # notice a change nobody expected. Read a mismatch here as "the folder was
+    # used", which is now ORDINARY, and only look further if something else is
+    # also wrong. Filed 2026-09-11 by GM + SD; ruling recorded 2026-09-14 by SD.
     "Clients/6609":  dict(dirs=5457,  files=110526, gb=4.40, scrape_gb=3.51,
                           ns_dirs=9940, candidates=255_394_871, seconds=None,
                           notpi_dirs=5710, notpi_candidates=139_024_562,
@@ -586,6 +612,18 @@ DERIVED = [
 ]
 
 WDF_RECOVER_REL = DERIVED[0][0]
+
+#: The artefacts whose builders read `c3.wdf`/`data.wdf` AND NOTHING ELSE, so
+#: an install shipping neither cannot produce them -- and must not be told it
+#: failed to.  `wdf_names.py` returns 0 without writing in that case, on
+#: purpose (its table is `coroot.GLOBAL`, and a zero-entry rewrite would cost
+#: every other client its recovered names), and bootstrap read "exited 0,
+#: artefact absent" as LANDED WRONG: measured on Zephyr 2026-09-18, exit 4
+#: after 0.6 s, which skipped the FOUR later artefacts and left the thumbnail
+#: work list empty.  Zephyr's assets are in `c3.tpi`/`data.tpi`, which declare
+#: their own paths and need no recovery at all -- see
+#: `coassets.AssetRoot.container_names`.
+NEEDS_WDF_ARCHIVE = (WDF_RECOVER_REL, "out/dll/wdf_name_recovery.json")
 
 #: **Ticked by default in the Settings page's artefact list, when they are not
 #: already built.** Five of the six.
@@ -1744,7 +1782,10 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
     several lines arrive inside one window only the newest is shown.  That is
     right for progress lines, which supersede each other, and it does drop
     record lines a full log would keep -- run the builder directly (the
-    report prints the command) if you want all of it.
+    report prints the command) if you want all of it.  The one line that is
+    never dropped is the LAST: when the child exits, whatever it said most
+    recently is painted whether or not a tick is due.  The exit is an event
+    the display answers; the heartbeat is only the clock between events.
 
     Returns `(returncode, tail)`; the tail is the last 40 lines, so a failure
     can print evidence instead of only telling you to re-run it.
@@ -1755,7 +1796,7 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
 
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, errors="replace")
+        text=True, bufsize=1, errors="backslashreplace")
     lines: "queue.Queue[str]" = queue.Queue()
 
     def pump() -> None:
@@ -1784,6 +1825,7 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
     t0 = time.time()
     last, tail, width, tick, shown = "", [], 0, 0, 0.0
     last_at = t0
+    painted = None                  # the `last` most recently put on screen
     while True:
         # Read liveness BEFORE draining: if the pump has finished, everything
         # it ever queued is already visible to this drain.
@@ -1797,7 +1839,18 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
             tail.append(last)
             del tail[:-40]
         now = time.time()
-        if now - shown >= period:
+        # Two reasons to paint. The CLOCK: a tick is due. The EVENT: the
+        # child has exited and its newest line is not the one on screen.
+        # Without the second, the final line is dropped whenever the child
+        # exits inside the period after a tick -- it is drained into `tail`
+        # on the same pass that sees the child dead, and the clock says "not
+        # yet". MEASURED in the gate suite, five kept FAIL logs on four
+        # trees: `tail` held all of scan 1/3, 2/3, 3/3; the screen showed
+        # `scan 2/3` three times and `scan 3/3` never. A progress display
+        # whose last state is missing reads as a builder that died
+        # mid-phase. Content is compared, not a flag: an exit after a line
+        # the screen already shows has nothing to add.
+        if now - shown >= period or (not alive and last != painted):
             tick += 1
             spin = "|/-\\"[tick % 4] + "  " if tty else ""
             # A phase the builder has not spoken from in a while is exactly
@@ -1814,6 +1867,7 @@ def _run_relaying(cmd, cwd, indent: str = "        ") -> tuple[int, list[str]]:
                 sys.stdout.write(status + "\n")
             sys.stdout.flush()
             shown = now
+            painted = last
         if not alive:
             break
         time.sleep(0.1)
@@ -1888,6 +1942,23 @@ def bootstrap(only_missing: bool = True, root=None, *,
     absent = [(rel, argv, cost) for rel, argv, cost in todo
               if not (REPO / argv[0]).is_file()]
     todo = [x for x in todo if x not in absent]
+    # NOTHING TO RECOVER IS NOT WORK. `wdf_recover` recovers names for the
+    # entries of `c3.wdf` / `data.wdf`; an install without them has no
+    # unresolved names, so the builder scans the corpus and finds nothing to
+    # match. `wdf_recover_estimate` has said so all along ("wdf_recover would
+    # open nothing and find nothing"), and `bootstrap` ran it anyway: on
+    # 7878 that was 45 minutes of scanning followed by a ZeroDivisionError
+    # printing "0/0" (2026-09-18, the owner's fresh-run matrix).
+    no_archive = []
+    if root is not None:
+        arcs = [a for a in ("c3.wdf", "data.wdf") if (root / a).is_file()]
+        if not arcs:
+            no_archive = [x for x in todo if x[0] in NEEDS_WDF_ARCHIVE]
+            todo = [x for x in todo if x not in no_archive]
+    for rel, _argv, _cost in no_archive:
+        print(f"  nothing to recover: {rel}")
+        print(f"        {root.name} has no c3.wdf/data.wdf, so there are no "
+              f"archive entries whose names need recovering.")
     for rel, argv, _cost in absent:
         have = coroot.derived_override(rel)
         if have:
@@ -2091,7 +2162,46 @@ def _thumbnail_corpus_uncached(root) -> dict:
                       f"be about this client.")
         return out
     pooled, names_loaded = meshtex.pooled_names()
-    universe = census["paths"] | pooled
+    # The paths this install's own CONTAINERS declare. `install_census` is a
+    # pure `os.scandir` walk -- it counts `.wdf` by SIZE and never opens one --
+    # so without this the cheap side is loose+pooled while
+    # `thumbs.texture_universe` (which constructs the index) also sees every
+    # name a `.tpd`/`.tpi` stores. MEASURED 2026-09-18 with the declared half
+    # on the index side only: Zephyr's estimate said 31,165 textures for a job
+    # of 110,575, a 79,410 shortfall, and 7878 declares 146,196 paths of which
+    # 105,789 are in neither the loose tree nor the recovered pool. An
+    # estimate that is not counting the job that will run is the defect this
+    # whole function exists to remove, one container-kind down.
+    #
+    # COST, on a 1.5 s poll: the `.tpi` index parse, 137.6 ms for c3.tpi and
+    # 212.1 ms for data.tpi by `coassets`' own measurements, and NOTHING for
+    # the seven WDF-only clients, which open no container and get an empty
+    # set. Cached with the rest of this function's answer.
+    import coassets                                 # noqa: PLC0415
+    declared: set = set()
+    # Pooled names this install's archives DO hold. The pool is GLOBAL, so
+    # the rest belong to somebody else's client and `thumbs.texture_universe`
+    # no longer queues them; an estimate that counted them would be quoting a
+    # job that will not run, which is the defect this function exists to
+    # remove. Affordable because the check skips `locate`'s loose-file stat:
+    # 0.01 ms per name against 0.32 ms, measured on 5017.
+    confirmed_pooled: set = set()
+    try:
+        ar = coassets.AssetRoot(Path(root))
+        try:
+            declared = ar.container_names()
+            local = census["paths"] | declared
+            confirmed_pooled = {p for p in pooled
+                                if p in local or ar.in_archives(p)}
+        finally:
+            ar.close()
+    except Exception:                                   # noqa: BLE001
+        # A root the reader refuses is still a root the census counted. Fall
+        # back to the whole pool rather than to NOTHING: over-reporting the
+        # estimate is a worse number, under-reporting it is a wrong one.
+        declared = set()
+        confirmed_pooled = pooled
+    universe = census["paths"] | declared | confirmed_pooled
     out["textures"] = sum(1 for p in universe if p.endswith(".dds"))
     for p in universe:
         if p.endswith(".dds"):
@@ -2330,12 +2440,8 @@ def thumbnail_state(server: str = "", root=None, paths=None) -> dict:
     """
     import thumbs                                   # noqa: PLC0415
 
-    if server:
-        out_dir = thumbs.REPO / "out" / "thumbs" / "servers" / server
-        manifest = out_dir / "manifest.json"
-    else:
-        out_dir = coroot.derived_path("out/thumbs", root)
-        manifest = out_dir / "manifest.json"
+    out_dir = coroot.thumbs_dir(root, server or "")
+    manifest = out_dir / "manifest.json"
     state: dict = {
         "dir": str(out_dir),
         "exists": out_dir.is_dir(),
@@ -2343,9 +2449,29 @@ def thumbnail_state(server: str = "", root=None, paths=None) -> dict:
         "meshes": 0, "textures": 0, "bytes": 0,
         "generated": None,
     }
-    if manifest.is_file():
+    # THE SAME READ-ONLY BRIDGE THE VIEWER USES (`unify.UnifiedIndex.thumbs`).
+    # Thumbnails moved to one shared folder (`coroot.thumbs_dir`), so a
+    # checkout whose renders sit in its OLD `out/thumbs` keeps SHOWING them
+    # while the shared folder is empty. This function did not know that and
+    # reported "none generated" over a grid full of thumbnails, which put the
+    # "generate?" prompt in front of a person who already had them (owner's
+    # 8731 viewer, 2026-09-16). The counts now describe what is shown;
+    # `dir` stays where a generation run WRITES, and `legacy` says where the
+    # shown set lives and that a run would start fresh.
+    read_from = manifest
+    if not manifest.is_file() and not server:
+        old = coroot.find_derived("out/thumbs/manifest.json", root)
+        if old is not None and old.is_file() and old != manifest:
+            read_from = old
+            state["legacy"] = {
+                "dir": str(old.parent), "manifest": str(old),
+                "note": ("shown from an older per-checkout thumbnail folder; "
+                         "the shared folder is empty, so the next generation "
+                         "run renders everything once into " + str(out_dir)),
+            }
+    if read_from.is_file():
         try:
-            doc = json.loads(manifest.read_text("utf-8"))
+            doc = json.loads(read_from.read_text("utf-8"))
             counts = doc.get("counts") or {}
             state.update({
                 "meshes": int(counts.get("meshes", 0) or 0),
@@ -2674,135 +2800,180 @@ def derived_problem(der, suppressed):
     }
 
 
+def meshes_only_problem(th: dict) -> dict:
+    """The info line for a `meshes-only` thumbnail state."""
+    # "meshes-only" means the MESH half is at least 95% done and the
+    # texture half is not. It does not mean there are no texture
+    # thumbnails: the owner's 7878 viewer (2026-09-16) had 134,857 of
+    # them and this line said "texture thumbnails are not" present. A
+    # partial set is reported as partial, with its count.
+    have_t = int(th.get("textures") or 0)
+    full_t = int((th.get("corpus") or {}).get("textures") or 0)
+    if have_t == 0:
+        tex = "texture thumbnails are not"
+    elif full_t > 0:
+        tex = (f"texture thumbnails are partial ({have_t:,} of "
+               f"{full_t:,})")
+    else:
+        tex = f"texture thumbnails are partial ({have_t:,})"
+    return {
+        "severity": "info",
+        "what": f"Mesh thumbnails are present; {tex}.",
+        "fix": "py -3 tools/thumbs.py --textures --resume"}
+
+
 def collect(explicit=None, *, with_thumbnails: bool = True) -> dict:
-    inst = check_install(explicit)
-    # Ask about the install that was actually RESOLVED, not the one that was
-    # requested: a rejected override would otherwise key the whole per-base
-    # half of this report to a root nothing is reading.
-    resolved = Path(inst["path"]) if inst.get("found") and inst.get("path")         else None
-    rep: dict = {
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "repo": str(REPO),
-        "platform": f"{platform.system()} {platform.release()}",
-        "install": inst,
-        "python": check_python(),
-        "packages": check_packages(),
-        "derived": check_derived(resolved),
-        "provenance": check_provenance(explicit),
-        "localServer": check_local_server(),
-        # Which index namespace this report is about. Two clients' reports are
-        # otherwise indistinguishable, which is what made the missing index
-        # invisible.
-        "baseId": _base_id_safe(resolved),
-    }
-    if with_thumbnails:
-        try:
-            # `explicit`, not the configured root: the rest of this report is
-            # about that install, and the thumbnail block would otherwise
-            # describe a different one.
-            rep["thumbnails"] = thumbnail_state(root=explicit)
-        except Exception as e:                       # pragma: no cover
-            rep["thumbnails"] = {"status": "unknown", "ok": False,
-                                 "error": f"{type(e).__name__}: {e}"}
+    """The whole report. **Fingerprints are memoised for its duration.**
 
-    problems = []
-    for t in rep["install"].get("rejectedOverrides", []):
-        problems.append({
-            "severity": "warning",
-            "what": f"The install root configured via {t['source']} "
-                    f"({t['path']}) was rejected: {t['verdict']}."
-                    + (" Auto-detection was used instead."
-                       if rep["install"]["ok"] else ""),
-            "fix": "Correct it, or clear it with "
-                   "`py -3 core/coroot.py --forget`."})
-    if not rep["install"]["ok"]:
-        problems.append({"severity": "error",
-                         "what": "The game install was not found (or is "
-                                 "incomplete).",
-                         "fix": rep["install"].get("fix", "")})
-    if not rep["python"]["ok"]:
-        problems.append({"severity": "error",
-                         "what": f"Python {rep['python']['value']} is older "
-                                 f"than {MIN_PYTHON[0]}.{MIN_PYTHON[1]}.",
-                         "fix": rep["python"]["fix"]})
-    for p in rep["packages"]:
-        if not p["present"]:
+    This is a READ-ONLY report and nothing inside it writes to an install, so
+    it can make the promise `coroot.stable_fingerprints()` asks for. It takes
+    4-15 `base_fingerprint` calls of one unchanging install -- `check_derived`
+    4, `check_provenance` 10 -- at 28-135 ms each, and `firstrun.js` polls it
+    every 1.5 s while a job runs.
+
+    MEASURED on the configured install: 0.86 s with 15 hash passes, against
+    31.8 ms for the first fingerprint and 0.277 ms for each one after.
+    """
+    # The scope wraps the whole body rather than delegating to a
+    # `_collect` helper: `tests/test_health_thumbs.py` reads this
+    # function's SOURCE to prove the report line comes from
+    # `meshes_only_problem` and not a copy, and a thin wrapper moved
+    # the body out of what that test can see. Splitting the function
+    # broke the instrument, not the subject, so the function stays
+    # whole.
+    with coroot.stable_fingerprints():
+        inst = check_install(explicit)
+        # Ask about the install that was actually RESOLVED, not the one that was
+        # requested: a rejected override would otherwise key the whole per-base
+        # half of this report to a root nothing is reading.
+        resolved = Path(inst["path"]) if inst.get("found") and inst.get("path")         else None
+        rep: dict = {
+            "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "repo": str(REPO),
+            "platform": f"{platform.system()} {platform.release()}",
+            "install": inst,
+            "python": check_python(),
+            "packages": check_packages(),
+            "derived": check_derived(resolved),
+            "provenance": check_provenance(explicit),
+            "localServer": check_local_server(),
+            # Which index namespace this report is about. Two clients' reports are
+            # otherwise indistinguishable, which is what made the missing index
+            # invisible.
+            "baseId": _base_id_safe(resolved),
+        }
+        if with_thumbnails:
+            try:
+                # `explicit`, not the configured root: the rest of this report is
+                # about that install, and the thumbnail block would otherwise
+                # describe a different one.
+                rep["thumbnails"] = thumbnail_state(root=explicit)
+            except Exception as e:                       # pragma: no cover
+                rep["thumbnails"] = {"status": "unknown", "ok": False,
+                                     "error": f"{type(e).__name__}: {e}"}
+
+        problems = []
+        for t in rep["install"].get("rejectedOverrides", []):
             problems.append({
-                "severity": "error" if p["required"] else "warning",
-                "what": f"{p['name']} is not installed -- {p['why']}",
-                "fix": p["fix"]})
-    der = rep["derived"]
-    if not der["ok"]:
-        problems.append(derived_problem(der, _derived_suppression()))
-    # Called out separately from the count above, because this one has a
-    # symptom the user will otherwise blame on the viewer: without it the
-    # mesh<->texture relation is rebuilt in-process on every open of this
-    # client, and that is 32-56 s during which the lists cannot collapse a
-    # mesh and its skins into one row. MEASURED on 7878 (37,856 meshes);
-    # 6090, which has the file, loads it in 1.6 s.
-    if "out/meshtex/coverage.json" in (der.get("missing") or []):
-        problems.append({
-            "severity": "warning",
-            "what": "This client has no mesh<->texture index "
-                    f"(out/indexes/{rep.get('baseId', '?')}/meshtex/"
-                    "coverage.json). Every time it is opened the viewer "
-                    "rebuilds that relation in memory -- tens of seconds "
-                    "during which asset lists show one row per FILE instead "
-                    "of one per asset.",
-            "fix": "Build it once from the Health & thumbnails panel, or on "
-                   "the command line: "
-                   + next((a["command"] for a in der["artefacts"]
-                           if a["path"] == "out/meshtex/coverage.json"),
-                          "py -3 tools/meshtex.py --coverage")})
+                "severity": "warning",
+                "what": f"The install root configured via {t['source']} "
+                        f"({t['path']}) was rejected: {t['verdict']}."
+                        + (" Auto-detection was used instead."
+                           if rep["install"]["ok"] else ""),
+                "fix": "Correct it, or clear it with "
+                       "`py -3 core/coroot.py --forget`."})
+        if not rep["install"]["ok"]:
+            problems.append({"severity": "error",
+                             "what": "The game install was not found (or is "
+                                     "incomplete).",
+                             "fix": rep["install"].get("fix", "")})
+        if not rep["python"]["ok"]:
+            problems.append({"severity": "error",
+                             "what": f"Python {rep['python']['value']} is older "
+                                     f"than {MIN_PYTHON[0]}.{MIN_PYTHON[1]}.",
+                             "fix": rep["python"]["fix"]})
+        for p in rep["packages"]:
+            if not p["present"]:
+                problems.append({
+                    "severity": "error" if p["required"] else "warning",
+                    "what": f"{p['name']} is not installed -- {p['why']}",
+                    "fix": p["fix"]})
+        der = rep["derived"]
+        if not der["ok"]:
+            problems.append(derived_problem(der, _derived_suppression()))
+        # Called out separately from the count above, because this one has a
+        # symptom the user will otherwise blame on the viewer: without it the
+        # mesh<->texture relation is rebuilt in-process on every open of this
+        # client, and that is 32-56 s during which the lists cannot collapse a
+        # mesh and its skins into one row. MEASURED on 7878 (37,856 meshes);
+        # 6090, which has the file, loads it in 1.6 s.
+        if "out/meshtex/coverage.json" in (der.get("missing") or []):
+            problems.append({
+                "severity": "warning",
+                "what": "This client has no mesh<->texture index "
+                        f"(out/indexes/{rep.get('baseId', '?')}/meshtex/"
+                        "coverage.json). Every time it is opened the viewer "
+                        "rebuilds that relation in memory -- tens of seconds "
+                        "during which asset lists show one row per FILE instead "
+                        "of one per asset.",
+                "fix": "Build it once from the Health & thumbnails panel, or on "
+                       "the command line: "
+                       + next((a["command"] for a in der["artefacts"]
+                               if a["path"] == "out/meshtex/coverage.json"),
+                              "py -3 tools/meshtex.py --coverage")})
 
-    prov = rep.get("provenance") or {}
-    if prov.get("foreign"):
-        problems.append({
-            "severity": "error",
-            "what": f"{len(prov['foreign'])} derived artefact(s) were built "
-                    "from a different install than the one configured, and "
-                    "say so. Reading them serves one client's facts as "
-                    "another's.",
-            "fix": "Rebuild them against this install, or point the tools "
-                   "back at the install they came from."})
-    elif prov.get("unclassified"):
-        problems.append({
-            "severity": "info",
-            "what": f"{len(prov['unclassified'])} derived artefact(s) live in "
-                    "a namespace that cannot record which install they "
-                    "describe, so nothing can check them.",
-            "fix": prov.get("fix", "")})
+        prov = rep.get("provenance") or {}
+        if prov.get("foreign"):
+            problems.append({
+                "severity": "error",
+                "what": f"{len(prov['foreign'])} derived artefact(s) were built "
+                        "from a different install than the one configured, and "
+                        "say so. Reading them serves one client's facts as "
+                        "another's.",
+                "fix": "Rebuild them against this install, or point the tools "
+                       "back at the install they came from."})
+        elif prov.get("unclassified"):
+            problems.append({
+                "severity": "info",
+                "what": f"{len(prov['unclassified'])} derived artefact(s) live in "
+                        "a namespace that cannot record which install they "
+                        "describe, so nothing can check them.",
+                "fix": prov.get("fix", "")})
 
-    ls = rep.get("localServer") or {}
-    if not ls.get("ready"):
-        missing = [p["name"] for p in ls.get("parts", []) if not p["present"]]
-        problems.append({
-            "severity": "info",
-            "what": "The optional local test server is not set up ("
-                    + ", ".join(missing) + " missing). Nothing needs it: "
-                    "client/ tests and `py -3 -m client selftest` run without "
-                    "it. It gives client/ a real server to exchange packets "
-                    "with.",
-            "fix": "py -3 tools/setup_coemu.py --check   "
-                   "(see docs/server_setup.md)"})
+        ls = rep.get("localServer") or {}
+        if not ls.get("ready"):
+            missing = [p["name"] for p in ls.get("parts", []) if not p["present"]]
+            problems.append({
+                "severity": "info",
+                "what": "The optional local test server is not set up ("
+                        + ", ".join(missing) + " missing). Nothing needs it: "
+                        "client/ tests and `py -3 -m client selftest` run without "
+                        "it. It gives client/ a real server to exchange packets "
+                        "with.",
+                "fix": "py -3 tools/setup_coemu.py --check   "
+                       "(see docs/server_setup.md)"})
 
-    th = rep.get("thumbnails") or {}
-    if th.get("status") == "none":
-        problems.append({
-            "severity": "info",
-            "what": "No thumbnails have been generated. Grids show "
-                    "placeholders until they are.",
-            "fix": th.get("plan", {}).get("cli", "py -3 tools/thumbs.py --all")})
-    elif th.get("status") == "meshes-only":
-        problems.append({
-            "severity": "info",
-            "what": "Mesh thumbnails are present; texture thumbnails are not.",
-            "fix": "py -3 tools/thumbs.py --textures --resume"})
+        th = rep.get("thumbnails") or {}
+        if th.get("legacy") and th.get("status") != "none":
+            problems.append({
+                "severity": "info",
+                "what": "Thumbnails are shown from an older per-checkout folder ("
+                        + th["legacy"]["dir"] + "). The shared folder ("
+                        + th.get("dir", "") + ") is empty, so the next "
+                        "generation run renders every thumbnail once.",
+                "fix": "nothing needed; generate only if you want the shared set"})
+        if th.get("status") == "none":
+            problems.append({
+                "severity": "info",
+                "what": "No thumbnails have been generated. Grids show "
+                        "placeholders until they are.",
+                "fix": th.get("plan", {}).get("cli", "py -3 tools/thumbs.py --all")})
+        elif th.get("status") == "meshes-only":
+            problems.append(meshes_only_problem(th))
 
-    rep["problems"] = problems
-    rep["ok"] = not any(p["severity"] == "error" for p in problems)
-    return rep
-
+        rep["problems"] = problems
+        rep["ok"] = not any(p["severity"] == "error" for p in problems)
+        return rep
 
 def write_report(rep: dict, path: Path = REPORT_PATH) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)

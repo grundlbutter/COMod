@@ -1,0 +1,501 @@
+/* fxview.css -- the Effects Viewer.
+ *
+ * The visual grammar carries the page's one job: telling a resolved thing from
+ * an unresolved one at a glance. `.fx-bad` is a hole, `.fx-warn` is a
+ * declared-but-absent, `.fx-decoy` is a file that is PRESENT and NOT read.
+ * Those three are never rendered in the same colour as ordinary text, because
+ * the whole argument of backlog section 6 is that a tidy list reads as a
+ * complete one. */
+
+/* The two "facts about this base" panels share a row. Each keeps its own
+ * scroll: capping them is what stops either from pushing the 3,391-row list
+ * off the viewport, and an internal scroll drops nothing -- which matters,
+ * because everything in both panels is a caveat and the caveats are the part
+ * that must not be the part that disappears. */
+.fx-basefacts {
+  flex: 0 0 auto;
+  display: flex; flex-wrap: wrap; align-items: stretch;
+  gap: 0 0.4rem;
+}
+.fx-basefacts > section { flex: 1 1 26rem; min-width: 0; }
+
+.fx-prov {
+  flex: 0 0 auto;
+  margin: 0.3rem 1rem 0.1rem;
+  padding: 0.35rem 0.6rem;
+  max-height: 32vh; overflow-y: auto;
+  border: 1px solid var(--line, #333);
+  border-left: 3px solid #c9a227;
+  background: var(--panel, #14161a);
+}
+.fx-prov h2 { font-size: 0.95rem; margin: 0 0 0.4rem; }
+.fx-prov h2 .mut { font-weight: normal; font-size: 0.82rem; }
+
+.fx-provtable { border-collapse: collapse; width: 100%; font-size: 0.84rem; }
+.fx-provtable th {
+  text-align: left; font-weight: 600; padding: 0.15rem 0.6rem 0.15rem 0;
+  border-bottom: 1px solid var(--line, #333); color: var(--mut, #9aa);
+}
+.fx-provtable td { padding: 0.05rem 0.6rem 0.05rem 0; vertical-align: top; }
+.fx-tname { font-weight: 600; }
+.fx-file { font-family: ui-monospace, Consolas, monospace; color: #7ec87e; }
+.fx-num { text-align: right; font-variant-numeric: tabular-nums; }
+.fx-decoy {
+  font-family: ui-monospace, Consolas, monospace;
+  color: #e0a030; font-weight: 600;
+}
+.fx-noterow td { padding-bottom: 0.15rem; font-size: 0.76rem; }
+
+.fx-unread {
+  margin-top: 0.5rem; padding: 0.4rem 0.6rem;
+  border: 1px dashed #a5642e; font-size: 0.84rem;
+}
+.fx-unread ul { margin: 0.25rem 0; padding-left: 1.2rem; }
+
+/* The dangling-rule targets. Rendered as CONTROLS, not as text, because they
+ * are the only route to a class of finding the list on the left cannot
+ * reach. */
+.fx-dangling { border-color: #ff7b72; }
+.fx-danglist { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.3rem 0; }
+.fx-danglink {
+  font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem;
+  background: none; color: #ff7b72; border: 1px solid #6b3a36;
+  padding: 0.05rem 0.3rem; cursor: pointer;
+}
+.fx-danglink:hover { background: rgba(255,123,114,0.14); }
+
+/* ------------------------------------------------------------------ layout */
+
+/* TWO PANES, EACH SCROLLING ITSELF -- the same idiom every other page in this
+ * viewer uses, and the right one for a 3,391-row library: the list must stay
+ * on screen while you read a subject, and a 4,000px document scroll loses it.
+ *
+ * `style.css` already styles the shared `main` as a flex child with
+ * `min-height: 0` and a THREE-column grid. Both are overridden here rather
+ * than worked around: inheriting `min-height: 0` without an explicit height
+ * collapses this grid to its own content box and drops the right column
+ * outside it, which is exactly what it did before this rule existed. */
+.fx-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 20rem) 1fr;
+  grid-template-rows: 100%;
+  gap: 0.6rem;
+  padding: 0.5rem 1rem 0.5rem;
+  overflow: hidden;
+}
+@media (max-width: 900px) {
+  /* Narrow: fall back to document scroll. Two independently scrolling panes
+     stacked in one short viewport gives each about 40% of the screen, which
+     is worse than a long page. */
+  .fx-main {
+    grid-template-columns: 1fr; grid-template-rows: auto auto;
+    overflow: visible; flex: 0 0 auto;
+  }
+  .fx-list { max-height: 60vh; }
+  .fx-subject { overflow: visible !important; }
+}
+
+.fx-list {
+  border: 1px solid var(--line, #333);
+  background: var(--panel, #14161a);
+  min-height: 0;
+  display: flex; flex-direction: column;
+}
+.fx-filters { display: flex; gap: 0.3rem; padding: 0.5rem; flex-wrap: wrap; }
+.fx-filters input[type=search] { flex: 1 1 8rem; min-width: 0; }
+.fx-chk { display: flex; align-items: center; gap: 0.25rem; font-size: 0.82rem; }
+#fx-count { padding: 0 0.5rem 0.35rem; font-size: 0.8rem; }
+
+.fx-names {
+  list-style: none; margin: 0; padding: 0;
+  overflow-y: auto; flex: 1 1 auto;
+  border-top: 1px solid var(--line, #333);
+}
+.fx-name {
+  display: flex; align-items: baseline; gap: 0.4rem;
+  padding: 0.18rem 0.55rem; cursor: pointer; font-size: 0.86rem;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.fx-name:hover { background: rgba(255,255,255,0.06); }
+.fx-name.sel { background: rgba(90,150,220,0.22); }
+.fx-n { font-family: ui-monospace, Consolas, monospace; }
+.fx-own { color: #9fd0ff; font-style: italic; }
+.fx-tagdot { color: #c9a227; font-size: 0.75rem; }
+.fx-formhint { margin-left: auto; font-size: 0.72rem; }
+
+/* ----------------------------------------------------------------- subject */
+
+.fx-subject { min-width: 0; min-height: 0; overflow-y: auto; padding-right: 0.3rem; }
+.fx-empty { padding: 2rem; text-align: center; }
+.fx-head { margin-bottom: 0.5rem; }
+.fx-head h2 { margin: 0; font-family: ui-monospace, Consolas, monospace; }
+
+.fx-card {
+  border: 1px solid var(--line, #333);
+  background: var(--panel, #14161a);
+  padding: 0.6rem 0.8rem; margin-bottom: 0.7rem;
+}
+.fx-card h3 { margin: 0 0 0.45rem; font-size: 0.92rem; }
+.fx-card h3 .mut { font-weight: normal; font-size: 0.82rem; }
+
+.fx-stagewrap { display: flex; gap: 0.7rem; align-items: flex-start; flex-wrap: wrap; }
+#fx-stage { background: #0b0d10; border: 1px solid var(--line, #333); max-width: 100%; }
+.fx-playbar { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.5rem; flex-wrap: wrap; }
+.fx-note { font-size: 0.8rem; max-width: 32rem; }
+
+.fx-tagrow { display: flex; gap: 0.35rem; margin-bottom: 0.4rem; }
+.fx-tagrow input { flex: 1 1 auto; min-width: 0; }
+.fx-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-bottom: 0.5rem; }
+.fx-chip {
+  display: inline-flex; align-items: center; gap: 0.2rem;
+  border: 1px solid #c9a227; border-radius: 2px;
+  padding: 0.05rem 0.2rem 0.05rem 0.35rem; font-size: 0.8rem;
+}
+.fx-chipx { border: none; background: none; cursor: pointer; color: inherit; padding: 0 0.15rem; }
+
+/* ------------------------------------------------------------ the chain */
+
+.fx-layer { border-top: 1px solid rgba(255,255,255,0.08); padding: 0.4rem 0; }
+.fx-layer:first-child { border-top: none; }
+.fx-layer-h { display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+.fx-form { font-size: 0.8rem; color: #9fd0ff; }
+.fx-chain {
+  display: flex; gap: 0.4rem; align-items: baseline;
+  font-size: 0.82rem; padding: 0.08rem 0 0.08rem 0.8rem; flex-wrap: wrap;
+}
+.fx-chain-k { width: 4.2rem; color: var(--mut, #9aa); flex: none; }
+.fx-id { font-family: ui-monospace, Consolas, monospace; }
+.fx-arrow { color: var(--mut, #9aa); }
+.fx-path { font-family: ui-monospace, Consolas, monospace; color: #7ec87e; }
+.fx-src { font-size: 0.75rem; }
+.fx-write { font-size: 0.78rem; padding-left: 0.8rem; color: #7ec87e; }
+.fx-write.fx-ro { color: #e0a030; }
+
+.fx-bad { color: #ff7b72; font-weight: 600; }
+.fx-warn { color: #e0a030; }
+
+/* THE STAGE VERDICT (backlog 24). One badge per layer row, saying what the GL
+   build did with it -- which is a different question from whether it
+   RESOLVED, and the two used to be reported by the same blank canvas.
+
+   `not reported` is grey and is the initial state on purpose: the badge is
+   present from the moment the row is drawn, because an ABSENT badge reads as
+   "nothing wrong" and this file's rule 2 is that nothing unresolved is
+   dropped for being untidy. It stays grey on the 2D path, where there is no
+   GL build to report. */
+.fx-stage { font-size: 0.76rem; padding: 0 0.3rem; border-radius: 3px; }
+.fx-stage-unknown { color: var(--mut, #9aa); }
+.fx-stage-drawn   { color: #7ec87e; }
+.fx-stage-empty   { color: #e0a030; font-weight: 600; }
+.fx-stage-absent  { color: #ff7b72; font-weight: 600; }
+.fx-stage-why     { padding-left: 0.8rem; font-size: 0.76rem; }
+.fx-vis-l { display: inline-flex; gap: 0.25rem; align-items: center;
+            font-size: 0.76rem; margin-left: auto; cursor: pointer; }
+.fx-vis-l.fx-vis-dead { cursor: not-allowed; color: #ff7b72; }
+.fx-vis-l.fx-vis-dead input { cursor: not-allowed; }
+
+/* THE PER-EFFECT LIST for a multi-effect subject (owner, 2026-09-10). Sits
+   under the stage rather than in the right column: it is about what is on
+   screen right now, and the right column is about what the effect NEEDS. */
+#fx-stagelist { margin-top: 0.5rem; }
+.fx-sl-h { display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+.fx-sl-note { font-size: 0.74rem; margin: 0.15rem 0 0.35rem 0; }
+.fx-sl-row {
+  display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap;
+  padding: 0.15rem 0; border-top: 1px solid rgba(255,255,255,0.06);
+}
+.fx-sl-name { font-family: ui-monospace, Consolas, monospace; min-width: 9rem; }
+
+/* ------------------------------------------------------- connection view */
+
+.fx-conncat { margin-bottom: 0.55rem; }
+.fx-conncat-h { display: flex; gap: 0.5rem; align-items: baseline; }
+.fx-conncat-h .fx-num {
+  border: 1px solid var(--line, #444); padding: 0 0.35rem; font-size: 0.8rem;
+}
+.fx-connlist { margin: 0.25rem 0 0; padding-left: 1.1rem; font-size: 0.82rem; }
+.fx-connlist li { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+
+/* NAVIGATION, AND THE CAVEAT IT CARRIES.
+ *
+ * `.fx-derived` is the same amber as `.fx-decoy` and `.fx-unread` and that is
+ * deliberate: all three say "this is not what a file told you". The
+ * weapon/action split is a predicate this page applies over ini/weapon.ini,
+ * not a column in Action3DEffect.ini, and now that each row is a LINK the
+ * distinction is one click from being read as the table's own. It is styled
+ * as a caveat rather than as fine print for the same reason `.fx-limits` is.
+ */
+.fx-connrow { display: block !important; padding: 0.15rem 0 0.25rem; }
+.fx-connrow-h { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: baseline; }
+.fx-connlinks { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
+.fx-connlinks .mut { font-size: 0.78rem; }
+button.fx-nav {
+  font-size: 0.76rem; padding: 0.05rem 0.4rem;
+  border: 1px solid var(--line, #444); cursor: pointer;
+}
+button.fx-nav:hover { border-color: #7ec87e; }
+button.fx-fxlink {
+  background: transparent; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: #7ec87e; text-decoration: underline;
+}
+.fx-fxlink-w { display: inline-flex; gap: 0.35rem; align-items: baseline; }
+
+.fx-derived {
+  font-size: 0.78rem; color: #e0a030;
+  border-left: 2px solid #a5642e; padding-left: 0.45rem; margin: 0.15rem 0;
+}
+
+.fx-connexp {
+  margin: 0.3rem 0 0.2rem 0.6rem; padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line, #333); border-left: 3px solid #4a7fb5;
+  background: var(--panel, #14161a); font-size: 0.82rem;
+}
+.fx-subjh { display: flex; gap: 0.5rem; align-items: baseline; margin: 0.2rem 0; }
+.fx-subjcount { display: flex; gap: 0.4rem; align-items: baseline; margin-top: 0.35rem; }
+.fx-subjcount .fx-num {
+  border: 1px solid var(--line, #444); padding: 0 0.35rem; font-size: 0.8rem;
+}
+.fx-applist { margin: 0.2rem 0; padding-left: 1.1rem; }
+.fx-applist li { padding: 0.05rem 0; }
+.fx-appbox { margin-top: 0.4rem; }
+.fx-appself { outline: 1px solid #4a7fb5; }
+/* The ids weapon.ini does not declare are a DIFFERENT list, so they get a
+ * different edge. Merging them into the declared list would make the derived
+ * split invisible; dropping them would make the list short and look whole. */
+.fx-appbox-undecl {
+  border-left: 2px solid #a5642e; padding-left: 0.45rem;
+}
+.fx-subjlim {
+  border-top: 1px solid var(--line, #333); border-left: 3px solid #a5642e;
+  margin-top: 0.45rem; padding: 0.3rem 0 0.1rem 0.45rem; font-size: 0.8rem;
+}
+.fx-subjlim ul { margin: 0.2rem 0; padding-left: 1.1rem; }
+.fx-connfoot {
+  border-top: 1px solid var(--line, #333); margin-top: 0.5rem; padding-top: 0.4rem;
+  font-size: 0.83rem;
+}
+
+/* THE DEFINITION BOX. Drawn FIRST in the Collect & export card and drawn in
+ * every state, because "the bundle carries the effect's definition" and "the
+ * bundle carries only art" are the difference between a working import and an
+ * effect that arrives undefined -- and the two look identical in a list of
+ * files. Three states, three colours, and UNKNOWN is deliberately NOT the same
+ * colour as "no": a failed check and a measured absence must not read alike. */
+.fx-defbox {
+  border-left: 3px solid var(--line, #444); padding: 0.35rem 0 0.35rem 0.6rem;
+  margin-bottom: 0.5rem; font-size: 0.85rem; line-height: 1.5;
+}
+.fx-defbox.carried { border-left-color: #4fa96f; }
+.fx-defbox.carried > b { color: #4fa96f; }
+.fx-defbox.missing { border-left-color: #e0a030; }
+.fx-defbox.missing > b { color: #e0a030; }
+.fx-defbox.unknown { border-left-color: #c9564c; }
+.fx-defbox.unknown > b { color: #c9564c; }
+.fx-defrow {
+  display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap;
+  margin: 0.2rem 0;
+}
+
+.fx-toolsrow {
+  display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.fx-toolsrow .mut { flex: 1 1 16rem; font-size: 0.8rem; line-height: 1.45; }
+
+.fx-collectlist { list-style: none; margin: 0.4rem 0; padding: 0; }
+.fx-collectlist li { display: flex; gap: 0.5rem; align-items: baseline; flex-wrap: wrap; padding: 0.12rem 0; }
+.fx-offer { flex-basis: 100%; padding-left: 1rem; font-size: 0.8rem; }
+.fx-writebox { border-top: 1px solid var(--line, #333); margin-top: 0.5rem; padding-top: 0.4rem; font-size: 0.83rem; }
+.fx-writebox .fx-ro { color: #e0a030; }
+
+/* The honesty rail is styled as a WARNING panel, not as fine print. It is the
+ * part of this page that most needs to be read and the part most likely to be
+ * skipped. */
+.fx-limits { border-left: 3px solid #a5642e; }
+.fx-limhead { margin-bottom: 0.35rem; }
+.fx-limlist, .fx-unres { margin: 0.2rem 0; padding-left: 1.2rem; font-size: 0.83rem; }
+.fx-unres li { color: #e0a030; }
+
+/* --------------------------------------------- compare across installs
+ *
+ * THE COLOURS CARRY THE DISTINCTION THIS PAGE EXISTS FOR, so they are not
+ * decoration and they are not interchangeable:
+ *
+ *   .fx-cmp-unread      still being walked -- UNREAD, not zero
+ *   .fx-cmp-unmeasured  the tables would not load there -- NOT zero
+ *   .fx-cmp-unprov      read, but which file answered is not known
+ *   .fx-cmp-null        measured, and genuinely nothing (the row's own
+ *                       `nullLabel` says which nothing, in the tooltip)
+ *   .fx-cmp-diff        a real difference between comparable columns
+ *
+ * The first three must never look like the fourth. An UNMEASURED column
+ * rendered as an empty one is the defect `tests/test_fxcompare.py` fires a
+ * mutant at, and it is a defect that reads as a clean result.
+ */
+
+.fx-cmp-card { border-left: 3px solid #3b6ea5; }
+.fx-cmp-bar { display: flex; gap: 0.5rem; align-items: baseline; flex-wrap: wrap; }
+.fx-cmp-picker {
+  border: 1px solid var(--line, #333); padding: 0.4rem 0.6rem;
+  margin: 0.4rem 0; font-size: 0.84rem;
+}
+.fx-cmp-baselist { list-style: none; margin: 0.3rem 0 0; padding: 0; }
+.fx-cmp-baselist label {
+  display: flex; gap: 0.45rem; align-items: baseline; flex-wrap: wrap;
+  padding: 0.1rem 0;
+}
+.fx-cmp-blabel { font-weight: 600; min-width: 16rem; }
+.fx-cmp-hint-dbc { color: #7ec87e; }
+.fx-cmp-hint-ini { color: var(--mut, #9aa); }
+.fx-cmp-root {
+  font-family: ui-monospace, Consolas, monospace; font-size: 0.75rem;
+  flex-basis: 100%;
+}
+.fx-cmp-out { margin-top: 0.5rem; overflow-x: auto; }
+
+/* The provenance split is the headline, so it is a panel and not a footnote.
+ * Every fact row under it is only readable in its light. */
+.fx-cmp-split {
+  border: 1px solid #a5642e; border-left-width: 3px; padding: 0.4rem 0.6rem;
+  margin-bottom: 0.5rem; font-size: 0.85rem;
+}
+.fx-cmp-nosplit {
+  border-left: 3px solid #3b6ea5; padding: 0.25rem 0.6rem;
+  margin-bottom: 0.5rem; font-size: 0.85rem; color: var(--mut, #9aa);
+}
+.fx-cmp-rail {
+  font-size: 0.83rem; margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--line, #333); padding-bottom: 0.35rem;
+}
+.fx-cmp-rail-bad { color: #e0a030; }
+
+.fx-cmp-heads {
+  display: flex; gap: 0.6rem; align-items: stretch; margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+.fx-cmp-head {
+  border: 1px solid var(--line, #333); padding: 0.3rem 0.5rem;
+  font-size: 0.8rem; flex: 1 1 15rem; min-width: 15rem;
+}
+.fx-cmp-head-off { border-style: dashed; }
+.fx-cmp-prov { list-style: none; margin: 0.2rem 0 0; padding: 0; }
+.fx-cmp-prov li {
+  display: flex; gap: 0.4rem; flex-wrap: wrap; padding: 0.04rem 0;
+}
+.fx-cmp-prov .fx-tname { width: 6.5rem; flex: none; }
+/* A file that IS the compiled twin is marked, because "3DEffect.dbc" and
+ * "3DEffect.ini" differ by three characters and the answer differs by more. */
+.fx-cmp-dbc { font-weight: 700; text-decoration: underline dotted; }
+
+.fx-cmp-table { border-collapse: collapse; font-size: 0.82rem; width: 100%; }
+.fx-cmp-table th {
+  text-align: left; font-weight: 600; padding: 0.1rem 0.6rem 0.1rem 0;
+  vertical-align: top; white-space: nowrap;
+}
+.fx-cmp-table td {
+  padding: 0.1rem 0.6rem 0.1rem 0; vertical-align: top;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.fx-cmp-table tr { border-bottom: 1px solid rgba(128, 128, 128, 0.15); }
+.fx-cmp-r-provenance { background: rgba(59, 110, 165, 0.10); }
+.fx-cmp-r-coverage { background: rgba(165, 100, 46, 0.10); }
+.fx-cmp-verdict { font-family: inherit; color: var(--mut, #9aa); }
+.fx-cmp-v-differs .fx-cmp-verdict { color: #e0a030; font-weight: 700; }
+.fx-cmp-v-insufficient .fx-cmp-verdict { font-style: italic; }
+
+.fx-cmp-diff { color: #e0a030; font-weight: 700; }
+.fx-cmp-unread { color: #6ea5d0; font-style: italic; font-family: inherit; }
+.fx-cmp-unmeasured {
+  color: #ff7b72; font-weight: 700; font-family: inherit;
+}
+.fx-cmp-unprov { color: #c9a0dc; text-decoration: underline wavy; }
+.fx-cmp-null { color: var(--mut, #9aa); }
+
+.fx-cmp-foot {
+  border-top: 1px solid var(--line, #333); margin-top: 0.5rem;
+  padding-top: 0.4rem; font-size: 0.83rem;
+}
+
+/* A verdict reached over fewer columns than the header shows names the ones
+ * it left out, right there. "same" must never read as "same everywhere". */
+.fx-cmp-na { color: var(--mut, #9aa); font-weight: 400; font-size: 0.78rem; }
+/* ------------------------------------------------------------- the census */
+/* Deliberately sharing the provenance strip's frame: they are two halves of
+ * one claim ("here are the numbers" / "here is the file they came out of")
+ * and separating them visually is how the second gets skipped. The buckets
+ * are NOT given a traffic-light green: `whole` on this page means "every
+ * layer resolved on THIS install", which is a measurement, not a grade, and
+ * a green tile invites reading it as one. */
+.fx-census {
+  flex: 0 0 auto;
+  margin: 0.3rem 1rem 0.1rem;
+  padding: 0.35rem 0.6rem;
+  max-height: 32vh; overflow-y: auto;
+  border: 1px solid var(--line, #333);
+  border-left: 3px solid #4a7fb5;
+  background: var(--panel, #14161a);
+}
+.fx-census h2 { font-size: 0.95rem; margin: 0 0 0.4rem; }
+.fx-census h2 .mut { font-weight: normal; font-size: 0.82rem; }
+
+.fx-censusgrid {
+  display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem;
+}
+.fx-censuscell {
+  flex: 1 1 12rem; min-width: 11rem;
+  border: 1px solid var(--line, #333); border-top-width: 3px;
+  padding: 0.35rem 0.5rem;
+}
+.fx-censusnum { font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.fx-censuslab { font-weight: 600; font-size: 0.8rem; letter-spacing: 0.03em; }
+.fx-censuspct { font-size: 0.78rem; }
+.fx-censusblurb { font-size: 0.76rem; margin: 0.25rem 0 0.3rem; }
+.fx-cs-whole { border-top-color: #6b8fa8; }
+.fx-cs-partial { border-top-color: #e0a030; }
+.fx-cs-broken { border-top-color: #ff7b72; }
+.fx-cs-unknown { border-top-color: var(--line, #444); }
+
+/* The fourth row is boxed APART from the three buckets on purpose -- it
+ * counts a different population and must not read as a fourth tile in the
+ * same row. */
+.fx-census4 {
+  border: 1px dashed #a5642e; padding: 0.35rem 0.5rem;
+  margin-bottom: 0.5rem; font-size: 0.84rem;
+}
+.fx-undeflist {
+  margin: 0.3rem 0 0; padding-left: 1.2rem; font-size: 0.8rem;
+  max-height: 9rem; overflow-y: auto;
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.fx-censuslinks { font-size: 0.84rem; margin-bottom: 0.45rem; }
+.fx-linktable { border-collapse: collapse; margin: 0.25rem 0; font-size: 0.82rem; }
+.fx-linktable th {
+  text-align: right; font-weight: 600; padding: 0.1rem 0.7rem 0.1rem 0;
+  border-bottom: 1px solid var(--line, #333); color: var(--mut, #9aa);
+}
+.fx-linktable th:first-child { text-align: left; }
+.fx-linktable td { padding: 0.05rem 0.7rem 0.05rem 0; }
+
+.fx-censusprov {
+  border-top: 1px solid var(--line, #333); margin-top: 0.45rem;
+  padding-top: 0.35rem; font-size: 0.82rem;
+}
+.fx-provlist {
+  margin: 0.2rem 0; padding-left: 1.2rem;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.fx-ok { color: #7ec87e; }
+
+/* The per-row state badge. One letter so it costs no width in a 3,391-row
+ * list, with the full label on hover. */
+.fx-statehint {
+  margin-left: 0.35rem; font-size: 0.68rem; font-weight: 700;
+  border: 1px solid; border-radius: 2px; padding: 0 0.22rem;
+}
+.fx-statehint.fx-cs-whole { color: #6b8fa8; border-color: #6b8fa8; }
+.fx-statehint.fx-cs-partial { color: #e0a030; border-color: #e0a030; }
+.fx-statehint.fx-cs-broken { color: #ff7b72; border-color: #ff7b72; }
+.fx-statehint.fx-cs-unknown { color: var(--mut, #9aa); border-color: var(--line, #444); }

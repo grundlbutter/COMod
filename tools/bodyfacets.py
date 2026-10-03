@@ -52,6 +52,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
+from attach import pad9                                # noqa: E402
 from coassets import DEFAULT_ROOT, load_items          # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -151,11 +152,23 @@ class BodyFacets:
     indirection is the only reason this module works on an official base.
     """
 
-    def __init__(self, root: Path = DEFAULT_ROOT, part_tables: Optional[dict] = None,
+    def __init__(self, root: "Path | AssetRoot" = DEFAULT_ROOT,
+                 part_tables: Optional[dict] = None,
                  resolve=None):
-        self.root = Path(root)
+        # `root` may be an `AssetRoot` -- `Catalog` passes its own, so a staged
+        # overlay reaches the item names the same way it reaches the meshes.
+        # `self.root` stays a plain Path either way (an AssetRoot carries the
+        # install path as `.root`), because callers read it as one.
+        # `pathlib.Path` HAS a `.root` -- the bare separator `'\'` -- so the
+        # obvious `getattr(root, "root", root)` silently collapses an install
+        # path to the filesystem root. Duck-type on `locate` instead, which is
+        # the discriminator `coroot.locate_table` uses and which `Path` does
+        # not answer to. `core/coassets.py:_load_items_block96` carries the
+        # same warning: it measured 0 rows on 6907 with the reader working
+        # perfectly one call below.
+        self.root = Path(root.root if hasattr(root, "locate") else root)
         self._resolve = resolve or (lambda ident, kind: None)
-        items = load_items(self.root)
+        items = load_items(root)
 
         #: 5-digit item family -> the rows in it.  Item ids are 6 digits whose
         #: LAST digit is a quality/tier step (3..9 mostly), and appearance ids
@@ -199,24 +212,47 @@ class BodyFacets:
         return min(c)
 
     def classify(self, ident: str) -> BodyRecord:
+        """One appearance id on the three axes, whichever way it is spelled.
+
+        The id is read NINE WIDE (`attach.pad9`) before any digit is sliced
+        out of it.  `r.ident` keeps the spelling the table used, because
+        `records` is keyed by it (`build` below) and `coviewer` hands it back
+        as the row's `id`.  `armor.ini` is `2135000` on 5017/5065/7878 and
+        `armet.ini` is seven wide on every client but CCO, so gated on
+        `len(ident) == 9` this returned kind "other" / gender "other" /
+        size "n/a" for every one of them, and NOTHING RAISED -- the pickers
+        showed every row under "other" and looked complete.  MEASURED
+        2026-09-25 on 5017: 2,198 of the 2,396 body records were "other"
+        (the 198 that classified are the nine-wide NPC bases), and every one
+        of the 1,708 armet options carried gender "other" / class "unknown"
+        / size "n/a".  Both sites feed this the raw id -- `build` for the
+        records, `builder.BuilderIndex._make` for the armet slot -- so the
+        rule is applied HERE, once, rather than at the callers.
+
+        `r.series` is the padded slice.  That is NOT `builder.Option.series`
+        (which feeds the dedup and is deliberately left raw -- the `series`
+        note in `builder._make`): this one resolves the class through
+        `series_profession`, and raw it read `500` out of `2135000`.
+        """
         r = BodyRecord(ident=ident)
-        if not (ident.isdigit() and len(ident) == 9):
+        wide = pad9(ident)
+        if not (wide.isdigit() and len(wide) == 9):
             r.kind = "other"
             return r
-        r.body_type = ident[:3]
-        r.series = ident[3:6]
+        r.body_type = wide[:3]
+        r.series = wide[3:6]
 
         if r.body_type in BODY_TYPES:
             r.gender, r.size = BODY_TYPES[r.body_type]
         else:
             r.gender, r.size = "other", "n/a"
 
-        if ident[3:] == "000000":
+        if wide[3:] == "000000":
             r.kind = "base body" if r.body_type in BODY_TYPES else "npc body"
             r.klass = "any" if r.body_type in BODY_TYPES else "unknown"
             return r
 
-        r.item_family = ident[3:8]
+        r.item_family = wide[3:8]
         fam = self.families.get(r.item_family, [])
         r.item_ids = [str(i["id"]) for i in fam]
         if fam:
@@ -227,10 +263,42 @@ class BodyFacets:
         r.klass = PROFESSION_CLASS.get(prof, "unknown") if prof is not None else "unknown"
         return r
 
+    #: What "the body-shaped tables" meant before the install was asked.
+    #: Kept as the fallback for an install whose declaration has no ``body``
+    #: part at all -- Zephyr is one: its ROPT declares ``body`` but ships
+    #: neither ``ini/armor.ini`` nor ``ini/armor.dbc``, so `part_tables()`
+    #: returns no ``body`` key and there is nothing to compare against.
+    BODY_TABLES_FALLBACK = ("body", "mix_body")
+
+    @classmethod
+    def body_tables(cls, part_tables: dict) -> tuple:
+        r"""The names of the parts backed by the SAME table as ``body``.
+
+        This used to be the literal ``("body", "mix_body")``, which is an
+        inference: it hardcodes both a vocabulary and a relationship the
+        install declares for itself. ``armor.ini`` is not "the armor table" --
+        it is *the mesh table for the part named* ``body`` -- and ROPT says
+        which other parts share it. On every install in the corpus that is
+        exactly ``body`` and ``mix_body``, so this is the AGREEING case and the
+        substitution changes no result; what it buys is that a client adding a
+        third body-backed part (the list has grown from 8 parts to 15 across
+        the corpus) is followed instead of silently half-read.
+
+        MEASURED 2026-09-06 over the 33 installs under `coroot.clients_dir()`
+        that `AssetRoot.part_tables()` opens: the set returned here equals
+        ``{"body", "mix_body"} & set(part_tables)`` on all 33, so the literal
+        and the derivation agree everywhere the literal applies.
+        """
+        body = part_tables.get("body")
+        if body is None:
+            return cls.BODY_TABLES_FALLBACK
+        return tuple(name for name, ini in part_tables.items()
+                     if ini.path == body.path)
+
     def build(self, part_tables: dict) -> dict[str, BodyRecord]:
         """Classify every appearance of the body-shaped tables."""
         seen: dict[str, BodyRecord] = {}
-        for table_name in ("body", "mix_body"):
+        for table_name in self.body_tables(part_tables):
             ini = part_tables.get(table_name)
             if ini is None:
                 continue

@@ -78,6 +78,23 @@ rather than reading the length and guessing.
 to ``[Header]\r\nHelpInfoAmount=867\r\n\r\n[DefaultInfo]``.  It was never a new
 cipher; it was simply never tried.
 
+**CORRECTED 2026-08-28 -- the family has FOUR members, not two**
+(``docs/dat_residue_was_the_caller_2026-08-28.md``).  ``WeaponActionData.dat``
+(273 B) and ``WeaponMotionData.dat`` (157 B) also open at seed 9527, and both
+were missed here for the same reason twice over: **their plaintext is GBK
+Chinese, so every printability guard in the pipeline scored them 32-45% and
+refused them.**  Re-running the family test with a GBK-aware acceptance
+criterion over all 1,682 ``.dat`` files finds exactly these four and nothing
+else.  They carry the dual-wield weapon-animation key
+(``right*1000 + left -> animation index``, ``0`` = no off-hand, ``999`` =
+wildcard) into ``3DMotion.ini`` and ``WeaponMotion.ini`` respectively, and
+``WeaponMotionData.dat`` is the residue
+``docs/m9_weaponmotiondata_residue_2026-08-27.md`` left open.
+
+*The lesson is the one this module already states about ``SHIFTED``: an
+acceptance test that encodes an assumption about the plaintext cannot say yes
+to a plaintext that violates it, however correct the key is.*
+
 **`kok_roleview.dat` (129 B) is a SECOND file in this family** and was missed by
 the classification this module was built from, which recorded one.  Found by
 running the test over every file instead of the expected list.  It decrypts to a
@@ -559,7 +576,7 @@ def classify(data: bytes, name: str = "<bytes>") -> Verdict:
     # `Play.dat` sits at 0.85 raw -- so `looks_like_text` returns True on the
     # OBFUSCATED bytes and the file is reported as "already text; no cipher
     # applied".  **That is a FALSE POSITIVE, not a gap**: measured on 6609 and
-    # 7878, where a consumer trusting the verdict reads `aYzgxzc` and
+    # 7878, where a consumer trusting the verdict reads `aYzgxzc` and
     # gets nothing.  On 5065/5517/6090 it fell through to `unknown`, which at
     # least refuses honestly.
     #

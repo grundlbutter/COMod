@@ -76,7 +76,8 @@ from coassets import (DEFAULT_ROOT, DMap, PUL_EMPTY,   # noqa: E402
 #
 # Neither walk raised.  The short one just described a smaller map, which is
 # indistinguishable from a map that is small.  See `dmap.decode_layer`.
-from dmap import UNINIT, decode_layer, layer_payload_for   # noqa: E402
+from dmap import (UNINIT, decode_layer, layer_payload_for,   # noqa: E402
+                  pux_terrain_refs, read_pux_full)
 
 
 def norm(p: str) -> str:
@@ -480,18 +481,52 @@ class MapIndex:
                     via="the .DMap header names it"))
         elif rec.puzzle.endswith(".pux"):
             # A `.pux` is `TqTerrain` -- the *PuzzleSave* format, not a
-            # compiled `.pul`, and far richer than one; `dmap.read_pux` reads
-            # its header and nothing here reads its tiles.  Feeding it to
+            # compiled `.pul`, and far richer than one.  Feeding it to
             # `Pul.parse` produces a spectacular struct error whose text
             # ("requires a buffer of at least 1,909,642,683,969,878,288
             # bytes") reads exactly like a corrupt file and would send someone
-            # hunting one.  135 of 7878's 470 maps and 4 of CCO's name a
-            # `.pux`, so this is a population, not an oddity -- and it is a
-            # limit of this reader, which is a different fact about the world
-            # from a file the install does not ship.
-            rec.unresolved.append(MapRef(
-                "ground", rec.puzzle, "unsupported",
-                via="TqTerrain (.pux); this reader reads compiled .pul"))
+            # hunting one, which is why it has its own branch.
+            #
+            # **IT USED TO REPORT THE GROUND UNRESOLVED, AND IT CRIED WOLF.**
+            # `dmap.read_pux_full` decodes the payload and `puzzle.py` has
+            # rendered pux grounds through it since; this reader simply never
+            # learnt, so 135 of 7878's 470 maps and 4 of CCO's listed their
+            # ground as "in a format this reader does not read" while drawing
+            # it in full. This module's own docstring names that duty: *a
+            # reference that is NOT unresolved must not appear here either --
+            # a list that cries wolf is read as carefully as a list that says
+            # nothing.* It was this module's turn to be the wolf.
+            #
+            # The terrain-row walk is `dmap.pux_terrain_refs`, shared with
+            # `puzzle.py`'s renderer and `mapparts.py`'s collector rather than
+            # written a third time here.
+            px = None
+            try:
+                px = read_pux_full(pul_path)
+            except Exception as e:                        # noqa: BLE001
+                rec.error = f"pux: {e}"
+                rec.unresolved.append(MapRef("ground", rec.puzzle, "unreadable",
+                                             via=str(e)[:120]))
+            if px is not None:
+                seen: list[str] = []
+                for ani, key in pux_terrain_refs(px):
+                    rec.ani = rec.ani or norm(ani)
+                    frames = self._frames(ani, key)
+                    if not frames:
+                        rec.unresolved.append(MapRef(
+                            "ground", key, "unknown", via=norm(ani)))
+                        continue
+                    for f in frames:
+                        if f in seen:
+                            continue
+                        if self._exists(f):
+                            seen.append(f)
+                        else:
+                            rec.unresolved.append(
+                                MapRef("ground", f, "absent", via=norm(ani)))
+                rec.tiles = seen
+                rec.tile_count = len(seen)
+                rec.region = self._region_of(seen)
         else:
             try:
                 pz = Pul.load(pul_path)
@@ -657,23 +692,46 @@ class MapIndex:
 
     # -- the whole list ----------------------------------------------------
     def summary(self) -> list[dict]:
-        """One row per map, cheap enough to build for all 136 at once: header
-        only, no art walk."""
+        """One row per map, header only, no art walk.
+
+        ITERATES THE UNION (`self.names()`), NOT THE LOOSE FILES. `map_files()`
+        is the ``map/map/*.DMap`` walk this module's own docstrings call "not
+        the map list": it is EMPTY on 7878, whose 470 maps ship inside DatPkg
+        archives and are named only in the ``GameMap.dat`` registry -- so the
+        Maps tab showed "0 of 0 maps" on a client full of maps. Each map's bytes
+        come from `open_map` (registry -> loose | .7z | archive), exactly as
+        `_build` reads them, so an archived map is a first-class row.
+
+        Reading a whole map to keep only its header is more work than statting a
+        loose file, but it is the only form that answers for every install, and
+        `api_maps` builds this once. If it ever measures too slow, the fix is a
+        header-only reader in `dmap`, not a return to the loose walk that
+        silently drops most of the list.
+        """
+        from dmap import open_map                           # noqa: PLC0415
         rows = []
-        for p in self.map_files():
+        for name in self.names():
+            stem = Path(name).stem
+            file_rel = f"map/map/{stem}.DMap".lower()
+            raw, src = open_map(self.root, stem)
+            if raw is None:
+                rows.append({"name": stem, "file": file_rel,
+                             "error": (src or "not found")[:80], "width": 0,
+                             "height": 0, "area": 0, "layerCount": 0})
+                continue
             try:
-                m = DMap.load(p)
-            except Exception as e:
-                rows.append({"name": p.stem, "file": f"map/map/{p.name}".lower(),
+                m = DMap.parse(raw)
+            except Exception as e:                            # noqa: BLE001
+                rows.append({"name": stem, "file": file_rel,
                              "error": str(e)[:80], "width": 0, "height": 0,
                              "area": 0, "layerCount": 0})
                 continue
             rows.append({
-                "name": p.stem, "file": f"map/map/{p.name}".lower(),
+                "name": stem, "file": file_rel,
                 "version": m.version, "width": m.width, "height": m.height,
                 "area": m.width * m.height, "layerCount": m.layer_count,
                 "puzzle": norm(m.puzzle_path),
-                "documentId": self._doc_ids.get(p.stem.lower()),
+                "documentId": self._doc_ids.get(stem.lower()),
                 "error": "",
             })
         rows.sort(key=lambda r: (-r["area"], r["name"]))

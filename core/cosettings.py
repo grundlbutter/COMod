@@ -325,9 +325,17 @@ def _write_doc(doc: dict) -> Path:
         return coroot.user_config_path()
     p = Path(override)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True), "utf-8")
-    tmp.replace(p)
+    # Per-pid temp for the same reason `coroot._save_user_config` uses one:
+    # a fixed `<file>.tmp` is a race between two processes on a shared box.
+    tmp = p.with_name(p.name + ".%d.tmp" % os.getpid())
+    try:
+        tmp.write_text(json.dumps(doc, indent=1, sort_keys=True), "utf-8")
+        tmp.replace(p)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     return p
 
 

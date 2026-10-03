@@ -55,6 +55,40 @@ from coassets import DEFAULT_ROOT, AssetRoot, parse_ini   # noqa: E402
 
 Mat4 = tuple
 
+
+def pad9(ident: str) -> str:
+    r"""An appearance id in the nine-wide spelling, or the id unchanged.
+
+    **THE ONE HOME OF THE RULE.**  The tables do not agree with themselves
+    across the corpus: `armor.ini` is `002135000` on 5517/6609/7205 and
+    `2135000` on 5017/5065/7878 for the SAME appearance, and `armet.ini` is
+    seven wide on 5017/5517/5065/7878/6609 (nine wide only on CCO).  Every
+    reader that slices a field out of the id by position -- `[:3]` body type
+    or shape, `[3:6]` series, `[6]` hair colour, `[7:9]` hair style -- reads
+    the wrong digits from the short spelling, and NOTHING RAISES.  MEASURED
+    2026-09-25: `head_kind('2119310')` said "headgear" for a hairstyle (every
+    one of 5017's 1,708 armet rows, so `default_loadout` dressed the figure
+    in no hair); `Catalogue.idle_motion('3135990')` looked up shape 313 and
+    returned None (the nine-wide spelling of the same body returned a
+    PartMesh); `hair_style('2119310')` was "".  Earlier, `shape_of('2135000')`
+    returned the whole id as the shape and 5017 listed zero actions for every
+    player body.  A confident wrong answer each time, and each site had grown
+    its own copy of the guard (`comod._padded9`, `anim.AnimDB.shape_of`, the
+    `len(ident) == 9` tests in `parts` and `builder`).  This is the copy they
+    all delegate to now, so the next reader does not have to know.
+
+    Only digits are padded, and only UPWARD: a nine-or-wider id is returned
+    untouched, so no base that already works can change; a non-numeric id
+    is returned stripped and otherwise as it came.  Weapon idents (six wide,
+    `410005`) MUST NOT be passed here -- padded, `000410005` reads as body
+    type 000 -- and `builder.BuilderIndex._make` records the picker learning
+    that from CCO's arrows.  `series` is NOT read from the padded id either:
+    re-slicing it broke the dedup on 5065 (same comment).
+    """
+    s = (ident or "").strip()
+    return s.zfill(9) if s.isdigit() and len(s) < 9 else s
+
+
 def socket_for(slot: str, plugin=None) -> Optional[str]:
     r"""The socket a slot hangs off, asking the parser plugin first.
 
@@ -871,7 +905,15 @@ class Catalogue:
         """
         if len(body_appearance) < 3:
             return None
-        shape = int(body_appearance[:3])
+        # `pad9` FIRST.  5017 spells `003135990` as `3135990`; sliced raw the
+        # shape below read 313, a shape nobody ships, so the idle for every
+        # player body on that client came back None -- silently, and the
+        # figure was posed from the mesh's embedded track (a T-pose on
+        # 004134000).  MEASURED 2026-09-25, same install, same body:
+        # `('3135990','000','100')` -> None, `('003135990','000','100')` ->
+        # PartMesh.  `tests/test_shape_width.py` drives this through a
+        # hand-written motion table so both spellings must build one key.
+        shape = int(pad9(body_appearance)[:3])
         path = self.motion.get(f"{shape}{weapon_type}{action}")
         if not path:
             # 6090 dropped the per-(set, action) alias rows CCO ships, so an
@@ -903,6 +945,23 @@ class Placed:
 class Figure:
     """A body plus equipped parts, composed the way the client composes them."""
 
+    #: **The fallback, not the answer.** This is a hand-written guess at a
+    #: mapping the install DECLARES for itself -- `ini/RolePart.ini` and the
+    #: `ROPT` section of `ini/c3.wdb` both say which table backs which part --
+    #: and `part_ini` asks the install first.
+    #:
+    #: MEASURED 2026-09-06 against the same merge `AssetRoot.role_parts()`
+    #: performs, over the 33 installs under `coroot.clients_dir()` that declare
+    #: parts: **where this dict has a key it AGREES with the declaration on all
+    #: 33 -- and 30 of the 33 declare a part it has no key for at all.**
+    #: 7867/7878 are the widest miss at five: `cape`, `spirit`, `mix_body`,
+    #: `mix_armet`, `mix_armet_dx8`. Those were unequippable here by
+    #: construction: `equip` looked the slot up, got None, and fell through to
+    #: `mesh_path`, which resolves an appearance id as if it were a mesh id.
+    #: Not an error; a silently wrong part.
+    #:
+    #: The agreement is why swapping the source is safe and the 30 are why it
+    #: is worth doing.
     INI = {"body": "armor.ini", "armet": "armet.ini", "armet_dx8": "armet1.ini",
            "l_weapon": "weapon.ini", "r_weapon": "weapon.ini",
            "misc": "misc.ini", "mount": "mount.ini", "head": "head.ini",
@@ -917,6 +976,9 @@ class Figure:
         #: part is hung off a socket the bodies do not carry.
         self.plugin = plugin
         self.cat = cat
+        #: Lazy slot -> plaintext table name, from the install's declaration.
+        #: None = not asked yet; see `part_ini`.
+        self._part_ini: Optional[dict] = None
         self.frame = frame
         self.body_appearance = body
         self.body_path = cat.appearance_mesh("armor.ini", body) or \
@@ -934,10 +996,38 @@ class Figure:
         bb = self.body_bbox()
         return 0.0 if bb is None else (-bb[0][2]) - (-bb[1][2])
 
+    def part_ini(self, slot: str) -> Optional[str]:
+        """The plaintext table backing `slot`, from the install's declaration.
+
+        `Catalogue.table` opens ``<root>/ini/<name>`` and parses plaintext, so
+        the declaration's path is reduced to a bare ``.ini`` basename here:
+        ROPT says ``ini/armor.dbc`` and `RolePart.ini` says ``ini/armor.ini``
+        for the same part, and both become ``armor.ini``.
+
+        Falls back to `INI` when the install declares nothing readable -- an
+        install with no `RolePart.ini` and no `c3.wdb` raises out of
+        `part_tables`, and this is a preview tool, so it degrades rather than
+        refusing. It degrades to EXACTLY the old constant, so nothing that
+        works today can stop working.
+        """
+        if self._part_ini is None:
+            m: dict[str, str] = {}
+            try:
+                for rec in self.cat.assets.role_parts():
+                    rel = rec["mesh_ini"].replace("\\", "/")
+                    name = rel.rsplit("/", 1)[-1]
+                    if name.lower().endswith(".dbc"):
+                        name = name[:-4] + ".ini"
+                    m[rec["part"]] = name
+            except Exception:                               # noqa: BLE001
+                m = {}
+            self._part_ini = m or dict(self.INI)
+        return self._part_ini.get(slot) or self.INI.get(slot)
+
     def equip(self, slot: str, appearance: str) -> Optional[Placed]:
         if self.body is None:
             return None
-        ini = self.INI.get(slot)
+        ini = self.part_ini(slot)
         logical = self.cat.appearance_mesh(ini, appearance) if ini else None
         if logical is None:
             logical = self.cat.mesh_path(appearance)

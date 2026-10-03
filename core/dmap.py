@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ani as _ani                       # noqa: E402
 import coroot                            # noqa: E402
 
 MASK32 = 0xFFFFFFFF
@@ -200,11 +201,63 @@ COVER_1005 = 420
 # `ini/3DEffect.ini` has 2,599 sections and none of these names; 6609 is a
 # compiled-table client and the plaintext `.ini` is the stale decoy
 # `patch6090.QUIRKS` already names. An empty grep looked exactly like a fact.
+#
+# ---------------------------------------------------------------------------
+# SUPERSEDED 2026-08-29.  THERE IS NO TAG 0.  IT IS THE TAIL OF THE TAG-19
+# RECORD, WHICH GREW BY 24 BYTES AT 1005 -- see `EFFECT_1005` below.
+#
+# Everything above is right about the BYTES and wrong about the RECORD
+# BOUNDARY, and the two consume identically -- `4 + 72` then `4 + 20` is the
+# same 100 bytes as `4 + 96` -- so nothing downstream of a *byte* offset could
+# tell them apart. What told them apart is the COUNT: the declared layer count
+# counts RECORDS, and splitting one record into two spends the count twice, so
+# the walk stops early with `layers_complete` still True.
+#
+#     `family06-01_new` declares 149 layers.  Under tag-0 the walk reads 149
+#     records and stops 5,916 bytes short of the trailing section; under
+#     `EFFECT_1005` it reads 149 records and lands exactly on it.
+#
+# THE FALSIFIER, and it is the reason this is not a matter of taste: over
+# every v1005/v1006 map on this box, **all 144 tag-0 records fall immediately
+# after a tag-19 record and none falls anywhere else** (144 of 144, 0
+# elsewhere -- and 144 is this comment's own recovered count). A record type
+# that only ever occurs glued to the back of one other record type is that
+# record's tail.
+#
+# `LAYER_TAG0_1005` is kept, unused, as the number this file used to publish,
+# so a reader who greps it finds this paragraph rather than nothing.
 LAYER_TAG0_1005 = 20
 
-#: Layer payload sizes for version >= 1005.  Same table, wider cover, plus the
-#: 1005-only tag 0.
-LAYER_PAYLOAD_1005 = {**LAYER_PAYLOAD, 4: COVER_1005, 0: LAYER_TAG0_1005}
+# THE EFFECT RECORD GREW BY 24 BYTES AT VERSION 1005.
+#
+#     <=1004   u32 tag(19) ; char[64] name ; u32 x ; u32 y          72 payload
+#     >=1005   ... and then u32 a ; u32 b ; u32 c ; float f[3]      96 payload
+#
+# MEASURED 2026-08-29 over all 12,100 effect records on the ambient CCO, the
+# CCO snapshot, 5517, 6609 and 7878, loose and archived:
+#
+#     the three u32   all zero on 11,378, all non-zero on 717, mixed on 5
+#     the three float 121 distinct triples, range 0.04 .. 7.0, and the top
+#                     six are (1,1,1) x8,642, (0.8,0.8,0.8), (0.7,0.7,0.7),
+#                     (0.5,0.5,0.5), (0.6,0.6,0.6), (1.0,1.2,1.2)
+#
+# which is a colour or scale triple and is not slack space. **What the three
+# floats and the three u32 ARE is not claimed here** -- only their width, which
+# is what the walk needs. Naming them would be the same guess `COVER_1005`
+# refuses.
+#
+# **Closure is not the evidence**, the standard `COVER_1005` sets. The content
+# check is 6609's, because 6609 is the only root here whose effect table is the
+# compiled `ini/3DEffect.dbc` rather than the stale plaintext decoy: **291 of
+# its 355 recovered effect names resolve**, and the 64 that do not are 36
+# distinct names in the `mj_ei_*` / `mj_hhdc_*` family -- *the same family, and
+# only that family*, that the superseded paragraph above already recorded as
+# the residue. A wider record that was wrong would have scattered it.
+EFFECT_1005 = 96
+
+#: Layer payload sizes for version >= 1005.  Same table, wider cover, wider
+#: effect, and NO tag 0.
+LAYER_PAYLOAD_1005 = {**LAYER_PAYLOAD, 4: COVER_1005, 19: EFFECT_1005}
 
 
 # AND VERSION 1006 RENUMBERS THE COVER TAG: 4 BECOMES 24.
@@ -248,11 +301,108 @@ LAYER_PAYLOAD_1005 = {**LAYER_PAYLOAD, 4: COVER_1005, 0: LAYER_TAG0_1005}
 # observed says it should, and carrying unmeasured entries across a version is
 # the guess this comment exists to refuse.  A 1006 map holding a tag-4 record
 # would read 416 and go loud, which is the correct failure.
+#
+# ---------------------------------------------------------------------------
+# HALF SUPERSEDED 2026-08-29.  1006 STILL DOES NOT INHERIT TAG 0 -- there is
+# no tag 0 (see `EFFECT_1005`).  BUT 1006 DOES HOLD TAG-4 RECORDS AND THEY ARE
+# 420, NOT 416.
+#
+# The refusal above was right to demand a measurement and wrong about what one
+# would find, and it could not have found them: 1006's tag-4 records are not in
+# the layer table at all.  They are in the SECOND counted record list 1006
+# writes after it (`LATE_LAYERS_MIN_VERSION` below), which nothing walked until
+# now.  **MEASURED 2026-08-29: 25,308 tag-4 records across the 176 v1006 maps,
+# every one of them 420 bytes** -- at 416 the walk desynchronises inside the
+# first map that has one.  Their content passes the `COVER_1005` check: on 6609
+# and 7878 every recovered `.ani` path exists.
 COVER_TAG_1006 = 24
 
-#: Layer payload sizes for version 1006: the base table plus the renumbered
-#: cover.  Deliberately NOT built on `LAYER_PAYLOAD_1005`.
-LAYER_PAYLOAD_1006 = {**LAYER_PAYLOAD, COVER_TAG_1006: COVER_1005}
+#: Layer payload sizes for version 1006: the base table, the renumbered cover,
+#: 1005's wider effect, and 1005's wider tag 4 -- which 1006 uses in its second
+#: record list.  Still NOT built on `LAYER_PAYLOAD_1005`: each entry is here
+#: because it was measured on a 1006 map, not because 1005 has it.
+LAYER_PAYLOAD_1006 = {**LAYER_PAYLOAD, COVER_TAG_1006: COVER_1005,
+                      4: COVER_1005, 19: EFFECT_1005}
+
+# AND 1006 WRITES A SECOND COUNTED RECORD LIST AFTER THE LAYER TABLE.
+#
+#     u32 n_layers ; n_layers records          <- the layer table
+#     u32 n_late   ; n_late   records          <- 1006 ONLY, this list
+#     u32 n_groups ; groups                    <- the trailing plane section
+#
+# Same records, same tags, same sizes -- a second list, not a new format.  It
+# is not an artefact of a mis-sized layer table: on `spirit01_new` the count is
+# 0 and the very next word is the group count; on `poker03_new` it is 1 and the
+# one record is a tag-19 effect; on `luckytree02_new` it is 12 and the first is
+# a tag-4 cover naming `ani\mapscene.ani`.
+#
+# MEASURED 2026-08-29 over the 176 v1006 maps: 41,000 records in this list --
+# 25,308 covers (tag 4), 11,597 effects (tag 19), 4 scenes (tag 1).  **No
+# v1005 or earlier map has it**: the same walk closes 19 of 19 v1005 maps and
+# all 1,831 pre-1005 maps without one, and inserting it there desynchronises
+# them immediately.  That asymmetry is the whole reason it is version-gated
+# rather than "read a count if one looks plausible".
+#
+# What the list MEANS is not claimed -- only that it exists, is counted, and
+# holds the same records.
+LATE_LAYERS_MIN_VERSION = 1006
+
+
+def late_layer_spans(raw: bytes, d) -> list:
+    """`[(start, end)]` for each record in the second list, over `raw`.
+
+    Re-walked from the bytes rather than remembered from the parse, because a
+    span is only trustworthy against the buffer it is being applied to. A
+    caller holding a `DMap` parsed from one file and bytes from another gets
+    an empty list here instead of offsets into the wrong buffer.
+
+    Returns [] when the list was not reached or the walk refused.
+    """
+    off = getattr(d, "late_layer_offset", -1)
+    end = getattr(d, "late_layer_end", -1)
+    if off < 0 or end < 0 or end > len(raw):
+        return []
+    payload = layer_payload_for(getattr(d, "version", 0))
+    spans = []
+    p = off + 4
+    for _ in range(int(getattr(d, "late_layer_count", 0) or 0)):
+        if p + 4 > end:
+            return []
+        (t,) = struct.unpack_from("<I", raw, p)
+        size = payload.get(t)
+        if size is None or p + 4 + size > end:
+            return []
+        spans.append((p, p + 4 + size))
+        p += 4 + size
+    return spans if p == end else []
+
+
+def splice_late_layers(raw: bytes, d, records: list) -> bytes:
+    """`raw` with the second record list replaced by `records`, count fixed.
+
+    **THE SURGICAL EDIT, and the only kind this file may take.** `.DMap` is
+    one of the 155 files `integrity.json` covers, so every byte outside the
+    record list is copied through untouched -- the same contract
+    `mapedit.stage_passability` holds for cell masks. Nothing here rewrites a
+    header, recomputes a layout, or re-encodes a record: `records` is a list
+    of RAW record bytes, which is what makes duplicating an existing cover
+    possible without an encoder for a format whose payload semantics are only
+    partly known.
+
+    Refuses rather than guesses when the spans do not reconstruct the region
+    exactly. A splice at a plausible-but-wrong offset corrupts the file
+    silently, and this is a file the client validates.
+    """
+    spans = late_layer_spans(raw, d)
+    if not spans and int(getattr(d, "late_layer_count", 0) or 0):
+        raise ValueError("late-layer spans do not reconstruct the region; "
+                         "refusing to splice")
+    off = getattr(d, "late_layer_offset", -1)
+    end = getattr(d, "late_layer_end", -1)
+    if off < 0 or end < 0:
+        raise ValueError("this map has no second record list to splice")
+    body = b"".join(records)
+    return (raw[:off] + struct.pack("<I", len(records)) + body + raw[end:])
 
 
 def layer_payload(version: int) -> dict:
@@ -357,6 +507,104 @@ PLANE_RECORD = 264
 #: the tempting-but-wrong "the stride is really 264" fix.
 EXTRA_RECORD = GROUP_HEADER + PLANE_RECORD          # 284
 
+# THE GROUP HEADER GREW BY THREE WORDS AT 1005, AND A GROUP'S CONTENTS ARE NOT
+# ALL PLANES.
+#
+# Two corrections, and they are separate.  The first is a width:
+#
+#     <=1004   u32 v0, v1, v2, v3 ; u32 n_items                     20 bytes
+#     >=1005   u32 v0, v1, v2, v3 ; u32 160 ; u32 5 ; u32 6 ;
+#              u32 n_items                                          32 bytes
+#
+# so `n_items` moves from +16 to +28 and the record body from +20 to +32.  The
+# pre-1005 reader finds `160` where the count should be, asks for 160 x 264
+# bytes, cannot have them, and refuses the whole tail -- which is `extra_count`
+# 160 beside `len(extra)` 0 on `magictower01_new`, the refusal working exactly
+# as designed on a header it was never given.
+#
+# The three new words are `160, 5, 6` on 358 of the 360 groups measured; the
+# two that differ are `(160, 3, 6)` and `(160, 3, 1)`.  **They are not named
+# here.**  A constant that varies twice is not a constant and a name would
+# assert a meaning the data does not carry.
+#
+# THE SECOND CORRECTION IS THE ONE THAT ALSO EXPLAINS A PRE-1005 MAP.  The
+# count is `n_items`, not `n_planes`, and the items are TAG-DISPATCHED records
+# from the same table the layer walk uses -- extended with tag 8, whose payload
+# is the `char[260]` background-plane path.  Tag 8 is `PUZZLE` in `LAYER_TYPES`
+# and the paths are `map\puzzle\*.pul`; the enum named it all along.
+#
+# `7878 newbie` is v1004 and left 360 bytes unread, and `docs/why_the_ambient_
+# install_disagrees_2026-08-29.md` recorded it as "not version-explained".  It
+# is explained here and it is not a version at all: its one group declares 2
+# items, the first is a tag-8 plane (`map\puzzle\newbiebg.pul`) and **the
+# second is a tag-19 effect named `daycrane`**, 76 bytes, not another 264-byte
+# plane.  The old model demanded 2 x 264, could not have them, and refused.
+# One map in 1,831 has a mixed group, which is why a plane-only reading
+# survived this long.
+#
+# MEASURED 2026-08-29, every map on ten installs, loose and archived, through
+# `map_names`/`open_map` so the registry decides which form is read:
+#
+#     version        maps   leaving a byte of the trailer unread
+#     pre-1005      1,831   1 -> 0        (`newbie`, above)
+#     1005 / 1006     195   194 -> 0
+#
+# Group items recovered: 360 tag-8 planes and 253 tag-19 effects.  **Closure is
+# not the evidence**: 360 of 360 plane paths end in `.pul` and 356 of 360
+# resolve through `AssetRoot`, the four being `newplain01/02-bg0{1,2}.pul` on
+# 7878, which are shipped-content rot of the `KNOWN_DANGLING` kind rather than
+# parse residue -- they follow the `<stem>-bgNN.pul` convention of the 356 that
+# do resolve.
+GROUP_HEADER_1005 = 32
+
+#: The tag a background-plane item carries inside a group, and its payload.
+#: `PLANE_RECORD` is `4 + PLANE_PATH` and stays the name earlier measurements
+#: are stated in.
+PLANE_TAG = 8
+PLANE_PATH = 260
+
+#: The 1005/1006 trailing section ends with eight bytes after the last group.
+#: **Zero on 194 of the 194 maps that have them**, so nothing is decoded from
+#: them and `parse` consumes them only when they are in fact zero -- a
+#: non-zero tail stays in `bytes_unconsumed` where it is audible.  The 195th
+#: map, 5517's `icecrypt-lev3`, ends immediately after `n_groups == 0` and has
+#: no tail at all, which is why this is "consume eight zero bytes if they are
+#: there" and not "the trailer is eight bytes longer".
+TRAILER_TAIL_1005 = 8
+
+
+def numeric_version(version: int) -> int:
+    r"""The numeric format version, or 0 for the `DMAP1xx`-tagged form.
+
+    A tagged map keeps its version in the 8-byte magic (`DMAP101`) and leaves
+    the u32 at +0 holding `DMAP_TAG` -- 0x50414D44, which is 1,346,456,900 and
+    therefore sorts **above every real version**.
+
+    `layer_payload` never noticed because it tests `== 1005` and `== 1006`.
+    Every `>= 1005` test added for the group section has to come through here
+    or the tagged maps inherit 1005's layout: MEASURED, that is not a
+    hypothetical -- **62 of the 184 tagged maps on this box start leaving
+    bytes unread** the moment they are handed the 32-byte group header, and
+    they read clean again through this function.
+    """
+    return 0 if version == DMAP_TAG else version
+
+
+def group_header(version: int) -> int:
+    """The width of one plane-group header at this map version."""
+    return (GROUP_HEADER_1005 if numeric_version(version) >= 1005
+            else GROUP_HEADER)
+
+
+def group_item_payload(version: int) -> dict:
+    """Payload sizes for the records inside a plane group.
+
+    The layer table plus tag 8.  One table, not two: a group holds the same
+    records the layer list holds, and `newbie`'s tag-19 item is read with the
+    same width the layer walk would give it.
+    """
+    return {**layer_payload(version), PLANE_TAG: PLANE_PATH}
+
 
 @dataclass
 class Cell:
@@ -385,14 +633,51 @@ class DMap:
     uninit_tail: bool = False
     version_string: str | None = None
     trailer: int | None = None
-    #: Planes the file *declares* -- the sum of every group's `n_planes`.
-    #: Deliberately not `len(extra)`: the two disagreeing is the parser's
-    #: own proof that it could not walk what the file promised, and
+    #: Items the file *declares* -- the sum of every group's `n_items`.
+    #: Deliberately not `len(extra_items)`: the two disagreeing is the
+    #: parser's own proof that it could not walk what the file promised, and
     #: `DMapTrailingSection` reads exactly that.
+    #:
+    #: **This is the ITEM count, and it equals the plane count on every map
+    #: but one.** A group's items are tag-dispatched records and only tag 8 is
+    #: a plane; `7878 newbie` is the single map on this box whose group mixes
+    #: a plane with an effect, so `extra_count == len(extra)` held everywhere
+    #: it was ever measured. Compare it against `extra_items`, not `extra`.
     extra_count: int = 0
-    #: How many groups those planes came from.
+    #: How many groups those items came from.
     extra_groups: int = 0
+    #: The background planes -- tag-8 items only, the shape `puzzle.py` reads.
     extra: list[dict] = field(default_factory=list, repr=False)
+    #: Every item the groups hold, planes and non-planes alike.
+    extra_items: list[dict] = field(default_factory=list, repr=False)
+    #: 1006's second record list: `late_layer_count` is what it declares and
+    #: `late_layers` is what was walked. See `LATE_LAYERS_MIN_VERSION`.
+    late_layer_count: int = 0
+    late_layers: list[dict] = field(default_factory=list, repr=False)
+    late_layer_error: str | None = None
+    #: WHERE the second record list sits, so an edit can be SURGICAL.
+    #:
+    #: `late_layer_offset` is the byte offset of the `uint32` count itself and
+    #: `late_layer_end` is one past the last record. Both are -1 when the list
+    #: was not reached -- on a pre-1006 map, or when the walk refused.
+    #:
+    #: The parser knew these all along and dropped them, which is the whole
+    #: reason an editor could not add a cover: `late_layers` says WHAT the
+    #: records are and nothing said WHERE. `.DMap` is one of the files
+    #: `integrity.json` covers, so the only responsible edit is the one
+    #: `stage_passability` already makes for cell masks -- patch the bytes
+    #: that change, copy every other byte through untouched, re-parse before
+    #: writing. That is impossible without an offset, and a full rewrite of a
+    #: checked file to add one record is not a trade anyone should take.
+    #:
+    #: Additive and default -1: every existing caller is unaffected, and a
+    #: caller that reads them without checking gets an obviously wrong offset
+    #: rather than a plausible one.
+    late_layer_offset: int = -1
+    late_layer_end: int = -1
+    #: The eight zero bytes 1005/1006 leave after the last group, when they
+    #: are there and when they are in fact zero. See `TRAILER_TAIL_1005`.
+    trailer_tail: bytes = b""
     bytes_unconsumed: int = 0
     #: What the loose file is worth against its `.7z` twin -- one of
     #: `ARCHIVE_STATES`.  The other audible channels report whether the file
@@ -619,7 +904,7 @@ def parse(path: str | Path, want_cells: bool = True,
     # Trailing section: groups of background planes.  See GROUP_HEADER above
     # for the layout and for why the older flat-284 reading looked right.
     #
-    # VERIFIED 2026-08-10 over all 181 maps with a trailer on 5517: the group
+    # VERIFIED 2026-08-10 over all 181 maps with a trailer ON 5517: the group
     # walk ends EXACTLY at EOF on 181 of 181, 0 misfits, and every one of the
     # recovered paths is a `.pul`.  171 maps yield byte-identical output to
     # the flat model; the 10 star maps gain the planes they were dropping.
@@ -627,15 +912,118 @@ def parse(path: str | Path, want_cells: bool = True,
     # single-plane records and 7,8,...,16 on exactly star01..star10 -- it was
     # the plane count all along.
     #
+    # AND THAT `181 / 181` IS THE RANGE, NOT A PROPERTY.  BOUNDED 2026-08-26
+    # over every declared install, loading each map the way the client does:
+    #
+    #     5017 142/0   5065 144/0   5165 154/0   5517 192/0   6090 247/0
+    #     cco  136/7   6609 297/17  zephyr 305/41   7878 470/164
+    #                                     (maps parsed / maps leaving bytes)
+    #
+    # **The boundary is the map VERSION.**  218 of the fleet's 219 v1005/v1006
+    # maps leave their tail unread; the one exception is 5517's `icecrypt-lev3`,
+    # which declares `n_groups = 0` -- it ships no background-plane section at
+    # all, so it ends at EOF with nothing to read rather than with the section
+    # read correctly.  Stated that way because the first reading of it was
+    # "the one 1005 map with no cover records", which is FALSE: it carries two
+    # covers.  Its trailer is empty, and that is a different fact.
+    # Every v1003/v1004 map on all six official clients and on CCO still closes
+    # at EOF, so nothing here is wrong -- it is bounded, and it did not say so.
+    #
+    # It is a different SECTION rather than a wrong stride, which is the same
+    # answer the star family got one version earlier: where a group walk that
+    # lands on EOF can be found at all (142 of the 229 gap maps), 140 of those
+    # need a 32-BYTE group header rather than this 20 -- the four `values`
+    # u32s, then three more (`160` on every recovered group, the others from
+    # {3,5} and {1,6}), then `n_planes` -- ending at EOF or 8 zero bytes short,
+    # with 302 of 311 recovered paths naming a `.pul` that exists on disk.
+    # (The 2 that fit at 20 are zephyr's `desert1` and `southgate`, v1004
+    # residue where only the section's START had moved.)  Nor does it begin
+    # where the layer walk ends: on `bp-flandlords-y_new` the group walk starts
+    # exactly `4 + 135 * 424` bytes later -- 135 being the u32 sitting there and
+    # 424 the 1005/1006 cover record -- so a SECOND counted list separates the
+    # layers from the backdrops, 43,696 bytes of it on `ninja01_new`.  Its first
+    # record's tag is 4, the tag 1006 renumbered to 24 for the list walked
+    # above (COVER_TAG_1006), naming `ani\mapscene-new.ani`.  OBSERVED, not
+    # modelled.
+    #
+    # NOT ACTED ON, deliberately.  87 of the 229 fit no reading defensible
+    # today, and `C-2026-08-11-claude-explorer-1005-tag0` is what a plausible
+    # wrong reading of an unmodelled 1005 structure already cost once.  The gap
+    # is pinned instead: `tools/test_viewer.py::DMapTrailerModelRange`,
+    # `docs/map_scenery.md` §5, CORRECTIONS
+    # `C-2026-08-26-claude-vibeco-dx-camera`.
+    #
     # `values` keeps the flat model's 6-int shape, [v0,v1,v2,v3,n_planes,flag],
     # so `tools/puzzle.py` (which reads v[0] as draw index and v[2],v[3] as
     # parallax) is unchanged.  Planes in a group share the group's header,
     # which is what makes them a group.
-    if d.layers_complete and o + 4 <= len(b):
-        d.extra_groups, planes, declared, end = parse_trailer(b, o)
+    #
+    # 1006 writes a SECOND counted record list between the layer table and
+    # this section (`LATE_LAYERS_MIN_VERSION`), so it is walked first.  Its
+    # failure is reported on its own field rather than `layer_error`: the two
+    # lists fail for different reasons and merging them would make a 1006
+    # regression read as a layer-table regression.
+    if (d.layers_complete
+            and numeric_version(version) >= LATE_LAYERS_MIN_VERSION
+            and o + 4 <= len(b)):
+        (nlate,) = struct.unpack_from("<I", b, o)
+        d.late_layer_count = nlate
+        d.late_layer_offset = o
+        end = o + 4
+        for i in range(nlate):
+            if end + 4 > len(b):
+                d.late_layer_error = f"late layer {i}: truncated before tag"
+                break
+            (t,) = struct.unpack_from("<I", b, end)
+            size = payload.get(t)
+            if size is None:
+                d.late_layer_error = (f"late layer {i}: unmodelled type {t} "
+                                      f"({LAYER_TYPES.get(t, '?')}) at "
+                                      f"offset {end}")
+                break
+            if end + 4 + size > len(b):
+                d.late_layer_error = f"late layer {i}: payload overruns file"
+                break
+            d.late_layers.append(decode_layer(t, b[end + 4:end + 4 + size], i))
+            end += 4 + size
+        else:
+            o = end
+            d.late_layer_end = end
+        if d.late_layer_error:
+            # Same refusal as the group walk: leave the whole list unread
+            # rather than half-read, so `bytes_unconsumed` stays loud.
+            d.late_layers = []
+            # AND THE OFFSETS GO WITH IT. A half-walked list leaves `end`
+            # pointing into the middle of a record, and an offset that is
+            # plausible but wrong is worse than none -- a splice there would
+            # corrupt the file silently. The refusal has to be total.
+            d.late_layer_offset = -1
+            d.late_layer_end = -1
+
+    if d.layers_complete and not d.late_layer_error and o + 4 <= len(b):
+        start = o
+        d.extra_groups, items, declared, end = parse_trailer_items(b, o, version)
         o = end
         d.extra_count = declared
-        d.extra = planes
+        d.extra_items = items
+        d.extra = [i for i in items if i["tag"] == PLANE_TAG]
+        # The eight zero bytes 1005/1006 leave after the last group.  Consumed
+        # only when there are exactly eight and they are zero -- see
+        # `TRAILER_TAIL_1005`.  Anything else stays in `bytes_unconsumed`,
+        # because a rule that swallows "whatever is left" cannot report a miss.
+        #
+        # AND ONLY WHEN THE GROUP WALK ACTUALLY WALKED.  On a refusal `end`
+        # comes back at `start + 4`, so a truncated map whose header overruns
+        # with exactly eight zero bytes to spare would have had its tail eaten
+        # AND its `extra_count == len(extra_items) == 0` -- both audible
+        # channels silent on the same file.  `walked` is that test: past the
+        # group headers, or no groups at all.
+        walked = end >= start + 4 + d.extra_groups * group_header(version)
+        if (walked and numeric_version(version) >= 1005
+                and len(b) - o == TRAILER_TAIL_1005
+                and b[o:] == bytes(TRAILER_TAIL_1005)):
+            d.trailer_tail = b[o:]
+            o = len(b)
     d.bytes_unconsumed = len(b) - o
     # Last, and unconditionally: everything above says whether the bytes we
     # read are well-formed, and none of it can say whether they are the bytes
@@ -645,46 +1033,89 @@ def parse(path: str | Path, want_cells: bool = True,
     return d
 
 
-def parse_trailer(b: bytes, o: int) -> tuple[int, list[dict], int, int]:
-    """Walk the background-plane groups at `o`.
+def parse_trailer_items(b: bytes, o: int,
+                        version: int = 0) -> tuple[int, list[dict], int, int]:
+    """Walk the background-plane groups at `o`, keeping every item.
 
-    Returns `(n_groups, planes, declared, end)`. `declared` is the sum of
-    every group's `n_planes` — what the file *claims* — and `planes` is what
-    could actually be walked. **On any shortfall the walk yields no planes
-    and `end` returns to `o`**, so `declared != len(planes)` and every
-    trailing byte stays counted in `bytes_unconsumed`. Reading what fits and
-    calling it a parse is the failure mode this shape exists to refuse.
+    Returns `(n_groups, items, declared, end)`. `declared` is the sum of every
+    group's `n_items` — what the file *claims* — and `items` is what could
+    actually be walked. **On any shortfall the walk yields no items and `end`
+    returns to `o`**, so `declared != len(items)` and every trailing byte
+    stays counted in `bytes_unconsumed`. Reading what fits and calling it a
+    parse is the failure mode this shape exists to refuse.
+
+    Each item carries its `tag`; a tag-8 item also carries `path`, and the
+    six-int `values` the flat model published — `[v0, v1, v2, v3, n_items,
+    tag]` — so `tools/puzzle.py` reads the same shape it always did. The three
+    words 1005 inserts are kept apart, in `head_extra`, rather than widened
+    into `values`, because `values[4]` is load-bearing at the call sites.
+
+    `version` decides the header width and the item table; the default is the
+    pre-1005 shape, which is what every caller that predates 1005 wants.
 
     Split out from `parse` so the refusal can be tested on a crafted body
     with no game install — a control that skips is not a control.
     """
+    hdr = group_header(version)
+    payload = group_item_payload(version)
     (n_groups,) = struct.unpack_from("<I", b, o)
     start = o = o + 4
-    planes: list[dict] = []
+    items: list[dict] = []
     declared = 0
     ok = True
     for _ in range(n_groups):
-        if o + GROUP_HEADER > len(b):
+        if o + hdr > len(b):
             ok = False
             break
+        # v0..v3, then whatever the version inserts, then n_items LAST --
+        # which is why the count is read from the END of the header and not
+        # from a fixed +16.
         head = struct.unpack_from("<4I", b, o)
-        (n_planes,) = struct.unpack_from("<I", b, o + 16)
-        o += GROUP_HEADER
-        declared += n_planes
-        if o + n_planes * PLANE_RECORD > len(b):
-            ok = False
+        n_extra_words = (hdr - GROUP_HEADER) // 4
+        extra_words = list(struct.unpack_from(f"<{n_extra_words}I", b, o + 16)) \
+            if n_extra_words else []
+        (n_items,) = struct.unpack_from("<I", b, o + hdr - 4)
+        o += hdr
+        declared += n_items
+        for _ in range(n_items):
+            if o + 4 > len(b):
+                ok = False
+                break
+            (tag,) = struct.unpack_from("<I", b, o)
+            size = payload.get(tag)
+            if size is None or o + 4 + size > len(b):
+                ok = False
+                break
+            rec = {"tag": tag, "values": [*head, n_items, tag],
+                   "head_extra": extra_words}
+            if tag == PLANE_TAG:
+                rec["path"] = _cstr(b[o + 4:o + 4 + PLANE_PATH])
+            else:
+                rec.update(decode_layer(tag, b[o + 4:o + 4 + size], len(items)))
+            items.append(rec)
+            o += 4 + size
+        if not ok:
             break
-        for _ in range(n_planes):
-            (flag,) = struct.unpack_from("<I", b, o)
-            planes.append({"values": [*head, n_planes, flag],
-                           "path": _cstr(b[o + 4:o + PLANE_RECORD])})
-            o += PLANE_RECORD
     if not ok:
         # Leave the tail unread rather than half-read.  `declared` still
         # carries what the file claimed, so the disagreement with
-        # `len(planes)` stays visible instead of being rounded away.
-        planes, o = [], start
-    return n_groups, planes, declared, o
+        # `len(items)` stays visible instead of being rounded away.
+        items, o = [], start
+    return n_groups, items, declared, o
+
+
+def parse_trailer(b: bytes, o: int,
+                  version: int = 0) -> tuple[int, list[dict], int, int]:
+    """`parse_trailer_items`, filtered to the background planes.
+
+    Kept at this name and this arity because `tools/puzzle.py` and the Route B
+    surveys consume a list of planes and nothing else. `declared` is still the
+    file's own claim and is still the ITEM count, so a group holding a
+    non-plane item shows up as `declared != len(planes)` — which is true, and
+    is why `parse` compares `declared` against `extra_items` instead.
+    """
+    n_groups, items, declared, end = parse_trailer_items(b, o, version)
+    return n_groups, [i for i in items if i["tag"] == PLANE_TAG], declared, end
 
 
 # ---------------------------------------------------------------------------
@@ -952,12 +1383,60 @@ def archive_entry(path: str | Path) -> tuple[int, int] | None:
     Reads only the 32-byte signature header and the small header it points at
     -- the content is never decompressed, and no external tool is involved.
 
-    **Deliberately narrow.**  Every ``map/map/*.7z`` in the corpus is one file,
-    one folder, one coder, with a plain (unencoded) header of 81..115 bytes --
-    736 archives across 5517, 6090 and 6609, no exceptions.  Anything else
+    **Deliberately narrow.**  Every ``map/map/*.7z`` examined is one file, one
+    folder, one coder, with a plain (unencoded) header of 81..115 bytes --
+    736 archives on 5517, 6090 and 6609, no exceptions.  Anything else
     returns None, which callers must treat as *unknown*, never as *matching*.
+
+    SCOPE, CORRECTED 2026-09-07.  That sentence used to open "Every
+    ``map/map/*.7z`` **in the corpus**", and 736 is exactly 5517 (192) +
+    6090 (247) + 6609 (297).  **The corpus holds 9,944 archives across the 29
+    installs that ship any**, derived from `coroot.clients_dir()` and counted
+    by `scratchpad/cheapclaims.py`; the three named are 7.4% of it.  The
+    finding is a real one about the 736 and it was never re-run on the other
+    26 installs, so "no exceptions" is a statement about three installs
+    wearing the grammar of a statement about all of them -- the same shape as
+    the RIBB parenthesis, which is why both are in
+    `docs/claim_enumeration_audit_2026-09-07.md`.  Per install, the 29 are:
+    5517 192, 6090 247, 6256 269, 6271 278, 6609 297, 6609.cn 297, 6652 300,
+    6680 307, 6707 312, 6716 278, 6772 320, 6805 323, 6868 324, 6907 329,
+    6968 343, 7009 354, 7065 374, 7083 375, 7110 375, 7135 381, 7170 385,
+    7182 385, 7189 389, 7205 396, 7632 435, 7682 435, 7867 469, 7878 470,
+    Zephyr 305.  The five with none are 4274, 5017, 5065, 5165 and
+    CCO-snapshot-2026-08-24.  **The header shape on the other 9,208 is
+    UNMEASURED** -- this is a scope correction, not a new result.
     An LZMA-encoded header (``kEncodedHeader``) is the obvious next shape and
     is refused rather than half-supported.
+
+    SCOPE CLOSED 2026-09-21.  The 9,208 above are measured, and the narrowness
+    turns out to cost **nothing**.  Census over every ``.7z`` under
+    `coroot.clients_dir()` -- **14,921 archives across 40 installs**, which is
+    also a correction to the 9,944/29 counted above (7632, 7682, 6609.cn and
+    6716 are gone, and 7217..7622, 7867, ThroneOfKings7939 and
+    DuueWanderer7952 arrived):
+
+        next-header id          kHeader(plain)  14,921 / 14,921
+        kEncodedHeader                                0
+        this reader ACCEPTED                    14,921 / 14,921
+        this reader REFUSED                           0
+        coder                   LZMA1 9,762, LZMA2 5,159
+
+    The discriminator is one byte: a 7z next-header opens with its property id,
+    ``0x01`` kHeader and ``0x17`` kEncodedHeader, so the shape is readable
+    without decoding anything.  **Not one archive in the corpus uses an encoded
+    header**, so support for it would be code aimed at a shape that does not
+    exist here -- which is why it stays refused rather than written.
+
+    Header acceptance is not successful decode, so that was measured
+    separately: `read_archive` on a STRATIFIED sample of **400** (10 per
+    install, all 40) decoded and reproduced its stored CRC32 on **400 of 400**,
+    zero mismatches, zero refusals.
+
+    *What this retires is a hazard rather than a bug.* The paragraph above
+    correctly told a reader that 92.6% of the corpus was unmeasured and named
+    `kEncodedHeader` as the next shape -- which points the next person at
+    speculative work.  A measured zero is the thing that stops that, and it
+    cost one header read per archive.
 
     VERIFIED against 7-Zip 's own ``l -slt`` output on all 736: identical size
     and CRC on 736, zero disagreements, zero refusals.  `test_viewer.py
@@ -1028,6 +1507,15 @@ def read_archive(path: str | Path) -> Optional[bytes]:
     one).  Both are `lzma.FORMAT_RAW` filters, so both decode here.  Every one
     of the 297 reproduces its stored CRC32, and the four LZMA2 bodies plus a
     sampled LZMA1 body are **byte-identical to 7-Zip's own ``e -so`` output**.
+
+    WIDENED TO THE WHOLE CORPUS 2026-09-21, and the 297's 99%/1% split was not
+    representative.  Over all **14,921** archives in 40 installs the coder is
+    **LZMA1 9,762 / LZMA2 5,159** -- LZMA2 is 34.6%, not 1.3%.  Both remain
+    `lzma.FORMAT_RAW` filters so both still decode here, and nothing about the
+    code changes; what changes is that "4 LZMA2" was a fact about 6609 wearing
+    the clothes of a fact about the format.  Decode plus stored-CRC32 verified
+    on a stratified 400 (10 per install, all 40): **400 of 400**, zero
+    mismatches.  See `archive_entry`'s SCOPE CLOSED note for the header census.
 
     Returns None rather than a guess for any shape outside that -- an encoded
     header, a second coder, a chain of them.  A wrong decode here is a wrong
@@ -1350,21 +1838,25 @@ def open_map(root: str | Path, name: str) -> tuple[Optional[bytes], str]:
 def parse_map(root: str | Path, name: str, **kw) -> tuple[Optional[DMap], str]:
     """`open_map` then `parse`, without a temporary file.
 
-    The parser takes a path, so an archive member is written to a scratch file
-    only if a caller needs one; here the bytes are parsed in place.
+    The docstring said "without a temporary file" while a `TemporaryDirectory`
+    sat three lines below it, writing the bytes out and reading them back for
+    every call. `parse` has taken `data=` since the 7878 archive work and
+    never touches the path when bytes are given (see the `b = ...` line in
+    `parse`), so the round trip is gone: this has 19 non-test callers, and
+    one palette load alone parsed 136 maps that way.
+
+    `path` stays the provenance the DMap reports -- the install location, not
+    a scratch file that no longer exists by the time anyone reads it.
     """
     raw, why = open_map(root, name)
     if raw is None:
         return None, why
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        p = Path(td) / f"{name}.DMap"
-        p.write_bytes(raw)
-        try:
-            d = parse(p, **kw)
-        except Exception as e:                            # noqa: BLE001
-            return None, f"{why}: did not parse: {e}"
-    d.path = Path(root) / "map" / "map" / f"{name}.DMap"
+    p = Path(root) / "map" / "map" / f"{name}.DMap"
+    try:
+        d = parse(p, data=raw, **kw)
+    except Exception as e:                                # noqa: BLE001
+        return None, f"{why}: did not parse: {e}"
+    d.path = p
     return d, why
 
 
@@ -1404,8 +1896,47 @@ def read_pux(path: str | Path) -> Optional[dict]:
     what is decoded is the geometry, which is what `puzzle.py` needs to place
     the ground and what it has been refusing for want of.
 
-    Layout, VERIFIED on all 237 `.pux` in the corpus (6609 20, 7878 136,
-    Zephyr 13, CCO 68 -- every one carrying the magic)::
+    Layout, VERIFIED on 237 `.pux` -- and the corpus holds **1,435 `.pux` in
+    the corpus across 27 of the 34 installs**, so the 237 is a quarter of it.
+
+    SUPERSEDED 2026-09-07, kept because the parenthesis is the whole lesson:
+
+        Layout, VERIFIED on all 237 `.pux` in the corpus (6609 20, 7878 136,
+        Zephyr 13, CCO 68 -- every one carrying the magic)
+
+    <- TRUE OF THE FOUR IT NAMES, and it read as true of the corpus.  Re-walked
+    2026-09-07 (`py -3 scratchpad/cheapclaims.py`, install list derived from
+    `coroot.clients_dir()`): those four hold exactly 20 / 136 / 13 / 68, so the
+    237 was never wrong -- but 23 further installs ship `.pux` and were not in
+    the list.  Per install: 6271 14, 6609 20, 6609.cn 20, 6652 22, 6680 24,
+    6707 24, 6716 14, 6772 29, 6805 32, 6868 32, 6907 34, 6968 40, 7009 47,
+    7065 61, 7083 62, 7110 62, 7135 63, 7170 65, 7182 65, 7189 69, 7205 74,
+    7632 105, 7682 105, 7867 135, 7878 136, CCO-snapshot-2026-08-24 68,
+    Zephyr 13.  ("CCO" in the old sentence is `CCO-snapshot-2026-08-24`; the
+    directory now called `CCO` holds `.gitignore` and `.gitkeep` and is not an
+    install.)  The seven with none are 4274, 5017, 5065, 5165, 5517, 6090 and
+    6256 -- `.pux` starts at 6271.
+
+    The LAYOUT is unaffected, and that is worth stating separately: it was read
+    off the header, and re-running `read_pux` over the whole corpus on
+    2026-09-07 returned a header for **1,435 of 1,435, zero refusals** -- the
+    1,198 nobody had walked included.  An enumeration being short does not make
+    the reading it supports wrong; it makes that reading's SUPPORT smaller than
+    it was quoted as being, which is the part that was published.
+
+    AND `.pux` IS NOT ONLY UNDER `map/`.  Twenty-one installs keep seven more
+    in a ROOT-LEVEL `puzzlesave/` -- `magictower01..04.pux` plus
+    `newborder01.PUX`, `newborder02.PUX` and `refine.PUX`, and note the
+    case.  7878 does not, which is how a scope check run on 7878 alone reports
+    "all of them are under `map/`" and is wrong about 21 other installs and 147
+    files -- the same defect as the parenthesis above, one level down, and it
+    was made and caught during this very correction.  `PUX_SUBTREES` in
+    `tests/test_claim_enumeration.py` is `map/` AND `puzzlesave/`, and the
+    bound behind it is an UNSCOPED walk of all 34 installs (34.8 s, same
+    1,435), not of one.
+
+    `tests/test_claim_enumeration.py` walks every install for this and reddens
+    if one grows a `.pux` the per-install count does not know about.  Layout::
 
         +0   char[10]  "TqTerrain\0"
         +10  2 bytes   varies; not named
@@ -1433,11 +1964,241 @@ def read_pux(path: str | Path) -> Optional[dict]:
             "bytes": len(b)}
 
 
-#: A `.pux` layer entry: u16 index into the terrain table, then two i16.
+#: A `.pux` layer entry: u16 index into the terrain table, then a **25-bit
+#: per-vertex alpha mask** stored as one little-endian u32.
+#:
+#: This reader keeps unpacking it as ``<Hhh`` -- `f0`, then the two `i16` it
+#: has always returned -- so the round-trip stays byte-exact and every existing
+#: caller keeps its 3-tuple.  The two `i16` are not two fields: they are the
+#: LOW 16 and HIGH 9 bits of one quantity.  `pux_layer_mask` joins them and
+#: `pux_mask_alpha` reads a vertex out of the result.
+#:
+#: DECODED from `Clients/7878/Env_DX9/Conquer.exe`, whose `.pux` loader (the
+#: sole referrer of the `"TqTerrain"` literal, RVA `0x8771CD`) reads the u16
+#: and then FOUR BYTES AS ONE FIELD into `+4` of a 0x14-byte layer node, and
+#: whose consumer at RVA **`0x872A68`** is, in full::
+#:
+#:     mov cl, [ebp+8]        ; vertex index
+#:     cmp cl, 0x19           ; 25
+#:     jae  ret0
+#:     xor eax, eax
+#:     inc eax
+#:     shl eax, cl            ; 1 << index
+#:     test [edx+4], eax      ; the field this constant describes
+#:     je   ret0
+#:     or al, 0xff            ; alpha 255
+#:
+#: -- i.e. ``alpha(i) = 255 if i < 25 and (mask >> i) & 1 else 0``.  Its caller
+#: at `0x87B3C1` forms the index as ``(v & 3) * 5 + (u & 3)`` over a 4x4 quad
+#: subdivision of the tile, so the 25 bits are the **5x5 grid of quad
+#: VERTICES**, row-major, and `0x87B439` shifts the returned alpha into bit 24
+#: of `0x00FFFFFF` -- a vertex colour.
+#:
+#: See `docs/pux_f1_f2_attribution_2026-09-06.md` for the data-side
+#: confirmation (991,695 layer entries over four installs: no bit at or above
+#: 25, no mask of zero, and a tile's rightmost vertex column agrees with its
+#: right neighbour's leftmost 98.8% against a 60.2% shuffled control).
 PUX_LAYER = 6
+
+#: The mask's grid: 5x5 vertices bounding a 4x4 subdivision of one tile.
+PUX_MASK_SIDE = 5
+PUX_MASK_BITS = PUX_MASK_SIDE * PUX_MASK_SIDE          # 25 -- the `cmp cl, 25`
+PUX_MASK_FULL = (1 << PUX_MASK_BITS) - 1               # 0x1FFFFFF
 
 #: The u32 that separates the two terrain tables. 1000 on all 136 files.
 PUX_SECTION = 1000
+
+
+def pux_layer_mask(f1: int, f2: int) -> int:
+    """The two `i16` of a `.pux` layer entry, rejoined into the one u32 the
+    client reads.
+
+    `f1` is the low half and `f2` the high half, little-endian, exactly as
+    they sat in the file -- so this is a re-read of the same four bytes and
+    not an interpretation of them.  The INTERPRETATION is that the result is
+    a 25-bit vertex mask, and that is `PUX_MASK_BITS` and `pux_mask_alpha`.
+    """
+    return (f1 & 0xFFFF) | ((f2 & 0xFFFF) << 16)
+
+
+def pux_mask_alpha(mask: int, col: int, row: int) -> int:
+    """The layer's alpha at vertex (`col`, `row`) of the tile: 0 or 255.
+
+    `col` runs along +x and `row` along +y, both 0..4, and the bit index is
+    ``row * 5 + col``.  **The axis assignment is MEASURED, not assumed**: the
+    disassembly gives the ``* 5`` and the bound, and the seam test in
+    `docs/pux_f1_f2_attribution_2026-09-06.md` §4 gives which of the two runs
+    along which axis -- the transposed convention scores 59.2% against a 61.8%
+    control on the same pairs, i.e. chance.
+
+    Vertex column 4 of a tile is the SAME SEAM as vertex column 0 of the tile
+    to its right; a compositor that treats the 25 bits as 5x5 *areas* will be
+    one sub-quad wide everywhere.
+    """
+    if not (0 <= col < PUX_MASK_SIDE and 0 <= row < PUX_MASK_SIDE):
+        return 0
+    return 255 if (mask >> (row * PUX_MASK_SIDE + col)) & 1 else 0
+
+
+#: Quads per tile edge: the 5x5 vertices bound a 4x4 subdivision, so the tile
+#: splits into 4 quads per axis and a quad is `PUX_GRID / 4` = 64 px -- the
+#: width of one map cell, which is the corroboration in
+#: `docs/pux_f1_f2_attribution_2026-09-06.md` 2.4 (the class builds a 256x256
+#: surface and 256/4 = 64).
+PUX_MASK_QUADS = PUX_MASK_SIDE - 1
+
+#: (quad px, corner pattern) -> that quad's interpolated alpha block. The
+#: vertex alphas are only ever 0 or 255, so a quad has just 16 possible corner
+#: patterns and every mask is an assembly of 16 blocks drawn from that set.
+#: Built once per (size, pattern) instead of per mask: a map has hundreds of
+#: distinct masks and 16 blocks between them.
+_PUX_QUAD_BLOCKS: dict = {}
+
+
+def _pux_quad_block(q: int, pattern: int) -> bytes:
+    """One quad's `q` x `q` alpha block, ANTI-DIAGONAL Gouraud between corners.
+
+    `pattern` packs the corner alphas as bits 0..3 in the order
+    (top-left, top-right, bottom-left, bottom-right) -- the same row-major
+    order `pux_mask_alpha` reads vertices in.
+
+    The client splits each sub-quad into two triangles on the ANTI-diagonal,
+    the edge TR--BL, and the raster interpolates each triangle linearly
+    (`docs/pux_interp_diagonal_2026-09-10.md`, traced from
+    `Clients/7878/Env_DX9/Conquer.exe` at `0x87B26A`). In (t, s) with t along
+    +x (col) and s along +y (row), that edge is the line `t + s == 1`: the TL
+    triangle (a00,a10,a01) covers `t + s <= 1` and the BR triangle
+    (a11,a10,a01) the rest. The two planes agree on the shared edge, so the
+    field is continuous. This REPLACED a bilinear fill, which differed in the
+    interior of the ~54% of drawn sub-quads whose corners are not co-planar.
+    """
+    key = (q, pattern)
+    hit = _PUX_QUAD_BLOCKS.get(key)
+    if hit is not None:
+        return hit
+    a00 = 255 if pattern & 1 else 0
+    a10 = 255 if pattern & 2 else 0
+    a01 = 255 if pattern & 4 else 0
+    a11 = 255 if pattern & 8 else 0
+    out = bytearray(q * q)
+    for r in range(q):
+        # Pixel CENTRES, not corners: the vertex sits ON the quad boundary, so
+        # the first pixel of a quad is half a pixel inside it and never reaches
+        # the vertex value exactly. Sampling at the corner instead would make
+        # the field one pixel wider than the quad at both ends and the seam
+        # between two quads would double-count the shared vertex.
+        s = (r + 0.5) / q
+        for c in range(q):
+            t = (c + 0.5) / q
+            if t + s <= 1.0:                       # TL triangle a00,a10,a01
+                val = a00 + (a10 - a00) * t + (a01 - a00) * s
+            else:                                  # BR triangle a11,a10,a01
+                val = a11 + (a10 - a11) * (1.0 - s) + (a01 - a11) * (1.0 - t)
+            out[r * q + c] = int(val + 0.5)
+    blk = bytes(out)
+    _PUX_QUAD_BLOCKS[key] = blk
+    return blk
+
+
+def pux_mask_field(mask: int, size: int) -> bytes:
+    """The layer's alpha over a `size` x `size` tile, row-major, one byte each.
+
+    The 25 bits are alphas AT VERTICES; the engine hands them to
+    `m_pPuzzleTriangle` as vertex colours and the raster interpolates between
+    them, so a compositor working in pixels has to interpolate too. The fill is
+    now TRACED, not assumed: the caller at RVA `0x87B26A` emits each sub-quad as
+    two triangles sharing the TR--BL edge -- Gouraud on the **anti-diagonal** --
+    and `_pux_quad_block` matches it (`docs/pux_interp_diagonal_2026-09-10.md`).
+    It read bilinear until 2026-09-10, which agrees at the vertices and edges
+    and differed in the interior of the ~54% of drawn sub-quads whose corners
+    are not co-planar.
+
+    A mask of `PUX_MASK_FULL` returns all-255 and is the common case (5.8-7.6%
+    of layer entries on three of four installs are exactly that, and it is the
+    single most common value on each).
+    """
+    n = size * size
+    if mask & PUX_MASK_FULL == PUX_MASK_FULL:
+        return b"\xff" * n
+    if mask & PUX_MASK_FULL == 0:
+        return b"\x00" * n
+    v = [[255 if (mask >> (r * PUX_MASK_SIDE + c)) & 1 else 0
+          for c in range(PUX_MASK_SIDE)] for r in range(PUX_MASK_SIDE)]
+    q, rem = divmod(size, PUX_MASK_QUADS)
+    if rem or q < 1:
+        # Off the fast path (a tile size that is not a multiple of 4). Same
+        # arithmetic, per pixel, so the two agree wherever both can run.
+        out = bytearray(n)
+        for y in range(size):
+            fy = (y + 0.5) * PUX_MASK_QUADS / size
+            j = min(PUX_MASK_QUADS - 1, int(fy))
+            s = fy - j
+            for x in range(size):
+                fx = (x + 0.5) * PUX_MASK_QUADS / size
+                i = min(PUX_MASK_QUADS - 1, int(fx))
+                t = fx - i
+                # Anti-diagonal Gouraud, the same split as _pux_quad_block.
+                a00, a10 = v[j][i], v[j][i + 1]
+                a01, a11 = v[j + 1][i], v[j + 1][i + 1]
+                if t + s <= 1.0:
+                    val = a00 + (a10 - a00) * t + (a01 - a00) * s
+                else:
+                    val = a11 + (a10 - a11) * (1.0 - s) + (a01 - a11) * (1.0 - t)
+                out[y * size + x] = int(val + 0.5)
+        return bytes(out)
+    out = bytearray(n)
+    for j in range(PUX_MASK_QUADS):
+        for i in range(PUX_MASK_QUADS):
+            pat = ((1 if v[j][i] else 0) | (2 if v[j][i + 1] else 0)
+                   | (4 if v[j + 1][i] else 0) | (8 if v[j + 1][i + 1] else 0))
+            blk = _pux_quad_block(q, pat)
+            x0 = i * q
+            for r in range(q):
+                o = (j * q + r) * size + x0
+                out[o:o + q] = blk[r * q:(r + 1) * q]
+    return bytes(out)
+
+
+def pux_terrain_refs(px: dict) -> list:
+    r"""``[(ani path, key)]`` -- every tile index a `.pux`'s tiles reference.
+
+    **THE ONE HOME FOR THIS WALK.** A `.pul` names one `.ani` for the whole
+    surface and its tiles index into it under ``Puzzle<N>``; a `.pux`
+    (TqTerrain) instead carries a terrain TABLE whose every row names its own
+    index AND its own key, and the tile payload indexes into that table. So
+    "which art does this ground use" is a different question for the two
+    formats, and the `.pux` answer had been written twice already --
+    `tools/puzzle.py` for rendering and `tools/mapparts.py` for collecting --
+    with `tools/mapindex.py` reporting the ground UNRESOLVED because it had
+    neither copy.
+
+    A third copy is how one of them stays wrong; that is the lesson
+    C-2026-08-09-ani-json-spelling was filed for, on this same family of
+    readers. Callers resolve the `(ani, key)` pairs through `load_ani`, which
+    is the half that already lives here.
+
+    **EVERY LAYER OF EVERY TILE**, not just the first. A `.pux` tile is a
+    STACK of 0 to 11+ layers, and walking only the flat ones leaves every
+    stacked layer's texture unaccounted for.
+
+    Returns pairs in a stable order (by terrain row index), deduplicated, so
+    two callers building a key set from it agree.
+    """
+    rows = (px or {}).get("terrain") or []
+    used = set()
+    for t in (px or {}).get("tiles") or ():
+        for layer in (t or ()):
+            if layer:
+                used.add(layer[0])
+    out = []
+    for i in sorted(used):
+        if not (0 <= i < len(rows)):
+            continue
+        r = rows[i] or {}
+        a, k = r.get("ani"), r.get("key")
+        if a and k:
+            out.append((str(a), str(k)))
+    return list(dict.fromkeys(out))
 
 
 def read_pux_full(path: str | Path, data: bytes | None = None) -> Optional[dict]:
@@ -1459,15 +2220,23 @@ def read_pux_full(path: str | Path, data: bytes | None = None) -> Optional[dict]
               u32       1000                    section separator
               u16 n2;   n2 x record             a SECOND table, n2 == 0 on
                                                 every map before 2024
-              u16       tile count              == width * height, ALWAYS
-              width*height x { u8 k; k x 6 }    the tile grid
-              0..2 x { u8 k; k x 6 }            a trailing section
+              u32       tile count              == width * height, ALWAYS
+              width*height x { u8 k; k x layer }  the tile grid
+              0..2 x { u8 k; k x layer }          a trailing section
               4..6 bytes                        all zero
 
         record := u16 n; char[n]   terrain name, GBK
                   u16 n; char[n]   the .ANI file the art lives in
                   u16 n; char[n]   the "PuzzleNN" key inside that .ANI
                   5 x i32          unnamed
+
+        layer  := u16              index into the terrain table
+                  u32              25-bit per-vertex alpha mask, 5x5,
+                                   row-major -- see PUX_LAYER
+
+    **The layer's four mask bytes are returned as the two `i16` this reader
+    has always returned**, so the round-trip is byte-exact and nothing
+    downstream has to change; `pux_layer_mask` rejoins them.
 
     THE SECOND TABLE IS WHY THE NEW MAPS FAILED.  Before 2024 it is empty and
     its two-byte count sits where a reader that does not know about it reads
@@ -1477,10 +2246,23 @@ def read_pux_full(path: str | Path, data: bytes | None = None) -> Optional[dict]
     exactly the 13 maps -- `2024stage`, `2025love01`, `monk01`..`monk04`,
     `faction02`, `faction03` and the rest -- that would not open.
 
-    VERIFIED, and by a predicate this parser does NOT force: the u16 before
+    VERIFIED, and by a predicate this parser does NOT force: the count before
     the grid equals `width * height` on **all 136** `.pux` in 7878, and the
     walk ends on an ALL-ZERO remainder on all 136.  A grammar that had
     drifted would have to land on both by luck, 136 times.
+
+    **THE TILE COUNT IS A u32 AND THIS READ IT AS A u16 UNTIL 2026-09-06** --
+    corrected here, and neither check above could catch it.  `w * h` is under
+    65,536 on every shipped map so the low half reads as the same number, and
+    the greedy trailing walk absorbed the two leftover bytes, so the all-zero
+    remainder held too.  What the two extra zero bytes became was **two tiles
+    with a layer count of zero at the FRONT of the grid**, displacing every
+    real tile by two slots: `tiles[0]` and `tiles[1]` were empty on 284 of 284
+    `.pux` over four installs while `tiles[2]` was empty on 68%.  The client
+    settles it -- `Clients/7878/Env_DX9/Conquer.exe` RVA `0x877258` is
+    ``fread(&count, 4, 1, f)`` and the tile loop runs `count` times.  Guarded
+    by `tests/test_pux.py::test_the_grid_is_not_offset_by_the_phantom_pair`,
+    which was proven to fail under the old width before it was written.
 
     Returns None rather than a partial decode -- a half-read map is worse
     than none, and the caller cannot tell a truncated grid from a small one.
@@ -1522,8 +2304,8 @@ def read_pux_full(path: str | Path, data: bytes | None = None) -> Optional[dict]
         if sep != PUX_SECTION:
             return None                  # not the shape; refuse
         t2, o = table(o)
-        (tc,) = struct.unpack_from("<H", b, o)
-        o += 2
+        (tc,) = struct.unpack_from("<I", b, o)
+        o += 4
         if tc != w * h:
             return None                  # the check that pins the grammar
         tiles = []
@@ -1603,13 +2385,19 @@ def read_gamemap_dat(path: str | Path) -> list[dict] | None:
     return rows
 
 
-def load_gamemap(root: str | Path) -> tuple[str, list[dict]]:
+def load_gamemap(root: "str | Path | AssetRoot") -> tuple[str, list[dict]]:
     r"""The install's map registry, whichever spelling it ships.
 
     `read_gamemap_dat` settled how to *parse* the binary form. This settles
     **which file to open**, which is the half that kept getting re-answered:
     the community client ships ``ini/GameMap.json`` and every official client
     ships the binary ``ini/GameMap.dat`` and no ``.json``.
+
+    **`root` may be an `AssetRoot`**, and then both lookups obey overlay ->
+    loose -> archive precedence; a plain path is joined directly, exactly as
+    before. See `coroot.locate_table`, which is duck-typed rather than
+    importing `coassets` -- this module must stay loadable without the
+    archive readers.
 
     Returns ``(rel, rows)`` -- the logical path that actually answered, so a
     caller can say which file it read -- or ``("", [])`` when neither ships.
@@ -1640,17 +2428,16 @@ def load_gamemap(root: str | Path) -> tuple[str, list[dict]]:
     rows' worth of official-client equivalents** -- 0 of 142-184 rows carried
     either -- and `cmd_summary` below had none either. Same class as C-2026-08-09-ani-json-spelling.
     """
-    r = Path(root)
-    js = r / "ini" / "GameMap.json"
-    if js.is_file():
+    js = coroot.locate_table(root, "ini/GameMap.json")
+    if js is not None:
         try:
             rows = json.loads(js.read_text("utf-8", errors="replace"))
         except ValueError:
             rows = None
         if isinstance(rows, list) and rows:
             return "ini/GameMap.json", [x for x in rows if isinstance(x, dict)]
-    dat = r / "ini" / "GameMap.dat"
-    if dat.is_file():
+    dat = coroot.locate_table(root, "ini/GameMap.dat")
+    if dat is not None:
         rows = read_gamemap_dat(dat)
         if rows:
             return "ini/GameMap.dat", rows
@@ -1682,33 +2469,55 @@ def read_ani(path: str | Path) -> dict[str, list[str]]:
     Unreadable or empty returns ``{}``: a missing tile index degrades to "no
     art found", which callers already handle, and there is no partial state
     worth inventing.
+
+    CORRECTED 2026-09-07 -- A REPEATED SECTION NAME NOW RESOLVES TO THE FIRST.
+    This function kept the **last** occurrence: `flush` assigned
+    ``out[section]``, so a second ``[Puzzle124]`` overwrote the first. The
+    client reads its inis through the Win32 profile API, which returns the
+    FIRST -- verified in `tools/itemart.py` by calling
+    ``GetPrivateProfileString`` on ``ItemMinIcon.Ani``, where ``[Item121223]``
+    yields the first body and not the last. That trap was documented there in
+    2026-08 and never applied here.
+
+    MEASURED over ``ani/**/*.ani`` on **nine** vanilla installs (4274, 5017,
+    5065, 5165, 5517, 6090, 6609, 7205, 7878 -- 543 files), old body against
+    new, key by key: **3,649 sections change answer and 0 files change their
+    key SET** -- no section is gained or lost, only which art it names. Every
+    one of the 3,649 is one of exactly two shapes:
+
+        3,641   the section name is declared more than once
+            8   a ``Frame<i>`` key is declared more than once inside one section
+
+    e.g. **5517** ``ani/faction.ani`` declares ``[Puzzle124]`` twice: the first
+    names ``data/map/puzzle/newplain/loess/loess052.dds`` -- what the client
+    draws -- and the second ``loess062.dds``, which is what this returned.
+    (6609, 7205 and 7878 ship that section once, so the example is per-client.)
+    Per client, sections that change: 5517 788, 6609 824, 7205 204, 7878 340.
+
+    HONESTLY SCOPED: that the profile API returns the first is verified. That
+    the client reads ``.ani`` *through that API* is INFERRED -- from
+    `tools/frame0probe.py`'s finding that a running client constructs literal
+    section keys (``Item480003``) and holds whole logical paths in memory. What
+    is settled is that the two readers in this repo no longer disagree with
+    each other, and that they now follow the convention `itemart` measured.
+
+    The body is now `core/ani.py`, so there is ONE `.ani` tokenizer rather
+    than a third hand-rolled copy; this stays the normalising view (lowercased
+    logical paths, `FrameAmount` deliberately ignored, sections with no frames
+    dropped) that its four callers and the community client's `.json` twin
+    both depend on. `ani.Sequence.client_frames` is the other view -- what the
+    client PLAYS, which walks ``Frame0..Frame<FrameAmount-1>`` by name -- and
+    the two disagree on about 1 section in 5,000. See `core/ani.py`.
     """
-    out: dict[str, list[str]] = {}
-    section = ""
-    frames: dict[int, str] = {}
-
-    def flush() -> None:
-        if section and frames:
-            out[section] = [frames[k] for k in sorted(frames)]
-
     try:
-        text = Path(path).read_text("latin-1", errors="replace")
+        af = _ani.AniFile.read(path)
     except OSError:
         return {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith((";", "#")):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            flush()
-            section, frames = line[1:-1].strip(), {}
-            continue
-        if "=" not in line:
-            continue
-        k, v = (x.strip() for x in line.split("=", 1))
-        if k.lower().startswith("frame") and k[5:].isdigit():
-            frames[int(k[5:])] = v.replace("\\", "/").lstrip("/").lower()
-    flush()
+    out: dict[str, list[str]] = {}
+    for s in af.sequences:
+        frames = [f.logical for f in s.listed_frames()]
+        if s.name and frames:
+            out.setdefault(s.name, frames)     # FIRST wins; see the note above
     return out
 
 
@@ -2057,3 +2866,22 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# BASELINE RE-SCOPE, 2026-09-19. The owner removed 6609.cn, CCO and Installers
+# from core/baseline_members.json -- "remove the three from baseline members,
+# then land the windows" -- so the baseline is 33 members. The dated figures
+# above were measured over the earlier population and stand as records of that
+# measurement. Over the 33, as re-derived by tests/test_claim_enumeration.py:
+#   the baseline holds **1,415 `.pux` across 26 of the 33 installs**
+#   the baseline holds 9,647 archives across 28 installs
+#
+# BASELINE RE-SCOPE (2), 2026-09-19. Later the same day the owner deleted 6716
+# and 7682 (byte-level copies of 6271 and 7632), renamed 7632 to 7622 (its
+# build stamp), and declared 7217 7250 7275 7280 7320 7336 7373 7387 7506 7535
+# 7562 7589 baseline members, so core/baseline_members.json holds 43. The
+# 33-member block above is kept as the record of that measurement. Over the
+# 43, re-measured per install by tests/test_claim_enumeration.py (7622 measures
+# exactly what 7632 recorded; the twelve new members were walked, not assumed):
+#   the baseline holds **2,398 `.pux` across 36 of the 43 installs**
+#   the baseline holds 13,965 archives across 38 installs

@@ -61,6 +61,7 @@ from typing import Callable, Optional
 __all__ = [
     "Catalog", "TableSpec", "CONTROL_RAW", "CONTROL_REDECODE",
     "CONTROL_CACHED",
+    "split_lines",
     "sections_from_text", "rows_from_text", "at_rows_from_text",
     "read_sections", "read_at_rows",
     "KIND_SECTIONS", "KIND_AT_ROWS", "KIND_CSV_ROWS", "KIND_SPACE_ROWS",
@@ -70,6 +71,7 @@ __all__ = [
     "control_section", "control_at_row",
     "build_catalogs", "no_tables_declared",
     "KIND_GAMEMAP", "gamemap_records",
+    "KIND_MAGIC_RECORDS", "magic_records", "magic_unique",
     "KIND_JSON_ROWS", "json_rows", "control_json_row",
 ]
 
@@ -97,8 +99,9 @@ CONTROL_CACHED = "cached"
 #: delimiter is NOT a property of the filename -- MEASURED across the range:
 #:
 #:     itemtype.dat        space-rows on 5017/5065/5165, at-rows from 5517
-#:     MagicType.dat       binary on 5017/5065, space-rows on 5165,
-#:                         at-rows from 5517
+#:     MagicType.dat       binary on 5017/5065 -- `KIND_MAGIC_RECORDS` since
+#:                         2026-09-07, a NAMED RECORD TABLE and not a shapeless
+#:                         one -- space-rows on 5165, at-rows from 5517
 #:     magictypeop.dat     csv-rows on every build that ships it
 #:     MapDestination.dat  ini-sections on ALL of them, never rows
 #:     AutoUseMagic.dat    ini-sections, not rows
@@ -329,13 +332,78 @@ class TableSpec:
     #: `itemtype.json` uses `id`, `monster.json` and `npc.json` use `type`,
     #: and `magictype.json` has no unique key at all.
     id_key: str = "id"
+    #: For the positional row kinds: which COLUMN carries the id and which
+    #: carries the label, MEASURED for this table. `None` falls back to the
+    #: plugin's `ITEM_COLUMNS`, which is where every row table's columns came
+    #: from until now.
+    #:
+    #: **That fallback is an `itemtype.dat` fact applied to every row table on
+    #: the build**, and it is only right by accident. `ITEM_COLUMNS` says
+    #: `{"id": 0, "name": 1}` because *item* rows put the name in column 1;
+    #: `Achievement.dat` puts a message id there and the name in column 2, so
+    #: browsing it under the plugin-wide map lists `19999 -> "0"` -- a column
+    #: of numbers where the names are, which is the same shape as the blank
+    #: labels `MEASURED_SECTION_LABELS` exists to prevent, one grammar over.
+    #:
+    #: Set it only from a measurement of the table itself. A wrong entry here
+    #: does not raise: it moves the label and the control probe onto a column
+    #: that exists, and the table still reads.
+    columns: Optional[dict] = None
     #: Set when the build has measured that this table cannot be enumerated,
     #: so the subject is still named and the reason travels with it.
     refusal: Optional[str] = None
+    #: PROVENANCE. `True` only on a spec that `censused.specs_for` built from
+    #: the generated census; every hand-written spec leaves it `False`.
+    #:
+    #: **This field exists because the generator could not tell its own output
+    #: apart from a curated spec, and so deleted 820 declarations.**
+    #: `gen_ini_specs.collect()` asks each plugin what it already declares and
+    #: skips those subjects, so a hand-curated spec always wins. Every plugin
+    #: now feeds the generated set back through `censused.extend`, so the
+    #: second run saw all 820 as already taken and emitted nothing -- the
+    #: generator read its own output. Measured 2026-08-15, repaired 2026-09-07;
+    #: see `docs/censused_regeneration_2026-08-15.md`.
+    #:
+    #: Subtracting `specs_for(name)` by SUBJECT was the obvious repair and is
+    #: wrong: a curated spec that legitimately collides on a subject with a
+    #: generated one would be dropped too, and those are exactly the entries
+    #: the "a hand-written spec always wins" rule exists to protect. A flag on
+    #: the object cannot make that mistake.
+    #:
+    #: It is deliberately NOT part of what a reader consumes -- nothing
+    #: branches on it at read time, and `to_dict` does not emit it. It is a
+    #: fact about where the declaration came from, not about the table.
+    generated: bool = False
+    #: PER-TABLE text encoding, MEASURED on this table. `None` (the default)
+    #: means the plugin's `TEXT_ENCODING`, which is every spec's behaviour
+    #: before this field existed. Added 2026-09-19 for the 7205 lineage: its
+    #: tables are GBK, but a few files are not (7878's `ChatFilter.ini` is a
+    #: bare UTF-16 BOM; `Title.ini`, `WrapTypeData.ini`, `Questinfo.ini` are
+    #: strict UTF-8), and one plugin-wide value either garbles or drops them.
+    #: A plugin usually sets this through `TABLE_ENCODING` rather than by
+    #: hand, because censused specs are generated.
+    encoding: Optional[str] = None
 
     @property
     def display(self) -> str:
         return self.source or f"ini/{self.filename}"
+
+
+#: CR/LF ONLY. **Never `str.splitlines()`**, which also breaks on U+0085 (NEL),
+#: U+2028, U+2029 and U+001C-001E. Under latin1 byte 0x85 IS U+0085, so every
+#: 0x85 inside a value became a PHANTOM line: 7878 `QuestinfoPassionServer.ini`
+#: read 27,171 lines for 23,362 real (3,809 0x85 bytes). The census
+#: (`tools/ini_census.py`) uses this same helper, so census and runtime agree.
+#: Found 2026-09-19 by SD's W4 gate on #133.
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def split_lines(text: str) -> list:
+    """Lines split on CR, LF and CRLF only; a final newline adds no line."""
+    parts = _LINE_BREAK.split(text)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
 
 
 _SECTION = re.compile(r"^\s*\[([^\]\r\n]+)\]\s*$")
@@ -361,7 +429,7 @@ def sections_from_text(text: str) -> tuple:
     out: dict = {}
     dupes: dict = {}
     cur: Optional[dict] = None
-    for line in text.splitlines():
+    for line in split_lines(text):
         line = line.strip()
         if not line or line[0] in ";#":
             continue
@@ -394,7 +462,7 @@ def rows_from_text(text: str, delimiter: Optional[str] = "@@") -> list:
     """
     rows = []
     first = True
-    for line in text.splitlines():
+    for line in split_lines(text):
         if not line.strip():
             continue
         # **A comment is not a row.** These files comment with `//`, and this
@@ -548,6 +616,118 @@ def gamemap_records(raw: bytes) -> tuple:
     return rows, note
 
 
+#: `MagicType.dat` on 5017 and 5065 ONLY -- the second binary content table
+#: whose grammar this project has established, and the first since
+#: `KIND_GAMEMAP`.
+#:
+#:     u32                  count
+#:     count times          u32 id          -- the index array
+#:     count times          1584-byte record
+#:
+#: and inside a record, the three fields that are MEASURED:
+#:
+#:     +0    u32            type
+#:     +4    u32            (unnamed)
+#:     +8    char[16]       name, NUL-terminated
+#:
+#: **The control is the two arrays agreeing, which is as strong as a binary
+#: format gets here**: `record.type == id // 10` on 648 of 648 records on 5017
+#: and 657 of 657 on 5065 -- the index array and the record array are
+#: different regions of the file and neither is derived from the other. The
+#: negative control is a one-record shift, which drops the agreement to
+#: 307/647 (47%). The parse also has to consume the file EXACTLY, and 1,580 /
+#: 1,588 / 1,600 / 792 / 3,168 all fail that on both builds.
+#:
+#: **The other 1,560 bytes of the record are NOT named**, and the field at +4
+#: is carried unnamed rather than called a level: the LEVEL is `id % 10`
+#: (`Thunder` is ids 10000-10004, five levels, and +4 reads 1 on all five).
+#: Guessing at the rest is what `tqdat.FIELDS_AT` does to `itemtype.dat`.
+#:
+#: This kind exists for two builds and no more. 5165 moved `MagicType.dat` to
+#: the TQ stream cipher as space-rows, and `plugins/catalog`'s kind table
+#: already records that boundary.
+KIND_MAGIC_RECORDS = "magic-records"
+
+#: 5017's file is 1,029,028 B: 4 + 648*4 + 648*1584. 5065's is 1,043,320:
+#: 4 + 657*4 + 657*1584. The width is a property of the format, not of a
+#: build, so it is a constant and a mismatch raises.
+_MAGIC_RECORD = 1584
+_MAGIC_NAME = slice(8, 24)
+
+
+def magic_records(raw: bytes) -> tuple:
+    """`(rows, note)` for `MagicType.dat`, or raise `ValueError`.
+
+    `rows` is `(id, name)` in file order. **Raises rather than returning a
+    short list** on any structural disagreement, for the reason
+    `gamemap_records` does: a binary parse that returns what it managed is
+    indistinguishable from a table that is genuinely that size, and this one
+    would report a plausible fraction of a skill list.
+    """
+    if len(raw) < 4:
+        raise ValueError("shorter than its own count field")
+    n = struct.unpack_from("<I", raw, 0)[0]
+    head = 4 + n * 4
+    want = head + n * _MAGIC_RECORD
+    if n == 0:
+        raise ValueError("declares zero records")
+    if want != len(raw):
+        raise ValueError(
+            f"declares {n} records, which needs {want} bytes at "
+            f"{_MAGIC_RECORD} per record, and the file is {len(raw)}")
+    ids = struct.unpack_from(f"<{n}I", raw, 4)
+    rows, agree = [], 0
+    for i, ident in enumerate(ids):
+        at = head + i * _MAGIC_RECORD
+        rec = raw[at:at + _MAGIC_RECORD]
+        if struct.unpack_from("<I", rec, 0)[0] == ident // 10:
+            agree += 1
+        field = rec[_MAGIC_NAME]
+        z = field.find(b"\x00")
+        if z < 0:
+            raise ValueError(f"record {i}: the name field is not "
+                             f"NUL-terminated, so this is not the layout")
+        name = field[:z]
+        if not name or any(not 32 <= c < 127 for c in name):
+            raise ValueError(f"record {i}: name {name!r} is not printable")
+        rows.append((str(ident), name.decode("latin-1")))
+    # The cross-check between the two arrays. Not a warning: a file where the
+    # index and the records disagree is a file this layout does not describe,
+    # and serving it would be serving names against the wrong ids.
+    if agree != n:
+        raise ValueError(
+            f"record.type == id // 10 on only {agree} of {n} records, so the "
+            f"index array and the record array are not describing each other")
+    return rows, (f"{n} records of {_MAGIC_RECORD} B, the parse consumes all "
+                  f"{len(raw)} bytes exactly, and record.type == id//10 on "
+                  f"all {n} -- the index array and the record array agree")
+
+
+def magic_unique(rows: list) -> tuple:
+    """`(unique_rows, {duplicated_id: count})`, FIRST wins.
+
+    **The index array really does repeat ids, with DIFFERENT names behind
+    them**: on 5017, id 30000 is `Fire` and then `HumanMessenger`, 40000 is
+    `SummonGuard` and then `Summon`, and 30600 is `Reflect` five times -- 648
+    records over 642 distinct ids.
+
+    So this is the same `unique` / `present` split `sections_from_text`
+    already makes for `npc.ini` and `Monster.dat`, and it exists in ONE place
+    for the same reason: `catalogs()` reporting distinct ids while `browse()`
+    listed every record is a surface that tells the user 642 and shows them
+    648, which `tests/test_subject_source_agreement.py` refuses -- and did.
+    """
+    out, dupes = [], {}
+    seen = set()
+    for ident, name in rows:
+        if ident in seen:
+            dupes[ident] = dupes.get(ident, 1) + 1
+            continue
+        seen.add(ident)
+        out.append((ident, name))
+    return out, dupes
+
+
 def read_sections(path: Path, encoding: str = "gbk") -> tuple:
     """`sections_from_text` over a plaintext file on disk."""
     return sections_from_text(Path(path).read_text(encoding, errors="replace"))
@@ -599,7 +779,7 @@ def flat_keys_from_text(text: str) -> tuple:
     """
     out: dict = {}
     dupes: dict = {}
-    for line in text.splitlines():
+    for line in split_lines(text):
         line = line.strip()
         if not line or line.startswith((";", "#", "//", "/", "--")):
             continue
@@ -629,7 +809,7 @@ def list_from_text(text: str) -> list:
     a schema nobody established.
     """
     out = []
-    for line in text.splitlines():
+    for line in split_lines(text):
         line = line.strip()
         if not line or line.startswith((";", "#", "//", "/", "--")):
             continue
@@ -691,6 +871,24 @@ def control_at_row(rows: list, witness: bytes, encoding: str, kind: str,
     r = rows[0]
     i_id = columns.get("id", 0)
     i_name = columns.get("name", 1)
+    #: **`name: None` is MEASURED -- "no column of this table is text" -- and
+    #: it is the commonest answer on the 6907 era's config tables.** 24 of the
+    #: 25 `.dat` row tables censused there have no column that is non-numeric
+    #: on every row; under `ITEM_COLUMNS["name"] = 1` every one of them would
+    #: print a column of numbers beside the ids, which is the `magic` defect
+    #: (`MagicNamesAreAMeasuredColumnNotColumnOne`) reproduced 24 times.
+    #:
+    #: The probe then spans columns 0 and 1 ANYWAY, and that is the point: a
+    #: bare id is a number that matches almost anywhere, so a control built on
+    #: one field alone would pass on noise -- the same reason `cco`'s
+    #: `levexp:weaponskill` probes the key WITH the value. Spanning two fields
+    #: proves the delimiter and the row's position without claiming the second
+    #: field is a name; the reported label stays empty, because it is.
+    nameless = i_name is None
+    if nameless:
+        if len(r) < 2:
+            return None, None
+        i_name = i_id + 1
     if len(r) <= max(i_id, i_name):
         return None, None
     # **A text row's fields must be text.** Zephyr's `Tips.dat` is a binary
@@ -723,6 +921,26 @@ def control_at_row(rows: list, witness: bytes, encoding: str, kind: str,
     # control rather than a substring search: what follows the match must be
     # the delimiter or the end of the line, so `id name` cannot match inside
     # `id nameplate`.
+    # **THE PROBE IS THE WHOLE SPAN FROM `i_id` TO `i_name`, not the two
+    # fields on their own.**
+    #
+    # This joined `r[i_id]` and `r[i_name]` directly, which is the same thing
+    # only while the two columns are ADJACENT -- true for every table that
+    # took the plugin-wide `{"id": 0, "name": 1}` and false the moment a spec
+    # measures its own columns. `Achievement.dat` puts the name in column 2,
+    # and the two-field probe `19999 Comprehensive` is a string that is not
+    # in the file: the control would have refused a table that reads
+    # perfectly, and "the columns are wrong" would have arrived wearing the
+    # words "no control could be checked back against the bytes".
+    #
+    # Spanning is also STRICTLY STRONGER than the pair was: every field
+    # between the two has to be there, in order, so the check now says the
+    # row's whole head is where the parse thinks it is.
+    lo, hi = (i_id, i_name) if i_id <= i_name else (i_name, i_id)
+    span = r[lo:hi + 1]
+    for field in span:
+        if any(ord(c) < 0x20 and c not in "\t" for c in field):
+            return None, None
     if delimiter is None:
         # **A whitespace run is not reconstructible, so it is MATCHED, not
         # rebuilt.** `line.split()` collapses any mix of spaces and tabs, so
@@ -732,13 +950,13 @@ def control_at_row(rows: list, witness: bytes, encoding: str, kind: str,
         # table that reads perfectly. Rejoining on the first run's exact
         # bytes would be worse -- it would pass this file and fail the next
         # one that varies its spacing, which most of these do.
-        pat = (re.escape(r[i_id].encode(encoding, "replace")) + rb"[ \t]+" +
-               re.escape(r[i_name].encode(encoding, "replace")) +
-               rb"(?=[ \t\r\n]|$)")
+        pat = rb"[ \t]+".join(
+            re.escape(f.encode(encoding, "replace")) for f in span)
+        pat += rb"(?=[ \t\r\n]|$)"
         if not re.search(pat, witness):
             return None, None
     else:
-        probe = f"{r[i_id]}{sep}{r[i_name]}".encode(encoding, "replace")
+        probe = sep.join(span).encode(encoding, "replace")
         at = witness.find(probe)
         if at < 0:
             return None, None
@@ -748,6 +966,13 @@ def control_at_row(rows: list, witness: bytes, encoding: str, kind: str,
             return None, None
     where = ("the raw bytes" if kind == CONTROL_RAW
              else "an independent re-decode")
+    if nameless:
+        # Say that no name was claimed. A control line reading `name='131'`
+        # over a table whose second column is a number is how an unmeasured
+        # default gets read back as a measurement.
+        return (f"id={r[i_id]} then {r[i_name]!r} ({len(r)} fields; this "
+                f"table has NO text column, so the id stands alone) "
+                f"-- found in {where}"), kind
     return (f"id={r[i_id]} name={r[i_name]!r} ({len(r)} fields) "
             f"-- found in {where}"), kind
 
@@ -767,7 +992,11 @@ def build_catalogs(specs, load: Callable, *, encoding: str,
     refusal rather than a zero.
     """
     out: dict = {}
+    plugin_encoding = encoding
     for spec in specs:
+        # A spec's own measured encoding wins; the probes a control encodes
+        # must use the same codec the text was decoded with.
+        encoding = getattr(spec, "encoding", None) or plugin_encoding
         if spec.refusal:
             out[spec.subject] = Catalog(spec.subject, spec.display, spec.kind,
                                         refusal=spec.refusal)
@@ -825,6 +1054,26 @@ def build_catalogs(specs, load: Callable, *, encoding: str,
                 control_kind=ckind)
             continue
 
+        if spec.kind == KIND_MAGIC_RECORDS:
+            # Same shape as the gamemap branch above and for the same reason:
+            # the records are bytes, so this reads the WITNESS, and the
+            # control is structural. `magic_records` raises rather than
+            # returning a short list, so a refusal here is a real one.
+            try:
+                rows, note = magic_records(witness)
+            except ValueError as e:
+                out[spec.subject] = Catalog(
+                    spec.subject, spec.display, spec.kind,
+                    refusal=f"{spec.display}: {e}")
+                continue
+            uniq, dupes = magic_unique(rows)
+            first = f"id={rows[0][0]} name={rows[0][1]!r}"
+            out[spec.subject] = Catalog(
+                spec.subject, spec.display, spec.kind, rows=len(uniq),
+                duplicated=dupes,
+                control=f"{first}; {note}", control_kind=ckind)
+            continue
+
         if text is None:
             out[spec.subject] = Catalog(
                 spec.subject, spec.display, spec.kind,
@@ -844,8 +1093,11 @@ def build_catalogs(specs, load: Callable, *, encoding: str,
         elif spec.kind in ROW_KINDS:
             delim = ROW_KINDS[spec.kind]
             rows = rows_from_text(text, delim)
-            ctl, got = control_at_row(rows, witness, encoding, ckind, columns,
-                                      delim)
+            # The spec's own MEASURED columns beat the plugin-wide default;
+            # see `TableSpec.columns` for why the default is an `itemtype`
+            # fact that happens to fit most row tables.
+            ctl, got = control_at_row(rows, witness, encoding, ckind,
+                                      spec.columns or columns, delim)
             out[spec.subject] = Catalog(
                 spec.subject, spec.display, spec.kind, rows=len(rows),
                 control=ctl, control_kind=got,

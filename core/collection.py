@@ -119,7 +119,18 @@ ROOT_NAME = "Collection"
 #: names its `.pul`, and the `.ani` names its tiles, so moving any of them
 #: breaks the reference that made it part of the map.  They are also the
 #: roles that can be *shared* with other maps -- see `Collection.stage`.
-MAP_ROLES = ("puzzle", "ani", "art")
+#: `scene` and `otherdata` joined 2026-09-15 with the rest of the DMap's
+#: record kinds (see `tools/mapparts.ROLES`). Both stage at their own logical
+#: path, both are referenced by the map by that path, and `scene` is shared
+#: between maps exactly as a tile is -- so both want the whole of the
+#: treatment this tuple selects, including the shared-art policy.
+#:
+#: `sound` is NOT in here, and that is deliberate rather than an oversight: a
+#: MODEL entry can carry a `sound` part too, and `stage` already routes the
+#: role to its own logical path. Adding it would put every model's sound
+#: under the map shared-art policy for no map-side gain.
+MAP_ROLES = ("puzzle", "plane", "ani", "art", "scene", "otherdata",
+             "config", "effectart")
 
 #: The Collection browses like any imported client: it publishes a server
 #: profile of its own under this name, so it gets the viewer's tree,
@@ -144,6 +155,384 @@ PROVENANCE_KEY = "provenance"
 PROV_RECORDED = "recorded"       # a stamp is present and well-formed
 PROV_UNRECORDED = "unrecorded"   # nothing recorded it; do not guess
 PROV_MALFORMED = "malformed"     # something is there and is not a stamp
+
+
+# ===========================================================================
+# SATELLITES -- what travels with a collected asset.  Backlog section 7.
+# ===========================================================================
+#
+# The owner asked for checkboxes: *"Effects (all of them, including hit
+# effects, weapon glow effects, particles), animations, textures, alt skin
+# textures, sounds ... make it up to the user to decide via checkboxes and to
+# provide a select all/select none button."*
+#
+# THE ENTRY SCHEMA IS **B + E**, decided by the owner 2026-09-06 and recorded
+# in `docs/comod_backlog.md` section 7.  Two blocks, spelled here so nothing
+# re-litigates them:
+#
+#     satellites : { <kind>: [ { path, sha, takenAt } ] }   -- B: what was TAKEN
+#     offered    : { <kind>: { available, taken, asOf } }   -- E: what was SEEN
+#
+# B is why `_unique_id` does not change and re-collect **merges**: identity is
+# still the mesh, so the library stays a set of decisions rather than growing a
+# second "zephyr-0816 (with effects)" beside the first.  E is why a gap is
+# *visible* rather than something the tool has to detect: the entry says
+# "Effects: 3 of 7 collected", so a user is never misled about what they kept.
+#
+# WHY `offered` IS NOT DERIVABLE FROM `satellites`, WHICH IS THE POINT
+# -------------------------------------------------------------------
+# An entry holding one effect is one of three different worlds and they are
+# not the same fact:
+#
+#   * one was offered and one was taken       -> complete
+#   * seven were offered and one was taken    -> six are still available
+#   * nothing measured what was on offer      -> UNKNOWN, and must say so
+#
+# Without `offered` all three read as "it has one effect".  `SAT_UNKNOWN` is
+# the third, and it is the *resting state of every entry written before this
+# existed*: back-filling it with a zero would manufacture a measurement nobody
+# took, which is the exact failure the bulletproof rule of section 6 forbids.
+# So migration falls out for free -- an old entry displays as "1 collected,
+# availability unknown -- re-check".
+
+#: `offered[kind].available` when nothing measured it.  Not zero, not absent:
+#: a value a renderer can print, so the honest answer survives the trip to the
+#: UI instead of being flattened into a number on the way.
+SAT_UNKNOWN = "unknown"
+
+#: The entry keys holding the two blocks.  Spelled once so a reader grepping
+#: for either finds every site, exactly as `PROVENANCE_KEY` is.
+SATELLITES_KEY = "satellites"
+OFFERED_KEY = "offered"
+
+
+class SatelliteKind:
+    """One checkbox: what it offers, what backs it, and whether SELECT ALL is
+    allowed to reach it.
+
+    ``select_all`` is the ruling, not a preference.  **OWNER, 2026-09-06:**
+    *"Make sure the animations can be exported, but put them in their own 'not
+    recommended' section that select all doesn't toggle."*  A `MOTI` motion set
+    is an external table bound by ordinal and used by dozens of meshes, so
+    ticking "animations" on one body does not copy *its* animation -- it copies
+    something other assets depend on.  The user may still tick it deliberately;
+    they may not arrive there by accident.
+
+    The backlog generalises the rule and so does this class: **any satellite
+    whose collection has consequences beyond this asset belongs in that
+    group.**  That is what `select_all` is False *for* -- it is not a list of
+    one special case, it is the predicate, and `why_not` is the consequence
+    stated in the row itself so a UI need not invent an explanation.
+    """
+
+    __slots__ = ("name", "label", "backed_by", "role", "select_all", "why_not")
+
+    def __init__(self, name: str, label: str, backed_by: str, role: str,
+                 select_all: bool = True, why_not: str = ""):
+        if not select_all and not why_not:
+            # A row excluded from SELECT ALL with no reason attached is how a
+            # ruling becomes folklore. Refused at import.
+            raise ValueError(
+                f"satellite kind {name!r} is outside SELECT ALL and says no "
+                f"why_not; the consequence has to travel with the row")
+        self.name = name
+        self.label = label
+        self.backed_by = backed_by
+        self.role = role
+        self.select_all = select_all
+        self.why_not = why_not
+
+    def as_dict(self) -> dict:
+        return {"name": self.name, "label": self.label,
+                "backedBy": self.backed_by, "role": self.role,
+                "selectAll": self.select_all, "whyNot": self.why_not}
+
+    def __repr__(self) -> str:                               # pragma: no cover
+        return f"<SatelliteKind {self.name} selectAll={self.select_all}>"
+
+
+#: The checkboxes, in the order the panel offers them, and the ONE place the
+#: SELECT-ALL ruling is written down.  Every one of the owner's named kinds is
+#: here -- *all* three effect forms on equal footing, per section 6's verified
+#: note that particles and ribbons are viewable and exportable.
+#:
+#: The three effect rows are separate rather than one "Effects" row because
+#: they come from three different tables and can each be empty for different
+#: reasons; collapsing them would make "Effects (0)" mean four things.
+SATELLITE_KINDS: tuple = (
+    SatelliteKind("textures", "Textures",
+                  "the paired skin(s) the appearance rows declare", "skin"),
+    SatelliteKind("altskins", "Alt skin textures",
+                  "the garment index / npcaltskin.alt_skins() -- the distinct "
+                  "textures this shared geometry wears", "skin"),
+    SatelliteKind("effects_hit", "Effects - hit",
+                  "WeaponEffect.ini, the impact spark keyed off the 3-digit "
+                  "weapon type", "effect"),
+    SatelliteKind("effects_glow", "Effects - weapon glow / aura",
+                  "Action3DEffect.ini; shows as aura (always-on) in "
+                  "`comod effects`", "effect"),
+    SatelliteKind("effects_particle", "Effects - particles",
+                  "PTCL / PTC3 -- viewable and exportable, not writable",
+                  "effect"),
+    SatelliteKind("sounds", "Sounds", "ordinary .wav / .mp3", "sound"),
+    SatelliteKind("animations", "Animations",
+                  "the shared motion set (`comod anim` resolves action -> set)",
+                  "motion", select_all=False,
+                  why_not="a MOTI motion set is an external table bound by "
+                          "ordinal and used by many meshes: taking it copies "
+                          "something dozens of other models depend on, so it "
+                          "is opt-in and SELECT ALL does not reach it"),
+)
+
+KIND_BY_NAME: dict = {k.name: k for k in SATELLITE_KINDS}
+
+#: Kind name -> the `parts` role it is filed under, so a selection turns into
+#: `gather_parts` input without a second table that can disagree with this one.
+KIND_ROLE: dict = {k.name: k.role for k in SATELLITE_KINDS}
+
+#: Where an effect goes when the collector did not say WHICH effect kind it
+#: ticked -- the directory sweep, or any caller written before the checkboxes
+#: existed.  It is deliberately **not** one of the three real effect kinds:
+#: role `effect` backs three of them, so picking one would be a guess printed
+#: in the same typeface as a measurement.  It is also deliberately not dropped:
+#: `satellite_report` reports any kind an entry holds, this one included, so an
+#: unclassified effect is visible as unclassified rather than absent.
+UNCLASSIFIED_EFFECTS = "effects_unclassified"
+
+#: The demotion, used only when a part carries no `kind`.  A coarser answer
+#: where the mapping is exact, and `UNCLASSIFIED_EFFECTS` where it is not.
+_KIND_FOR_ROLE: dict = {
+    "motion": "animations",
+    "sound": "sounds",
+    "skin": "textures",
+    "effect": UNCLASSIFIED_EFFECTS,
+}
+
+
+def select_all_kinds() -> tuple:
+    """Exactly the kinds a SELECT ALL button ticks.
+
+    **THE MUST-FIRE LIVES HERE.**  This is the only definition of what SELECT
+    ALL means, and it is derived from `SatelliteKind.select_all` rather than
+    written out as a list, so the ruling cannot be honoured in the table and
+    quietly broken in the button.  `tools/webui/builder.js` ticks precisely the
+    names this returns -- shipped to it as `selectAllKinds` -- and holds no
+    kind list of its own, so there is no second place for the two to drift.
+    """
+    return tuple(k.name for k in SATELLITE_KINDS if k.select_all)
+
+
+def not_recommended_kinds() -> tuple:
+    """The kinds in the separate NOT RECOMMENDED group: exportable, opt-in,
+    and never reached by SELECT ALL."""
+    return tuple(k.name for k in SATELLITE_KINDS if not k.select_all)
+
+
+def sanitize_selection(names: Iterable[str]) -> list[str]:
+    """The requested kinds, filtered to ones that exist, order preserved.
+
+    An unknown kind is DROPPED rather than raising: a selection arrives from a
+    browser that may be a version behind, and refusing the whole collect
+    because one checkbox was renamed loses the six the user did tick.  It is
+    also never invented -- a name that is not in `KIND_BY_NAME` collects
+    nothing, so a typo cannot silently widen the take.
+    """
+    seen: set = set()
+    out: list[str] = []
+    for n in names or ():
+        k = str(n or "").strip()
+        if k in KIND_BY_NAME and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def kinds_json() -> list[dict]:
+    """The checkbox table for the UI: every kind, its label, what backs it and
+    whether SELECT ALL reaches it."""
+    return [k.as_dict() for k in SATELLITE_KINDS]
+
+
+def _sat_key(rec: dict) -> str:
+    return str((rec or {}).get("path") or "").replace("\\", "/").lower()
+
+
+def merge_satellites(prev: Optional[dict], new: Optional[dict],
+                     *, at: str = "") -> dict:
+    """**B**: the taken-satellite block, MERGED rather than replaced.
+
+    *"Re-collecting with more satellites ADDS them; identity stays the mesh.
+    This matches what the user actually means -- 'I kept this before, now I
+    want its effects too' -- and nothing is ever silently dropped."*
+
+    A satellite already held keeps its recorded `takenAt` unless its `sha`
+    changed, in which case this take replaces it and stamps the new time: the
+    field answers "when did these bytes get here", and carrying an old date
+    over new bytes would make the entry lie about its own contents.
+
+    Removal is never a side effect of collecting.  It is `prune_satellites`,
+    which B requires anyway because a satellite's source can change after it
+    was taken.
+    """
+    stamp = at or _now()
+    out: dict = {}
+    for kind, recs in (prev or {}).items():
+        if not isinstance(recs, list):
+            continue
+        out[kind] = [dict(r) for r in recs if isinstance(r, dict)]
+    for kind, recs in (new or {}).items():
+        if not isinstance(recs, list):
+            continue
+        bucket = out.setdefault(kind, [])
+        by_path = {_sat_key(r): i for i, r in enumerate(bucket)}
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            rec = {"path": str(r.get("path") or ""),
+                   "sha": str(r.get("sha") or ""),
+                   "takenAt": str(r.get("takenAt") or stamp)}
+            # Anything else the collector measured travels too, but never
+            # over the three fields the schema names.
+            for k, v in r.items():
+                if k not in ("path", "sha", "takenAt"):
+                    rec[k] = v
+            i = by_path.get(_sat_key(rec))
+            if i is None:
+                by_path[_sat_key(rec)] = len(bucket)
+                bucket.append(rec)
+            elif bucket[i].get("sha") != rec["sha"]:
+                bucket[i] = rec                  # new bytes, new takenAt
+            else:
+                # Same bytes: keep the ORIGINAL takenAt. Re-collecting an
+                # unchanged file is not a new acquisition of it.
+                keep = bucket[i].get("takenAt")
+                bucket[i] = {**rec, "takenAt": keep or rec["takenAt"]}
+    for kind in list(out):
+        out[kind].sort(key=_sat_key)
+    return out
+
+
+def merge_offered(prev: Optional[dict], new: Optional[dict]) -> dict:
+    """**E**: what was ON OFFER, refreshed for the kinds this collect
+    measured and left alone for the kinds it did not.
+
+    A kind absent from `new` was not looked at on this pass, and its old block
+    is still the last real measurement of it -- with its own `asOf` saying how
+    old.  Overwriting it with a zero, or deleting it, would both replace a
+    stale measurement with a false one.  *"An `available` count is true only as
+    of a moment ... and is re-checked against the source rather than trusted
+    forever."*
+    """
+    out: dict = {}
+    for kind, blk in (prev or {}).items():
+        if isinstance(blk, dict):
+            out[kind] = dict(blk)
+    for kind, blk in (new or {}).items():
+        if not isinstance(blk, dict):
+            continue
+        avail = blk.get("available", SAT_UNKNOWN)
+        out[kind] = {
+            "available": (avail if avail == SAT_UNKNOWN
+                          else int(avail or 0)),
+            "taken": int(blk.get("taken") or 0),
+            "asOf": str(blk.get("asOf") or _now()),
+        }
+    return out
+
+
+def satellite_state(entry: dict, kind: str) -> dict:
+    """What an entry can honestly say about ONE kind.
+
+    Four `state` values and none of them collapse into another:
+
+    ``complete``   every satellite that was on offer was taken.
+    ``partial``    some were; ``available - taken`` are still there to get.
+    ``unknown``    nothing measured the offer.  **This is what an entry
+                   written before the `offered` block existed says**, and it
+                   is the honest reading of a missing block -- not zero.
+    ``none``       the offer was measured and was empty.
+
+    A caller rendering "Effects: 3 of 7 collected" reads `taken` and
+    `available`; a caller that finds ``available == SAT_UNKNOWN`` must print
+    the uncertainty rather than a number, and the value is a string precisely
+    so that arithmetic on it fails loudly instead of quietly producing 0.
+    """
+    taken = len(((entry or {}).get(SATELLITES_KEY) or {}).get(kind) or [])
+    blk = ((entry or {}).get(OFFERED_KEY) or {}).get(kind)
+    if not isinstance(blk, dict) or "available" not in blk:
+        return {"kind": kind, "taken": taken, "available": SAT_UNKNOWN,
+                "asOf": "", "state": "unknown",
+                "why": ("nothing recorded what this asset was offered, so how "
+                        "much is missing is not known -- re-check the source")}
+    avail = blk.get("available", SAT_UNKNOWN)
+    as_of = str(blk.get("asOf") or "")
+    if avail == SAT_UNKNOWN:
+        return {"kind": kind, "taken": taken, "available": SAT_UNKNOWN,
+                "asOf": as_of, "state": "unknown",
+                "why": "the offer was recorded as unmeasured"}
+    avail = int(avail or 0)
+    if avail == 0:
+        state = "none"
+    elif taken >= avail:
+        state = "complete"
+    else:
+        state = "partial"
+    return {"kind": kind, "taken": taken, "available": avail, "asOf": as_of,
+            "state": state,
+            "why": ("" if state != "partial"
+                    else f"{avail - taken} more were on offer as of {as_of}")}
+
+
+def satellite_report(entry: dict) -> list[dict]:
+    """`satellite_state` for every kind, in the panel's order -- including the
+    kinds this entry holds nothing of, because "no effects were kept" and "no
+    effects were offered" are the two answers the report exists to separate.
+
+    Kinds the entry holds that are NOT in the checkbox table are appended and
+    flagged `extra`.  That covers `UNCLASSIFIED_EFFECTS` and anything a future
+    version of this tool files that this one does not know about: reporting
+    only the kinds in `SATELLITE_KINDS` would make a satellite that is on disk
+    and in the index invisible in the one view that claims to list them.
+    """
+    known = {k.name for k in SATELLITE_KINDS}
+    out = [satellite_state(entry, k.name) for k in SATELLITE_KINDS]
+    for kind in sorted((entry or {}).get(SATELLITES_KEY) or {}):
+        if kind in known:
+            continue
+        st = satellite_state(entry, kind)
+        st["extra"] = True
+        out.append(st)
+    return out
+
+
+def prune_satellites(entry: dict, kind: str = "",
+                     paths: Iterable[str] = ()) -> list[dict]:
+    """Remove taken satellites from an entry's block and return the records
+    removed.  **The only removal path there is**, which is what B costs:
+    because re-collect never drops anything, an entry can accumulate
+    satellites whose source has since changed, and the way back out has to be
+    something the user asked for by name.
+
+    ``kind`` empty means every kind; ``paths`` empty means every satellite of
+    the kinds named.  Does not touch `offered` -- pruning changes what is
+    HELD, not what was once on offer, and rewriting the offer to match would
+    erase the very gap the block exists to show.
+    """
+    sats = (entry or {}).get(SATELLITES_KEY) or {}
+    want = {str(p).replace("\\", "/").lower() for p in (paths or ())}
+    dropped: list[dict] = []
+    for k in ([kind] if kind else list(sats)):
+        recs = sats.get(k)
+        if not isinstance(recs, list):
+            continue
+        keep = []
+        for r in recs:
+            if not want or _sat_key(r) in want:
+                dropped.append(r)
+            else:
+                keep.append(r)
+        sats[k] = keep
+    return dropped
 
 
 def entry_provenance(entry: dict) -> Optional[dict]:
@@ -682,12 +1071,46 @@ class Collection:
             source_texture: str = "", swap_for: str = "",
             note: str = "",
             parts: Iterable[tuple[str, str, str, bytes]] = (),
-            provenance: Optional[dict] = None) -> dict:
+            provenance: Optional[dict] = None,
+            offered: Optional[dict] = None,
+            also_taken: Optional[dict] = None,
+            merge_parts: bool = False) -> dict:
         """Copy one mesh (and its skins) into a category folder.
 
         Re-collecting the same source updates that entry in place rather than
         making a second copy: the collection is a set of decisions, and the
         same decision twice is still one decision.
+
+        ``offered`` is **E** (backlog section 7): ``{kind: {available, taken,
+        asOf}}`` -- what was ON OFFER when this collect ran, so a later gap is
+        distinguishable from "never offered".  `None` means this collector did
+        not measure the offer, and the entry then says `SAT_UNKNOWN` rather
+        than being back-filled with a number nobody took.
+
+        ``merge_parts`` is **B**, and it is **OFF by default**, which is a
+        decision and not caution.  When on, parts the previous entry held and
+        this collect did not re-take are carried forward -- bytes and record --
+        so "I kept this before, now I want its effects too" cannot silently
+        drop the motions that were already there.  Removal then becomes
+        `prune`, never a side effect of collecting again, which is the cost
+        section 7 explicitly accepted when it chose B.
+
+        **Why it is off by default, and this was measured rather than
+        guessed.**  B is a ruling about the CHECKBOX collect: a user who ticks
+        "effects" on something they already kept means "add these", and
+        dropping their motions would be the silent loss the ruling forbids.  A
+        re-collect that sends NO selection means something else -- the
+        collector re-resolved this asset and this is now what it finds -- and
+        `test_viewer.Curation.test_re_collecting_does_not_leave_the_old_files_behind`
+        pins that: the storekeeper's action files became reachable, the
+        re-collect found different parts, and the ones it no longer claimed
+        used to sit on disk with nothing in the index pointing at them.
+        Merging by default turned that test red, and it was right to.
+
+        So the two semantics are kept apart by the same discriminator the rest
+        of this feature uses: a caller that sends a selection gets B, and a
+        caller that does not gets exactly what it always got.  `post_collect`
+        passes `merge_parts=selective` for that reason and no other.
 
         ``provenance`` is `core/provenance.stamp()`'s record for the install
         the bytes were read out of.  It is **passed in, not computed here**:
@@ -709,6 +1132,29 @@ class Collection:
             raise CollectionError("no mesh bytes")
 
         prev = self.by_source(server, source_mesh) if source_mesh else None
+        # **B, and it has to happen BEFORE the delete below.** The previous
+        # entry's files are about to be unlinked, so anything this collect is
+        # not re-taking has to be read into memory first or it is gone. The
+        # carry set is keyed on the part's SOURCE path -- the logical path it
+        # came from -- because that is what identifies a satellite across two
+        # collects; the on-disk filename is derived and can change with the
+        # category. A part the new take also names is NOT carried: the new
+        # bytes win, which is a refresh, not a drop.
+        carried: list[tuple[dict, bytes]] = []
+        if prev and merge_parts:
+            fresh = {str(p[2] or "").replace("\\", "/").lower()
+                     for p in parts if len(p) > 2}
+            for q in prev.get("parts", []):
+                if str(q.get("source") or "").replace("\\", "/").lower() in fresh:
+                    continue
+                f = self.root / str(q.get("file") or "")
+                if not f.is_file():
+                    # The record outlived its bytes. Dropping the record is
+                    # right -- an entry claiming a file that is not there is
+                    # exactly the "collection that claims to hold something it
+                    # does not" section 7 warns about.
+                    continue
+                carried.append((dict(q), f.read_bytes()))
         if prev:
             # Re-collecting replaces the entry, so the old copy goes first --
             # every file of it, not just when the shelf changed. A re-collect
@@ -733,18 +1179,65 @@ class Collection:
         (folder / f"{stem}{ext}").write_bytes(mesh_bytes)
 
         skin_files, skin_shas = [], []
-        for i, (sname, sbytes) in enumerate(skins):
+        skin_taken: list[tuple[str, dict]] = []
+        for i, srec in enumerate(skins):
+            # A 3rd element carries `{kind, path}` for a skin taken through a
+            # CHECKBOX rather than as the entry's primary. Skins do not travel
+            # as `parts`, so without this the `satellites` block would
+            # under-report exactly the alt skins the user ticked -- an entry
+            # holding a file it does not admit to. Two-tuples still work, so
+            # every existing caller is unchanged.
+            sname, sbytes = srec[0], srec[1]
+            extra = dict(srec[2]) if len(srec) > 2 and srec[2] else {}
             sext = Path(sname).suffix or ".dds"
             fn = f"{stem}{sext}" if i == 0 else f"{stem}_s{i}{sext}"
             (folder / fn).write_bytes(sbytes)
             skin_files.append(fn)
             skin_shas.append(_sha(sbytes))
+            if extra.get("kind"):
+                skin_taken.append((str(extra["kind"]),
+                                   {"path": extra.get("path") or sname,
+                                    "sha": skin_shas[-1]}))
 
         # Everything else the asset needs to behave: its motion files, the
         # effects that ride on it. A model collected without these is a
         # statue -- it was the whole point of collecting it that it moves.
         part_recs = []
         src_stem = Path(source_mesh or "").stem.lower()
+        # -- ONE STORED FILE PER LOGICAL PATH ------------------------------
+        #
+        # The stored name is derived from the part's BASENAME, and a basename
+        # is not unique across an entry's sources. Effect art is the extreme
+        # case and it is not exotic: every effect container names its files
+        # `1.c3`, `2.c3`, `1.dds`... so `c3/effect/scene-ff/airwall_bluef/2.c3`
+        # and `c3/effect/scene-ff/airwall_gold/2.c3` both derived
+        # `<map>__effectart-2.c3`. The second write TRUNCATED the first, the
+        # filemap then pointed both logical paths at one file, and eleven of
+        # `sary02_new`'s effect files became one. Nothing errored: the entry
+        # listed every part, every part had a `sha`, and the shas were of the
+        # bytes that had been written -- one of which was no longer there.
+        #
+        # Map art has the same shape waiting (`data/map/a/2/a239.dds` against
+        # another folder's `a239.dds`); it had simply not collided yet.
+        #
+        # A short digest OF THE SOURCE PATH, not a counter: it is stable
+        # across re-collects whatever order the closure walks in, so
+        # re-collecting a map rewrites the same filenames rather than
+        # shuffling them.
+        used: set = set()
+
+        def _unique(fn: str, psource: str) -> str:
+            if fn.lower() not in used:
+                used.add(fn.lower())
+                return fn
+            q = Path(fn)
+            tag = hashlib.sha1(
+                str(psource or fn).replace("\\", "/").lower().encode("utf-8")
+            ).hexdigest()[:8]
+            alt = f"{q.stem}-{tag}{q.suffix}"
+            used.add(alt.lower())
+            return alt
+
         for prec_in in parts:
             # A 5th element carries per-file facts the collector measured and
             # `stage` needs back -- whether a map's art is shared with other
@@ -766,11 +1259,27 @@ class Collection:
                 code, _ = action_code(src_stem, pstem.lower())
                 if code:
                     pstem = code
-            fn = f"{stem}__{role}-{slugify(pstem)}{pext}"
+            fn = _unique(f"{stem}__{role}-{slugify(pstem)}{pext}", psource)
             (folder / fn).write_bytes(pbytes)
             part_recs.append({"role": role, "file": f"{category}/{fn}",
                               "source": psource, "sha": _sha(pbytes),
                               **extra})
+
+        # The carried-forward half of B. Written into THIS category's folder
+        # under this entry's stem, so a re-collect that also changed the shelf
+        # does not leave them orphaned in the old one; the record's `file` is
+        # rewritten to match, and everything else about it is kept verbatim --
+        # including the `kind` the original collect recorded, which is the only
+        # thing that can still say which checkbox it came from.
+        for q, blob in carried:
+            role = str(q.get("role") or "effect")
+            base = Path(str(q.get("file") or "")).name
+            fn = base if base.startswith(f"{stem}__") else \
+                f"{stem}__{role}-{slugify(Path(base).stem)}{Path(base).suffix}"
+            fn = _unique(fn, q.get("source") or fn)
+            (folder / fn).write_bytes(blob)
+            part_recs.append({**q, "file": f"{category}/{fn}",
+                              "carriedForward": True})
 
         entry = {
             "id": stem,
@@ -794,6 +1303,83 @@ class Collection:
             # it costs one word to keep.
             PROVENANCE_KEY: dict(provenance) if provenance else None,
         }
+        # ---- B + E, the two blocks section 7 decided on -------------------
+        # `satellites` is built from the part records rather than passed in
+        # separately, so the block and the files on disk cannot disagree: a
+        # kind appears here exactly when a file for it was written above. The
+        # part's `kind` is what the collector ticked; a part with no kind (an
+        # older caller, or the directory sweep) is filed by its ROLE through
+        # `_KIND_FOR_ROLE`, which is a demotion to a coarser answer and never
+        # an invention of a finer one.
+        taken_now: dict = {}
+        for q in part_recs:
+            kind = str(q.get("kind") or "") or _KIND_FOR_ROLE.get(
+                str(q.get("role") or ""), "")
+            if not kind:
+                continue
+            taken_now.setdefault(kind, []).append(
+                {"path": q.get("source") or "", "sha": q.get("sha") or "",
+                 "takenAt": q.get("takenAt") or entry["collectedAt"]})
+        # The primary skin is a texture that travels today and always did;
+        # `sourceTexture` stays as it was, and the `textures` kind is additive
+        # AROUND it so existing entries keep working unchanged.
+        if source_texture and skin_shas:
+            taken_now.setdefault("textures", []).insert(
+                0, {"path": source_texture, "sha": skin_shas[0],
+                    "takenAt": entry["collectedAt"]})
+        for kind, rec in skin_taken:
+            taken_now.setdefault(kind, []).append(
+                {**rec, "takenAt": entry["collectedAt"]})
+        # `also_taken` files a satellite this entry ALREADY HOLDS under a
+        # second kind, without writing a second copy of it.
+        #
+        # It exists for one measured case. On CCO's Steel Blade the offer
+        # lists `c3/texture/410008.dds` under `altskins`, and the Builder
+        # passes that same file as the entry's primary skin -- so the collect
+        # writes it once, files it under `textures`, and the entry then read
+        # "Alt skins: 2 of 3" while holding all three. Overstating a GAP is a
+        # smaller sin than overstating completeness and it is still a
+        # misreport, and E is worth nothing if its numbers are approximate.
+        for kind, recs in (also_taken or {}).items():
+            for r in recs:
+                taken_now.setdefault(kind, []).append(
+                    {"path": r.get("path") or "", "sha": r.get("sha") or "",
+                     "takenAt": entry["collectedAt"],
+                     # Named, so a reader of the index can see that this row
+                     # shares a file with another kind rather than wondering
+                     # why two entries carry one sha.
+                     "alsoUnder": r.get("alsoUnder", "")})
+        entry[SATELLITES_KEY] = merge_satellites(
+            (prev or {}).get(SATELLITES_KEY) if merge_parts else None,
+            taken_now, at=entry["collectedAt"])
+        entry[OFFERED_KEY] = merge_offered(
+            (prev or {}).get(OFFERED_KEY), offered)
+        # **`taken` is MEASURED here, never carried in.** A caller building the
+        # block from an offer knows what it INTENDED to take, and the two are
+        # not the same number: a file can fail to read, or collide with the
+        # primary skin and be dropped as a duplicate. Observed live on CCO
+        # 2.0, 2026-09-07 -- an entry said `altskins taken=3` while holding 2.
+        # E's whole purpose is that the entry does not overstate what it has,
+        # so the count comes from the satellites block that was just written
+        # and cannot disagree with it. On a re-collect it is the MERGED total,
+        # which is also what "how much of the offer do I now hold" means.
+        for kind, blk in entry[OFFERED_KEY].items():
+            blk["taken"] = len(entry[SATELLITES_KEY].get(kind) or [])
+            # `available` can never be less than `taken`, and correcting it
+            # here is the weakest TRUE statement rather than a fabrication: a
+            # satellite this entry holds was, by definition, available.
+            #
+            # It happens for a real reason. `sourceTexture` -- the primary
+            # skin -- travels with every collect and is counted under
+            # `textures`, but it comes from the CALLER, not from the offer:
+            # the Builder passes the quality-8 texture off the loadout while
+            # the offer's paired-texture row is the appearance's own declared
+            # Texture0, and on CCO's Steel Blade those are two different
+            # files. So the entry legitimately held 2 and the offer had
+            # counted 1, which rendered as "2 of 1 collected".
+            avail = blk.get("available")
+            if isinstance(avail, int) and avail < blk["taken"]:
+                blk["available"] = blk["taken"]
         # a per-entry sidecar, so a folder is self-describing even if the
         # index is lost or the folder is copied somewhere else
         (folder / f"{stem}.json").write_text(
@@ -805,6 +1391,44 @@ class Collection:
             self.entries.append(entry)
         self.save()
         return entry
+
+    def prune(self, ident: str, *, kind: str = "",
+              paths: Iterable[str] = (), delete_files: bool = True) -> dict:
+        """Drop satellites from an entry on purpose.
+
+        **B requires this and it is the price of B.**  Because re-collect
+        merges and never removes, an entry accumulates satellites whose source
+        may since have changed, and the only way back out has to be an action
+        the user named.  Nothing here is reachable from `add`.
+
+        `offered` is deliberately untouched: pruning changes what is HELD, not
+        what was once on offer, and rewriting the offer to match would erase
+        the very gap E exists to show.  After a prune the entry reads
+        "Effects: 0 of 7 collected", which is true.
+        """
+        e = self.by_id(ident)
+        if e is None:
+            raise CollectionError(f"no entry {ident!r}")
+        dropped = prune_satellites(e, kind=kind, paths=paths)
+        gone = {str(r.get("path") or "").replace("\\", "/").lower()
+                for r in dropped}
+        kept_parts, removed_files = [], []
+        for q in e.get("parts", []):
+            src = str(q.get("source") or "").replace("\\", "/").lower()
+            if gone and src in gone:
+                removed_files.append(str(q.get("file") or ""))
+                continue
+            kept_parts.append(q)
+        e["parts"] = kept_parts
+        if delete_files:
+            for rel in removed_files:
+                p = self.root / rel
+                if p.is_file():
+                    p.unlink()
+        self.save()
+        return {"id": ident, "dropped": dropped, "files": removed_files,
+                "satellites": e.get(SATELLITES_KEY, {}),
+                "report": satellite_report(e)}
 
     def remove(self, ident: str, *, delete_files: bool = True) -> bool:
         e = self.by_id(ident)
@@ -852,6 +1476,7 @@ class Collection:
         library by construction instead of by remembering to delete it.
         """
         filemap: dict[str, list] = {}
+        collisions = 0
         for e in self.entries:
             # An entry's motion and effect files are part of what was kept.
             # Listing only mesh and skin left them in the library folder but
@@ -861,10 +1486,49 @@ class Collection:
             for rel in rels:
                 filemap[f"{PROFILE_NAME}/{rel}".lower()] = [
                     "l", f"{ROOT_NAME}/{rel}", e["category"]]
+
+            # -- AND AT THE PATH THE GAME KNOWS IT BY ----------------------
+            #
+            # The block above publishes what was kept as a browsable PILE,
+            # under `collection/<category>/<file>`. That is the right shape
+            # for "show me what I have collected" and it is the wrong shape
+            # for everything that resolves an asset by the path the client
+            # uses: a collected map landed at
+            # `collection/maps/sary02_new__art-a239.dds` and nothing looking
+            # for `data/map/a/2/a239.dds` found it. Selecting the Collection
+            # in the Map Editor listed ZERO maps for exactly this reason --
+            # `MapEditor` asks for `map/map/<name>.DMap`, which was in the
+            # library and not in its namespace.
+            #
+            # `source` is the logical path the part was collected FROM, and
+            # it is already what `stage` writes the part back to. Publishing
+            # it here makes the Collection view a PREVIEW of that staging:
+            # what the install looks like with this collection applied.
+            #
+            # Both spellings point at the same file, so this costs one
+            # filemap row per part and no bytes.
+            src_of = {"mesh": e.get("sourceMesh"),
+                      **{p["file"]: p.get("source") for p in e.get("parts", [])}}
+            for rel in rels:
+                src = src_of.get("mesh") if rel == e["mesh"] else src_of.get(rel)
+                src = str(src or "").replace("\\", "/").strip("/").lower()
+                # A path that is not a real logical path is not published:
+                # `skins` carry no source, and an entry collected before
+                # sources were recorded has none either.
+                if not src or src.startswith(PROFILE_NAME + "/"):
+                    continue
+                if src in filemap:
+                    collisions += 1
+                filemap[src] = ["l", f"{ROOT_NAME}/{rel}", e["category"]]
         profile = {
             "server": PROFILE_NAME, "tag": PROFILE_TAG,
             "clientVersion": "curated",
             "files": len(filemap), "entries": len(self.entries),
+            # Two entries collected from different clients can claim one
+            # logical path; the last one written wins, and saying how many
+            # did is the difference between a view you can reason about and
+            # one that quietly shows you somebody else's art.
+            "pathCollisions": collisions,
             "counts": self.counts(),
             "publishedAt": _now(),
         }
@@ -1025,6 +1689,52 @@ class Collection:
                 # that made them part of the map.
                 dst = prec["source"]
             else:
+                continue
+
+            # A SNIPPET IS NOT A FILE, AND UNTIL 2026-09-16 THIS WROTE ONE
+            # OVER THE OTHER.
+            #
+            # `mapparts` marks a part `apply="merge"` when `source` names a
+            # SHARED table and the part's bytes are only the sections or rows
+            # THIS map owns -- an `.ani` index, a `GameMap` row set, an
+            # `3DEffect.ini` section. Nothing in this file read that field:
+            # every part was written as bytes to `dst`, so staging a collected
+            # map replaced the shared original with one map's cut of it.
+            #
+            # MEASURED, by running this function into a throwaway directory
+            # rather than reading it (`scratchpad/stage_snippet_probe.py`,
+            # sary02_new on 7878):
+            #
+            #     ani/mapscene-new.ani   staged   14,171 B over 1,127,723 B
+            #     ani/ZF.ani             staged    2,322 B over    87,037 B
+            #     ani/n-canyon.ani       staged  200,083 B over   387,423 B
+            #     sharedArt decisions raised: 0
+            #
+            # `ani/mapscene-new.ani` is referenced by 208 other maps. That is
+            # 98.7% of a shared index deleted, with no warning, by a function
+            # whose own comment six lines below says overwriting one "is a
+            # decision about all of them".
+            #
+            # REFUSED RATHER THAN MERGED, and that is the honest fix rather
+            # than the lazy one: this project has no splicer for these
+            # formats, and writing a merge we have not implemented is exactly
+            # what just happened. The refusal names the format and the keys,
+            # so the tool that does implement it knows what it owes.
+            how = prec.get("apply", "replace")
+            if how != "replace":
+                keys = prec.get("mergeKeys") or []
+                out["skipped"].append(
+                    f"{role}: {dst} needs a {how} of "
+                    f"{len(keys)} {prec.get('mergeFormat') or 'unknown-format'} "
+                    f"key(s), and staging writes whole files -- writing this "
+                    f"cut here would delete every other map's rows")
+                out.setdefault("needsMerge", []).append({
+                    "path": dst, "role": role, "apply": how,
+                    "format": prec.get("mergeFormat") or "",
+                    "keys": list(keys),
+                    "why": (f"{dst} is a shared table; this part carries only "
+                            f"the {len(keys)} key(s) this entry owns"),
+                })
                 continue
 
             # Shared art: stage it only where it would actually change

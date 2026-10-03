@@ -507,6 +507,21 @@ def self_audit(path: Path) -> list:
 # occupancy
 # ---------------------------------------------------------------------------
 
+def stage_label() -> str:
+    """The stage tree as this command's output NAMES it: comod's `STAGE`,
+    relative to the checkout (`Installed/stage`).
+
+    Derived, never re-typed. The printed instructions said `mods/stage/` for
+    weeks after the tree moved -- and the swap page shows this output
+    verbatim, so the stale name was on screen beside a drawer that read the
+    real one."""
+    import comod                                          # noqa: PLC0415
+    try:
+        return comod.STAGE.relative_to(comod.PROJECT).as_posix()
+    except ValueError:
+        return comod.STAGE.as_posix()
+
+
 def occupancy_sources(view: coassets.AssetRoot, root: Path) -> dict:
     """Every id-ish token the free set is the complement of, by source name."""
     srcs: dict = {}
@@ -572,7 +587,7 @@ def occupancy_sources(view: coassets.AssetRoot, root: Path) -> dict:
     import comod                                          # noqa: PLC0415
     stage_root = comod.STAGE
     sdir = stage_root / "c3" / "npc"
-    srcs["mods/stage/c3/npc/"] = (
+    srcs[f"{stage_label()}/c3/npc/"] = (
         [p.stem for p in sdir.rglob("*") if p.is_file()]
         if sdir.is_dir() else [])
 
@@ -596,7 +611,7 @@ def occupancy_sources(view: coassets.AssetRoot, root: Path) -> dict:
                 v = row_.get(fld)
                 if v is not None:
                     toks.append(v)
-    srcs[f"mods/stage/{_CONV.npc_table}"] = toks
+    srcs[f"{stage_label()}/{_CONV.npc_table}"] = toks
     return srcs
 
 
@@ -965,7 +980,7 @@ def run(args) -> int:
             # printed. A plain copy into the stage tree is what `install`
             # consumes either way, and it is the route that was verified.
             print(f"                 copy mods/work/{Path(s.old.source).name}"
-                  f"  ->  mods/stage/{s.path}")
+                  f"  ->  {stage_label()}/{s.path}")
             print("         checked stage-mesh would REJECT this file (no "
                   "usable PHY chunk), so a plain copy is given instead")
 
@@ -982,7 +997,7 @@ def run(args) -> int:
     print(f"\n  STEP 2 -- change {len(edits)} field(s) in one row.")
     print(f"  Open a copy of the table, not the installed one:")
     print(f"         py -3 tools/comod.py stage {_CONV.npc_table}")
-    print(f"  then edit  mods/stage/{_CONV.npc_table}")
+    print(f"  then edit  {stage_label()}/{_CONV.npc_table}")
     for n, s in enumerate(edits, 1):
         print(f"\n    2.{n}  file    {s.path}")
         print(f"         row     {s.key}")
@@ -1206,7 +1221,7 @@ def run(args) -> int:
     print(f"  {len(sheet.steps)} instruction(s) to type, "
           f"{len(sheet.refusals)} refused, 0 files written by this command.")
     print("  THIS command applies nothing, and still does not. "
-          "tools/npcstage.py stages\n  this same plan into mods/stage, and "
+          "tools/npcstage.py stages\n  this same plan into " + stage_label() + ", and "
           "comod.py install applies THAT -- with a\n  backup of every file it "
           "displaces, and an uninstall that puts them back.")
     if failures or sheet.refusals:
