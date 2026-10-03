@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 import c3phy                                              # noqa: E402
 import dbcshadow                                          # noqa: E402
+import motionpool                                         # noqa: E402
 import effects as fx                                      # noqa: E402
 import attach                                             # noqa: E402
 from coassets import DEFAULT_ROOT, AssetRoot, parse_ini    # noqa: E402
@@ -336,6 +337,128 @@ JUMP_DISTANCES = (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120)
 #: family digits are not recoverable from the shipped data.
 WEAPONSET_UNARMED = "000"
 
+#: Where one `MotionIndex` key came from.  `SRC_INI_PATH` is the ten-wide
+#: `0001410100` row re-spelled seven-wide from its own path -- the row IS in
+#: the ini, under the other spelling, which is why it is not `SRC_INI`.
+#:
+#: RE-EXPORTED FROM `core/motionpool.py`, which now owns the ini+dbc merge so
+#: the Blender add-on can share it (it cannot import this module: 1,700 lines
+#: of CLI, and `attach` with it).  Kept as names here because `comod anim` and
+#: `tools/models.py` print them and a rename would be a silent output change.
+SRC_INI = motionpool.SRC_INI
+SRC_INI_PATH = motionpool.SRC_INI_PATH
+SRC_DBC = motionpool.SRC_DBC
+
+#: The `weapon.ini` type band whose MOTION type is another type's: the weapon
+#: SOULS of Classic Conquer (CCO), 800..899 in the id's type field.
+#:
+#: THE DEFECT THIS EXISTS FOR (measured 2026-09-30 in the owner's Character
+#: Builder on CCO): body 001193510 with item 804240 `BowSoulLv130` in a hand
+#: slot showed EVERY action as "no own motion". `weapon_type("804240")` split
+#: the id and answered `804`; `weaponset` keyed set 804; `actions_for(1, 804)`
+#: is 0, so `loadout_motions` reported own_set False, 0 motions in its own
+#: set, and every action fell through to the unarmed clips. A real bow
+#: (500320) on the same body: set 500, own_set True, 57 own clips present.
+#:
+#: WHAT THE CLIENT'S OWN TABLES SAY, read 2026-09-30 on the CCO snapshot
+#: (`Clients/CCO-snapshot-2026-08-24`, the same ini tables):
+#:
+#: * `weapon.ini` [804240] has Part=1, Mesh0=500320, Texture0=500325 -- the
+#:   soul's appearance IS a 500-series bow mesh. Census over all 5,384
+#:   sections: soul type 800 -> mesh type 410 (28 rows), 801 -> 420 (26),
+#:   802 -> 480 (26), 803 -> 421 (26), 804 -> 500 (25); 131 soul rows, every
+#:   one carrying a mesh of ANOTHER type. `itemtype.json` names them
+#:   BladeSoulLv*, SwordSoulLv*, ClubSoulLv*, BkswrdSoulLv*, BowSoulLv*.
+#: * `3dmotion.ini` declares set 804 TEN WIDE on each player shape --
+#:   `0001804240=c3/0001/500/150.c3` (shape 0001, set 804, action 240) points
+#:   the soul at the BOW folder -- and not as one row: 101 rows per shape
+#:   (0001..0004), 90 into `c3/000N/500/` and 11 into `000/`, and **all 101
+#:   are path-for-path the rows the 500 set names for the same actions**
+#:   (the bow's own 240 is `1500240=c3/0001/500/150.c3`). Likewise 800 -> 410
+#:   (83-87 rows/shape, 83-87 identical), 801 -> 420, 802 -> 480, 803 -> 421
+#:   (88/88 each). The soul sets are verbatim prefixes of their mesh type's
+#:   set: the game itself says "a soul animates as the weapon it holds".
+#:   Our index cannot reach those rows from a player shape -- CCO spells its
+#:   500 rows seven wide (`1500240`) and the 8xx rows ten wide, `_split`
+#:   files the latter under shape `0001`, and every caller asks with `1`
+#:   (`lookup("0001","804","240")` is exact; `lookup("1","804","240")` falls
+#:   to 000). Even reached, they cover 101 of the 192 actions the 500 set
+#:   has. Resolving through the MESH type gives the whole set, and agrees
+#:   with the table on every row the table has.
+#: * The owner confirmed it in-game: a soul animates as the weapon mesh it
+#:   puts in your hand.
+#:
+#: WHY ONLY SOULS. Of the 5,253 non-soul `weapon.ini` rows, 18 carry a mesh
+#: whose type is not the id's, and none of them is this case: `1051000`
+#: FreezingArrow (7-digit ammunition, Mesh0 1050000, neither type owns a
+#: motion set); `410302` NowbieBlade (Mesh0=0, no mesh at all); and 16 rows
+#: of types 350/360/422 borrowing each other's meshes (five 350xxx with
+#: 360xxx meshes, seven 360xxx with 422xxx meshes -- FireStick / SugarGourd
+#: / the Roses -- four 360xxx with 350xxx meshes). Types 350, 360 and 422
+#: each OWN a motion set in `3dmotion.ini` (178 / 190 / 178 actions on shape
+#: 1, aliasing to 560 / 410 / 410 through `attach.WEAPON_MOTION_SET`), so the
+#: table already answers them BY ITEM TYPE and the mesh would send a 350 item
+#: to the 410 family instead. No in-game confirmation exists for that, so the
+#: rule stops at the soul band. CCO-SPECIFIC BY MEASUREMENT: 131 soul
+#: sections on the CCO snapshot, 0 on the other 44 clients under `Clients/`.
+SOUL_TYPE_MIN = 800
+SOUL_TYPE_MAX = 899
+
+#: How `AnimDB.weapon_type_via` arrived at a weapon's MOTION type. `id` is the
+#: ordinary split (the id's own type field IS the motion type); `mesh` is the
+#: soul rule above (the type of the `weapon.ini` Mesh0 the id puts in the
+#: hand). A soul with no row or no Mesh0 reports `id` -- the fallback is the
+#: split, and `loadout_motions` says so in `limits`.
+WEAPON_TYPE_VIA_ID = "id"
+WEAPON_TYPE_VIA_MESH = "mesh"
+
+
+def weapon_type_of_id(appearance: str) -> str:
+    """A `weapon.ini` section name split as `<type><sub>`, type = all but the
+    last three digits (`docs/effects.md` §8 step 1). `''` for anything too
+    short to split, which includes the `0` a mesh-less row writes in Mesh0."""
+    a = (appearance or "").strip()
+    return a[:-3] if len(a) > 3 else ""
+
+
+def is_soul_type(weapon_type: str) -> bool:
+    """Whether a split type field sits in the soul band (`SOUL_TYPE_MIN`..
+    `SOUL_TYPE_MAX`). Digits only; anything else is not a soul."""
+    t = (weapon_type or "").strip()
+    return t.isdigit() and SOUL_TYPE_MIN <= int(t) <= SOUL_TYPE_MAX
+
+
+def soul_motion_type(appearance: str, weapon_rows) -> tuple[str, str]:
+    """`(motion type, via)` for one weapon appearance, by the soul rule.
+
+    Pure: `weapon_rows` is `weapon.ini` as `parse_ini` returns it --
+    `{section: {key: value}}`, sections keyed by the id AS WRITTEN (weapon
+    ids are six wide and are never padded; `shape_of`'s docstring owns that
+    rule). `AnimDB.weapon_type_via` feeds it the install's table; the
+    hermetic arms in `tests/test_loadout_motions.py` feed it a synthetic one.
+
+    * not a soul -> the id's own type, `WEAPON_TYPE_VIA_ID` (unchanged
+      behaviour for the 5,253 ordinary rows).
+    * a soul with a row whose Mesh0 splits to a type -> that type,
+      `WEAPON_TYPE_VIA_MESH`: `804240` (Mesh0=500320) -> `500`.
+    * a soul with no row, or a row with no Mesh0 (absent, empty or `0`) ->
+      the id's own type, `WEAPON_TYPE_VIA_ID`. Documented fallback: the split
+      is what every caller got before this rule existed, and `804` keys no
+      set, so the loadout reports the unarmed set -- true, and labelled.
+    """
+    a = (appearance or "").strip()
+    t = weapon_type_of_id(a)
+    if not is_soul_type(t):
+        return t, WEAPON_TYPE_VIA_ID
+    sec = (weapon_rows or {}).get(a)
+    if not sec:
+        return t, WEAPON_TYPE_VIA_ID
+    mesh = str(sec.get("Mesh0", "") or "").strip()
+    mt = weapon_type_of_id(mesh)
+    if not mt or not mt.isdigit() or int(mt) == 0:
+        return t, WEAPON_TYPE_VIA_ID
+    return mt, WEAPON_TYPE_VIA_MESH
+
 
 def weaponset_from_type(weapon_type: str) -> str:
     """`7XY` form of a single weapon type, per the arithmetic in §4.3."""
@@ -363,74 +486,42 @@ class MotionIndex:
     def __init__(self, root: Path | str = DEFAULT_ROOT):
         self.root = Path(root)
         self.raw: dict[str, str] = {}
+        #: `key -> which file put this spelling in the index`, one of
+        #: `SRC_INI`, `SRC_INI_PATH`, `SRC_DBC`.  Purely additive bookkeeping:
+        #: nothing here feeds a lookup.  It exists because "which table did
+        #: this answer come from" is not recoverable afterwards -- the dbc
+        #: overlay lands ON TOP of the ini rows and the merged `raw` cannot
+        #: tell a live row from a 2009 decoy that happened to agree.  A
+        #: modder reading `comod anim` needs that distinction to know which
+        #: file to edit, and on 5517/6609/7205 the answer is the .dbc.
+        self.source: dict[str, str] = {}
         self.row_count = 0
         self.duplicate_rows = 0
         self.conflicting_rows = 0
-        p = self.root / "ini" / "3dmotion.ini"
-        pat = re.compile(r"^c3/(\d{4})/(\d{3})/(\d{1,3})\.c3$", re.I)
-        if p.is_file():
-            rebuilt: list = []
-            for line in p.read_text("latin-1", errors="replace").splitlines():
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                if not k:
-                    continue
-                v = v.strip().replace("\\", "/")
-                self.row_count += 1
-                if k in self.raw:
-                    self.duplicate_rows += 1
-                    self.conflicting_rows += (self.raw[k] != v)
-                self.raw[k] = v
-                m = pat.match(v)
-                if m:
-                    rebuilt.append((str(int(m.group(1))) + m.group(2)
-                                    + m.group(3).zfill(3), v))
-            # **The official plaintext ini pads the body-motion key to TEN
-            # wide** -- `0001410100 = c3/0001/410/100.c3` -- where CCO writes
-            # it seven, `1410100 = c3/0001/410/100.c3`, and `key()` builds the
-            # seven-wide form. On 5517/6090 the dbc overlay below rebuilds
-            # that spelling from the path and the difference never shows; on
-            # 5017/5065/5165 there is no dbc, so **every body-motion lookup
-            # missed**, silently, and `AnimDB.clip` returned None for both the
-            # bare and the armed idle on all three. Index the path-derived
-            # spelling too.
-            #
-            # `setdefault`: a key the file states explicitly is never replaced
-            # by one derived from a path, so this can only add rows and cannot
-            # change an answer any base gives today. Not counted in
-            # `row_count`, which reports what the file itself carries.
-            for k, v in rebuilt:
-                self.raw.setdefault(k, v)
-        # Official 6090-era clients keep that ini as a 2009 stale decoy and
-        # ship the live table as 3dmotion.dbc (core/dbc.py). Overlay it so
-        # the live rows win: reading only the ini is what left every 6090
-        # body in a T-pose. The dbc's integer ids do NOT reproduce the ini
-        # key strings (the 7-digit player form strips the shape's leading
-        # zeros, which int() cannot round-trip), so the key is rebuilt from
-        # the row's PATH -- c3/<shape>/<ws>/<action>.c3 spells all three
-        # fields. Rows that are not that layout (chained "-N" stems, the
-        # flat NPC family) are left to the ini and to npcart, which resolve
-        # them by other means.
-        # Asked through `dbcshadow`, the one place that answers "is this ini
-        # shadowed on this base", rather than spelling the twin's name here.
-        # The pairing is case-insensitive and per base, and a second local
-        # copy of the rule is how it drifts out of step.
-        pdbc = dbcshadow.compiled_twin(p)
-        if pdbc is not None:
-            import dbc as dbcmod
-            for mv in dbcmod.Rsdb.parse(pdbc.read_bytes()).paths.values():
-                mv = mv.replace("\\", "/")
-                m = pat.match(mv)
-                if not m:
-                    continue
-                k = str(int(m.group(1))) + m.group(2) + m.group(3).zfill(3)
-                self.row_count += 1
-                if k in self.raw:
-                    self.duplicate_rows += 1
-                    self.conflicting_rows += (self.raw[k] != mv)
-                self.raw[k] = mv
+        #: The two files behind this index. `ini_file` is named whether or
+        #: not it exists (ask `.is_file()`); `dbc_file` is None when this
+        #: base ships no compiled twin. A client with neither is a clean
+        #: "this client ships no motion table" -- Zephyr, MEASURED, 0 keys
+        #: -- and 7878 ships the ini with no twin.
+        #
+        # THE MERGE ITSELF MOVED TO `core/motionpool.py` and this is now the
+        # only caller of it in `tools/`.  It moved because the Blender add-on
+        # needs the same rows to pick a skeleton-solve pool, and the two ways
+        # to give it them were to vendor this whole module or to write the
+        # ini+dbc merge a second time next to it.  `dbcshadow`'s own docstring
+        # says why the second one is not an option: "a second local copy of
+        # the rule is how it drifts out of step".  Nothing about the merge
+        # changed -- `tests/test_comod_anim.py` compares row and key counts
+        # across the shipped bases, and `tests/test_motionpool.py` pins the
+        # delegation itself.
+        rows = motionpool.motion_rows(self.root)
+        self.raw = rows.raw
+        self.source = rows.source
+        self.ini_file = rows.ini_file
+        self.dbc_file: Optional[Path] = rows.dbc_file
+        self.row_count = rows.row_count
+        self.duplicate_rows = rows.duplicate_rows
+        self.conflicting_rows = rows.conflicting_rows
         self.keys: list[MotionKey] = [self._split(k, v) for k, v in self.raw.items()]
         self.by_shape: dict[str, set[str]] = {}
         self.by_shape_ws: dict[tuple[str, str], set[str]] = {}
@@ -451,6 +542,45 @@ class MotionIndex:
             distance: Optional[int] = None) -> str:
         d = "" if distance is None else str(distance)
         return f"{d}{shape}{weaponset}{action}"
+
+    def declared_actions(self, shape: str, weaponset: str) -> list[str]:
+        """Every action code this table DECLARES for a shape and weapon set.
+
+        The UNION of the weapon set's own actions and the unarmed set's,
+        because `lookup` falls back to `000` and six actions are unarmed-only
+        on every player shape -- enumerating the weapon set alone silently
+        drops present, playable motions. Same union `loadout_motions` takes,
+        and for the same reason.
+
+        **This exists because `builder.actions_for` was iterating
+        `anim.ACTIONS`, a CURATED table of 75 codes, and calling that "every
+        action this loadout can play".** MEASURED 2026-09-22 on body
+        003188490 + bow 500219: the table declares **198** actions for that
+        loadout, so **131 had no row in the menu at all** -- and 82 of those
+        131 were exactly the motions another client could supply. The menu's
+        "+82" badge and the list's one `+` were counting different
+        populations, and the owner was right that the additions were real.
+
+        Distance-prefixed jump rows are excluded: their key carries the
+        distance FIRST, so they cannot match a `<shape><weaponset>` prefix,
+        and they are a different question from "which actions exist".
+        """
+        out: set[str] = set()
+        # ... AND THE SET THE TYPE ANIMATES FROM when that is another number
+        # (`motion_set_alias`): on 5517 `(2, 580)` declares nothing and 560
+        # declares 42, two of which -- 925, 926 -- the unarmed set lacks.
+        # Same union `loadout_motions` takes; `dict.fromkeys` so a set is not
+        # scanned twice when the three names coincide.
+        for ws in dict.fromkeys((weaponset, motion_set_alias(weaponset),
+                                 WEAPONSET_UNARMED)):
+            pre = "%s%s" % (shape, ws)
+            n = len(pre)
+            for k in self.raw:
+                if len(k) == n + 3 and k.startswith(pre):
+                    a = k[n:]
+                    if a.isdigit():
+                        out.add(a)
+        return sorted(out)
 
     def lookup(self, shape: str, weaponset: str, action: str,
                distance: Optional[int] = None) -> tuple[Optional[str], str]:
@@ -531,7 +661,14 @@ class ActionCtrl:
 
 def load_action_ctrl(root: Path | str = DEFAULT_ROOT) -> list[ActionCtrl]:
     out: list[ActionCtrl] = []
-    for sec, d in parse_ini(Path(root) / "ini" / "ActionCtrl.ini").items():
+    # PRECAUTIONARY, and labelled so nobody reads it as a bug fix:
+    # `ActionCtrl.ini` is present on ALL NINE declared clients (measured
+    # 2026-09-18), so unlike the `3DEffect.ini` and `armor.ini` guards in
+    # this batch it fixes nothing today. It is here because three tools
+    # died on an absent table tonight and each was "the file every client
+    # ships" until a client did not ship it.
+    ctrl = Path(root) / "ini" / "ActionCtrl.ini"
+    for sec, d in (parse_ini(ctrl) if ctrl.is_file() else {}).items():
         if len(sec) != 10 or not sec.isdigit():
             continue
         n = int(d.get("Section", "0") or 0)
@@ -787,17 +924,101 @@ class AnimDB:
         VERIFIED: `002135000` -> `2` -> `c3/0002/...`.  The shape is the first
         three digits with leading zeros stripped, which is how the 7-digit key
         form arises for player bodies (`docs/attachment.md` §8.1).
+
+        **THE ID IS NORMALISED TO NINE WIDE FIRST, AND THAT IS NOT A GUESS --
+        HALF THE CORPUS SPELLS IT THE OTHER WAY.**  5517, 6609 and 7205 write
+        `002135000` in `armor.ini`; 5017, 5065 and 7878 write `2135000` for
+        the SAME appearance.  Fed the seven-wide form this used to fall
+        through to `str(int(s))` and return THE WHOLE ID as the shape.
+
+        Not a crash, and that is what made it expensive: every key built from
+        it missed, so the caller reported **zero actions** for a body that
+        animates perfectly.  MEASURED on 5017 `armor.ini` -- 2,572 sections,
+        NONE spelled nine wide, so **every player body on that client listed
+        no animations at all**, and the owner reported it as the viewer being
+        broken.  After padding, 2,372 of those sections land on shapes
+        1/2/3/4 and the remaining ~200 are genuine one-off NPC series.
+
+        **The rule was already known and already MEASURED -- it just lived in
+        one caller instead of here.**  `comod._padded9` carried it (and its
+        own docstring cites 7878 id `1000000` reporting "UNRESOLVED"), while
+        the other eight `shape_of` call sites did not.  One site knowing a
+        convention and the rest not is the same shape as the four spellings
+        of `table_profile_for`; the fix is the same, which is to put it where
+        nobody has to know.
+
+        **And then it grew a third copy here.**  2026-09-25: the armet
+        readers (`parts.head_kind`, `hair_colour`, `builder.hair_style`) and
+        `attach.Catalogue.idle_motion` were found reading the id raw with
+        exactly this defect, so the rule moved once more, to `attach.pad9`,
+        and every one of those sites -- this one, `comod._padded9`, the
+        head readers, `idle_motion` -- delegates to it.  The description
+        below is of `pad9`'s behaviour; `tests/test_shape_width.py` pins the
+        delegates EQUAL to it by result.
+
+        Only digits are padded, and only UPWARD: a nine-or-wider id is
+        returned untouched, so no base that already works can change.  Weapon
+        idents are six wide and must never be padded -- they never reach here,
+        because every caller passes a BODY appearance (checked, nine call
+        sites) and that is this function's stated contract.
         """
-        s = (appearance or "").strip()
+        s = attach.pad9(appearance)
         if len(s) >= 9 and s[:3].isdigit():
             return str(int(s[:3]))
         return str(int(s)) if s.isdigit() else s
 
-    def weapon_type(self, weapon_appearance: str) -> str:
-        """A `weapon.ini` section name split as `<type><sub>`, type = all but
-        the last three digits (`docs/effects.md` §8 step 1)."""
+    def _weapon_rows(self) -> dict:
+        """`ini/weapon.ini` as `{section: {key: value}}`, read once.
+
+        `self._weapon_ini` was declared in `__init__` and, MEASURED by grep
+        before this method existed, populated nowhere -- a cache with no
+        writer. It is filled here through `attach.Catalogue.table`, the same
+        reader `coviewer._anim_clip` already trusts for the BODY's Mesh0
+        (`db.cat.appearance_mesh("armor.ini", body)`), so the body mesh and
+        the weapon mesh come out of one parse with one caveat: `table` reads
+        the plaintext, which from 5517 on is a 2009 decoy beside the live
+        `.dbc` twin (declared at `Catalogue.table`). That does not bite the
+        one rule reading this: souls ship on CCO alone (131 sections; 0 on
+        the other 44 clients), and CCO's ini IS its live table.
+        """
+        if self._weapon_ini is None:
+            try:
+                self._weapon_ini = dict(self.cat.table("weapon.ini") or {})
+            except Exception:                                # noqa: BLE001
+                # A table this install cannot serve is "no rows", and every
+                # soul then takes the documented id fallback -- the answer
+                # the caller got before this rule existed, not a crash in
+                # the middle of listing a menu.
+                self._weapon_ini = {}
+        return self._weapon_ini
+
+    def weapon_type_via(self, weapon_appearance: str) -> tuple[str, str]:
+        """`(motion type, via)` for one weapon appearance.
+
+        The id's own type field for every ordinary weapon (`via` is
+        `WEAPON_TYPE_VIA_ID`), and for a SOUL (type 800..899) the type of the
+        `weapon.ini` Mesh0 it puts in the hand (`WEAPON_TYPE_VIA_MESH`) --
+        `804240` BowSoulLv130, Mesh0=500320 -> `500`. The rule, its census
+        and the `3dmotion.ini` row that shows it is the client's own
+        convention are at `SOUL_TYPE_MIN`; the resolution is
+        `soul_motion_type`, which is pure and tested without an install.
+
+        The table is opened only for a soul: the 5,253 ordinary rows answer
+        from the id alone exactly as before, so no base that worked can
+        change and the first `weaponset()` on an unarmed body reads nothing.
+        """
         a = (weapon_appearance or "").strip()
-        return a[:-3] if len(a) > 3 else ""
+        t = weapon_type_of_id(a)
+        if not is_soul_type(t):
+            return t, WEAPON_TYPE_VIA_ID
+        return soul_motion_type(a, self._weapon_rows())
+
+    def weapon_type(self, weapon_appearance: str) -> str:
+        """The MOTION type of a weapon appearance: `docs/effects.md` §8 step
+        1's split (all but the last three digits) for every ordinary weapon,
+        and for a soul the type of the mesh it holds -- `weapon_type_via`
+        says which, and why."""
+        return self.weapon_type_via(weapon_appearance)[0]
 
     def weaponset(self, right: str = "", left: str = "") -> str:
         """The `<weaponset>` field for an equipped loadout.
@@ -840,11 +1061,7 @@ class AnimDB:
         exact = self.index.key(shape, weaponset, action, distance)
         if exact in self.index.raw:
             return self.index.lookup(shape, weaponset, action, distance)
-        try:
-            import attach as attachmod
-            alias = attachmod.motion_set_for(weaponset)
-        except Exception:                                 # pragma: no cover
-            alias = weaponset
+        alias = motion_set_alias(weaponset)
         if alias != weaponset:
             akey = self.index.key(shape, alias, action, distance)
             if akey in self.index.raw:
@@ -896,6 +1113,254 @@ class AnimDB:
             out.append(c)
             cur = c.chain_next
         return out
+
+
+# ---------------------------------------------------------------------------
+# a whole loadout's motions, deduplicated -- what an export can actually carry
+# ---------------------------------------------------------------------------
+
+#: Route labels for how a loadout's action reached its motion file. These are
+#: reported, never collapsed: a weapon whose type has no motion set of its own
+#: still animates, out of the UNARMED set, and an export that presented those
+#: files as the weapon's own would be claiming bespoke animation that does not
+#: exist. MEASURED on CCO 2026-09-22: of 31 weapon types over 5,389 weapon
+#: appearances, 23 carry their own set on all four player shapes (92 of 124
+#: shape/type cells) and 8 do not -- type 900 alone is 560 appearances.
+ROUTE_OWN = "own"            # the weapon type's own motion set answered
+ROUTE_FALLBACK = "fallback"  # resolved, but from a set this weapon does not own
+
+
+def route_is_own(how: str) -> bool:
+    """THE ONE 'own motion' predicate over `AnimDB.resolve`'s `how`.
+
+    `how` is the route's WORDING -- `MotionIndex.lookup`'s label, which
+    `resolve` SUFFIXES when the alias table answered::
+
+        exact (weapon set 580 animates from set 560)
+
+    That is an exact hit. Weapon type 580 has no rows of its own on 5517 and
+    the client animates it out of folder 560 by its own rule
+    (`attach.WEAPON_MOTION_SET`, CORRECTIONS C27), so 560's motion IS the
+    type's own. Four callers spelled the predicate as `how == "exact"` and
+    every one read the suffix as a fallback. MEASURED 2026-09-25 on 5517,
+    body 002135000 + weapon 580001: 40 of the 157 menu rows resolve through
+    that wording and all 40 were labelled "no own motion"; `loadout_motions`
+    marked every one of the loadout's 123 files ROUTE_FALLBACK and reported
+    the unarmed set as playing.
+
+    So the predicate lives here, once. Callers carry the boolean BESIDE the
+    string (`own` next to `how`) and nothing downstream compares the string.
+    """
+    return (how or "").startswith("exact")
+
+
+def motion_set_alias(weaponset: str) -> str:
+    """The folder a weapon set animates from, or the set itself.
+
+    `attach.WEAPON_MOTION_SET` (CORRECTIONS C27): the official plaintext ini
+    carries the alias rows ten wide, 5517/6090's live `.dbc` drops them, and
+    on those bases the table is what says `580 -> 560`. Wrapped so `resolve`,
+    `declared_actions` and `loadout_motions` cannot disagree about which
+    table answers.
+    """
+    try:
+        import attach as attachmod                       # noqa: PLC0415
+        return attachmod.motion_set_for(weaponset)
+    except Exception:                                    # pragma: no cover
+        return weaponset
+
+
+@dataclass
+class LoadoutMotion:
+    """One motion FILE a loadout uses, with every action that reaches it.
+
+    The unit is the file, not the action, because actions alias heavily: body
+    `003188490` with a bow resolves 112 actions onto **59 files** (700-704 and
+    712 all land on `c3/0003/500/100.c3`). A per-action list would put the
+    same file in a zip six times and tell the reader they had six animations.
+    """
+    path: str
+    present: bool
+    actions: list = field(default_factory=list)
+    route: str = ROUTE_OWN
+    how: str = ""
+
+    @property
+    def named(self) -> list:
+        """`[(code, name, group)]` for the actions that have a researched name.
+
+        66 of the 192 action codes a bow loadout resolves carry one. The rest
+        are real motions with no established meaning, and they are NOT dropped
+        -- `actions` still holds them and `label` says how many.
+        """
+        out = []
+        for c in self.actions:
+            a = ACTIONS.get(c)
+            if a:
+                out.append((c, a.name, a.group))
+        return out
+
+    @property
+    def group(self) -> str:
+        """The action group to file this under, or `other` when none is named.
+
+        First named action wins rather than a vote: the aliases of one file
+        are the same motion, so a file with a named action and six unnamed
+        ones belongs under the named one's group.
+        """
+        for _c, _n, g in self.named:
+            return g
+        return "other"
+
+    @property
+    def label(self) -> str:
+        named = self.named
+        if not named:
+            return "action %s" % ", ".join(self.actions[:4])
+        head = "%s (%s)" % (named[0][1], named[0][0])
+        extra = len(self.actions) - 1
+        return head if not extra else "%s +%d more action(s)" % (head, extra)
+
+
+@dataclass
+class LoadoutMotions:
+    """Every motion a (body, right hand, left hand) loadout can play."""
+    body: str
+    shape: str
+    weaponset: str
+    #: The RESOLVED motion type -- `500` for a bow soul, not its id's `804`.
+    weapon_type: str
+    own_set: bool
+    motions: list = field(default_factory=list)
+    action_count: int = 0
+    limits: list = field(default_factory=list)
+    #: `WEAPON_TYPE_VIA_ID` or `WEAPON_TYPE_VIA_MESH`: how `weapon_type` was
+    #: reached (`AnimDB.weapon_type_via`). Last, with a default, so the
+    #: keyword constructor above and every reader of the older fields are
+    #: untouched.
+    weapon_type_via: str = WEAPON_TYPE_VIA_ID
+
+    @property
+    def present(self) -> list:
+        return [m for m in self.motions if m.present]
+
+
+def loadout_motions(db: AnimDB, body: str, *, right: str = "", left: str = "",
+                    shape: Optional[str] = None) -> LoadoutMotions:
+    """Resolve a whole equipped loadout to the motion files it plays.
+
+    **This is the question `c3tex.MotionBinding` does not answer and was never
+    meant to.** That classifier asks "is it safe to add or remove a mesh in
+    this container", and its honest answer for a body mesh is LOCKED-or-
+    UNKNOWN: *some* shared external set animates it. Which one depends on the
+    EQUIPPED WEAPON, which is not a property of the mesh and cannot be read
+    off it -- so a per-file classifier is structurally unable to say, and the
+    Import/Export panel showed `UNKNOWN` with nothing to export.
+
+    The pairing is `ini/3dmotion.ini`'s own: `<shape><weaponset><action>`,
+    resolved through `MotionIndex.lookup`'s documented fallback chain. Nothing
+    here invents a rule; it supplies the two halves of the key that live on
+    different objects and deduplicates the result.
+
+    `shape` overrides the shape derived from `body`, for the 1001-1004 family
+    and for monster / npc shapes no shipped table maps an appearance onto.
+    """
+    sh = shape or db.shape_of(body)
+    ws = db.weaponset(right=right, left=left)
+    # THE RESOLVED TYPE, AND HOW IT WAS RESOLVED. For a bow soul this is
+    # `("500", "mesh")`, not the `804` its id splits to -- `weaponset` above
+    # already keys the bow set through the same call, and a summary that
+    # said `804` beside a set of `500` would be two answers to one question.
+    # The hand rule is `weaponset`'s: the right hand decides when both hold
+    # something, else whichever is filled.
+    wt, via = db.weapon_type_via(right)
+    deciding = right
+    if not wt:
+        wt, via = db.weapon_type_via(left)
+        deciding = left
+    # THE SET A WEAPON TYPE ANIMATES FROM IS NOT ALWAYS ITS OWN NUMBER. On
+    # 5517 `(2, 580)` has no rows and `(2, 560)` has 42; `resolve` answers a
+    # 580 loadout out of 560 by the alias table. `own` used to be
+    # `(sh, ws) in by_shape_ws` -- False there -- so all 123 of that
+    # loadout's files were ROUTE_FALLBACK and the limit below said the
+    # unarmed set was playing. Neither was true. The route is now read off
+    # `resolve`'s own answer, per motion, through `route_is_own`.
+    alias = motion_set_alias(ws)
+
+    # THE UNION, NOT THE WEAPON SET'S OWN ACTION LIST -- and this was a real
+    # under-report, not a precaution. `actions_for(shape, ws)` returns only
+    # the keys that set HAS, so enumerating it alone both (a) drops actions
+    # the client can still play and (b) makes `route` a constant, because the
+    # fallback chain can never fire for a key that exists.
+    #
+    # MEASURED on CCO 2026-09-22, and identical on all four player shapes:
+    # the bow set (500) carries 192 actions, the unarmed set 197, and **6 are
+    # unarmed-only** -- 290, 918, 920, 921, 922, 988. A bow loadout plays all
+    # six out of the unarmed set. Enumerating the bow set alone loses them
+    # silently, which is the shape of omission this whole panel refuses.
+    #
+    # And the ALIASED set's, for the same reason: 560 declares 925 and 926
+    # and the unarmed set does not, so a 580 loadout enumerated from
+    # (580 | 000) lost both files silently (MEASURED 2026-09-25 on 5517).
+    actions = sorted(set(db.index.actions_for(sh, ws))
+                     | set(db.index.actions_for(sh, alias))
+                     | set(db.index.actions_for(sh, WEAPONSET_UNARMED)))
+
+    by_path: dict = {}
+    for a in actions:
+        path, how = db.resolve(sh, ws, a)
+        if not path:
+            continue
+        m = by_path.get(path)
+        if m is None:
+            m = LoadoutMotion(path=path, present=db.assets.exists(path),
+                              route=(ROUTE_OWN if route_is_own(how)
+                                     else ROUTE_FALLBACK),
+                              how=how)
+            by_path[path] = m
+        m.actions.append(a)
+    for m in by_path.values():
+        m.actions.sort()
+    # The loadout owns a set when any action reached one exactly -- its own
+    # rows or the aliased folder's. Derived from the same answers the rows
+    # carry, so the summary cannot disagree with them.
+    own = any(m.route == ROUTE_OWN for m in by_path.values())
+
+    out = LoadoutMotions(
+        body=body, shape=sh, weaponset=ws, weapon_type=wt, own_set=own,
+        motions=[by_path[p] for p in sorted(by_path)],
+        action_count=len(actions), weapon_type_via=via)
+    # A SOUL THAT FELL BACK TO ITS ID IS SAID, NOT SILENT. `soul_motion_type`
+    # answers `id` for a soul with no `weapon.ini` row or no Mesh0, and `8xx`
+    # keys no set on any player shape, so the "no motion set of its own"
+    # limit below is TRUE of it -- but the reader's fix is the missing row,
+    # not the motion table, and the limit alone points at the wrong file.
+    if (deciding and via == WEAPON_TYPE_VIA_ID
+            and is_soul_type(weapon_type_of_id(deciding))):
+        out.limits.append(
+            "soul %s has no weapon.ini row with a Mesh0, so its motion type "
+            "is its id's (%s) rather than the mesh it holds; a soul animates "
+            "as the weapon mesh in its hand (anim.SOUL_TYPE_MIN)"
+            % (deciding, wt or "?"))
+    if not own and (right or left):
+        out.limits.append(
+            "weapon type %s has no motion set of its own for shape %s; these "
+            "are the unarmed set's motions, which is what the client plays"
+            % (wt or "?", sh))
+    if right and left:
+        # `AnimDB.weaponset` documents this: a two-weapon loadout keys a `6XY`
+        # combination code whose family digits are assigned by the packed exe
+        # and are spelled out nowhere in the shipped data.
+        out.limits.append(
+            "two weapons equipped: the 6XY dual-wield motion set is not "
+            "resolvable from shipped data, so this is the RIGHT hand's set")
+    absent = [m for m in out.motions if not m.present]
+    if absent:
+        out.limits.append(
+            "%d of %d motion files this loadout names are not installed "
+            "(1,100 of 3,260 named motions are absent on some bases -- "
+            "docs/animation.md 2.1)" % (len(absent), len(out.motions)))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1366,13 +1831,15 @@ def validate(db: AnimDB, limit: Optional[int] = None) -> int:
     print("9. frame-rate evidence")
     print("=" * 78)
     try:
-        db_fx = fx.EffectDB(db.root)
-        by = collections.defaultdict(collections.Counter)
-        for r in db_fx.action_rules:
-            if r.effect and r.effect != "none":
-                e = db_fx.resolve(r.effect)
-                if e:
-                    by[r.action][e.frame_interval] += 1
+        # `with`: no `assets=` here, so this OWNS the install it opens and is
+        # the only thing that can hand it back.
+        with fx.EffectDB(db.root) as db_fx:
+            by = collections.defaultdict(collections.Counter)
+            for r in db_fx.action_rules:
+                if r.effect and r.effect != "none":
+                    e = db_fx.resolve(r.effect)
+                    if e:
+                        by[r.action][e.frame_interval] += 1
         for a in sorted(by):
             tot = sum(by[a].values())
             print("  Action3DEffect action %-4s -> %-5d effects, "

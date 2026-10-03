@@ -40,21 +40,67 @@ fast = ["numpy>=1.24"]
 
 [tool.setuptools]
 # The set is closed under its own imports: coassets needs coroot, safepath,
-# tqhash, wdf, tqdat and dbcshadow; dmap needs coroot; the rest are leaves that import
+# tqhash, wdf, tqdat and dbcshadow; dmap needs coroot and ani; the rest are leaves that import
 # only the standard library. `tools/test_viewer.py::CoreBoundary` enforces that.
 py-modules = [
+    "coblowfish",  # CO Blowfish port (static half of the stage-2 cipher work).
+                  #   Listed because it SHIPS in core/, not because it is
+                  #   covered -- nothing imports it yet and it has no test.
     "coroot",     # install discovery: --root -> CO_ROOT -> saved config -> autodiscovery
     "safepath",   # confine an untrusted relative path to a trusted root
     "tqhash",     # the TQ filename hash
     "wdf",        # WDF archive reader
     "dds",        # DDS / BC decoding
     "c3phy",      # C3 / PHY mesh parsing
+    "gltfread",   # stdlib glTF 2.0 reader: buffers, accessors, nodes, skins, one LINEAR
+                  #   animation. The donor side of tools/c3retarget.py (director/c3retarget).
+    "c3ccfl",     # C3 / CCFL authoring annotation (note + CreateTime)
+    "bonejoint",  # the skeleton SOLVED from a multi-frame motion set: two
+                  #   bones are joined at the point both carry to the same
+                  #   place in every frame. Exact where the skin-derived tree
+                  #   is a proxy. Registered in all THREE lists in one commit
+    "motionpool", # WHICH clips that solve is measured on. Declares a
+                  #   shape's clips from ini/3dmotion.ini plus its
+                  #   compiled twin and ranks them for ARTICULATION
+                  #   COVERAGE -- a clip holding a pair rigid is
+                  #   silence about it, not agreement. Takes the MOTI
+                  #   parse as a callable so COre never reaches into
+                  #   tools/. Registered in all THREE lists in one
+                  #   commit
+    "bonelabel",  # anatomical NAMES for that solved skeleton: chest,
+                  #   spine, shoulder/upper_arm/forearm/hand, thigh/
+                  #   shin/foot/toe, by topology plus mirror geometry.
+                  #   The chest is FOUND, not assumed to be the tree's
+                  #   root -- body 0002 arrives rooted at the pelvis
+    "bonetree",   # the bone HIERARCHY, derived from the skin: a vertex
+                  #   blended between two bones sits at the joint between
+                  #   them, so the two-influence skin is an adjacency graph
+                  #   and the tree is its maximum-weight spanning forest.
+                  #   Pure stdlib, duck-typed on PhyVertex. Registered in all
+                  #   THREE lists in one commit -- CORE, CoreBoundary.MEMBERS
+                  #   and here
+    "boneplace",  # where a C3 bone belongs, derived from the skin: a .c3
+                  #   stores no rest skeleton, so the Blender importer places
+                  #   each bone along the principal axis of its own weighted
+                  #   vertices. Pure stdlib and duck-typed on PhyVertex, so it
+                  #   imports nothing of ours. Registered in all THREE lists in
+                  #   one commit -- CORE, CoreBoundary.MEMBERS and here
+    "strtable",   # the client's string table + the printf format-SIGNATURE
+                  #   gate: 103 keys move their slots across the lineage and
+                  #   no key uses positional specs, so binding a build's call
+                  #   sites to another build's table renders wrong values
+                  #   silently unless the signatures are verified at load
     "dmap",       # DMap map grids
+    "ani",        # ani/*.ani frame manifests as ORDERED SEQUENCES: read,
+                  #   report, and rewrite Frame0..N with FrameAmount together.
+                  #   `dmap.read_ani` is a normalising view of this, so dmap
+                  #   does not import cleanly without it
     "tpd",        # NetDragon DatPkg .tpi/.tpd reader
     "coassets",   # the asset VFS that ties the above together
     "colibrary",  # per-server views over a COmmunity Library checkout
     "collection", # the curated Collection inside a COmmunity Library
     "wdb",        # ini/c3.wdb, the client's BDMG/RSDB resource database
+    "wdbpack",    # the same file's obfuscated member INDEX -- read and write
     "dbc",        # the compiled ini/*.dbc tables of official clients
                   #   (RSDB id->path, SIMO simple objects)
     "dbcshadow",  # the gate: is this ini shadowed by a compiled .dbc twin on
@@ -65,11 +111,25 @@ py-modules = [
                   #   (itemtype.dat, Monster.dat)
     "inidat",     # WHICH cipher an ini/*.dat is under: RSA, TQ stream, the
                   #   12-byte block cipher (tail only), or destroyed
+    "block96",    # and how to READ that 12-byte block cipher on 6907..7878,
+                  #   through the ECB block dictionary: what survives a
+                  #   partial decode, and what must be refused rather than
+                  #   served short
     "provenance", # stamp a derived artefact with the install it came from,
                   #   and refuse one that came from somewhere else
+    "tags",       # the local overlay: tag / bookmark / rename any asset,
+                  #   keyed on BOTH logical path AND content hash so a tag
+                  #   survives a patch (MOVED) and a lossy re-encode (CHANGED).
+                  #   Rename is an overlay, never a disk write. Imports only
+                  #   coroot and the stdlib.
     "monsterart", # a monster body id -> its geometry directory and skin;
                   #   colour morphs borrow another family's mesh
+    "portage",    # the export/import FOUNDATION (backlog item 5): transform
+                  #   dispatch and the three format guards (lossy DDS, length-
+                  #   preserving .dat, ordered .ani frames)
     "dcache",
+    "tpdcache",   # opt-in, per-client cache of inflated .tpd entries,
+                  #   keyed on the STORED bytes so a patch never serves stale
     "npcalloc",
     "verdict",     # cache decoded tables between runs; a cached decode is
                   #   reported as its own control kind, never as a fresh one

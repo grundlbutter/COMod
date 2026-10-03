@@ -474,14 +474,129 @@ def surface_size(hdr: DdsHeader, level: int = 0) -> tuple[int, int, int]:
     return w, h, w * h * (hdr.rgb_bits // 8)
 
 
+def full_chain_levels(hdr: DdsHeader) -> int:
+    """Levels in a COMPLETE chain down to 1x1, whatever the header declares."""
+    n = 1
+    w, h = hdr.width, hdr.height
+    while w > 1 or h > 1:
+        w = max(1, w >> 1)
+        h = max(1, h >> 1)
+        n += 1
+    return n
+
+
+def levels_present(data: bytes, hdr: Optional[DdsHeader] = None) -> int:
+    r"""How many whole mip levels the payload ACTUALLY holds.
+
+    MEASURED from the file's length, not read from `DDS_HEADER.dwMipMapCount`,
+    and the two disagree on real retail files.
+
+    **The disagreement is the file's, not ours.**  On install 7878,
+    `c3/body/7197110.dds` is 512x512 DXT5 with `dwSize=124`, `dwFlags` carrying
+    `DDSD_MIPMAPCOUNT`, `dwCaps` carrying `DDSCAPS_MIPMAP|DDSCAPS_COMPLEX`, and
+    `dwMipMapCount` (offset 28) = **2** -- while the payload is 349,552 bytes,
+    which is the complete 10-level chain to the byte (the declared 2 levels
+    would be 327,680).  `c3/misc/7199031.dds` is the same shape at 256x256:
+    declares 2, carries the whole 9-level chain.  Every field we read is the
+    documented one at the documented offset; the header is internally
+    inconsistent as shipped.
+
+    HOW MANY, by FULL enumeration and not a sample (loose tree plus every
+    archive entry whose first four bytes are `DDS `, 2026-09-04):
+
+        7878   327 of 235,958 readable headers (0.139%)
+        6609     0 of  93,487
+        5517     0 of  37,198
+        5065     0 of  24,565
+
+    A seeded 4,000-file sample of 7878 finds 5 of them, which is why the
+    number to quote is the enumeration.  What the 327 are, measured:
+
+      * 326 declare **2**; one (`1.dds`, 512x512) declares **1**
+      * 302 DXT5, 25 DXT1; 128x128 (49), 256x256 (172), 512x512 (87),
+        1024x1024 (19)
+      * **all 327 are LOOSE files; zero are archive entries.** This is a
+        loose-patch authoring defect, not something in the shipped containers
+
+    And NOTHING on any of these installs is short, surplus, or equal to some
+    other whole level count: the declared count either predicts the payload
+    exactly or is this one defect.  (Separately, 54 of 7878's 108,977 archive
+    entries NAMED `.dds` are PNG (19), JPEG (19), ICO (15) or empty (1); they
+    are excluded by magic, not counted as DDS defects.)
+
+    So `dwMipMapCount` is ADVISORY on this corpus and this function is the
+    number to size anything by.  `decode()` already walked the real chain --
+    it sums `surface_size` per level and never consults `hdr.mipmaps` -- so
+    level 0 was never affected and no Python consumer in this repo ever asked
+    for level > 0.  The hazard this closes is the NEXT one that does.
+
+    WHO TRUSTS THE DECLARED COUNT, searched rather than assumed.  Exactly one
+    site in the repo sizes anything by it: `routeb/render.cpp`'s `LoadDDSMem`
+    reads `*(uint32_t*)(data+28)` into `mips` and builds that many D3D11
+    subresources.  It clamps DOWN when the bytes run out and never UP, so on
+    one of these 327 files it would upload a 2-level texture from a 10-level
+    payload -- fewer mips than the file carries, which costs minification
+    quality at distance and cannot corrupt or crash.  It is left alone: this
+    change may not touch `render.cpp`, and the DEFAULT frame is still
+    4,320,054 bytes.  The other readers of the field only DISPLAY it
+    (`tools/webui/app.js`, `coassets.DdsInfo`) or group by it
+    (`tools/test_viewer.py`).
+
+    Returns the number of leading levels that fit **entirely** inside the file,
+    capped at a complete chain.  A file with no payload at all returns 0, which
+    is a real answer (some entries are header-only) and not an error.
+
+    NOT a validity check: a payload that is longer than a complete chain (a
+    cubemap's six faces, or trailing junk) still returns the chain length.  Use
+    it with `full_chain_levels` when the question is "is this file complete".
+
+    CUBEMAPS ARE THE KNOWN LIMIT, stated rather than silently wrong: six faces
+    make the payload six times a single face's chain, so this returns a full
+    chain for a cubemap that carries only one level per face, and `decode()`
+    of a level past the first would then read into the SECOND FACE instead of
+    refusing.  That was equally true before this function existed -- `decode()`
+    has always read face 0 only -- so nothing regressed; it is simply not
+    fixed.  MEASURED 2026-09-04 over the LOOSE trees only: 0 cubemaps in
+    5517's 17,054 and 0 in 5065's 4,421.  The archive halves and the other
+    installs were NOT counted for this -- unmeasured, not zero.
+    """
+    hdr = parse_header(data) if hdr is None else hdr
+    avail = len(data) - hdr.data_offset
+    acc = 0
+    n = 0
+    for lvl in range(full_chain_levels(hdr)):
+        sz = surface_size(hdr, lvl)[2]
+        if acc + sz > avail:
+            break
+        acc += sz
+        n += 1
+    return n
+
+
 def decode(data: bytes, level: int = 0) -> tuple[int, int, bytes]:
     """Decode a DDS to (width, height, RGBA8 bytes), top row first.
 
     `level` selects a mipmap; level 0 is the base surface.  Almost every
     texture in this install declares mipmaps=0 (the engine generates its own),
     so level 0 is normally the only surface present.
+
+    The walk to `level` sums `surface_size` per level and never reads
+    `hdr.mipmaps`, so a file whose declared count under-states its payload
+    (see `levels_present`) decodes every level it really carries.  A level the
+    file does NOT carry raises `DdsError` naming both counts -- it used to
+    raise an opaque "need N bytes, have 0" on the compressed path and, on the
+    uncompressed path, silently return a SHORT buffer that the caller would
+    hand to `Image.frombytes` as if it were whole.
     """
     hdr = parse_header(data)
+    if level < 0:
+        raise DdsError(f"negative mip level {level}")
+    have = levels_present(data, hdr)
+    if level >= have:
+        raise DdsError(
+            f"mip level {level} is not in this file: it carries {have} whole "
+            f"level(s) of a {full_chain_levels(hdr)}-level chain and declares "
+            f"{hdr.mipmaps}")
     off = hdr.data_offset
     for lvl in range(level):
         _, _, sz = surface_size(hdr, lvl)
@@ -540,6 +655,11 @@ def info_dict(data: bytes) -> dict:
     hdr = parse_header(data)
     return {
         "width": hdr.width, "height": hdr.height, "mipmaps": hdr.mipmaps,
+        # DECLARED vs MEASURED, both reported, because on 7878 they disagree on
+        # real files and a single "mipmaps" number cannot say which it is.
+        "mipmaps_declared": hdr.mipmaps,
+        "mipmaps_present": levels_present(data, hdr),
+        "mip_chain_full": full_chain_levels(hdr),
         "format": hdr.fourcc or f"uncompressed {hdr.rgb_bits}bpp",
         "fourcc": hdr.fourcc, "has_alpha": hdr.has_alpha,
         "compressed": hdr.compressed, "cubemap": hdr.cubemap,

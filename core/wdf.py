@@ -167,6 +167,20 @@ class WdfArchive:
         except Exception:
             self._fh.close()
             raise
+        # EVERY LATER FAILURE CLOSES TOO.  The mmap guard above was already
+        # here; what was missing is that the four `WdfError`s below it raise
+        # AFTER both the handle and the mapping exist, and a constructor that
+        # raises hands the caller no object to `close()` -- so a malformed
+        # archive leaked a handle that nothing could ever reach.  One guard
+        # over the whole parse rather than four, so a fifth check added later
+        # inherits it instead of having to remember.
+        try:
+            self._init_index()
+        except Exception:
+            self.close()
+            raise
+
+    def _init_index(self) -> None:
         self.file_size = self.path.stat().st_size
 
         if self.file_size < HEADER_SIZE:

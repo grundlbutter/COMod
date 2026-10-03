@@ -98,7 +98,7 @@ from plugins import Plugin                              # noqa: E402
 from plugins.catalog import (  # noqa: E402
     npc_specs,                           # noqa: E402
     TableSpec, KIND_AT_ROWS, KIND_CSV_ROWS, KIND_SECTIONS, KIND_GAMEMAP,
-    MEASURED_SECTION_LABELS)
+    KIND_SPACE_ROWS, MEASURED_SECTION_LABELS)
 
 #: Zephyr's own census -- 58 `.dat` in `ini/`, of which 37 are readable:
 #: 30 `tq-stream`, 4 `binary-plain`, 3 `plaintext`. It is the richest content
@@ -144,7 +144,16 @@ SPECS_ZEPHYR = (
               "tq-stream"),
     TableSpec("item:refine:upgrade", "item_refine_upgrade.dat", KIND_AT_ROWS,
               "tq-stream"),
-    TableSpec("magic", "MagicType.dat", KIND_AT_ROWS, "tq-stream"),
+    # **The NAME is column 3, MEASURED, and the plugin-wide `ITEM_COLUMNS`
+    # puts it on column 1.** Column 1 is a numeric group id, so `browse magic`
+    # listed a column of numbers where the skill names are -- the same defect
+    # `MEASURED_SECTION_LABELS` exists to prevent, one grammar over. Column 3
+    # is the ONLY column of the 48-53 that is non-numeric on every row
+    # (`Thunder`, `Fire`, `Tornado`), which is what makes this a measurement
+    # rather than a preference. The 5165 file has one fewer leading id and
+    # puts the same field at column 2; see `patch5165`.
+    TableSpec("magic", "MagicType.dat", KIND_AT_ROWS, "tq-stream",
+              columns={"id": 0, "name": 3}),
     TableSpec("magic:ex", "magictypeex.dat", KIND_AT_ROWS, "tq-stream"),
     TableSpec("magic:op", "magictypeop.dat", KIND_CSV_ROWS, "tq-stream"),
     # No key appears in every section of either (both open with a
@@ -154,12 +163,54 @@ SPECS_ZEPHYR = (
               label_key=None),
     TableSpec("stagegoal", "StageGoal.dat", KIND_SECTIONS, "tq-stream",
               label_key=None),
-    TableSpec("title", "title_type.dat", KIND_AT_ROWS, "tq-stream"),
+    # **The name is column 2, MEASURED on this install's own file**: 69 rows
+    # of 8 fields, column 2 non-numeric on 69/69 (68 distinct: `Overlord`,
+    # `Chosen~One`), column 1 numeric on all 69. The same column patch6907
+    # measures for the same filename across its ten installs -- stated per
+    # build rather than shared, because that is the borrowing this project
+    # keeps paying for.
+    TableSpec("title", "title_type.dat", KIND_AT_ROWS, "tq-stream",
+              columns={"id": 0, "name": 2}),
     TableSpec("task:reward", "task_reward_type.dat", KIND_AT_ROWS,
               "tq-stream"),
     TableSpec("shop:exchange", "exchange_shop_goods.dat", KIND_AT_ROWS,
               "tq-stream"),
-    TableSpec("award", "award_config.dat", KIND_AT_ROWS, "tq-stream"),
+    # **The name is the LAST column, 7**: 99 rows of 8 fields, column 7
+    # non-numeric on 99/99 (`Praying(S)`), column 1 numeric on all 99.
+    TableSpec("award", "award_config.dat", KIND_AT_ROWS, "tq-stream",
+              columns={"id": 0, "name": 7}),
+    # **NAMED, MEASURED, AND NOT DECLARED.** An undeclared subject is
+    # not merely unread, it is INVISIBLE -- the tool's silence about
+    # levexp.dat read exactly like its silence about a file that is not
+    # there. The refusal carries the measurement instead.
+    # **The codec is `unknown` and that is `core/inidat.py`'s own word,
+    # not a shrug.** The classifier tries the lineage's seed 9527 and
+    # this file is the one table that takes 1234, so it recognises
+    # nothing -- MEASURED, `inidat.classify(...).family == "unknown"` on
+    # every tq-stream build that ships it. Declaring `tq-stream` here
+    # would be a claim the classifier contradicts, and
+    # `TheSpecsMatchTheDisk.test_the_declared_codec_is_what_inidat_
+    # classifies` says so out loud.
+    TableSpec("levexp", "levexp.dat", KIND_SPACE_ROWS,
+              "unknown", label_key=None, refusal=(
+        "levexp.dat OPENS on this install and its grammar is still not "
+        "declared, and those are different sentences. "
+        "core/tqdat.decrypt(raw, 1234) -- the one seed in the lineage that "
+        "is not 9527 -- returns 100.0% printable text from this build's OWN "
+        "bytes: 193 rows of 5 space-separated fields, 3,733 B, every field "
+        "numeric. What is missing is not the cipher and not the row shape, "
+        "it is the COLUMNS: the file carries no header, every one of the 5 "
+        "fields is a bare number, "
+        "refs/conquer-online-wiki-mdbook/src/files/content/levexp.dat.md is "
+        "an empty stub, and no table on this install holds those values. "
+        "That is the Action.dat refusal word for word -- a settled row shape "
+        "whose row means nothing anything here can check -- so declaring it "
+        "would hand a user 193 rows of anonymous numbers to edit with no "
+        "control at all. Whoever settles the columns will also need a "
+        "per-spec seed: Plugin.load_table's tq-stream branch calls "
+        "tqdat.decrypt with the default 9527, and TableSpec has no seed "
+        "field. 3,733 B and 193 rows -- this server's own file, not a copy "
+        "of the official one, and it opens at the same seed.")),
     TableSpec("gamemap", "GameMap.dat", KIND_GAMEMAP, "binary-plain"),
 )
 from plugins.plaintext import (COMPILED_MARKERS,        # noqa: E402
@@ -169,6 +220,13 @@ SPECS_ZEPHYR = SPECS_ZEPHYR + npc_specs(('npc.ini', 'NpcX.ini', 'terrainnpc.ini'
 
 
 class Zephyr1057(Plugin):
+    #: PER-TABLE encoding, MEASURED 2026-09-19 by a strict decode of the
+    #: whole file: `TexasChatGUI.ini` (2,733 B, 744 high, 17 x 0x85) and
+    #: `TexasChatGUI800X600.ini` (2,788 B, same) are strict UTF-8 and fail
+    #: strict GBK at byte 2. (`OperateActivity.ini` here is pure ASCII.)
+    TABLE_ENCODING = {"texaschatgui.ini": "utf-8",
+                      "texaschatgui800x600.ini": "utf-8"}
+
     name = "zephyr1057"
     label = "Zephyr Conquer (private server)"
     origin = "server"
@@ -176,6 +234,23 @@ class Zephyr1057(Plugin):
 
     #: Same measurement as the official builds for the tables it shares.
     ROW_LABEL_KEY = MEASURED_SECTION_LABELS
+
+    #: The positional twin, for the CENSUSED `.ini` (which carry no `columns`
+    #: field of their own), measured on this install:
+    #:
+    #:   region.ini         258 rows of 14; column 6 a place name on 258/258
+    #:                      (78 distinct), column 1 numeric on all 258.
+    #:   EventTypeName.ini  24 rows of 3; column 2 the name on 24/24, and the
+    #:                      id is column 1 (24 distinct) not column 0 (one).
+    #:   VipTrans.ini       31 rows of 3; column 2 a city name on 31/31.
+    #:
+    #: This build ships no `restrain.ini`, so there is no entry for it --
+    #: absent rather than inherited from the official builds that do.
+    ROW_COLUMNS = {
+        "region": {"id": 0, "name": 6},
+        "eventtypename": {"id": 1, "name": 2},
+        "viptrans": {"id": 0, "name": 2},
+    }
 
     def table_specs(self, root):
         # Curated specs plus every `.ini` the grammar census

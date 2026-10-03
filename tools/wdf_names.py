@@ -25,8 +25,32 @@ client's names.
 The OUTPUT stays shared (``coroot.GLOBAL`` lists
 ``out/dll/wdf_name_recovery``): a WDF entry's name is recovered by hashing a
 candidate string, the TQ hash is a pure function of that string, so an entry
-resolved here is true in every install.  Pointing this at a second client
-therefore TOPS UP one table rather than producing a rival one.
+resolved here is true in every install.
+
+**THIS USED TO SAY THAT POINTING IT AT A SECOND CLIENT "TOPS UP one table
+rather than producing a rival one".  IT DOES NOT, AND NEVER DID.**  ``main``
+starts from an empty ``resolved`` and WRITES THE JSON FRESH, so a second
+client's run REPLACES the shared table with only what that client's archives
+could resolve; every name the previous client contributed and this one cannot
+is lost.  The sentence described the design the shared path deserves, not the
+code underneath it, which is the worst way for a docstring to be wrong: the
+next reader points this at another install ON THE STRENGTH OF IT and empties
+a table eight tools read, silently, with an exit code of 0.  Corrected
+2026-09-18 rather than left standing while the merge is written.
+
+**THE EARLY RETURN BELOW IS LOAD-BEARING BECAUSE OF THIS.**  When an install
+ships no ``c3.wdf``/``data.wdf`` this tool returns 0 without writing, and that
+is the only thing standing between a DatPkg/TPD client and a zero-entry
+rewrite of every other client's names.  It is not a tidy-up for an empty
+case; it is the guard.  A TPD client needs none of this anyway -- a
+``.tpd``/``.tpi`` pair stores the path itself, which
+``coassets.AssetRoot.declared_names`` reads directly.
+
+Making the write a real MERGE -- seed ``resolved`` from the existing table,
+union this run into it -- is the right end state and is filed separately: it
+changes the semantics of a GLOBAL artefact that eight tools read, so it owes
+its own control (a second client's names must survive a run against the
+first), and that is a measurement rather than a rider on a docstring fix.
 
 Shared output and install-independent input are different claims, and only the
 first one holds here.  ``tools/build_opcodes.py`` is the one builder in

@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+r"""block96.py -- reading the `ini/*.dat` tables of the 6907..7878 cipher era.
+
+**THE CIPHER CHANGES BETWEEN 6868 AND 6907, AND NOTHING IN THE FILE SAYS SO.**
+Every official client up to and including 6868 encrypts `ini/*.dat` with the TQ
+stream cipher at seed 9527, which `core/tqdat.py` undoes. From 6907 onward the
+same filenames carry the 12-byte ECB block cipher `core/inidat.py` calls
+`block96`, whose key is not known and is not recoverable by search. MEASURED
+2026-08-30, coverage of the 7878 block dictionary against each build's
+`ini/itemtype.dat` (`py -3 tools/datdict.py decode <client>/ini/itemtype.dat`):
+
+    6772  0.0%      6805  0.0%      6868  0.0%      6907  86.4%      7878  100%
+
+**Those three zeroes are rounded, and the exact figures are better than the
+round ones.** 29 of 6772's 736,820 blocks are in the dictionary, and 38 of
+6805's and 6868's 797,654 -- 0.005%. Every one of the 38 was traced: **all of
+them come from `UserHelpInfo.ini.dat`, one of the poisoned pairs described
+below**, so all 38 map to ciphertext rather than to plaintext, and **not one
+genuine dictionary entry crosses the boundary**. 0 real shared blocks against
+779,199 on 6907 is what two different keys look like, and the residue is the
+poisoning showing up in a second place rather than a hole in the boundary.
+
+WHAT THIS MODULE IS FOR
+-----------------------
+`tools/datdict.py` established that the cipher's ECB structure makes a
+`{ciphertext block -> plaintext block}` dictionary a correct decryptor for any
+file whose blocks it holds, with no `ndac.dll` and no 32-bit process. It is a
+command-line tool: it decodes a file and prints a coverage percentage.
+
+That percentage is **not** a readability figure, and the whole reason this
+module exists is that the gap between the two is enormous. On 6907:
+
+    itemtype.dat   86.41% of BLOCKS known  ->   9.7% of ROWS undamaged
+    Monster.dat    84.56% of BLOCKS known  ->      1 of ~2,100 sections
+
+Independently reproduced on 7205 by another seat: 86.1% of blocks, 5.2% of
+whole rows -- a different build, a different row width, the same shape of gap.
+
+**Every row figure here is a FLOOR and every percentage a CEILING.** The count
+they are taken against is the number of lines the decode produced, and a marker
+that lands on a `\r\n` deletes that line break and merges two rows into one --
+so the denominator under-reports and the ratio flatters. `Recovery.lines` says
+so where it is defined; nothing in this module reports a recovery figure
+without the bound.
+
+Reproduce with `py -3 tools/datdict.py decode
+C:/COMod/ConquerAssets/Clients/6907/ini/itemtype.dat` for the block figure and
+`tests/test_patch6907.py` for the row figures.
+
+Why: an unknown block becomes a 12-byte marker in the output, and one marker
+anywhere in a row damages that row. Rows are ~500 bytes -- about 40 blocks --
+so a 13.6% per-block miss rate lands on most rows. Section headers are worse
+than that: `[MatureMindofEvil]` is a short unique string that appears once, so
+it is exactly the kind of block a dictionary built from a *different client*
+does not hold, and a marker that swallows the `\r\n` before a header merges two
+rows into one and deletes a section outright.
+
+THE THREE RULES THIS MODULE ENFORCES, AND WHY EACH ONE IS NECESSARY
+--------------------------------------------------------------------
+1. **THE DICTIONARY IS POISONED, AND ITS 100% FILES ARE THE TRAP.**
+   `datdict.build_dict` pairs every `derived/7878-dat-decrypted/**/*.dat.out`
+   with its encrypted source, excluding three files by name. But `plugins/
+   patch7878.py:NOT_CONTENT` records **fourteen** `.out` files that are still
+   ciphertext -- the `ndac.dll` oracle ran, wrote a file, and the bytes did not
+   decrypt. **Twelve** of those fourteen went into the dictionary as if they
+   were plaintext. (An earlier note here said eleven; that subtracted the whole
+   three-name literal, but only two of its names were `NOT_CONTENT` members --
+   the third, `levexp.dat`, is the separate `HELD_OUT` case. Recounted against
+   the corpus 2026-08-30: twelve names, fourteen pairings, because
+   `RaceTrackProp.dat` sits at three relative paths.)
+
+   So a 6907 file that is byte-identical to 7878's decodes at **100% coverage
+   into high-entropy garbage**. MEASURED, four of them:
+
+       UserHelpInfo.ini.dat  100.0%  H=7.95  39.2% printable   <- ciphertext
+       RaceTrackProp.dat     100.0%  H=7.89  40.2%             <- ciphertext
+       ShowHandTableRace.dat 100.0%  H=7.79  37.7%             <- ciphertext
+       WeaponActionData.dat  100.0%  H=7.26  40.3%             <- ciphertext
+
+   compared with a genuine 100%:
+
+       UserHelpInfo.dat      100.0%  H=5.17 100.0% printable   <- real text
+
+   **Coverage cannot detect this**, because coverage measures whether the
+   blocks were in the map, and they were. `is_block96` is the guard: this
+   module refuses to apply the dictionary to any file `core/inidat.classify`
+   does not call `block96`, and all four of the poisoned files above classify
+   as something else (`tq-stream`, `rsa-mysqldump`, `unknown`). The guard is a
+   *different instrument* from the thing it is guarding, which is the only kind
+   that can catch this.
+
+   THE BUILDER IS FIXED (2026-08-30, `tools/datdict.py`): it now excludes by
+   NAME (`NOT_CONTENT` + `HELD_OUT`, 15) and by CIPHER (a source `inidat`
+   assigns to a different identified family). Rebuilt, the four files above go
+   from 100% coverage to **0%**, every real table's coverage and entropy is
+   bit-identical, and the dictionary's reach into 6772/6805/6868 falls from
+   ~39,200 distinct blocks to **exactly zero**. The name gate alone did not
+   reach zero -- ten blocks of `kok_roleview.dat`, which no list names,
+   survived it; the cipher gate is what closed them.
+
+   **THE SHIPPED PICKLE IS STILL THE POISONED ONE.** It is owner-held derived
+   data and replacing it needs the owner's agreement, so this guard stays load-
+   bearing until it is swapped. That is what these refusals are for.
+
+2. **A DAMAGED ROW IS NEVER SERVED WHOLE.** `recover_rows` keeps only the
+   fields BEFORE the first marker, minus the one the marker truncated. Those
+   fields keep their column positions -- the truncation only removes from the
+   end -- so column 52 of a recovered row is still column 52, and a row too
+   short to reach it reports nothing rather than something shifted. That is
+   the difference between a short answer and a wrong one.
+
+3. **A SECTION WHOSE HEADER MIGHT HAVE BEEN EATEN IS DROPPED, KEYS AND ALL.**
+   A marker containing a `\r\n` merges a header into the line above it. The
+   keys that follow then look like they belong to the *previous* section, and
+   nothing raises. `recover_sections` therefore treats any damaged line as
+   ending attribution: keys are kept only while the last intact `[header]` is
+   still known to be theirs. This is why Monster.dat yields 1 section from
+   46,271 undamaged lines -- dropping the damaged lines and parsing what is
+   left would have yielded a plausible several-hundred-section table with keys
+   attached to the wrong monsters.
+
+WHAT IT DOES NOT DO
+-------------------
+* **It does not recover the cipher.** The dictionary is a lookup table; a block
+  absent from it stays absent. `docs/dat_phase_c_2026-08-13.md` §17.4 has the
+  algorithm's state.
+* **It does not extend the dictionary from an older client.** Tried and
+  measured: 6868's `itemtype.dat` decrypts cleanly under TQ 9527 and would be
+  known plaintext -- but its rows carry **65** fields where 6907's carry 64,
+  and the two differ within the first row (`...@@0@@01@@1000@@` against
+  `...@@0@@1@@1000@@`), so the byte streams do not align and there is no free
+  known-plaintext. Reproduce with
+  `py -3 -c "import sys;sys.path.insert(0,'core');import tqdat;
+  print(tqdat.decrypt(open(r'C:/COMod/ConquerAssets/Clients/6868/ini/itemtype.dat','rb').read(),9527)[:200])"`.
+* **It never writes.** Nothing here touches `Clients/`, and the dictionary and
+  the derived corpus are read-only owner data.
+"""
+from __future__ import annotations
+
+import math
+import os
+import pickle
+import re                                             # for _HEADER, ported 2026-09-03
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import inidat                                         # noqa: E402
+
+#: The ECB block size, in bytes. 96 bits, hence the family name.
+BLOCK = 12
+
+#: The trailing `len % 12` bytes are not enciphered, they are XORed with this.
+#: Established over 139 files with a negative control; see `tools/datdict.py`.
+TAIL_XOR = 0x54
+
+#: What a ciphertext block with no plaintext in the dictionary becomes.
+#: **Exactly one block wide**, so an unknown block never shifts the bytes after
+#: it -- every later block stays at its own offset and stays decodable. It
+#: carries no `@@`, no comma and no newline, which is what makes the two
+#: recovery rules below able to see it as damage rather than as content.
+UNKNOWN = b"<?UNKNOWN?>\x00"
+
+#: Where the dictionary lives, as a RELATIONSHIP to the install rather than an
+#: absolute path: `ConquerAssets/Clients/<build>` -> `ConquerAssets/derived/...`.
+#: Same convention as `plugins/patch7878.derived_tables`, and for the same
+#: reason -- an absolute path here is a machine-specific assumption that works
+#: on one box and reports "no dictionary" everywhere else.
+DICT_DIRNAME = "7878-dat-decrypted"
+DICT_BASENAME = "block_dict.pkl"
+
+#: Points at a dictionary somewhere else. Read for its side of the argument
+#: only: this module never writes one.
+ENV_DICT = "CO_BLOCK96_DICT"
+
+#: The builds MEASURED to share the 7878 key, and the ones measured not to.
+#: Recorded as data because the boundary is the single most useful fact in this
+#: module and a caller that guesses it wrong gets 0% and no explanation.
+KEY_ERA_FROM = "6907"
+KEY_ERA_BEFORE = ("6772", "6805", "6868")
+
+#: The `itemtype.dat` columns this era has evidence for, and **only** those.
+#:
+#: An ERA fact rather than a per-build one, because it was measured twice
+#: independently and both builds agree on the index while disagreeing on the
+#: row width:
+#:
+#:     6907   64 fields   col 52 = Gift 733 · QuestItem 224 · GiftPack 143 ·
+#:                                 Pack 54 · EpicWeapon 42 · Halbert 37
+#:     7878   68 fields   col 52 = Garment (patch7878.ITEM_COLUMNS)
+#:
+#: `tqdat.FIELDS_AT` names 59 columns and must NOT be applied to either: it
+#: puts `elemResEarth` on column 52 and `itemType` on 53, so a garment row
+#: comes back as ``elemResEarth='Garment'`` with no error anywhere. Rows here
+#: are read positionally and the other 61 columns stay unnamed.
+ITEM_COLUMNS = {"id": 0, "name": 1, "itemClass": 52}
+
+
+# ---------------------------------------------------------------------------
+# the dictionary
+# ---------------------------------------------------------------------------
+
+def dictionary_path(root=None) -> Optional[Path]:
+    r"""The block dictionary for this collection, or None.
+
+    Three steps, in order, and each one only ever ADDS an answer where the
+    step before it had none -- so no caller that already resolved a path can
+    be handed a different one by this function:
+
+      1. `$CO_BLOCK96_DICT`, when it names a real file. The override, and it
+         still wins outright.
+      2. `<root>/../../derived/<DICT_DIRNAME>/<DICT_BASENAME>` -- the
+         dictionary beside the `Clients/` directory the named install sits
+         in. Kept FIRST among the derivations so a caller naming a client in
+         some OTHER collection (a `_variants/` copy, a second asset tree)
+         still gets that collection's dictionary rather than the configured
+         one.
+      3. `coroot.assets_dir()/derived/...` -- the configured collection.
+
+    **STEP 3 IS THE FIX, 2026-09-07, and step 2 is why it was needed.**
+    `root.parent.parent` is `assets_dir()` computed the long way round: it is
+    only ever correct because clients live at `<assets>/Clients/<build>`. So
+    the parameter was doing two jobs -- *which client am I decoding* and
+    *where does the dictionary live* -- and any caller holding a root that is
+    not a client directory got the wrong answer to the second one. Measured
+    on this box:
+
+        coroot.find()            C:\Program Files\Classic Conquer 2.0
+          -> parent.parent       C:\
+          -> dictionary_path     C:\derived\...       -> None
+        clients_dir()/"6907"     -> the real file      -> 4,059,815 blocks
+
+    and None is a LEGITIMATE answer here ("no dictionary on this box"), so
+    the wrong root refused by name instead of failing. Four shipping call
+    sites passed no root at all and were refusing on a box that holds the
+    dictionary; `tests/test_patch7205.have_dict` asked the same un-rooted
+    question, so the suite skipped ten tests and read OK.
+
+    The dictionary is a property of the COLLECTION, not of a build -- one
+    7878 block dictionary decodes every block96 client under it -- so
+    resolving it from `assets_dir()` puts the client root back to meaning
+    only "which client". `coroot` is vendored into the Blender addon
+    alongside this module (`blender/io_scene_c3/vendor/`), so the import is
+    available wherever this module is.
+    """
+    env = os.environ.get(ENV_DICT)
+    if env:
+        p = Path(env)
+        return p if p.is_file() else None
+    if root is not None:
+        p = (Path(root).resolve().parent.parent / "derived" / DICT_DIRNAME
+             / DICT_BASENAME)
+        if p.is_file():
+            return p
+    # The configured collection. Imported here rather than at module scope to
+    # keep this module importable in the constrained environments the addon
+    # runs in, the same way `_tqdat()` below defers `tqdat`.
+    try:
+        try:
+            from core import coroot                   # noqa: PLC0415
+        except ImportError:                           # pragma: no cover
+            import coroot                             # noqa: PLC0415
+        p = (coroot.assets_dir() / "derived" / DICT_DIRNAME / DICT_BASENAME)
+    except Exception:                                 # pragma: no cover
+        return None
+    return p if p.is_file() else None
+
+
+def root_for_table(path) -> Optional[Path]:
+    """The client root that owns an `ini/*.dat`, for `dictionary_path`.
+
+    `<root>/ini/<name>.dat` -> `<root>`; **None for any other shape.**
+
+    The dictionary is a property of the ASSETS TREE, not of one client:
+    `Clients/6907` and `Clients/7878` resolve to the same file, because
+    `dictionary_path` only ever walks the root up to the directory holding
+    `Clients/`. So any client root in the right tree answers, and a path that
+    is not laid out as `<root>/ini/<file>` cannot be turned into one by
+    guessing.
+
+    It returns None rather than a guess ON PURPOSE. A wrong root makes
+    `dictionary_path` answer None, and None is indistinguishable from "no
+    dictionary on this box" -- so a guess would not fail, it would report the
+    tables as unreadable and look exactly like a true negative. That is the
+    defect this function exists to stop repeating, not a new one to introduce.
+    """
+    p = Path(path).resolve()
+    return p.parent.parent if p.parent.name.lower() == "ini" else None
+
+
+#: `{(path, mtime, size): dict}`. The pickle is ~103 MB and costs ~1.5 s to
+#: load, and a plugin's `catalogs()` opens 70 tables -- reloading per table
+#: turns a 3-second answer into a two-minute one. Keyed on mtime and size as
+#: well as path so a rebuilt dictionary is not served from the cache.
+_CACHE: dict = {}
+
+
+def load_dictionary(root=None, path=None) -> Optional[dict]:
+    """`{ct_block: pt_block}`, or None when there is no dictionary on this box.
+
+    None is a real answer and callers must say so rather than reporting an
+    empty table: "this client's tables are encrypted with a key we hold no
+    dictionary for" and "this client has no tables" are different facts, and
+    only one of them is about the client.
+    """
+    p = Path(path) if path is not None else dictionary_path(root)
+    if p is None or not p.is_file():
+        return None
+    st = p.stat()
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    hit = _CACHE.get(key)
+    if hit is None:
+        hit = pickle.loads(p.read_bytes())
+        _CACHE.clear()          # one dictionary at a time; each is ~1 GB live
+        _CACHE[key] = hit
+    return hit
+
+
+def why_no_dictionary(root=None) -> str:
+    """The refusal text, naming the path that was looked for."""
+    #: `where` is computed BEFORE the env branch, because the env branch needs it
+    #: too. It used to be computed after, so a caller who had set $CO_BLOCK96_DICT
+    #: to a bad path was told the override was wrong and NOT where a good one
+    #: lives -- which is the moment that information is most useful. Caught by
+    #: `test_patch7205.Refusals.test_no_dictionary_refuses_by_name`, which asserts
+    #: the refusal names `derived`; I nearly relaxed that assertion instead, on the
+    #: reasoning that naming `derived/` is wrong when the override is set. It is
+    #: not: knowing the override is bad does not tell you what a good one is.
+    #
+    #: **It must name every place `dictionary_path` ACTUALLY looked, 2026-09-07.**
+    #: When that function grew the `assets_dir()` step, naming only the
+    #: root-derived candidate would have made this text wrong in the one
+    #: direction that costs a reader real time: it would send them to
+    #: `C:\derived\...` -- a path the code no longer depends on -- while the
+    #: collection it did consult went unnamed. Both are listed when they
+    #: differ, and `derived/` appears either way.
+    rel = "derived/%s/%s" % (DICT_DIRNAME, DICT_BASENAME)
+    cands: list = []
+    if root is not None:
+        cands.append(str(Path(root).resolve().parent.parent / "derived"
+                         / DICT_DIRNAME / DICT_BASENAME))
+    try:
+        try:
+            from core import coroot                   # noqa: PLC0415
+        except ImportError:                           # pragma: no cover
+            import coroot                             # noqa: PLC0415
+        c = str(coroot.assets_dir() / "derived" / DICT_DIRNAME / DICT_BASENAME)
+        if c not in cands:
+            cands.append(c)
+    except Exception:                                 # pragma: no cover
+        pass
+    where = " or ".join(cands) if cands else "<ConquerAssets>/" + rel
+    env = os.environ.get(ENV_DICT)
+    if env:
+        return (f"${ENV_DICT} names {env!r}, which is not a file. The block96 "
+                f"dictionary is required to read this build's ini/*.dat. "
+                f"Expected {where}, or point ${ENV_DICT} at a built dictionary.")
+    return (f"the block96 dictionary is not on this box. Expected {where}, or "
+            f"${ENV_DICT}. Build it with `py -3 tools/datdict.py build`, which "
+            f"needs the decrypted 7878 corpus. Nothing is copied into "
+            f"Clients/, which stays vanilla.")
+
+
+# ---------------------------------------------------------------------------
+# decoding
+# ---------------------------------------------------------------------------
+
+def decode(ciphertext: bytes, d: dict) -> tuple:
+    """`(plaintext, total_blocks, unknown_blocks)`.
+
+    A block the dictionary does not hold becomes `UNKNOWN` -- reported through
+    the count, never guessed. This is the same function `tools/datdict.py`
+    exposes on the command line; it lives here so the reader and the tool
+    cannot drift, and `tests/test_datdict.py` still exercises it through
+    `datdict`.
+    """
+    out = bytearray()
+    total = unknown = 0
+    n_full = len(ciphertext) - len(ciphertext) % BLOCK
+    for i in range(0, n_full, BLOCK):
+        ct = ciphertext[i:i + BLOCK]
+        total += 1
+        pt = d.get(ct)
+        if pt is None:
+            unknown += 1
+            out += UNKNOWN
+        else:
+            out += pt
+    rem = ciphertext[n_full:]
+    if rem:
+        out += bytes(b ^ TAIL_XOR for b in rem)
+    return bytes(out), total, unknown
+
+
+#: The two `inidat` verdicts that mean "this file entered the block96 test".
+#:
+#: `BLOCK96_REFUTED` is included, and that is a correction rather than a
+#: loosening. It means the entry test passed and only the TAIL corroboration
+#: failed -- `inidat` predicts the file's `len % 12` tail will decode to
+#: text, and refuses the family when the tail is bare punctuation. On 6907
+#: exactly one file lands there, `MapDestination.dat`, whose 1-byte tail is
+#: `.`; the dictionary opens 53.3% of its blocks into
+#: ``[1010-1]\r\ntitle=New~Skil...`` and recovers 170 sections. So the
+#: refutation is a FALSE NEGATIVE on this file, and inidat's own reason string
+#: says as much ("the oracle confirms it decrypts"). Excluding the verdict
+#: would have thrown away a table that reads.
+#:
+#: Every OTHER verdict stays excluded, because each of them is a POSITIVE
+#: identification of a different cipher, and that is what the guard is for.
+CANDIDATE_FAMILIES = (inidat.Family.BLOCK96, inidat.Family.BLOCK96_REFUTED)
+
+#: Shannon entropy above which a decode is ciphertext rather than a table.
+#:
+#: MEASURED on 6907, over the decoded bytes with the markers removed. The two
+#: populations do not overlap and nothing sits near the boundary:
+#:
+#:     REAL TABLES        itemtype 2.39 · magictypeop 2.12 · official_type 4.05
+#:                        mounttype 4.98 · MapDestination 5.08 · UserHelpInfo
+#:                        5.21 · AutoUseMagic 5.36  <- the highest real one
+#:     POISONED DECODES   WeaponActionData 7.26 · ShowHandTableRace 7.79 ·
+#:                        RaceTrackProp 7.89 · UserHelpInfo.ini.dat 8.00
+#:
+#: A gap of 1.9 bits between the worst real table and the best fake one, so
+#: the threshold is not doing delicate work. **This is a SECOND instrument,
+#: not a spare**: the classifier is the thing that can be wrong -- it already
+#: is, on `MapDestination.dat` -- so the guard that admits a candidate family
+#: needs a check that does not consult the classifier at all.
+#:
+#: Note what does NOT work here: printability. `AutoUseMagic.dat` decodes to
+#: 78.7% printable because its plaintext is Chinese, which is under the
+#: fakes' own 39%-ish figure once you allow any slack. `patch7878.OPENS_VIA`
+#: records two tables that every printability guard in this pipeline refused
+#: for exactly that reason.
+MAX_ENTROPY = 6.5
+
+
+_HEADER_ANY = re.compile(rb"^\[[^\]\r\n]+\]\r?$", re.M)
+
+#: A record start that begins IMMEDIATELY after a marker, i.e. one whose
+#: preceding `\r\n` was inside an unknown block. `\x00` is the marker's last
+#: byte. These records exist -- something is there -- but their leading
+#: characters may be the TAIL of an id whose first characters the marker ate,
+#: so they are COUNTED and never served. Without them the floor is badly
+#: short: 7205's `itemtype.dat` showed 26,025 intact line breaks and 13,746
+#: of these.
+_EMBEDDED_ROW = re.compile(rb"\x00\d+@@")
+_EMBEDDED_SECTION = re.compile(rb"\x00\[[^\]\r\n]{1,40}\]")
+
+
+
+
+def is_block96(raw: bytes, name: str = "<bytes>") -> bool:
+    """Would `core/inidat.py` place this file in the block96 family?
+
+    **The first guard against the poisoned dictionary entries** -- see rule 1
+    in the module docstring. `inidat.classify` reaches its verdict from the
+    file's own bytes and knows nothing about the dictionary, so it is an
+    independent instrument: it calls `UserHelpInfo.ini.dat` a TQ-stream file
+    and `RaceTrackProp.dat` an RSA one whatever the dictionary covers.
+    """
+    return inidat.classify(raw, name).family in CANDIDATE_FAMILIES
+
+
+def entropy(data: bytes) -> float:
+    """Shannon entropy in bits per byte. 0.0 for empty input."""
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    total = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            total -= p * math.log2(p)
+    return total
+
+
+# ---------------------------------------------------------------------------
+# recovery: what survives a partial decode
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Recovery:
+    """What the reader got, and what it could not get. Both, always.
+
+    A served count on its own is the failure this whole surface is built to
+    avoid: "5,387 items" reads as a statement about the client when it is a
+    statement about the dictionary. Every field here is needed to tell those
+    apart, so they travel together.
+    """
+    #: Non-blank lines in the decoded plaintext.
+    #:
+    #: **THIS IS A FLOOR ON THE FILE'S ROW COUNT, NOT THE ROW COUNT.** The
+    #: marker carries no newline, so an unknown block that lands on a `\r\n`
+    #: DELETES that line break and merges two rows into one line. Every such
+    #: merge costs the count one. So `lines` under-reports and `recovered`
+    #: (units/lines) correspondingly OVER-reports -- both are bounds, in the
+    #: flattering direction, and they are labelled that way everywhere they
+    #: are printed.
+    #:
+    #: The size of the effect is visible in the neighbours: 6907's
+    #: `itemtype.dat` decodes to 22,265 lines while 6868's -- one patch
+    #: earlier, fully readable under the TQ cipher -- carries 33,639 rows.
+    #: Some of that gap is content and some is merges; nothing here can say
+    #: which, which is exactly why this is reported as a floor rather than
+    #: reconciled into a single number.
+    #:
+    #: For a sections table it is not a section count either, and for a
+    #: different reason: the headers are what the damage destroys.
+    lines: int = 0
+    #: Lines carrying no marker at all -- fully recovered.
+    intact: int = 0
+    #: Lines the reader could serve something from. For rows, `intact` plus
+    #: the truncated rows whose leading fields survived; for sections, the
+    #: lines attributed to a section whose header is known.
+    served: int = 0
+    #: Rows/sections the reader actually emitted.
+    units: int = 0
+    blocks: int = 0
+    unknown_blocks: int = 0
+
+    @property
+    def coverage(self) -> float:
+        """Fraction of 12-byte BLOCKS the dictionary held. The number
+        `datdict.py decode` prints, and the one that overstates readability."""
+        return 1.0 if not self.blocks else (
+            (self.blocks - self.unknown_blocks) / self.blocks)
+
+    @property
+    def recovered(self) -> float:
+        """**An UPPER BOUND on** the fraction of the file the reader served.
+
+        `served / lines`, and `lines` is a floor (see above), so this is a
+        ceiling: 0.242 on 6907's `itemtype.dat` where `coverage` says 0.864,
+        and the true figure is at or below 0.242. Both numbers flatter the
+        reader and both are reported as bounds rather than as measurements.
+        """
+        return 1.0 if not self.lines else self.served / self.lines
+
+    def summary(self) -> str:
+        return (f"{self.units:,} recovered, a FLOOR, from >={self.lines:,} "
+                f"lines (<={self.recovered * 100:.1f}% -- lines merge where a "
+                f"marker eats a newline, so the denominator is itself a "
+                f"floor); {self.intact:,} undamaged; blocks "
+                f"{self.blocks - self.unknown_blocks:,}/{self.blocks:,} known "
+                f"({self.coverage * 100:.1f}%) -- the block figure is NOT the "
+                f"row figure")
+
+
+def _lines(plaintext: bytes):
+    """Non-blank lines, `\\r` stripped.
+
+    Split on `\\n` only. `UNKNOWN` carries no newline, so a marker can DELETE a
+    line break but never invent one: every boundary seen here is a real one
+    from the plaintext, which is what makes a line's leading bytes trustworthy
+    even when its tail is not.
+    """
+    for raw in plaintext.split(b"\n"):
+        line = raw.rstrip(b"\r")
+        if line.strip():
+            yield line
+
+
+def recover_rows(plaintext: bytes, delimiter: bytes = b"@@",
+                 blocks: int = 0, unknown_blocks: int = 0,
+                 min_fields: int = 2) -> tuple:
+    """`(text, Recovery)` -- positional rows, truncated at the first damage.
+
+    Fields before the first marker keep their column positions, because the
+    only thing dropped is the tail. So a recovered row is SHORT, never SHIFTED,
+    and a caller reading column 52 either gets column 52 or gets nothing.
+
+    The field the marker landed in is dropped even when it looks complete:
+    `1234` truncated from `12345` is a plausible number and there is no way to
+    tell from the output which it is.
+
+    `min_fields=2` because both the surfaces that consume these rows -- the
+    catalog control and `coassets.load_items` -- key on `(id, name)`, and a row
+    with only an id has nothing to be looked up by.
+    """
+    out = []
+    lines = intact = served = 0
+    for line in _lines(plaintext):
+        lines += 1
+        at = line.find(UNKNOWN)
+        if at < 0:
+            intact += 1
+            served += 1
+            out.append(line)
+            continue
+        fields = line[:at].split(delimiter)[:-1]     # drop the truncated field
+        if len(fields) < min_fields:
+            continue
+        served += 1
+        out.append(delimiter.join(fields))
+    return (b"\n".join(out) + b"\n" if out else b""), Recovery(
+        lines=lines, intact=intact, served=served, units=len(out),
+        blocks=blocks, unknown_blocks=unknown_blocks)
+
+
+#: `clean_sections` needs this. Master carries NO compiled-regex constants and
+#: did not import `re` at all -- both come across here. My first dependency
+#: probe walked `ast.Call` only, so it saw `flush` and `len` and missed a
+#: regex used as `_HEADER.match(...)`: A PROBE THAT CHECKS CALLS DOES NOT
+#: CHECK REFERENCES. The second probe walked every Name load and found it.
+_HEADER = re.compile(rb"^\[[^\]\r\n]+\]$")
+
+#: PORTED 2026-09-03, second pass. `read_itemtype` / `read_monster` are the
+#: block96-CIPHER readers -- they delegate the grammar to `tqdat.parse_*` but the
+#: decryption is this module's. THEY ARE NOT `tqdat.read_itemtype`.
+#:
+#: I remapped the test's `block96.read_itemtype` to `tqdat.read_itemtype` earlier
+#: today because master had that NAME. Wrong: same name, different function. The
+#: remap made `test_a_binary_plain_table_is_refused_by_name` fail against a seed
+#: error, and I nearly filed that as master's drift. MAP BY BEHAVIOUR, NOT BY NAME.
+#:
+#: `_open(check=True)` is the guard the test asserts: it raises ValueError naming
+#: block96 rather than letting a fallback caller load a 477 MB dictionary to
+#: discover the file was never this cipher -- so "different cipher" cannot be read
+#: as "empty table".
+
+def _tqdat():
+    try:
+        from core import tqdat                        # noqa: PLC0415
+    except ImportError:                               # pragma: no cover
+        import tqdat                                  # noqa: PLC0415
+    return tqdat
+
+
+def _open(path, table: Optional[dict], check: bool) -> tuple:
+    """`(plaintext, raw)`, refusing a file that is not this cipher.
+
+    `check=True` is the guard `is_block96` exists for: it keeps a fallback
+    caller from loading 477 MB to discover the file was never block96.  It
+    raises `ValueError` rather than returning nothing, so "this is a different
+    cipher" cannot be mistaken for "this table is empty" -- the same
+    distinction `tqdat.decrypt_table` raises to preserve.
+    """
+    raw = Path(path).read_bytes()
+    if check and not is_block96(raw, Path(path).name):
+        raise ValueError(
+            f"{path}: core/inidat.py does not classify this as block96, so "
+            f"the 6907-7878 dictionary is the wrong reader for it")
+    if table is None:
+        # `root` was UNDEFINED here: the no-dictionary path raised NameError
+        # instead of the FileNotFoundError it names. Unreachable on a box where
+        # the assets_dir fallback answers, which is why no test caught it.
+        _root = root_for_table(path)
+        table = load_dictionary(_root)
+        if table is None:
+            raise FileNotFoundError(why_no_dictionary(_root))
+    # RETURNS ITS BOUNDS, not the raw bytes. Both callers wrote
+    # `pt, _raw = _open(...)` and never used `raw`, while the block counts --
+    # which this module's header insists a decode must never be reported
+    # without -- were discarded right here.
+    return decode(raw, table)
+
+
+def read_itemtype(path, table: Optional[dict] = None,
+                  encoding: str = "latin-1", check: bool = True) -> list:
+    """`itemtype.dat` rows, WHOLE ONES ONLY, keyed like CCO's itemtype.json.
+
+    The parse is `tqdat.parse_itemtype` unchanged -- this file is the same
+    `@@` grammar as the TQ-era one, only under a different cipher -- so a
+    column name means here exactly what it means there, including the places
+    where `FIELDS_AT` runs out and the tail lands in `unnamed`.
+
+    **The count is a floor, not the table.**  On 7205 that is 2,068 rows of a
+    table with at least 39,771; `read_table(path, d, kind).recovery` is how a caller finds out.
+    """
+    pt, _blocks, _unknown = _open(path, table, check)
+    text, _kept, _dropped = clean_rows(pt)
+    return _tqdat().parse_itemtype(text.decode(encoding, "replace"))
+
+
+def read_monster(path, table: Optional[dict] = None,
+                 encoding: str = "latin-1", check: bool = True) -> list:
+    """`Monster.dat` sections, WHOLE ONES ONLY, shaped like monster.json."""
+    pt, _blocks, _unknown = _open(path, table, check)
+    text, _kept, _dropped = clean_sections(pt)
+    return _tqdat().parse_monster(text.decode(encoding, "replace"))
+
+
+#: PORTED 2026-09-03 from claude/patch7205-2026-08-30 for the `block96` reader
+#: in plugins/__init__.py. These are NOT duplicates of `recover_sections` /
+#: `recover_rows` and must not be collapsed into them.
+#:
+#: MEASURED by the Director of COMod, both implementations on the SAME plaintext:
+#:     7205 Monster.dat   recover_sections -> 823    clean_sections -> 558
+#:     6907 Monster.dat   recover_sections ->   1    clean_sections ->   0
+#:
+#: The 265-section difference is NOT extra monsters. Keys per section:
+#:     kept by both              median 24
+#:     kept only by recover_*    median  0, mean 5.2, 86% below the common median
+#:     first four: [7905] 0, [7654] 0, [7658] 0, [7638] 0
+#:
+#: `recover_sections` keeps mostly-EMPTY headers -- a `[7905]` with nothing under
+#: it parses cleanly, counts as a section and carries no data. Serving that output
+#: inflates every downstream count by ~46%. The strict rule below is the correct
+#: one for a reader; the permissive one is correct for recovery analysis. THEY ARE
+#: DIFFERENT QUESTIONS AND BOTH ANSWERS ARE KEPT.
+#:
+#: The GM proposed porting on the reasoning that MORE output is the safe
+#: direction. That was wrong and this comment exists because it was wrong: more
+#: output is only safe once you have asked WHAT the extra output is.
+
+def clean_rows(plaintext: bytes) -> tuple:
+    """`(text_bytes, kept, dropped)` -- lines carrying no marker.
+
+    Correct for `@@`/`,` row tables ONLY, where rows are independent.  A
+    marker that swallowed a row terminator merges two rows into one line, and
+    that line carries the marker, so the merge is dropped rather than served
+    as a row with someone else's fields on the end.
+
+    Not correct for section tables; use `clean_sections`.
+    """
+    kept, dropped = [], 0
+    for line in plaintext.split(b"\r\n"):
+        if not line.strip():
+            continue
+        if UNKNOWN in line:
+            dropped += 1
+        else:
+            kept.append(line)
+    return b"\r\n".join(kept), len(kept), dropped
+
+
+def clean_sections(plaintext: bytes) -> tuple:
+    """`(text_bytes, kept_sections, dropped_sections)` -- WHOLE sections only.
+
+    A section is kept when its `[header]` and every line up to the next
+    header are marker-free.  Anything else is discarded entirely:
+
+      * a damaged **key** line, dropped on its own, leaves a section that
+        parses fine and is one key short, with nothing saying so;
+      * a damaged **header** hands every key below it to the section above,
+        which is a wrong row rather than a missing one.
+
+    Both are silent, and the second one invents data.  Whole sections only.
+
+    **A damaged line poisons the section it appears IN, and that is not a
+    conservatism to relax.**  A marker is 12 bytes of "we do not know what was
+    here", so a damaged line is indistinguishable between *a key of the open
+    section* and *the header of a new one*.  If it is a key, the open section
+    is short; if it is a header, the open section ended cleanly and a new one
+    began.  Nothing in the decode can tell which, so the open section goes too:
+
+        [good] Name=Alpha | <marker>ad] Name=Beta | [after] Name=Gamma
+        ->  kept: [after] only.  [good] is dropped because `<marker>ad]`
+            might have been one of ITS keys.
+
+    `dropped` therefore counts damaged RUNS, not sections: the run above is
+    one drop covering at least two real sections.  It is a floor on the loss
+    in exactly the way `Recovery.lines` is a floor on the total, and for the
+    same reason -- what a marker ate is not countable.
+
+    (This said "`coverage`'s `record_floor`" until 2026-09-07.  **There is no
+    `coverage()` in this module and there never has been** -- `coverage` is a
+    property on `Recovery` and `record_floor` is a field of nothing.  The
+    quantity it named is real and is NOT `Recovery.lines`, which is looser;
+    `tests/test_patch7205.TheFloorThatRecoveryCannotExpress` records the
+    difference rather than leaving a cross-reference to a function that
+    cannot be opened.)
+    """
+    lines = plaintext.split(b"\r\n")
+    out: list = []
+    cur: list = []
+    ok = False
+    kept = dropped = 0
+
+    def flush():
+        nonlocal kept, dropped
+        if not cur:
+            return
+        if ok:
+            out.extend(cur)
+            kept += 1
+        else:
+            dropped += 1
+
+    for line in lines:
+        s = line.strip()
+        if _HEADER.match(s) and UNKNOWN not in line:
+            flush()
+            cur = [line]
+            ok = True
+            continue
+        if UNKNOWN in line:
+            # Damaged.  If it looks like a header the parse cannot trust it
+            # either, so the section it opens is unopened and everything up to
+            # the next INTACT header belongs to nobody.
+            #
+            # With no section open (`cur` empty) the run is dropped WITHOUT
+            # being counted: leading damage, before the first intact header,
+            # cannot be attributed to a section that was never seen.  That
+            # keeps `dropped` a count of runs that took something we could
+            # otherwise have served, rather than a number with two meanings.
+            ok = False
+            if cur:
+                cur.append(line)
+            continue
+        if cur:
+            cur.append(line)
+    flush()
+    return b"\r\n".join(out), kept, dropped
+
+
+def recover_sections(plaintext: bytes, blocks: int = 0,
+                     unknown_blocks: int = 0) -> tuple:
+    """`(text, Recovery)` -- only sections whose header is KNOWN to be theirs.
+
+    **A damaged line ends attribution.** The marker can contain the `\\r\\n`
+    before a `[header]`, which merges the header into the line above and
+    deletes it; the keys that follow then attach to the previous section and
+    nothing raises. So after any damaged line the reader has no section until
+    the next intact header, and the keys in between are discarded rather than
+    given to a monster that did not have them.
+
+    The cost is visible and is the point: on 6907's `Monster.dat` this returns
+    ONE section out of 46,271 undamaged lines, because the headers are what the
+    damage takes. Filtering damaged lines and parsing the rest instead returns
+    a table of several hundred confidently mis-attributed sections.
+    """
+    out: list = []
+    lines = intact = served = 0
+    units = 0
+    attributing = False
+    for line in _lines(plaintext):
+        lines += 1
+        if UNKNOWN in line:
+            attributing = False
+            continue
+        intact += 1
+        s = line.strip()
+        if s.startswith(b"[") and s.endswith(b"]"):
+            attributing = True
+            units += 1
+            served += 1
+            out.append(line)
+        elif attributing:
+            served += 1
+            out.append(line)
+    return (b"\n".join(out) + b"\n" if out else b""), Recovery(
+        lines=lines, intact=intact, served=served, units=units,
+        blocks=blocks, unknown_blocks=unknown_blocks)
+
+
+# ---------------------------------------------------------------------------
+# the one call a reader needs
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Table:
+    """A decoded table, or the reason there is none."""
+    #: The recovered text, safe to parse. None when nothing could be read.
+    text: Optional[bytes] = None
+    #: The FULL decode including markers -- what a positive control searches.
+    #: Deliberately not the same bytes as `text`: a control that searches the
+    #: reader's own output is checking the reader against itself.
+    witness: bytes = b""
+    recovery: Optional[Recovery] = None
+    refusal: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.text is not None
+
+
+#: Below this share of a file's lines, the reader has not read the table -- it
+#: has caught a fragment of one. 1% is not a quality bar; it is the line
+#: between "short" and "nothing", and it exists because a served count of 1 out
+#: of ~2,100 sections reads in a listing as *this client has one monster*.
+#: Anything above it is served WITH its shortfall attached (`Recovery.summary`)
+#: rather than silently rounded up to a table.
+MIN_RECOVERED = 0.01
+
+#: How many decoded bytes the entropy check looks at. `itemtype.dat` decodes
+#: to 10.8 MB and the verdict is stable long before that; capped so opening a
+#: 70-table catalog does not pay a full pass over every one of them.
+_ENTROPY_SAMPLE = 200_000
+
+
+def read_table(path, d: dict, kind: str = "rows",
+               delimiter: bytes = b"@@") -> Table:
+    """Decode one `ini/*.dat` and recover what survives. Never raises.
+
+    `kind` is `"rows"` or `"sections"` -- the two recovery rules are genuinely
+    different and picking the wrong one is not a formatting difference, it is
+    the mis-attribution in `recover_sections`'s docstring.
+
+    The decode is run TWICE, from disk both times, exactly as
+    `Plugin.load_table` does for the TQ tables: the second run is the witness,
+    so a positive control checks the parse against bytes the parse did not
+    produce. It witnesses the PARSE and not the CIPHER -- the same decode
+    happening twice cannot testify that the dictionary was right -- which is
+    why callers report it as a re-decode control and not a raw one.
+    """
+    p = Path(path)
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        return Table(refusal=f"{p.name}: unreadable: {e}")
+    if not raw:
+        return Table(refusal=f"{p.name}: the client ships it as a 0-byte file")
+    if not is_block96(raw, p.name):
+        fam = inidat.classify(raw, p.name).family
+        return Table(refusal=(
+            f"{p.name}: core/inidat.py classifies this {fam!r}, which is not "
+            f"in the block96 family, so the block dictionary must not be "
+            f"applied to it. Twelve of the fourteen files "
+            f"patch7878.NOT_CONTENT names as failed decrypts went into the "
+            f"shipped dictionary as if they were plaintext, and those decode "
+            f"at 100% "
+            f"coverage into ciphertext -- coverage cannot tell you that, and "
+            f"this classification can."))
+    pt, blocks, unknown = decode(raw, d)
+    witness, _b, _u = decode(p.read_bytes(), d)
+    # THE SECOND INSTRUMENT, and it does not consult the classifier. A decode
+    # that came out of the dictionary's poisoned entries is ciphertext, and
+    # ciphertext is high-entropy whatever any classifier says. Measured over
+    # the recovered bytes with the markers stripped, since 100,000 copies of a
+    # constant marker would drag the figure down on a badly-covered file.
+    body = pt.replace(UNKNOWN, b"")
+    h = entropy(body[:_ENTROPY_SAMPLE])
+    if h > MAX_ENTROPY:
+        return Table(witness=witness, refusal=(
+            f"{p.name}: the dictionary covers "
+            f"{100 * (blocks - unknown) / blocks if blocks else 100:.1f}% of "
+            f"this file's blocks and the result has entropy {h:.2f} bits/byte "
+            f"-- above {MAX_ENTROPY}, so it is ciphertext, not a table. The "
+            f"most likely cause is a poisoned dictionary entry: twelve of "
+            f"the fourteen `.out` files patch7878.NOT_CONTENT names as failed "
+            f"decrypts were paired into the shipped dictionary as if they were "
+            f"plaintext. COVERAGE CANNOT SEE THIS -- those files read 100%. "
+            f"`tools/datdict.py` now gates on both the name and the cipher; "
+            f"if this fires, the dictionary predates that fix."))
+    if kind == "sections":
+        text, rec = recover_sections(pt, blocks, unknown)
+    else:
+        text, rec = recover_rows(pt, delimiter, blocks, unknown)
+    if rec.units == 0 or rec.recovered < MIN_RECOVERED:
+        return Table(witness=witness, recovery=rec, refusal=(
+            f"{p.name}: the block dictionary holds "
+            f"{rec.coverage * 100:.1f}% of this file's blocks but only "
+            f"{rec.units:,} {kind[:-1] if kind.endswith('s') else kind}(s) "
+            f"survive that ({rec.recovered * 100:.2f}% of {rec.lines:,} "
+            f"lines), which is a fragment and not a table. The blocks are "
+            f"known; the rows are not. Nothing is served rather than a count "
+            f"that would read as a fact about the client."))
+    return Table(text=text, witness=witness, recovery=rec)

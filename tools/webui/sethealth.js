@@ -1271,36 +1271,61 @@
     if (rendering) return;
     rendering = true;
     let boot, thumb, index;
+    // IN PARALLEL, AND SAYING WHAT IT IS WAITING ON. These six requests used
+    // to be awaited one after another, and nothing was drawn until the last
+    // landed -- so the panel read "loading..." for the SUM of them. MEASURED
+    // 2026-09-18 on a fresh checkout's first visit, with the PC in use:
+    // /api/bootstrap/checklist 111 s and /api/thumbs/status 72 s (0.4 s and
+    // 3.4 s once warm). A new user's first Settings visit is exactly that
+    // cold case, and "loading..." with no end in sight reads as a hang. Now
+    // the wait is the SLOWEST request, not the total, and until the first
+    // draw the panel names each pending request and how long it has taken.
+    const pending = new Map();
+    const track = (name, promise) => {
+      pending.set(name, Date.now());
+      return promise.finally(() => pending.delete(name));
+    };
+    const firstDraw = !host.dataset.drawn;
+    const ticker = firstDraw ? setInterval(() => {
+      if (!pending.size) return;
+      const now = Date.now();
+      host.textContent = 'loading… waiting on ' + [...pending].map(
+        ([n, t]) => `${n} (${Math.round((now - t) / 1000)} s)`).join(', ');
+    }, 1000) : null;
     try {
-      boot = await jget('/api/bootstrap/status');
-      // The cheap version, once. The estimate is opt-in and never rides the
+      // The cheap checklist, once. The estimate is opt-in and never rides the
       // 2 s poll: it walks each install and benchmarks the CPU, MEASURED at
       // 1-14 s per client.
-      if (!book) book = await jget('/api/bootstrap/checklist');
       // THE SELECTION AND THE ADVANCED FLAG, from the server, once. Both are
       // stored settings, so a page opened in a second window shows the same
       // ticks -- which a `localStorage` selection could not.
-      if (!selection) selection = await jget('/api/selection');
-      if (picked === null) picked = new Set(selection.stored || []);
-      try {
-        const st = await jget('/api/settings');
-        const adv = (st.settings || []).find(
-          s => s.name === 'show_advanced_options');
-        advanced = !!(adv && adv.value);
-      } catch (e) {
+      const got = await Promise.all([
+        track('bootstrap status', jget('/api/bootstrap/status')),
+        book ? book : track('client checklist', jget('/api/bootstrap/checklist')),
+        selection ? selection : track('selection', jget('/api/selection')),
         // The supply section falls back to its RESTRICTED form, never its
         // open one: failing closed is the only safe direction for a control
         // whose whole purpose is to withhold fields by default.
-        advanced = false;
-      }
-      thumb = await jget('/api/thumbs/status');
-      index = await jget('/api/index/status');
+        track('settings', jget('/api/settings')).catch(() => null),
+        track('thumbnail status', jget('/api/thumbs/status')),
+        track('index status', jget('/api/index/status')),
+      ]);
+      boot = got[0]; book = got[1]; selection = got[2];
+      thumb = got[4]; index = got[5];
+      if (picked === null) picked = new Set(selection.stored || []);
+      const st = got[3];
+      const adv = st && (st.settings || []).find(
+        s => s.name === 'show_advanced_options');
+      advanced = !!(adv && adv.value);
     } catch (e) {
+      if (ticker) clearInterval(ticker);
       host.textContent = '';
       host.appendChild(mk('div', 'set-bad', String(e.message || e)));
       rendering = false;
       return;
     }
+    if (ticker) clearInterval(ticker);
+    host.dataset.drawn = '1';
     host.textContent = '';
     host.appendChild(bootstrapBlock(boot));
     host.appendChild(thumbBlock(thumb));

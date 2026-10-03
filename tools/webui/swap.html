@@ -296,7 +296,7 @@
     <div class="sw-drawer-in">
       <h3>Mod staging</h3>
       <p class="sw-note">
-        Staged files live in <code id="stage-dir">mods/stage</code>. Nothing
+        Staged files live in <code id="stage-dir">Installed/stage</code>. Nothing
         touches the game install until you press <b>Install</b>, which runs
         <code>comod.py install --yes</code> &mdash; the same path as the CLI,
         with its backups and its <code>uninstall</code> revert.
@@ -306,7 +306,9 @@
         <button id="btn-dry" class="sw-go" type="button">Install (dry run)</button>
         <button id="btn-install" class="sw-go" type="button">Install for real</button>
         <button id="btn-amend" class="sw-go" type="button">Add to install (amend)</button>
-        <button id="btn-uninstall" class="sw-go" type="button">Uninstall / revert</button>
+        <button id="btn-uninstall-dry" class="sw-go" type="button">Uninstall (dry run)</button>
+        <button id="btn-uninstall" class="sw-go" type="button"
+                title="Reverts every entry on record, newest first. To revert only the newest, use Revert this under Installed, by date.">Uninstall / revert</button>
         <button id="btn-clear" class="sw-go" type="button">Clear staging</button>
         <button id="drawer-close" class="sw-go" type="button">close</button>
       </div>

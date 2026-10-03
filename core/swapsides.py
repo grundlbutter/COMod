@@ -121,6 +121,7 @@ __all__ = [
     "OFFERED_KIND", "LibraryView", "Offering",
     "read_library", "offering_for", "cohort_line", "displacement_note",
     "NPC_DISPLACEMENT_OWNER", "COHORT_OWNER",
+    "_DISPLACEMENT_VERIFIED", "_DISPLACEMENT_WHY",
 ]
 
 
@@ -686,9 +687,57 @@ def cohort_line(membership) -> dict:
 
 NPC_DISPLACEMENT_OWNER = "COMod Explorer -- unassigned"
 
-#: `core/collection.py:84`, quoted so the gate below fails loudly if the
-#: constant is ever widened to include NPC roles and this note goes stale.
-_MAP_ROLES_AT_WRITING = ("puzzle", "ani", "art")
+#: `core/collection.MAP_ROLES`, quoted so the gate fails loudly if the constant
+#: moves under this note again.
+#:
+#: **RE-PINNED 2026-09-16, AND THE WIDENING IT CAUGHT WAS NOT THE DEFECT.**
+#: It was pinned at `("puzzle", "ani", "art")`; the map work widened MAP_ROLES
+#: to eight and this tripwire fired, because five roles had silently flipped
+#: from `covered=None` to `covered=True` with nobody checking. Measuring that
+#: found something worse in a role the widening never touched -- see
+#: `_DISPLACEMENT_VERIFIED`.
+_MAP_ROLES_AT_WRITING = ("puzzle", "plane", "ani", "art", "scene", "otherdata",
+                         "config", "effectart")
+
+#: **Roles where the byte-identity displacement check was MEASURED to run.**
+#:
+#: Membership of `MAP_ROLES` is necessary and not sufficient. The check is
+#: `collection.py`'s `if role in MAP_ROLES and prec.get("shared")`, so a role
+#: whose parts never carry `shared` reaches it never -- and `covered=True`
+#: would then be "the check said this is safe" standing in for "the check does
+#: not run here", which `displacement_note` exists to keep apart.
+#:
+#: Measured over 12 maps on 7878, every part's `rel` looked up in the
+#: whole-install `shared_art_index` (70,755 rels) --
+#: `scratchpad/swapsides_why.py`:
+#:
+#:     role        parts  shared  in the index   verdict
+#:     art          2535    2533          2533   fires
+#:     scene           3       3             3   fires
+#:     ani            35       0            35   SHARED, FLAG NOT SET (defect)
+#:     puzzle         12       0             0   per-map in fact
+#:     plane           8       0             0   per-map in fact
+#:     otherdata       4       0             0   per-map by construction
+#:     config          5       0             0   per-map in fact
+#:     effectart      41       0             0   per-map in fact
+_DISPLACEMENT_VERIFIED = ("art", "scene")
+
+#: Why the check does not run for each of the others. A measured "we do not
+#: know" closes a question as well as a measured yes; an UNmeasured `True`
+#: closes nothing and reads like a guarantee.
+_DISPLACEMENT_WHY = {
+    "puzzle": "its files are per-map in fact (0 of 12 parts appear in "
+              "shared_art_index), so the shared-art check has nothing to do",
+    "plane": "its files are per-map in fact (0 of 8 parts in the index)",
+    "otherdata": "per-map BY CONSTRUCTION -- `<name>.OtherData` -- so it can "
+                 "never be shared and shared_art_index does not index it",
+    "config": "its parts are cuts of shared plaintext tables and are REFUSED "
+              "at staging as merges, so the check is never reached",
+    "ani": "its parts are cuts of a shared index and are REFUSED at staging "
+           "as merges, so the check is never reached -- they DO now carry the "
+           "shared flag, which they did not until 2026-09-16",
+    "effectart": "0 of 41 parts appear in the index in the measured sample",
+}
 
 
 def displacement_note(role: str = "npc") -> dict:
@@ -705,19 +754,44 @@ def displacement_note(role: str = "npc") -> dict:
     an uncovered role, never `False` and never `True`: "the check said this
     is safe" and "the check does not run here" are opposite facts and the
     second must not be rendered as the first.
+
+    **AND FROM 2026-09-16, MEMBERSHIP OF `MAP_ROLES` IS NOT ENOUGH TO EARN A
+    `True`.**  The gate has two halves -- ``role in MAP_ROLES`` **and**
+    ``prec.get("shared")`` -- and this function used to read only the first,
+    so widening `MAP_ROLES` from three roles to eight silently promoted five
+    of them to "the check said this is safe" over a check that never ran.
+    `covered` is now `True` only for `_DISPLACEMENT_VERIFIED`, the roles
+    measured to reach it, and `None` with a REASON for the rest.  That is the
+    shape a measured "we do not know" takes; it closes the question as well as
+    a measured yes, which an unmeasured `True` never did.
     """
     import collection as _col
-    covered = str(role) in _col.MAP_ROLES
+    role = str(role)
     live = tuple(_col.MAP_ROLES)
-    out = {"role": str(role), "owner": NPC_DISPLACEMENT_OWNER,
-           "gate": f"core/collection.py:839 -- role in MAP_ROLES {live}"}
-    if covered:
+    out = {"role": role, "owner": NPC_DISPLACEMENT_OWNER,
+           "gate": f"core/collection.py -- role in MAP_ROLES {live} "
+                   f"AND the part carries `shared`"}
+    if role in _DISPLACEMENT_VERIFIED:
         out["covered"] = True
         out["headline"] = (f"Byte-identity displacement is computed for "
                            f"{role}: an overwrite with identical bytes is "
                            f"skipped rather than staged.")
         return out
     out["covered"] = None
+    if role in live:
+        # IN `MAP_ROLES` AND STILL NOT COVERED, which is the case this
+        # function used to render as `True`. Membership is half the gate; the
+        # part must also carry `shared`, and for these roles it never does.
+        out["headline"] = (
+            f"NOT VERIFIED: {role!r} is in MAP_ROLES, but no displacement "
+            f"check has been observed to run for it -- "
+            f"{_DISPLACEMENT_WHY.get(role, 'nothing has measured it')}.")
+        out["why"] = _DISPLACEMENT_WHY.get(role, "")
+        out["staleWarning"] = ("" if live == _MAP_ROLES_AT_WRITING else
+                               f"MAP_ROLES has changed since this note was "
+                               f"written ({_MAP_ROLES_AT_WRITING} -> {live}); "
+                               f"re-read core/collection.py before trusting it.")
+        return out
     out["headline"] = (
         f"NOT WIRED IN: no displacement check runs for {role!r}. The "
         f"byte-identity check is gated on {live}, so nothing here has "

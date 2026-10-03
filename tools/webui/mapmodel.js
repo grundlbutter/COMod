@@ -27,6 +27,12 @@
  * server can actually render (`mapedit.ZOOMS`), and the canvas scales the
  * result. `Gulf` is 34,944 x 22,400 art pixels; nothing may ever ask for that
  * at level 1, and `visibleTiles()` is what makes sure nothing does.
+ *
+ * The notch is 5% of the current zoom (`WHEEL`), the buttons spend five of
+ * them (`BUTTON_NOTCHES`), and `wheelNotches()` is what turns a device's
+ * `deltaY` into notches so the step is 5% per DETENT rather than 5% per
+ * event. `zoomPercent()` formats the result; all four are pinned by
+ * `tests/test_mapedit_zoom_step.py`, executed in a real V8.
  */
 
 'use strict';
@@ -38,30 +44,209 @@ const MapModel = (() => {
   /** Integer decimations the server renders. Must match `mapedit.ZOOMS`. */
   const ZOOMS = [1, 2, 4, 8, 16, 32, 64];
   /** Draw order, furthest first. Must match `mapedit.LAYERS`. */
-  const LAYERS = ['background', 'ground', 'terrain', 'cover', 'passability'];
+  const LAYERS = ['background', 'ground', 'terrain', 'cover', 'interactive',
+                  'passability'];
 
   const MIN_ZOOM = 1 / 64;
   const MAX_ZOOM = 4;
-  /** One wheel notch. 1.25 gives ~3 notches per doubling, which reads as
-   *  smooth without needing many intermediate tile levels. */
-  const WHEEL = 1.25;
+  /** One wheel notch, MULTIPLICATIVE: 5% of the CURRENT zoom, not 5
+   *  percentage points.
+   *
+   *  The owner asked for "5% per scroll tick" and the two readings are not
+   *  close here, because MIN_ZOOM..MAX_ZOOM spans 256x. Additive 5 points
+   *  would be a 320% jump on the first notch out of MIN_ZOOM (1.56% -> 6.56%)
+   *  and a 1.25% nudge near MAX_ZOOM (400% -> 405%) -- the same gesture doing
+   *  wildly different things at the two ends. Multiplicative is constant in
+   *  the only unit the eye has, ratio: every notch resizes what you are
+   *  looking at by the same 5% wherever you are. It is also what the old
+   *  constant was (1.25 = 25% per notch), so this is a change of ONE number
+   *  and not a change of law.
+   *
+   *  Measured on the resulting ladder: 14.2 notches per doubling (was 3.1),
+   *  113.7 notches MIN_ZOOM -> MAX_ZOOM (was 24.9). A free-spin wheel crosses
+   *  that in one flick; a detented one takes deliberate scrolling, which is
+   *  what was asked for. `BUTTON_NOTCHES` below is what keeps the coarse step
+   *  available for the +/- controls. */
+  const WHEEL = 1.05;
+  /** What the +/- buttons and the +/- keys spend per press.
+   *
+   *  1.05^5 = 1.2763, within 2.1% of the 1.25 those controls stepped before
+   *  this change, so a click keeps the feel it had. Only the WHEEL was asked
+   *  to get finer -- a button that moved 5% would need 14 presses to double,
+   *  which is a regression dressed up as consistency. */
+  const BUTTON_NOTCHES = 5;
 
   const clampZoom = z => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
 
+  /** One physical wheel detent, per `WheelEvent.deltaMode`:
+   *  0 DOM_DELTA_PIXEL (Chromium emits 100 px per detent),
+   *  1 DOM_DELTA_LINE  (Gecko emits 3 lines per detent),
+   *  2 DOM_DELTA_PAGE. */
+  const DETENT = [100, 3, 1];
+  /** Cap per EVENT. Some drivers deliver one accumulated delta of several
+   *  thousand after a flick; uncapped that is a teleport to a clamp. */
+  const MAX_EVENT_NOTCHES = 4;
+
+  /** A wheel event's delta as SIGNED notches, positive = zoom in.
+   *
+   *  Counting one notch per event -- what this did before -- does not deliver
+   *  "5% per tick" on the hardware people have: a high-resolution wheel emits
+   *  several events per physical detent, so the per-tick step was the constant
+   *  raised to a device-dependent power and no value of WHEEL could fix it.
+   *  Scaling by the delta makes the notch mean a detent on every device, and
+   *  makes a trackpad's small deltas fractional notches rather than full ones.
+   *  Fractional is fine: `zoomAt` is a `Math.pow`, not a table lookup.
+   */
+  function wheelNotches(deltaY, deltaMode) {
+    const unit = DETENT[deltaMode | 0] || DETENT[0];
+    const n = -deltaY / unit;
+    return Math.min(MAX_EVENT_NOTCHES, Math.max(-MAX_EVENT_NOTCHES, n));
+  }
+
+  /** The zoom as a percentage STRING, for the HUD and the zoom label.
+   *
+   *  The decimals are banded because a fixed 0 of them cannot show a 5% step:
+   *  measured over the whole 114-rung ladder, `toFixed(0)` repeats the same
+   *  integer for up to TEN consecutive notches down at MIN_ZOOM (everything
+   *  from 1.56% to 2.4% prints "2%"). A readout that does not move is read as
+   *  a wheel that does not work, which is the bug this change is fixing.
+   *
+   *  Banding on the value keeps the quantum at or under 1% of the value in
+   *  every band, and 5% > 1%, so every notch changes the string: 0 duplicate
+   *  pairs over those 114 rungs, asserted in tests/test_mapedit_zoom_step.py.
+   */
+  function zoomPercent(zoom) {
+    const p = zoom * 100;
+    const d = p >= 100 ? 0 : p >= 10 ? 1 : 2;
+    return p.toFixed(d);
+  }
+
+  /** The layer rows for a map, furthest first, as the server derived them.
+   *
+   *  THE LIST IS THE MAP'S, NOT THE CONSTANT'S. `LAYERS` above names the
+   *  five layer KINDS; a map's actual layers are one row per backdrop PLANE
+   *  (`background:0`, `background:1`, ... -- `star10` has sixteen) plus
+   *  whichever of ground / terrain / cover / passability it has anything in.
+   *  `mapedit.MapArt.layers()` measures that and omits the empty ones, so
+   *  this is a passthrough with a shape guarantee rather than a second
+   *  derivation: a rule implemented twice is a rule that drifts, and the
+   *  renderer addresses these ids straight through to `render_background`'s
+   *  plane index.
+   *
+   *  An older payload (no `layers`, or the pre-2026-09-14 `[{id,title}]`
+   *  form) falls back to the five kinds, so a stale tab still works.
+   */
+  function mapLayers(info) {
+    const rows = (info && info.layers) || [];
+    const usable = rows.filter(r => r && r.id && typeof r.count === 'number');
+    if (usable.length) return usable;
+    return LAYERS.map(id => ({ id, kind: id, plane: null, title: id,
+                               count: 0, detail: '', help: '' }));
+  }
+
+  /** The default draw order for a map: exactly the order `mapLayers` is in,
+   *  which is the order `terrain.art_texture()` composites in. */
+  function defaultOrder(info) {
+    return mapLayers(info).map(r => r.id);
+
+  }
+
   /** Fresh state for a map. `layers` defaults to everything the game draws;
-   *  the passability grid is a data overlay, so it starts off. */
+   *  the passability grid is a data overlay, so it starts off.
+   *
+   *  `order` is the user's draw order, an array of layer ids. It exists
+   *  because the owner wants to hand BACK a human-determined order -- the
+   *  tool cannot tell them what the client's real order is, so it has to let
+   *  them try one and read it off. `orderedLayers()` is the only thing that
+   *  should ever be iterated to draw; `order` on its own can go stale
+   *  against the map. */
   function create(info) {
+    const rows = mapLayers(info);
+    const layers = {};
+    for (const r of rows) layers[r.id] = r.kind !== 'passability';
     return {
       name: info ? info.name : '',
       px: info && info.pixels ? info.pixels.slice() : [0, 0],
       cells: info && info.mapSize ? info.mapSize.slice() : [0, 0],
       zoom: 1 / 8,
       ox: 0, oy: 0,
-      layers: { background: true, ground: true, terrain: true, cover: true,
-                passability: false },
+      layers,
+      order: rows.map(r => r.id),
       t: 0,
       selection: null,
     };
+  }
+
+  // -- the layer order ----------------------------------------------------
+
+  /**
+   * The map's layer rows in the state's order, furthest first.
+   *
+   * RECONCILED, NOT TRUSTED. `state.order` is user data and the map under it
+   * can change (open a different map, restage art, reload). Ids the map no
+   * longer has are dropped and ids the state has never seen are appended in
+   * their default position, so a panel rebuilt from this can never lose a
+   * layer or show one that does not exist -- which is what "reordering
+   * survives a re-render" actually requires.
+   */
+  function orderedLayers(state, info) {
+    const rows = mapLayers(info);
+    const by = new Map(rows.map(r => [r.id, r]));
+    const out = [];
+    const seen = new Set();
+    for (const id of (state && state.order) || []) {
+      if (by.has(id) && !seen.has(id)) { out.push(by.get(id)); seen.add(id); }
+    }
+    for (let i = 0; i < rows.length; i++) {
+      if (seen.has(rows[i].id)) continue;
+      // Back where it belongs by default, not at the end: a layer that
+      // appears after a restage must not land on top of everything.
+      out.splice(Math.min(i, out.length), 0, rows[i]);
+      seen.add(rows[i].id);
+    }
+    return out;
+  }
+
+  /** The ids of the layers that are BOTH present and switched on, in order.
+   *  This is what the renderer draws, and nothing else may decide it. */
+  function activeLayers(state, info) {
+    return orderedLayers(state, info)
+      .filter(r => state && state.layers[r.id] !== false)
+      .map(r => r.id);
+  }
+
+  /** Move one layer `delta` places (−1 = one step further back). Returns a
+   *  new state; returns the SAME state when the move would fall off either
+   *  end, so a caller can tell "nothing happened" from "moved". */
+  function moveLayer(state, info, id, delta) {
+    const ids = orderedLayers(state, info).map(r => r.id);
+    const i = ids.indexOf(id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= ids.length) return state;
+    ids.splice(j, 0, ids.splice(i, 1)[0]);
+    return Object.assign({}, state, { order: ids });
+  }
+
+  /** Back to the composite order the game draws in. */
+  function resetOrder(state, info) {
+    return Object.assign({}, state, { order: defaultOrder(info) });
+  }
+
+  /**
+   * The current order as one line of text the owner can copy back to us.
+   *
+   * THIS IS THE DELIVERABLE, not a debug aid. The reordering exists so a
+   * human can arrive at a draw order by eye and tell us what it was; an
+   * order that only lives in a panel's DOM cannot be told to anyone. Off
+   * layers are marked rather than dropped, because "cover was off" is part
+   * of what the eye was judging.
+   */
+  function orderText(state, info) {
+    const rows = orderedLayers(state, info);
+    if (!rows.length) return '';
+    const on = rows.map(r => (state && state.layers[r.id] === false)
+                             ? '(' + r.id + ')' : r.id);
+    return `${(state && state.name) || ''}: ${on.join(' -> ')}`;
   }
 
   /** The integer decimation to ask the server for at this zoom.
@@ -109,7 +294,8 @@ const MapModel = (() => {
     [state.ox + sx / state.zoom, state.oy + sy / state.zoom];
 
   /** Zoom about a screen point, so the art under the cursor stays under it.
-   *  `steps` is signed wheel notches. */
+   *  `steps` is signed wheel notches and MAY BE FRACTIONAL -- `wheelNotches`
+   *  returns a fraction for a trackpad or a high-resolution wheel. */
   function zoomAt(state, steps, sx, sy) {
     const zoom = clampZoom(state.zoom * Math.pow(WHEEL, steps));
     if (zoom === state.zoom) return state;
@@ -148,7 +334,14 @@ const MapModel = (() => {
     const z = tileLevel(state.zoom);
     const span = TILE * z;                       // art pixels per tile
     const size = span * state.zoom;              // display pixels per tile
-    const wanted = layers || LAYERS.filter(l => state.layers[l]);
+    // THE STATE'S ORDER, not `LAYERS`. The PNG fallback path draws these in
+    // the order they come back in, so a reorder in the panel has to reach it
+    // here as well or the two renderers show different pictures for the same
+    // panel. `state.order` holds per-plane ids (`background:3`), which
+    // `/api/mapedit/tile` now accepts.
+    const wanted = layers
+      || (state.order ? state.order.filter(l => state.layers[l] !== false)
+                      : LAYERS.filter(l => state.layers[l]));
     const tx0 = Math.max(0, Math.floor(state.ox / span));
     const ty0 = Math.max(0, Math.floor(state.oy / span));
     const tx1 = Math.floor((state.ox + viewW / state.zoom) / span);
@@ -384,14 +577,26 @@ const MapModel = (() => {
         // `stale` draws: the file is a valid map and the user can see it in
         // their own folder, so refusing would look like a bug. The note is
         // what carries the warning.
+        //
+        // `archive` DRAWS TOO, and leaving it out greyed every map on the
+        // newest client. A `.DMap` shipping only inside a per-map `.7z` is
+        // the NORM from 5517 on -- `mapedit._row` says so in its own comment
+        // -- and those rows open, parse and render like any other. Measured:
+        // 7878 is 730 of 730 `archive`, so ALL 730 were presented as
+        // unusable while the editor drew every one of them; 6090 greyed 48,
+        // 5517 greyed 11. The state is NEWER THAN THE CONDITION, which is why
+        // this read as fine when it was written and is wrong now.
+        // Pinned by `tests/test_mapedit_picker_drawable.py`.
         drawable: r.state === 'ok' || r.state === 'mismatch'
-                  || r.state === 'stale',
+                  || r.state === 'stale' || r.state === 'archive',
         note: r.why || STATE_NOTE[r.state] || '',
       }));
   }
 
-  return { TILE, ZOOMS, LAYERS, MIN_ZOOM, MAX_ZOOM,
-           create, tileLevel, fitZoom, fit, centreOn,
+  return { TILE, ZOOMS, LAYERS, MIN_ZOOM, MAX_ZOOM, WHEEL, BUTTON_NOTCHES,
+           mapLayers, defaultOrder, orderedLayers, activeLayers,
+           moveLayer, resetOrder, orderText,
+           create, tileLevel, fitZoom, fit, centreOn, wheelNotches, zoomPercent,
            artToScreen, screenToArt, zoomAt, panBy, clamp,
            visibleTiles, tileQuery, outlines, corner, diamond,
            inspector, pickerRows };

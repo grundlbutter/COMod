@@ -53,6 +53,126 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
 sys.path.insert(0, str(HERE))
+# `core/` explicitly, rather than as a side effect of `import bodyfacets`
+# (which prepends it on line 53 of its own file).  The pin below has to run
+# BEFORE `import coassets`, so it cannot wait for another module to arrange
+# its imports for it.
+sys.path.insert(0, str(PROJECT / "core"))
+
+#: Exit code for **nothing was measured**, the same value and the same meaning
+#: as `routeb.corpus.EXIT_NOT_MEASURED`.  Duplicated rather than imported:
+#: this runs before `sys.path` is fully arranged and before any Route B code
+#: is importable, and a suite that cannot start must not depend on the module
+#: it would have to import to say so.  The invariant, ruled 2026-08-26 in
+#: `docs/routeb_corpus_refusal_2026-08-26.md`:
+#:
+#:     exit 0   the measurement ran and reproduced
+#:     exit 1   the measurement RAN and disagreed
+#:     exit 3   NOTHING WAS MEASURED -- no figure exists
+#:
+#: A suite that refuses to start has produced no verdict, so 3 rather than 1:
+#: a mistyped `--install` must not read as a red suite.
+EXIT_NOT_MEASURED = 3
+
+
+def _pin_install_from_argv(argv=None) -> str:
+    r"""Honour ``--install PATH`` by making it this process's ``CO_ROOT``.
+
+    **The flag is implemented AS the environment variable, and that is the
+    whole of its correctness.** This file resolves the install
+    **29 times independently** -- `coroot.default_root()` at 13 call sites and
+    `__import__("coroot").default_root()` at 16 more, inside test bodies --
+    besides the module-level `DEFAULT_ROOT` that `coassets` computes at import.
+    A `--install` that set some module global would reach the tests that read
+    that global and none of the others, which is exactly
+    `docs/routeb_install_pinning_2026-08-15.md` C3: a flag accepted, printed
+    and ignored, reporting one client's numbers while claiming another's.
+    Setting `CO_ROOT` reaches **every** site by construction, including ones
+    added later by someone who never read this docstring.
+
+    So this must run **before `import coassets`**, whose module-level
+    ``DEFAULT_ROOT = coroot.default_root()`` is the earliest resolution in the
+    process. That is why it sits between the `sys.path` setup and the project
+    imports rather than in `_main()`, where a flag would normally be parsed.
+
+    Explicit beats environment, per `core/coroot.py`'s committed contract, so
+    ``--install`` overwrites an existing ``CO_ROOT`` rather than conflicting
+    with it.
+
+    Refuses, rather than falling back to the configured install:
+
+    * ``--install`` with no value            -> exit 3
+    * ``--install`` naming a non-install     -> exit 3, ``NOT AN INSTALL``
+    * ``CO_ROOT`` naming a non-install       -> exit 3, ``NOT AN INSTALL``
+
+    The third is not this flag's business and is handled here anyway, because
+    it is the "Known limit, not fixed" of
+    `docs/routeb_install_pinning_2026-08-15.md`: a bogus ``CO_ROOT`` surfaces
+    as a raw `RootNotHonoured` traceback out of `coassets`'s import and exits
+    **1**, i.e. *nothing was measured* wearing *a measurement disagreed*'s exit
+    code. Closed for this suite only -- `core/` is not this file's surface --
+    by asking `coroot.env_refusal()`, the predicate `find()` itself uses, one
+    line before the import that would have raised.
+
+    Returns the honoured path as a string, or ``""`` when nothing was pinned.
+    """
+    import coroot as _coroot
+
+    argv = sys.argv if argv is None else argv
+    want = ""
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--install":
+            if i + 1 >= len(argv):
+                print("[test_viewer] --install needs a path -- REFUSING TO "
+                      "MEASURE", file=sys.stderr, flush=True)
+                raise SystemExit(EXIT_NOT_MEASURED)
+            want = argv[i + 1]
+            del argv[i:i + 2]
+            continue
+        if a.startswith("--install="):
+            want = a.split("=", 1)[1]
+            del argv[i]
+            continue
+        i += 1
+
+    if want:
+        # `looks_like_root`, not "the directory exists" -- the distinction this
+        # whole file's `requires_base` docstring is about, applied to the flag.
+        if not _coroot.looks_like_root(Path(want)):
+            print(f"[test_viewer] NOT AN INSTALL -- REFUSING TO MEASURE: "
+                  f"{want}", file=sys.stderr, flush=True)
+            print("[test_viewer] declining to fall back to the configured "
+                  "install; nothing was measured",
+                  file=sys.stderr, flush=True)
+            raise SystemExit(EXIT_NOT_MEASURED)
+        os.environ[_coroot.ENV_VAR] = str(Path(want))
+        _coroot.invalidate_cache()
+        return str(Path(want))
+
+    refusal = _coroot.env_refusal()
+    if refusal is not None:
+        print(f"[test_viewer] NOT AN INSTALL -- REFUSING TO MEASURE: "
+              f"{_coroot.ENV_VAR}={os.environ.get(_coroot.ENV_VAR)!r}",
+              file=sys.stderr, flush=True)
+        print(str(refusal), file=sys.stderr, flush=True)
+        raise SystemExit(EXIT_NOT_MEASURED)
+    return ""
+
+
+#: The path `--install` pinned, or "" when the install was resolved ambiently.
+#: Printed by `_measured_on`, so a transcript says whether the install was
+#: *chosen* or *discovered* -- the difference that makes two rigs' failure
+#: counts comparable or not.
+#:
+#: **argv is only read when this file IS the program.** `tools/gatematrix.py`
+#: imports this module through `spec_from_file_location`, and a flag scan at
+#: import time would eat an unrelated `--install` out of ITS command line and
+#: silently re-aim a run it does not own. The `CO_ROOT` refusal is unconditional
+#: because it is a statement about the process, not about anyone's argv.
+PINNED_INSTALL = _pin_install_from_argv(
+    None if __name__ == "__main__" else [])
 
 import bodyfacets                                # noqa: E402
 import c3phy                                     # noqa: E402
@@ -86,6 +206,19 @@ HAVE_TILESET = (HERE / "tileset.py").is_file()
 HAVE_EXTRACTOR = (HERE / "extract_comod.py").is_file()
 
 
+def _thumb_manifest(name: str):
+    """The configured install's thumbnail manifest, where the viewer reads it.
+
+    `coroot.thumbs_dir` first (the shared folder, or an override), then a
+    cache still in the old per-checkout layout.
+    """
+    p = coroot.thumbs_dir() / name
+    if p.is_file():
+        return p
+    # the same read-only bridge `unify.UnifiedIndex.thumbs` uses
+    return coroot.find_derived("out/thumbs/" + name)
+
+
 def _thumbs_rendered(kind: str = "meshes") -> bool:
     """True only when a *complete* thumbnail corpus is on disk.
 
@@ -96,7 +229,7 @@ def _thumbs_rendered(kind: str = "meshes") -> bool:
     would fail for a reason that is a user's deliberate choice, not a bug.
     """
     name = "manifest_meshes.json" if kind == "meshes" else "manifest.json"
-    p = coroot.find_derived("out/thumbs/" + name)
+    p = _thumb_manifest(name)
     if p is None:
         return False
     try:
@@ -127,8 +260,10 @@ def requires_base(*kinds: str, why: str = ""):
     """Skip unless the configured install is one of ``kinds``.
 
     `HAVE_ROOT` answers "does a directory exist", which is the wrong question
-    for any test that asserts a fact about *particular* game data. This machine
-    holds eight installs and the suite's fixtures were written against CCO 2.0;
+    for any test that asserts a fact about *particular* game data. This box
+    holds **33** installs (measured 2026-08-29; this line said *eight* until
+    then, as did `coroot`'s own docstring) and the suite's fixtures were
+    written against CCO 2.0;
     run them on a patch client and they fail -- reporting identically to a real
     regression, so the only way to read the suite is to diff the failure set
     against a remembered one. That is what made 45 failures and 9 errors
@@ -154,6 +289,173 @@ def requires_base(*kinds: str, why: str = ""):
     if why:
         reason += f" ({why})"
     return unittest.skipUnless(have in want, reason)
+
+
+# ---------------------------------------------------------------------------
+# DECLARED INSTALLS -- the test names the install, and a MISSING PIN FAILS
+# ---------------------------------------------------------------------------
+#
+# `requires_base` above is the SKIP family, and it answers a different
+# question. It asks what the *ambient* install was declared as and stands the
+# test down when that is not the kind it wants. Right for a fixture that needs
+# a *kind*; it cannot express the thing below, and the difference is the whole
+# reason both exist:
+#
+#     requires_base      the AMBIENT install decides which tests run
+#     DeclaredInstall    the TEST decides which install it measures
+#
+# **A number is a fact about one install.** Nine tests in this file carried
+# such numbers -- 181 maps, 95 status rows, 68 placements, the Storekeeper's
+# name -- while reading whatever `coassets.DEFAULT_ROOT` happened to resolve
+# to. Each was green on the box it was written on and red everywhere else,
+# and that red is indistinguishable from a regression: it accuses the code of
+# a defect it does not have. `docs/two_reds_one_install_2026-08-26.md` is the
+# case that forced the ruling -- a mod installed into the LIVE CCO at
+# 2026-08-25T21:07Z reddened tests whose subject was never touched.
+#
+# **A MISSING PIN FAILS, IT NEVER SKIPS.** `core/coroot.py` already refuses
+# loudly when a WRONG base is declared (`RootNotHonoured`) and defaults
+# *silently* when NONE is; closing that second half is the point of this
+# class. A skip is a silence, and this whole episode exists because a silence
+# was read as an answer -- `tests/test_npcaltskin.py` carries the same rule
+# and the same sentence, after a nonexistent pin there turned a class into
+# `OK (skipped=24)`, a green verdict over an instrument that measured nothing.
+#
+# **The raise happens PER TEST, by name, never from `setUpClass`.** A
+# class-level raise removes every test in the class from `testsRun` and
+# records ONE holder -- see `_main`'s note on the same hazard -- so the test
+# name vanishes from the report, and a test that stopped running reads
+# exactly like a test that got fixed. Classes below that need the pin during
+# fixture construction stash the failure and re-raise it from `setUp`.
+#
+# Only the NAME is spelled here. The SEARCH PATH comes from `coroot`, which
+# `tests/test_sanitization.py` makes the one file allowed to hold an install
+# path -- and a directory name is not a path.
+#
+# **AND A NAME IS NOT THE INSTALL EITHER.** Every pin below also records a
+# CONTENT fingerprint (`coroot.pin_fingerprint`), because the name half of
+# this class was doing all the work until 2026-09-07 and a drifted `5517`
+# satisfied it. The two halves answer different questions -- *is the right
+# directory here* and *is the right client in it* -- and the second one is
+# the one the asserted numbers actually depend on.
+#
+# Naming an install is not new in this file -- `TheDeclaredMeshBeatsTheDerived
+# One` names 7878, `_install_with` walks 6609/7878/5517 -- but those sites all
+# `skipTest` when the install is absent, and that is the half this class
+# changes. For the nine tests pinned below, absence is a FAILURE, by owner's
+# ruling 2026-08-28. It is per test, so adopting it elsewhere is a decision
+# somebody makes deliberately rather than one that spreads by being nearby.
+#: Process cache for `DeclaredInstall.path`, keyed ``(name, covers)``.
+#:
+#: `coroot.pin_fingerprint` is MEASURED at 31-229 ms warm and 0.5-3.6 s COLD
+#: per install, and four of the pins below name 5517. Without this the pin
+#: check would cost more than several of the tests it guards. Cached in the
+#: TEST module and not in `coroot` on purpose: the client-modifying tools
+#: legitimately rewrite an install mid-process and must keep seeing the truth;
+#: a test run does not write to the clients tree at all.
+_PIN_FP_CACHE: dict = {}
+
+
+class DeclaredInstall:
+    """One install, named AND fingerprinted by the test that measures it.
+
+    `why` is not decoration: it is the record of what makes this install the
+    right one, and it is printed when the pin cannot be resolved, which is
+    the moment somebody needs it.
+
+    **THE NAME IS NOT THE INSTALL, and until 2026-09-07 this class only
+    checked the name.** A directory called ``5517`` whose content had drifted
+    -- a mod dropped in, a half-finished re-extract, a repack under a
+    borrowed name -- satisfied this pin and would have been REFUSED by
+    `routeb/corpus.py`'s `RECORDED_FINGERPRINT` over the same install one
+    directory away. Two mechanisms over one question, and only one of them
+    was checking anything. The residual was recorded in
+    `TwinCityCoverExport`'s docstring and in CORRECTIONS
+    ``C-2026-08-26-claude-vibeco-dx-camera-ambient-install``; this closes it.
+
+    `fingerprint` is REQUIRED, positionally impossible to forget, and there
+    is deliberately **no default and no None**. An optional fingerprint is
+    how the vacuous case comes back: a pin added without one would silently
+    be name-only again, and the check that "runs" over it would assert
+    nothing. `tests/test_pin_fingerprint.py` parses this file and
+    `tests/test_npcaltskin.py` with `ast` and fails on any pin site that omits
+    it, so the guarantee is a property of the TREE and not of anyone's memory.
+
+    `covers` names the subtrees, relative to the root, whose ``(path, size)``
+    manifest joins the ``ini/`` content digest -- see `coroot.pin_fingerprint`
+    for what that catches and, more usefully, what it does not. Empty
+    ``covers`` is a real answer, not a shrug: it says this pin's subject lives
+    in ``ini/``, which is hashed byte for byte.
+
+    RE-RECORDING is a code change with no flag and no environment variable,
+    for `routeb/corpus.py`'s reason: an escape hatch restores exactly the
+    ambient resolution the pin removes. The refusal prints the command that
+    produces the new value.
+    """
+
+    def __init__(self, name: str, why: str, fingerprint: str,
+                 covers: tuple = ()):
+        self.name = name
+        self.why = why
+        self.fingerprint = fingerprint
+        self.covers = tuple(covers)
+
+    def __str__(self) -> str:                        # pragma: no cover
+        return self.name
+
+    def path(self) -> Path:
+        """The declared install's root, or raise. NEVER returns a fallback.
+
+        Two ways to fail and they are deliberately the same KIND of failure
+        -- an `AssertionError`, never a skip -- because "the pin is not here"
+        and "the pin is not what it was" are both *this test measured
+        nothing*, and a skip is a silence that gets read as an answer.
+        """
+        seen = [str(d) for d in coroot.clients_search_dirs()]
+        found = None
+        for d in seen:
+            c = Path(d) / self.name
+            if c.is_dir():
+                found = c
+                break
+        if found is None:
+            raise AssertionError(
+                f"declared install {self.name!r} is not present under any of "
+                f"{seen} -- this test is PINNED to it on purpose ({self.why}) "
+                f"and must NOT fall back to the discovered install, because "
+                f"the numbers it asserts are that install's. "
+                f"A MISSING PIN FAILS, IT NEVER SKIPS.")
+
+        key = (self.name, self.covers)
+        got = _PIN_FP_CACHE.get(key)
+        if got is None:
+            got = _PIN_FP_CACHE[key] = coroot.pin_fingerprint(found,
+                                                              self.covers)
+        if got == self.fingerprint:
+            return found
+
+        detail = (f"its content fingerprint is {got}" if got else
+                  "its `ini/` could not be hashed at all, so the directory "
+                  "carries no identity to check and is not an install")
+        raise AssertionError(
+            f"DRIFTED PIN -- {self.name!r} at {found} is NOT the install "
+            f"these numbers were measured on.\n"
+            f"  recorded  {self.fingerprint}\n"
+            f"  found     {got or '(none)'}\n"
+            f"  {detail}\n"
+            f"  covers    {self.covers or '(ini/ only)'}\n"
+            f"  pinned because: {self.why}\n"
+            f"\n"
+            f"  THE NAME MATCHED AND THE CONTENT DID NOT. Nothing here is a\n"
+            f"  defect in the code under test: a figure measured against this\n"
+            f"  directory would read exactly like a regression and would not\n"
+            f"  be one -- which is the false regression this pin exists to\n"
+            f"  abolish, and which a name-only pin could not see.\n"
+            f"  What this install is now:\n"
+            f"    py -3 tools/pinfingerprint.py {self.name}\n"
+            f"  Restore the recorded install, or RE-MEASURE the numbers this\n"
+            f"  test asserts and re-record the fingerprint in the same commit.\n"
+            f"  A MISSING PIN FAILS AND SO DOES A DRIFTED ONE.")
 
 
 #: The compiled-table census, quoted by every gate that turns on ``.dbc``
@@ -939,7 +1241,7 @@ class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
     The bug (`C-2026-08-20-socket-root`): `attach` read `ini/RolePart.ini
     [Dumy]` from `coassets.DEFAULT_ROOT` -- a different root-resolution path
     from the one the viewer uses to choose the install it serves. On this rig
-    they disagreed, 7878 (53 entries) against 5517 (8), so a viewer showing
+    they disagreed, 7878 (52 entries) against 5517 (7), so a viewer showing
     7878 classified 3 of a model's 17 chunks as sockets instead of 15 and drew
     the other 12 attachment points as geometry: a textured box on the model.
 
@@ -1070,11 +1372,144 @@ class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
         srv.game_root = self.long_root
         self.assertTrue(coviewer.is_socket_chunk("v_head"))
 
+    def test_coviewer_never_asks_parts_for_sockets_without_a_root(self):
+        """The third socket test in this file, and the one that was missed.
+
+        `coviewer` has TWO ways to decide what a socket is. `is_socket_chunk`
+        (above) reads `ACTIVE_ROOT` and was fixed first. The other way is
+        `parts.socket_anchors` / `parts.body_bounds`, which reach
+        `attach.PartMesh.parse` and fall back to `DEFAULT_ROOT` when handed no
+        `root` -- a *silent* fallback, since a short `[Dumy]` list parses fine
+        and simply stops recognising attachment points. Having the first one
+        right is what made the second easy to call fixed: the callee learned to
+        take a `root` on 2026-08-17 and these seven call sites went on not
+        passing one until 2026-08-28.
+
+        Read out of the AST rather than by regex so a reflow of the call across
+        lines cannot make it pass. Source inspection is the right instrument
+        here because the defect is *the argument not being written*: the two
+        answers only diverge on a rig whose `CO_ROOT` differs from the served
+        install, so a behavioural test would pass on this box either way (see
+        `docs/socket_root_reapplied_2026-08-28.md`: 0 of 500 differ as this box
+        is configured, 45 of 500 with `CO_ROOT=6090`).
+
+        Falsifier: drop `root=` from any one of the call sites and this fails,
+        naming the line.
+
+        THE COUNT USED TO BE PINNED AT SEVEN AND THAT IS WHY THIS WAS RED ON
+        MASTER (2026-08-30). The pin was written 2026-08-28 by `ce16d81b` and
+        expired **one day later**: `7e4a98cf` fixed a real and unrelated defect
+        -- `/api/meshanim` declared `sockets` in its response and never wrote
+        it -- by adding an eighth call site, which passes `root=` correctly.
+        So the guard proper was green and the *census* was red, for a day, on
+        a commit that had done nothing wrong. That commit even re-measured its
+        own scope; it had no reason to know a test in another file counted
+        these.
+
+        AND IT STAYED RED BECAUSE OF WHERE THE CENSUS LIVES. `test_viewer.py`
+        is a `long` gate -- it runs only under `gates.py --long`. `7e4a98cf`'s
+        recorded gate evidence is targeted suites plus `gates.py --check`, so
+        the one test that counted its call sites never ran. **A census in a
+        long-only gate, over source that fast-gated commits routinely edit, is
+        a tripwire nobody standing next to it can see.** That is an argument
+        for the assertion not being a census, which is what it now is not.
+
+        The count was carrying a real job -- the scan keys on the module
+        prefix, so **renaming the import alias would make it find nothing and
+        pass vacuously**. That job is now done properly instead of by proxy:
+        the alias is READ OUT OF `coviewer`'s OWN IMPORTS, so the scan follows
+        a rename rather than being blinded by one, and `from parts import
+        socket_anchors` is followed too. What remains is a non-vacuity
+        assertion on the import scan and on the call scan, neither of which
+        can go stale when somebody adds a route.
+
+        The residual limit, stated rather than left to be discovered: an alias
+        laundered through a local (`p = partsmod; p.socket_anchors(...)`) is
+        invisible to this, as it is to any AST scan that does not do dataflow.
+        No call site in the file is written that way today.
+        """
+        import ast
+        src = (Path(__file__).resolve().parent / "coviewer.py").read_text("utf-8")
+        tree = ast.parse(src)
+        watched = {"socket_anchors", "body_bounds"}
+
+        # Whatever `coviewer` calls the parts module, and whatever it pulled
+        # out of it by name. Derived, never assumed.
+        aliases, direct = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for al in node.names:
+                    if al.name == "parts":
+                        aliases.add(al.asname or al.name)
+            elif isinstance(node, ast.ImportFrom) and node.module == "parts":
+                for al in node.names:
+                    if al.name in watched:
+                        direct.add(al.asname or al.name)
+        self.assertTrue(
+            aliases or direct,
+            "coviewer.py imports `parts` in a form this scan does not read, "
+            "so every assertion below would pass over nothing")
+
+        bare, found = [], 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if (isinstance(f, ast.Attribute) and f.attr in watched
+                    and isinstance(f.value, ast.Name) and f.value.id in aliases):
+                label = "%s.%s" % (f.value.id, f.attr)
+            elif isinstance(f, ast.Name) and f.id in direct:
+                label = f.id
+            else:
+                continue
+            found += 1
+            if not any(k.arg == "root" for k in node.keywords):
+                bare.append("line %d: %s" % (node.lineno, label))
+        self.assertEqual(bare, [], "coviewer classifies with DEFAULT_ROOT at "
+                                   + "; ".join(bare))
+        # An empty `bare` is only clean if the scan could have found anything.
+        # A floor, not a census: it fails when the scan goes blind and stays
+        # quiet when somebody legitimately adds a caller.
+        self.assertGreater(found, 0,
+                           "no %s call found in coviewer.py at all -- the "
+                           "assertion above passed over nothing"
+                           % " / ".join(sorted(watched)))
+
+    # -- the four callers that parse bare bytes ---------------------------
+    # `coviewer` was fixed first because it is the one a person watches.
+    # These four were left, and the residual is recorded in
+    # docs/CORRECTIONS.md as the unfinished half of
+    # `C-2026-08-20-socket-root`: `parts.moti_sockets`, `parts.body_bounds`,
+    # `thumbs.mesh_geometry` and `superfx._bbox` each classified under
+    # `DEFAULT_ROOT` because `PartMesh.parse` is handed bytes and had
+    # nowhere to put the install they came from.
+    #
+    # RECOVERED 2026-09-03 from claude/amazing-hertz-9f6567 before retiring
+    # it. That branch was an integrator's RESCUE of a session's stranded
+    # worktree -- 216 added lines, of which 204 had since reached master by
+    # another route. These twelve comment lines were the entire residue, and
+    # deleting the branch as "unverified WIP" would have taken them with it.
     def _mesh(self, *chunks) -> bytes:
         """A minimal MAXFILE container: one PHY4 per name, then one MOTI each.
 
         All PHY chunks first and all MOTI chunks after, which is the layout
         `attach.PartMesh.parse` pairs by ordinal rather than by adjacency.
+
+        Synthesised rather than read from an install, so the guard does not
+        depend on which clients this rig holds. **The separation is a
+        load-bearing parameter, not decoration.** `_asset` places `v_body` at
+        the origin and `v_head` 500 units away so the two bounds-takers have
+        something to *disagree* about: a socket counted as geometry drags the
+        box out to enclose it, which is the measurable form of the same miss
+        that draws a textured box on the model in the viewer.
+
+        Measured, because "load-bearing" is a claim: collapse the 500 to 0 and
+        `test_parts_body_bounds_reads_the_bytes_own_install` and
+        `test_superfx_bbox_reads_the_meshs_own_install` FAIL -- the two that
+        compare boxes, and only those two. So the fixture reports its own
+        loss of discrimination rather than passing quietly, which is the
+        opposite of what a shrunken fixture usually does and is worth not
+        having to re-derive.
         """
         import c3write
         out = bytearray(c3phy.C3_MAGIC)
@@ -1096,7 +1531,15 @@ class TheSocketTestFollowsTheInstallBeingDrawn(unittest.TestCase):
         return bytes(out)
 
     def _asset(self) -> bytes:
-        """A body whose one attachment point is 500 units off the geometry."""
+        """A body whose one attachment point is 500 units off the geometry.
+
+        Synthesised rather than read: two triangles, `v_body` at the origin
+        and `v_head` 500 units away, each with its own identity MOTI. THE
+        500 IS WHAT MAKES THE TWO BOUNDS-TAKERS DISCRIMINATE -- a socket
+        counted as geometry drags the box out to enclose it, which is the
+        measurable form of the same miss that draws a textured box in the
+        viewer.
+        """
         return self._mesh(("v_body", 0.0), ("v_head", 500.0))
 
     def test_parts_moti_sockets_reads_the_bytes_own_install(self):
@@ -1400,6 +1843,143 @@ class TwoViewersMustNotShareOnePort(unittest.TestCase):
                       (10013, 10048), f"unexpected refusal: {cm.exception}")
 
 
+class TheListenBacklogHoldsAColdPageLoad(unittest.TestCase):
+    r"""`request_queue_size`, and the premise that makes a short one fatal.
+
+    THE DEFECT, measured 2026-09-30. `ViewerServer` never overrode
+    `socketserver.TCPServer.request_queue_size`, so it listened with a queue of
+    5 while `tools/webui/effects.html` presents a cold burst of 13 subresources
+    over up to 6 connections. `tests/test_texbundle_endpoint.py` and
+    `tests/test_texbundle_cache.py` red in `setUpClass` on
+    `typeof window.CoEffects === 'object'` when the burst overflowed it: from
+    Chrome's own net log, `ERR_CONNECTION_REFUSED` on eight scripts including
+    `effects.js`, and from the server's own request log (`COVIEWER_VERBOSE=1`)
+    not one of those eight ever accepted. Two arms, two CHECKOUTS rather than a
+    knob, strictly interleaved, 20 draws each:
+
+        queue 5     3 red / 20      5 draws saw a refusal
+        queue 128   0 red / 20      0 draws saw a refusal
+
+    one-sided Fisher p = 0.024 on the refusals. Independently replicated by
+    another seat, by a different method (knob against knob, rate only):
+    7/60 red at 5 against 0/60 at 128, p ~ 0.008.
+
+    NOTE WHICH ARM CARRIES THE RESULT. On the red count alone, 3/20 against
+    0/20 is p = 0.115 -- NOT significant. What makes this conclusive is the
+    mechanism, not the symptom: the refusal is named per URL by the net log and
+    absent from the server's accept log, and the intervention removes the
+    refusal itself. A seat that had counted only red and green would have
+    needed several times the draws to see anything.
+    """
+
+    #: The page whose cold load overflowed the queue. Counted from the MARKUP,
+    #: because a regex over the whole file counts `/ui/effects.js` twice -- line
+    #: 449 quotes that tag inside an HTML comment, which is how a first census
+    #: got 14.
+    PAGE = "effects.html"
+
+    def _subresources(self):
+        import coviewer
+        import re
+        src = (Path(coviewer.__file__).resolve().parent / "webui"
+               / self.PAGE).read_text(encoding="utf-8")
+        # Strip comments FIRST, then count, for the reason in `PAGE`.
+        bare = re.sub(r"<!--.*?-->", "", src, flags=re.S)
+        return (re.findall(r"<script\s[^>]*\bsrc=", bare)
+                + re.findall(r"<link\s[^>]*\bstylesheet", bare))
+
+    def test_the_backlog_is_not_socketservers_default(self):
+        """The pin, and the must-fire: deleting the override reds here.
+
+        A separate assertion from the sizing one below because they fail for
+        different reasons -- this one catches the override being REMOVED, which
+        is the regression that actually happened for the life of this tool.
+        """
+        import coviewer
+        import socketserver
+        self.assertNotEqual(
+            coviewer.ViewerServer.request_queue_size,
+            socketserver.TCPServer.request_queue_size,
+            "ViewerServer is back on socketserver's default backlog (%d). That "
+            "is listen(%d) for every page this tool serves, and on Windows an "
+            "overflowed accept queue answers RST -- the browser reports "
+            "ERR_CONNECTION_REFUSED and does not retry a subresource, so the "
+            "page reaches readyState 'complete' permanently missing scripts."
+            % (socketserver.TCPServer.request_queue_size,
+               socketserver.TCPServer.request_queue_size))
+
+    def test_the_backlog_covers_the_burst_the_page_presents(self):
+        """Sized against the PAGE, not against a number somebody liked.
+
+        Tying the assertion to the real subresource count is what keeps this
+        honest if the page grows: a queue that was comfortable at 13 is the
+        same defect again at 200.
+        """
+        import coviewer
+        n = len(self._subresources())
+        self.assertGreaterEqual(
+            n, 13, "counted %d subresources in %s; this gate's own premise "
+                   "has drifted and the count needs re-deriving" % (n, self.PAGE))
+        self.assertGreaterEqual(
+            coviewer.ViewerServer.request_queue_size, n,
+            "backlog %d is smaller than the %d subresources %s asks for on a "
+            "cold load" % (coviewer.ViewerServer.request_queue_size, n,
+                           self.PAGE))
+
+    @unittest.skipUnless(os.name == "nt", "measured on Windows only")
+    def test_an_overflowed_queue_fails_instead_of_waiting(self):
+        """THE PREMISE OF THE FIX, asserted rather than believed.
+
+        If a full accept queue merely made connections WAIT for a slot, a short
+        backlog would cost latency and there would be no defect -- only a slow
+        page. It does not: the bound is honoured exactly and every attempt past
+        it FAILS, which is what a browser reports as ERR_CONNECTION_REFUSED and
+        never retries for a subresource.
+
+        RAW sockets, and `ViewerServer` deliberately not involved: this is a
+        claim about the platform, so if it ever stops being true the reader
+        meets a failing test naming the assumption instead of a comment nobody
+        can check.
+
+        THE TRAP THIS TEST FELL INTO FIRST, recorded because it is invisible
+        and it reds three times identically. With `settimeout()` set, Python
+        connects non-blocking and waits in `select`, and the refusal surfaces
+        as `TimeoutError` instead of `ConnectionRefusedError` -- so the first
+        version of this test reported "this platform now DROPS instead of
+        refusing" on a platform that was refusing perfectly well, and would
+        have been read as REFUTING the fix it was written to support. The
+        connect below is BLOCKING for exactly that reason.
+        """
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(srv.close)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)                          # never accepted
+        port = srv.getsockname()[1]
+        ok, fails = 0, []
+        for _ in range(12):
+            c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.addCleanup(c.close)
+            try:
+                c.connect(("127.0.0.1", port))   # BLOCKING -- see the docstring
+                ok += 1
+            except OSError as e:
+                fails.append(e)
+                break
+        self.assertTrue(
+            fails, "12 connections all succeeded against listen(1) with nothing "
+                   "accepting them. If the queue is no longer a bound, the "
+                   "backlog override in ViewerServer is not load-bearing.")
+        self.assertIsInstance(
+            fails[0], ConnectionRefusedError,
+            "a full accept queue failed with %r rather than refusing. A "
+            "TimeoutError here usually means this connect stopped being "
+            "blocking -- see the docstring -- not that the platform changed."
+            % (fails[0],))
+        self.assertLessEqual(
+            ok, 4, "listen(1) admitted %d connections before failing; the queue "
+                   "bound is much looser than this fix assumes" % ok)
+
+
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
 class Resolution(unittest.TestCase):
     """Provenance -- 'pointing towards the files in question'."""
@@ -1549,6 +2129,98 @@ class Resolution(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
+class TheDeclaredMeshBeatsTheDerivedOne(unittest.TestCase):
+    """`resolve_garment` must prefer the install's DECLARED mesh id.
+
+    The garment rule DERIVES a key from the id it is handed -- the last six
+    digits, plus a body-type prefix. The install states the answer instead:
+    every single-part section of `armor.ini` carries `Mesh0=`, already parsed
+    into `PartRef.mesh` and already used by `resolve_appearance`. It was never
+    consulted by `resolve_garment`, which derived a key instead.
+
+    Measured on 7878's `armor.ini` when this landed -- 955 sections, the whole
+    table, resolver output compared row by row against master:
+
+        GAINED  (None -> a file)   21
+        LOST    (a file -> None)    0
+        CHANGED (file -> file)      4
+
+    The four are the point. `1132000`, `2132000`, `3132000` and `4132000` all
+    DERIVE to `c3/body/7132000.c3` and all DECLARE `1135000`, so the derived
+    rule showed the wrong armour on four body types at once.
+
+    LOST must stay 0: the declaration is tried FIRST and the derived key
+    remains as the fallback, because 83 rows resolve only by the derived key.
+    A rule that replaced rather than preceded it would lose them.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import coroot
+        from coassets import AssetRoot
+        cls.root = coroot.clients_dir() / "7878"
+        if not (cls.root / "ini" / "armor.ini").is_file():
+            raise unittest.SkipTest(
+                "needs install 7878 with ini/armor.ini at %s -- this test names "
+                "the install it measures, because a garment count is a fact "
+                "about ONE install" % cls.root)
+        cls.ar = AssetRoot(str(cls.root))
+        cls.DIRS = ("body", "armet", "weapon", "mount", "head", "hair", "mesh")
+
+    def test_the_four_known_disagreements_resolve_to_the_DECLARED_mesh(self):
+        """The falsifier. Revert the declared-first ordering and these four go
+        back to 7132000, which is what shipped before and was wrong."""
+        for ident in ("1132000", "2132000", "3132000", "4132000"):
+            with self.subTest(ident=ident):
+                self.assertEqual(self.ar._declared_mesh(ident),
+                                 ident[0] + "135000",
+                                 "armor.ini's own Mesh0 for this row")
+                got = self.ar.resolve_garment(ident, self.DIRS, ".c3")
+                self.assertIsNotNone(got, "%s must still resolve" % ident)
+                self.assertEqual(got[1], "7135000",
+                                 "%s resolved to the DERIVED mesh, not the "
+                                 "declared one" % ident)
+
+    def test_a_multi_part_appearance_declares_nothing_and_falls_through(self):
+        """A multi-part row has no single mesh. Taking `parts[0]` for it would
+        be a guess, so `_declared_mesh` returns None and the derived rule --
+        which is what answered those rows before -- still does."""
+        multi = [a.ident for ini in self.ar.part_tables().values()
+                 for a in ini if len(a.parts) > 1]
+        if not multi:
+            self.skipTest("this install ships no multi-part appearance, so the "
+                          "fall-through cannot be exercised here")
+        for ident in multi[:5]:
+            with self.subTest(ident=ident):
+                self.assertIsNone(self.ar._declared_mesh(ident))
+
+    def test_the_declaration_does_not_LOSE_a_row_the_derived_rule_resolved(self):
+        """The regression arm, and the reason declared-first is an ORDERING and
+        not a replacement. 83 rows on 7878 resolve only by the derived key."""
+        import re
+        raw = (self.root / "ini" / "armor.ini").read_bytes().decode("latin1")
+        idents = re.findall(r"\[(\d+)\]", raw)
+        self.assertGreater(len(idents), 100, "armor.ini parsed to almost "
+                                             "nothing -- the test would be vacuous")
+        unresolved_with_a_declaration = 0
+        for ident in idents:
+            if self.ar._declared_mesh(ident) is None:
+                continue
+            if self.ar.resolve_garment(ident, self.DIRS, ".c3") is None:
+                unresolved_with_a_declaration += 1
+        # Not asserting a count: it is install-specific. Asserting that the
+        # resolver still answers for the rows it answered for before is done
+        # by the four above plus the suite; this arm guards the SHAPE -- a
+        # declaration that resolves to nothing must not shadow a derived key
+        # that does.
+        for ident in ("1130000", "1130100"):
+            if self.ar._declared_mesh(ident):
+                self.assertIsNotNone(
+                    self.ar.resolve_garment(ident, self.DIRS, ".c3"),
+                    "%s resolved before the declaration was consulted and must "
+                    "still resolve" % ident)
+
+
 class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
     r"""`Catalog.resolve_id` / `Catalog.exists` must answer about the INSTALL,
     not about `out/wdf/*_names.json`.
@@ -1634,10 +2306,27 @@ class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
         self.assertTrue(self.cat.tables, "no part tables loaded")
 
     def test_resolve_id_agrees_with_the_container_over_every_row(self):
-        """Every appearance row of every part table, mesh and texture.
+        r"""Every appearance row of every part table, mesh and texture.
 
         `bite` is the second control: at least one resolution must come back
         from the hash path -- a path the stripped name set does not contain.
+
+        COMPARED CASE-INSENSITIVELY, AND THE CASE IS PINNED SEPARATELY RATHER
+        THAN DROPPED. `Catalog`'s namespace is lowercased at construction --
+        `_scan_loose` lowercases every name, `exists()` lowercases its
+        argument, `_path_set` membership is a lowercase test -- while
+        `AssetRoot` returns whatever spelling the declaring table used. The
+        two are not free to differ: `resolve_id`'s answer is fed straight back
+        into `_path_set` lookups (the `.dds` sibling probe), so a mixed-case
+        return would miss a file that is there. So the assertion below is
+        "the same file", and `test_resolve_id_answers_in_the_lowercase_
+        namespace` is "and in this class's spelling" -- which together say
+        strictly more than the exact-equality check they replace.
+
+        The case that forced the split is real, not hypothetical: this
+        install's own table declares `c3/hair/5119078.C3` with an uppercase
+        extension, and `armet[001119360]`'s mesh `100000000` reaches it only
+        through the declaration.
         """
         bite = 0
         checked = 0
@@ -1646,7 +2335,8 @@ class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
                 mine = self.cat.resolve_id(ref, kind)
                 theirs = self._oracle(ref, kind)
                 self.assertEqual(
-                    mine, theirs,
+                    mine.lower() if mine else mine,
+                    theirs.lower() if theirs else theirs,
                     f"{table}[{ident}] {kind} {ref!r}: the catalogue says "
                     f"{mine!r}, the container says {theirs!r}")
                 checked += 1
@@ -1658,6 +2348,29 @@ class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
             f"{checked} references checked and not one resolved through the "
             f"hash lookup -- the fixture is not exercising the path this test "
             f"exists to guard")
+
+    def test_resolve_id_answers_in_the_lowercase_namespace(self):
+        """The other half of the comparison above -- see its docstring.
+
+        Every branch of `resolve_id` must return a path in the spelling
+        `_path_set` uses, because the caller's next move is a `_path_set`
+        lookup. The DECLARED branch is the one that can break this: it copies
+        a path out of `ini/c3.wdb` or `ini/3dobj.ini`, and those tables spell
+        directories `c3/Mount/`, `c3/MountSaddle/` and extensions `.C3`.
+        """
+        checked = 0
+        for _table, _ident, pr in self._rows():
+            for ref, kind in ((pr.mesh, "mesh"), (pr.texture, "texture")):
+                got = self.cat.resolve_id(ref, kind)
+                if got is None:
+                    continue
+                checked += 1
+                self.assertEqual(
+                    got, got.lower(),
+                    f"resolve_id({ref!r}, {kind!r}) returned {got!r}, which is "
+                    f"not in the lowercase namespace Catalog indexes -- a "
+                    f"`_path_set` lookup on it will miss a file that is there")
+        self.assertGreater(checked, 100, "no reference resolved at all")
 
     def test_exists_agrees_with_the_container(self):
         """`Catalog.exists` is injected into assetcat, mapindex, unify,
@@ -2398,9 +3111,16 @@ class ThumbnailFallbackTrustsContent(unittest.TestCase):
         if not self.cat.exists(tex):
             self.skipTest("this base ships no sample texture")
         self.assertTrue(looks(tex))
-        self.assertNotIn("read", self.coviewer.Handler.__dict__,
-                         "Handler grew its own read(); _looks_like_dds must "
-                         "be re-checked -- it deliberately uses cat.read")
+        # It used `cat.read` and now uses `cat.peek` (2026-09-18: the 6x in
+        # its docstring was the cost of `AssetRoot` having no `peek`, not of
+        # sniffing). The guard follows the method actually called -- a guard
+        # still watching `read` would protect nothing -- and keeps `read`,
+        # because a Handler.read would shadow Catalog.read for other callers.
+        for name in ("peek", "read"):
+            self.assertNotIn(name, self.coviewer.Handler.__dict__,
+                             f"Handler grew its own {name}(); _looks_like_dds "
+                             f"must be re-checked -- it deliberately uses "
+                             f"cat.peek")
 
 
 @unittest.skipUnless(HAVE_ROOT, "game install not present")
@@ -3924,7 +4644,23 @@ class AttachmentChain(unittest.TestCase):
         # ...and EVERY grouped mesh must still yield sockets. Under adjacency
         # pairing all 403 of these produce none at all and fall back silently to
         # a rotation-less estimate.
-        checked = broken = 0
+        #
+        # THE TWO FAILURES ARE COUNTED SEPARATELY BECAUSE ONLY ONE OF THEM IS
+        # THE BUG. The adjacency bug produced NO SOCKETS AT ALL -- that is
+        # `silent`, and it stays at 0. A mesh that yields a socket set without
+        # `v_armet` is a different statement: it has been read correctly and
+        # has no headgear mount. That case became reachable on 2026-09-06,
+        # when `Catalog.resolve_id` started consulting the install's own
+        # `ini/c3.wdb` / `ini/3dobj.ini` declaration and `body[472000000]`
+        # -- a MONSTER body, `c3/monster/472/1.c3` -- resolved for the first
+        # time. Measured: it yields `v_head, v_l_shield, v_l_weapon,
+        # v_mantle, v_pet, v_r_weapon` and no `v_armet`, which is what a
+        # monster body is. Rolling it into `broken` would have reported a
+        # correctly-read monster as the adjacency bug; asserting it away
+        # would have hidden a real one. So it is named, and any OTHER mesh
+        # landing in `no_armet` fails.
+        checked = silent = 0
+        no_armet = []
         for mesh in sorted(parsed):        # what PARSED, never `seen` -- an
             raw = self.cat.read(mesh)      # unparseable mesh survived loop 1
                                            # and raised here as an ERROR
@@ -3936,12 +4672,19 @@ class AttachmentChain(unittest.TestCase):
                 continue
             checked += 1
             socks = self.parts.moti_sockets(raw)
-            if not socks or "v_armet" not in socks:
-                broken += 1
+            if not socks:
+                silent += 1
+            elif "v_armet" not in socks:
+                no_armet.append(mesh)
         self.assertGreaterEqual(checked, 300, "expected grouped meshes to test")
-        self.assertEqual(broken, 0,
-                         f"{broken}/{checked} grouped meshes yielded no sockets "
-                         f"— that is the adjacency bug")
+        self.assertEqual(silent, 0,
+                         f"{silent}/{checked} grouped meshes yielded no sockets "
+                         f"at all — that is the adjacency bug")
+        self.assertEqual(
+            [m for m in no_armet if not m.startswith("c3/monster/")], [],
+            f"{len(no_armet)} grouped meshes yield sockets but no v_armet, and "
+            f"these are not the known monster bodies: {no_armet} — a body that "
+            f"reads clean and mounts no headgear is a finding, not a tolerance")
 
     def test_socket_reference_numbers(self):
         r"""The reference points from `attach.py --validate`, asserted so a
@@ -4138,11 +4881,33 @@ class AttachmentChain(unittest.TestCase):
             if max(abs(sx - 1), abs(sy - 1), abs(sz - 1)) > 0.01:
                 scaled += 1
         self.assertGreater(n, 1000, "expected most armets to ship a MOTI")
-        self.assertGreater(rotated / n, 0.3,
-                           f"only {rotated}/{n} armets carry a rotation — if "
+        # THE ABSOLUTE COUNT IS THE EVIDENCE; THE RATIO IS A PROXY FOR IT, AND
+        # ON 2026-09-06 THE DENOMINATOR MOVED WITHOUT THE EVIDENCE MOVING.
+        # `Catalog.resolve_id` began consulting the install's own declaration
+        # and 1,088 more `armet` rows resolved -- all of them `c3/hair/`
+        # meshes, LOST 0 and CHANGED 0 (measured by re-running this walk
+        # against origin/master's coviewer.py on the same install):
+        #
+        #     before  n=1,830  rotated=802 (43.8%)  scaled=1,019 (55.7%)
+        #     after   n=2,918  rotated=826 (28.3%)  scaled=1,050 (36.0%)
+        #     worst   180.0 degrees, both
+        #
+        # 24 MORE rotated headgears and 31 more scaled ones, smaller
+        # fractions, and not one of the 802 or the 1,019 lost. Dropping stage
+        # 2 still misorients 826 armets, which is the claim. Both numbers are
+        # pinned so a real regression -- rotations disappearing -- cannot hide
+        # behind a growing denominator, and the same is done to `scaled`.
+        self.assertGreater(rotated, 800,
+                           f"only {rotated} armets carry a rotation — if "
                            f"this drops, the hair-orientation evidence changed")
+        self.assertGreater(rotated / n, 0.25,
+                           f"only {rotated}/{n} armets carry a rotation — a "
+                           f"fall here with `rotated` intact means the "
+                           f"resolvable armet set grew again; check what "
+                           f"joined it before moving this number")
         self.assertGreater(worst, 170, "one family is a full 180 degree flip")
-        self.assertGreater(scaled / n, 0.4)
+        self.assertGreater(scaled, 1000, f"only {scaled} armets carry a scale")
+        self.assertGreater(scaled / n, 0.3, f"{scaled}/{n} armets scaled")
 
     def test_baking_the_part_motion_moves_the_geometry(self):
         """Whatever the matrix contains, opting in must actually change the
@@ -4229,7 +4994,9 @@ class EffectPlayback(unittest.TestCase):
         import effects as effmod
         sc = self.pl.scene("definitely-not-an-effect")
         self.assertFalse(sc.found)
-        want = effmod.EffectDB(ROOT).sources["3DEffect"].path.name
+        db = effmod.EffectDB(ROOT)
+        self.addCleanup(db.close)
+        want = db.sources["3DEffect"].path.name
         self.assertIn(want, sc.error)
         self.assertIn("3DEffect", sc.error)
 
@@ -4952,20 +5719,52 @@ class CharacterBuilder(unittest.TestCase):
     # -- slots that cannot be used ----------------------------------------
     @requires_base("cco", why="asserts CCO's content; verified to pass there and fail on 5517")
     def test_unusable_slots_report_a_reason_and_offer_nothing(self):
-        """shield/pelvis do not ship at all; head/misc/mount ship an ini whose
+        r"""shield/pelvis do not ship at all; head/misc ship an ini whose
         meshes resolve to nothing. Both must be greyed with a reason rather than
-        opening an empty picker."""
+        opening an empty picker.
+
+        **MOUNT LEFT THIS LIST ON 2026-09-06 AND IT IS THE INSTALL THAT
+        CHANGED, NOT THE THRESHOLD.** `Catalog.resolve_id` now consults the
+        install's own `ini/c3.wdb` / `ini/3dobj.ini` declaration, and a mount
+        mesh is the shape the derived `c3/<dir>/<id>.<ext>` probe cannot
+        reach: two levels deep under a filename that is not the id. Measured
+        on this install -- `ini/mount.ini` has 1,317 rows and exactly ONE of
+        them resolves, `80500000` -> `c3/mount/850/8500000.c3`, 91,445 bytes
+        loose, 8 `PHY4` + 4 `MOTI`, with `c3/mount/850/8500000.dds` beside it.
+        So the slot has one real option and "offers nothing" is no longer
+        true of it. The row is asserted BY NAME below rather than as a count,
+        because a slot that quietly grew a second unexplained option is the
+        thing this class exists to notice.
+        """
         info = {s["name"]: s for s in self.idx.slot_info()}
         for name in ("shield", "pelvis"):
             self.assertFalse(info[name]["shipped"], name)
             self.assertFalse(info[name]["usable"], name)
             self.assertIn("does not ship", info[name]["reason"])
-        for name in ("head", "misc", "mount"):
+        self.assertTrue(info["mount"]["shipped"], "mount")
+        self.assertTrue(
+            info["mount"]["usable"],
+            "mount offers nothing -- the declared c3/mount/850/8500000.c3 "
+            "stopped resolving, so resolve_id is back to the derived probe "
+            "alone (see this method's docstring)")
+        self.assertEqual(
+            [(o.ident, o.mesh) for o in self.idx.options["mount"]],
+            [("80500000", "c3/mount/850/8500000.c3")],
+            "mount's option set is no longer the single declared row this "
+            "install ships")
+        for name in ("head", "misc"):
             self.assertTrue(info[name]["shipped"], name)
             self.assertFalse(info[name]["usable"], name)
             self.assertGreater(info[name]["rows"], 0, name)
             self.assertEqual(info[name]["count"], 0, name)
-            self.assertIn("not one of their meshes resolves", info[name]["reason"])
+            # SHAPE, NOT SENTENCE -- the second expired assertion in this
+            # class. It required "not one of their meshes resolves"; the
+            # message now reads "ini/head.ini ships 4 entries but none of them
+            # resolves to a mesh AND a texture the client can open (...)",
+            # which says strictly more. What matters is that the reason names
+            # how many rows ship and states that none of them resolve.
+            self.assertIn(str(info[name]["rows"]), info[name]["reason"], name)
+            self.assertIn("none of them resolves", info[name]["reason"], name)
         for name in ("body", "armet", "l_weapon", "r_weapon"):
             self.assertTrue(info[name]["usable"], name)
             self.assertGreater(info[name]["garments"], 4, name)
@@ -4975,7 +5774,23 @@ class CharacterBuilder(unittest.TestCase):
         info = {s["name"]: s for s in self.idx.slot_info()}["armet_dx8"]
         self.assertTrue(info["usable"])
         self.assertLess(info["count"], info["rows"] * 0.05)
-        self.assertIn("have art that ships", info["reason"])
+        # ASSERT THE SHAPE, NOT THE SENTENCE. This used to require the phrase
+        # "have art that ships", and that phrase exists in NO product file --
+        # grep it: the only two hits are in this test module. The message was
+        # reworded to say more (it now breaks the shortfall down by cause) and
+        # the assertion was not updated, so it had been failing on the one
+        # install where this test actually runs. Measured wording today:
+        #
+        #   "only 8 of 950 entries in ini/armet1.ini resolve both a mesh and a
+        #    texture that ship (942 of the rest have no mesh, ...)"
+        #
+        # What the test is FOR is that a barely-stocked slot quantifies its own
+        # shortfall rather than just saying "unavailable", so that is what is
+        # asserted: both figures present, and the shipping qualifier. A future
+        # rewording that keeps the meaning will keep passing.
+        self.assertIn(str(info["count"]), info["reason"])
+        self.assertIn("of %d entries" % info["rows"], info["reason"])
+        self.assertIn("that ship", info["reason"])
 
     # -- filters -----------------------------------------------------------
     def test_facet_counts_are_cross_filtered_and_never_land_on_nothing(self):
@@ -5780,7 +6595,7 @@ class DefaultView(unittest.TestCase):
             self.skipTest(_index_reason("out/thumbs/manifest_meshes.json",
                                         present=True,
                                         note="fewer than 4,000 mesh renders"))
-        manifest = coroot.find_derived("out/thumbs/manifest_meshes.json")
+        manifest = _thumb_manifest("manifest_meshes.json")
         r = json.loads(manifest.read_text("utf-8")).get("renderer", {})
         self.assertIn("yaw", r)
         self.assertAlmostEqual(yaw, r["yaw"], places=6,
@@ -6324,10 +7139,34 @@ class AlwaysOnSentinelWidth(unittest.TestCase):
                     f"{kind}: {r.action!r} and {bare!r} resolved differently")
 
     def _db(self, kind):
+        """An `EffectDB` on `kind`'s install, released when the test ends.
+
+        TEN callers take a db from here and none of them could hand it back:
+        this constructs with no `assets=`, so each call OPENS EVERY CONTAINER
+        in that install and owns the root (`EffectDB._owns_assets`), and the
+        only reference that could close it was gone when the local went out
+        of scope.  Tests here loop over `BASES`, so one test leaked up to
+        three installs' worth of handles.
+
+        THE RELEASE IS REGISTERED HERE, not asked of the callers, because
+        this is the only place that knows a db was *created* rather than
+        borrowed -- ownership stays where construction is.  Per-test, not
+        cached on the class: `EffectDB` memoises `sources`, `_flat_records`,
+        `_form_cache` and `_form_index` on first use, and this class asserts
+        over `sources` and over per-base counts, so one shared instance would
+        make those answers depend on test ORDER.  Caching would be the
+        FASTER option, and that is the trade being declined: it buys speed
+        this class did not ask for with an order dependency in assertions
+        whose whole job is to be read per base.  This way adds no
+        construction either -- `addCleanup` only closes what was already
+        built -- so the open-and-parse cost that dominates here is unchanged.
+        """
         root = self.BASES.get(kind)
         if root is None:
             self.skipTest(f"no {kind} install declared")
-        return self.fx.EffectDB(root)
+        db = self.fx.EffectDB(root)
+        self.addCleanup(db.close)
+        return db
 
     def test_every_client_ships_always_on_rows(self):
         """The refutation itself, read off the raw table. The counts are
@@ -7264,6 +8103,35 @@ class HideAnimationAssetsToggle(unittest.TestCase):
                 f"http://127.0.0.1:{self.port}{path}", timeout=120) as r:
             return json.load(r)
 
+    #: How long to wait for the unified index before calling it a failure.
+    #: With a current coverage.json it is ready in ~1.6 s. Without one it is
+    #: built live -- 27.5 s cold on CCO, measured 2026-09-18 -- and this file's
+    #: own record puts the loaded-suite penalty near 12x, so a live build under
+    #: the full suite can reach ~330 s. 600 s covers that with margin; a
+    #: `failed` state ends the wait at once instead.
+    UNIFIED_BUDGET = 600.0
+
+    def _wait_unified_ready(self) -> None:
+        """Block until the route reports the unified index READY.
+
+        Polled through `/api/catfiles` itself, via the `unifiedIndex` field
+        every response carries, so this waits on exactly the state the page
+        sees -- not on a Python-side flag the route might not share.
+        """
+        deadline = time.time() + self.UNIFIED_BUDGET
+        last = None
+        while time.time() < deadline:
+            st = self._get("/api/catfiles?category=character&limit=1")[
+                "unifiedIndex"]
+            last = st.get("state")
+            if last == "ready":
+                return
+            if last == "failed":
+                self.fail(f"the unified index build FAILED: {st.get('error')}")
+            time.sleep(0.5)
+        self.fail(f"the unified index was not ready after "
+                  f"{self.UNIFIED_BUDGET:.0f} s (last state {last!r})")
+
     @unittest.skipUnless(HAVE_ROOT, "game install not present")
     def test_the_route_hides_the_buckets_and_the_counts_follow(self):
         off = self._get("/api/categories")
@@ -7293,9 +8161,40 @@ class HideAnimationAssetsToggle(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_ROOT, "game install not present")
     def test_the_file_list_stops_serving_motion_paths(self):
+        """Hiding motion removes exactly the motion rows -- IN ONE INDEX STATE.
+
+        **THIS WAS A RACE, confirmed 2026-09-18.** `total` counts rows AFTER
+        textures fold under their meshes; `motionHidden` counts paths BEFORE.
+        The unified index that does the folding builds on a background
+        thread, and `unified_now()` hands back an index that folds NOTHING
+        until it lands. So the two requests below could see DIFFERENT index
+        states: with a current coverage.json the index loads in ~1.6 s, lands
+        BETWEEN them, and the probe read `off unified=False total=6398`
+        against `on unified=True total=2400` -> 3998 != 1180. Without coverage
+        the live build takes 30-60 s, both requests land before it, NOTHING
+        folds, and the test passed having exercised no folding at all.
+
+        Under ONE state the inequality `off - on <= motionHidden` holds by
+        construction (hiding motion only removes paths, so what folds with it
+        on also folds with it off), so 3998 > 1180 was impossible without the
+        state changing mid-test.
+
+        So: wait until the index is READY, then require both responses to
+        report the SAME `unified` -- and require that state to be True, or
+        the equality below passes vacuously with nothing folded.
+        """
         import catalog
+        self._wait_unified_ready()
         off = self._get("/api/catfiles?category=character&limit=2000")
         on = self._get("/api/catfiles?category=character&limit=2000&hideMotion=1")
+        self.assertEqual(
+            off["unified"], on["unified"],
+            "the two requests were answered from DIFFERENT unified-index states "
+            "-- the race this test used to lose; its totals are not comparable")
+        self.assertTrue(
+            on["unified"],
+            "the unified index was not in force, so nothing folded and the "
+            "equality below would pass without testing folding at all")
         self.assertGreater(on["motionHidden"], 0)
         self.assertEqual(off["total"] - on["total"], on["motionHidden"])
         ac = self.cat.assetcat
@@ -8357,9 +9256,25 @@ class GameClientPage(unittest.TestCase):
 
     def test_map_effects_have_their_own_clock(self):
         """`frameLoop` sleeps when the character stands still -- right for a
-        stride, wrong for a torch."""
-        self.assertIn("mapfxTimer", self.js)
-        self.assertIn("setEffectTime(performance.now() - mapfxT0", self.js)
+        stride, wrong for a torch.
+
+        REWRITTEN 2026-09-25. This used to assert `mapfxTimer` and
+        `setEffectTime(performance.now() - mapfxT0` -- the SHAPE of a second
+        `setInterval` -- and it was right to go red when that timer was
+        removed. The clock survives; what is gone is its separate DRAW, which
+        cost a second full render on every moving frame and 24 a second while
+        standing still. The invariant is the clock, not the timer, so this
+        asserts the clock: it is ticked from the frame loop and the frame loop
+        refuses to sleep while it is running.
+
+        `tests/test_one_draw_per_frame.py` owns the rest of it, including the
+        arms that fire against the pre-fix source.
+        """
+        self.assertIn("mapfxOn", self.js)
+        self.assertIn("setEffectTime(now - mapfxT0", self.js)
+        self.assertNotIn("mapfxTimer", self.js,
+                         "the effect clock is back on a timer of its own, "
+                         "which is a second renderer beside frameLoop")
 
     def test_the_server_route_uses_the_full_diamond_transform(self):
         """docs/world_effects.md 2. The EFFECT layer's x,y are pixels in the
@@ -8596,36 +9511,74 @@ class GameClientPage(unittest.TestCase):
             self.assertIn(state, (HERE / "worldfx.py").read_text("utf-8"),
                           f"{state} is a distinct outcome and must stay one")
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    #: PINNED 2026-08-28, for the two `ini/statuseffect.ini` tests below ONLY
+    #: -- not for this class, whose other install-touching tests read
+    #: `ini/armor.ini` and are about the reader rather than one table's
+    #: contents.
+    #:
+    #: The docstring under it already said **"95 rows spanning bits 0..117 on
+    #: 5517"** while the code read `coassets.DEFAULT_ROOT`. The bit-63 test is
+    #: the one that shows why that is not pedantry: its first assertion is a
+    #: SELF-CHECK -- *"no rows above bit 63; this test proves nothing here"* --
+    #: and it is the assertion that was failing. The table is short on CCO,
+    #: 4274, 5017, 5065 and 5165, so the instrument correctly announced it had
+    #: no sample. Widening it to accept a short table would have deleted the
+    #: only thing standing between this test and a green run over nothing.
+    #: Rows above bit 63 exist on 5517 and 6090; 5517 is the one the census
+    #: was taken on.
+    #: No `covers`: the subject is `ini/statuseffect.ini`, which the base
+    #: fingerprint hashes BYTE FOR BYTE. This pin is fully covered -- the
+    #: only one of the seven of which that is true without qualification.
+    STATUS_PIN = DeclaredInstall(
+        "5517",
+        why="ini/statuseffect.ini's 95 rows spanning bits 0..117 -- the "
+            "sparseness and the above-63 rows both -- were counted on 5517; "
+            "the table is shorter than bit 63 on cco/4274/5017/5065/5165",
+        fingerprint="76c7f4499934")
+
     def test_status_bits_join_on_the_rows_own_number_not_its_ordinal(self):
         """`ini/statuseffect.ini` is SPARSE -- 95 rows spanning bits 0..117 on
         5517 -- so reading it positionally offsets every aura past the first
         gap, and the result is a plausible wrong glow rather than an error."""
         import worldfx
-        rows = worldfx.status_rows(ROOT)
+        root = self.STATUS_PIN.path()
+        rows = worldfx.status_rows(root)
         by_bit = {b: c1 for b, c1, _ in rows}
         self.assertNotEqual(len(rows), max(by_bit) + 1,
                             "the table is expected to be sparse; if it is "
                             "dense here, this test proves nothing")
-        got = worldfx.status_auras(1 << 18, ROOT)
+        got = worldfx.status_auras(1 << 18, root)
         self.assertEqual([18], [a["bit"] for a in got])
         self.assertEqual(by_bit[18], got[0]["name"])
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_bits_above_63_cannot_travel_on_1014_and_are_not_invented(self):
         """`status` is a u64 and the table names rows out to bit 117. Those
         rows are not undrawable, they are UNREACHABLE by this message, and a
         resolver that widened past 64 would report auras the wire cannot ask
         for."""
         import worldfx
-        rows = worldfx.status_rows(ROOT)
+        root = self.STATUS_PIN.path()
+        rows = worldfx.status_rows(root)
+        # MEASURED at c14d1048, rows above bit 63 per install: cco 0/20,
+        # 5017 0/29, 5065 0/29, 5165 0/44, 5517 40/95, 6090 64/120,
+        # 6609 96/152, 7878 369/411, Zephyr 96/152.  Four of the nine tables
+        # never reach past bit 63, so read against the AMBIENT install this
+        # assertion went red saying a resolver had widened when no resolver
+        # had been asked anything.  The 2026-08-26 repair for that was to
+        # `skipTest` here; STATUS_PIN is the repair that landed instead, and
+        # under a pin the skip would be WRONG.  The pin fixes the corpus at
+        # 5517, where 40 of 95 rows sit above 63, so a table that no longer
+        # reaches past 63 is not "this box is different" -- it is the pin's
+        # stated premise having broken, which must FAIL rather than go quiet.
         self.assertTrue([b for b, _, _ in rows if b > 63],
-                        "no rows above bit 63; this test proves nothing here")
-        self.assertEqual([], worldfx.status_auras(1 << 63, ROOT) and
-                         [a for a in worldfx.status_auras(1 << 63, ROOT)
+                        "no rows above bit 63 on the PINNED 5517 table, where "
+                        "40 of 95 were counted -- the pin's premise is gone, "
+                        "so this test proves nothing and says so")
+        self.assertEqual([], worldfx.status_auras(1 << 63, root) and
+                         [a for a in worldfx.status_auras(1 << 63, root)
                           if a["state"] == "found"])
         for bit in (64, 90, 117):
-            self.assertEqual([], worldfx.status_auras(1 << bit, ROOT),
+            self.assertEqual([], worldfx.status_auras(1 << bit, root),
                              f"bit {bit} is outside the u64 the wire carries")
 
 
@@ -9196,32 +10149,42 @@ class CoverRecordGrewAt1005(unittest.TestCase):
             return dmap.parse(p, want_cells=False, verify=False)
 
     def test_the_table_widens_only_at_1005(self):
-        """No install. 1006 is excluded deliberately and that is asserted.
+        """No install. The wider cover starts at 1005 and pre-1005 keeps 416.
 
-        Only two 1006 maps exist and **neither reaches a cover record** —
-        `newplain_new` stops at layer 0 on an unmodelled type 24, `forum01_new`
-        fails its row checksums outright. So there is no measurement behind
-        extending 420 to 1006, and an unmeasured guess is the failure the
-        comment beside `COVER_1005` exists to record.
+        **1006 WAS EXCLUDED HERE AND THE EXCLUSION IS SUPERSEDED
+        (2026-08-29).** The reasoning was sound and the corpus was too small:
+        only two 1006 maps were visible and neither reached a cover record, so
+        extending 420 to 1006 would have been an unmeasured guess. There are
+        176 v1006 maps on this box now, and **25,308 tag-4 records among
+        them** -- not in the layer table, which is why nothing here could see
+        them, but in the second counted record list 1006 writes after it. All
+        420, and at 416 the walk desynchronises inside the first map that has
+        one. See `docs/dmap_plane_groups_1005_2026-08-29.md` section 2.2 and
+        `DMapPlaneGroups1005` below.
         """
         import dmap
         self.assertEqual(dmap.LAYER_PAYLOAD[4], 416)
         self.assertEqual(dmap.COVER_1005, 420)
-        for v in (1003, 1004, 1006):
+        for v in (1003, 1004):
             with self.subTest(version=v):
                 self.assertEqual(dmap.layer_payload(v)[4], 416)
         self.assertEqual(dmap.layer_payload(1005)[4], 420)
+        self.assertEqual(dmap.layer_payload(1006)[4], 420,
+                         "measured on 1006 maps, not inherited from 1005")
         # 1005 differs in exactly two ways and no more: the cover is wider
-        # and tag 0 is new. Everything else is shared, not copied -- and this
-        # assertion is what caught tag 0 being added, so it is kept in the
-        # form that fails when a third difference appears without a reason.
+        # and the effect is wider. Everything else is shared, not copied --
+        # and this assertion is what caught the tag-0 reading being added, so
+        # it is kept in the form that fails when a third difference appears
+        # without a reason. Tag 0 is gone from it because there is no tag 0:
+        # see `test_1005_widens_the_effect_record_and_there_is_no_tag_0`.
         shared = {k: v for k, v in dmap.layer_payload(1005).items()
-                  if k not in (4, 0)}
+                  if k not in (4, 19)}
         self.assertEqual(shared,
                          {k: v for k, v in dmap.LAYER_PAYLOAD.items()
-                          if k != 4})
-        self.assertNotIn(0, dmap.LAYER_PAYLOAD,
-                         "tag 0 belongs to 1005 only")
+                          if k not in (4, 19)})
+        self.assertNotIn(0, dmap.LAYER_PAYLOAD)
+        self.assertNotIn(0, dmap.layer_payload(1005),
+                         "there is no tag 0 -- it is the tag-19 record's tail")
 
     def test_a_1005_body_reads_at_420_and_reproduces_the_bug_at_416(self):
         """CONTROL, both directions, no install — so it cannot skip.
@@ -9246,8 +10209,27 @@ class CoverRecordGrewAt1005(unittest.TestCase):
                       "the shipped signature is `unmodelled type 0 (NONE)`")
         self.assertNotEqual(bad.bytes_unconsumed, 0)
 
-    def test_1005_adds_a_tag_0_record_and_19_is_a_TAG_not_a_length(self):
-        r"""The four maps that still stopped at 420, and the misreading.
+    def test_1005_widens_the_effect_record_and_there_is_no_tag_0(self):
+        r"""The four maps that still stopped at 420, and TWO misreadings.
+
+        **SUPERSEDED IN PART, 2026-08-29: there is no tag 0.** It is the last
+        24 bytes of the tag-19 record, which grew from 72 to 96 bytes of
+        payload at 1005 (`dmap.EFFECT_1005`). Everything below about the BYTES
+        is right; the RECORD BOUNDARY was wrong, and `4 + 72` then `4 + 20`
+        consumes the same 100 bytes as `4 + 96`, so no byte offset could tell
+        them apart. What told them apart is the COUNT: the declared layer
+        count counts records, so splitting one record in two spends the count
+        twice and stops the walk 5,916 bytes early on `family06-01_new` --
+        with `layers_complete` still True, which is why nothing said so.
+
+        The falsifier, over every v1005/v1006 map on this box: **all 144 of
+        the 144 tag-0 records fall immediately after a tag-19 record and none
+        falls anywhere else** -- and 144 is this test's own recovered count. A
+        record type that only ever occurs glued to the back of one other
+        record type is that record's tail. See
+        `docs/dmap_plane_groups_1005_2026-08-29.md` section 2.1.
+
+        The original reasoning, kept because both readings are instructive:
 
         At the stop: two `u32` zeros, three floats `1.0 1.0 1.0`, then **19**,
         then a NUL-padded name. I read `19` as a length prefix because a string
@@ -9277,13 +10259,20 @@ class CoverRecordGrewAt1005(unittest.TestCase):
         exactly like a fact.
         """
         import dmap
-        self.assertEqual(dmap.LAYER_TAG0_1005, 20)
         self.assertNotIn(0, dmap.layer_payload(1004),
-                         "tag 0 must not leak into pre-1005 maps")
-        self.assertEqual(dmap.layer_payload(1005)[0], 20)
+                         "no tag 0 anywhere, and least of all pre-1005")
+        self.assertNotIn(0, dmap.layer_payload(1005),
+                         "the 20-byte tag-0 record is the tag-19 record's "
+                         "tail, not a record of its own")
         self.assertEqual(dmap.LAYER_PAYLOAD.get(19), 72,
-                         "19 is EFFECT3D and its size is unchanged; if this "
+                         "19 is EFFECT3D and pre-1005 keeps 72; if this "
                          "moved, the 'length prefix' reading has come back")
+        self.assertEqual(dmap.layer_payload(1005)[19], dmap.EFFECT_1005)
+        self.assertEqual(dmap.layer_payload(1006)[19], dmap.EFFECT_1005)
+        # The two readings consume the same bytes. Asserted, because it is
+        # the whole reason the wrong one survived a byte-level review.
+        self.assertEqual(dmap.EFFECT_1005,
+                         dmap.LAYER_PAYLOAD[19] + 4 + dmap.LAYER_TAG0_1005)
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_every_1005_map_reads_every_declared_layer(self):
@@ -9350,9 +10339,13 @@ class CoverRecordGrewAt1005(unittest.TestCase):
         # 1006 is built on the BASE table, not on 1005's: carrying unmeasured
         # entries across a version is the guess the comment refuses.
         self.assertNotIn(0, dmap.layer_payload(1006),
-                         "1005's tag 0 must not be inherited by 1006")
-        self.assertEqual(dmap.layer_payload(1006)[4], 416,
-                         "1005's widened tag 4 must not be inherited either")
+                         "there is no tag 0 to inherit")
+        # SUPERSEDED 2026-08-29: 1006 DOES hold tag-4 records -- 25,308 of
+        # them, all 420 -- but in the second counted record list it writes
+        # after the layer table, which is why no layer-table measurement
+        # could find them. The refusal above was right to demand one.
+        self.assertEqual(dmap.layer_payload(1006)[4], dmap.COVER_1005,
+                         "measured on 1006's own records, not inherited")
         self.assertNotIn(24, dmap.LAYER_PAYLOAD,
                          "tag 24 belongs to 1006 only")
         self.assertNotIn(24, dmap.layer_payload(1005))
@@ -10019,11 +11012,63 @@ class DMapTrailingSection(unittest.TestCase):
 
     REC = 264
 
-    def _maps(self):
-        import coroot
-        return sorted((Path(coroot.default_root()) / "map" / "map").glob("*.DMap"))
+    #: PINNED 2026-08-28. Every number in the docstring above says "on 5517"
+    #: and none of them was read from 5517 -- `_maps` walked
+    #: `coroot.default_root()`, so the corpus was whatever install the box was
+    #: configured for. That is not a small drift: the map corpus is what these
+    #: assertions COUNT. MEASURED across the installs on this box, same tree,
+    #: same commit, only the root changing:
+    #:
+    #:      install     loose .DMap   single-plane groups   maps leaving bytes unread
+    #:      5517                181                  > 60                          0
+    #:      5165                154                  > 60                          0
+    #:      5065                144                    56                          0
+    #:      5017                142                    55                          0
+    #:      cco (live)          136                    47                          7
+    #:      4274                108                    46                          0
+    #:      7878                  0            no map/map at all
+    #:
+    #: Only the live CCO leaves bytes unread, and only it fails the wrongness
+    #: test -- seven maps, `2020love01_new` through `spirit01_new`, none of
+    #: which is on 5517 at all. The control's `> 60` is a threshold about
+    #: 5517's corpus SIZE, and four installs miss it by simply being smaller.
+    #:
+    #: `2009-7x.DMap` -- one of the two maps §5 validated the stride on -- is
+    #: simply ABSENT on 4274/5017/5065/7878, so the stride test errored with
+    #: `FileNotFoundError` rather than failing an assertion, which is a
+    #: missing corpus wearing the costume of a broken parser.
+    #:
+    #: The ambient run was refuting a parser that is correct, on a corpus it
+    #: was never measured against. 5165 also passes all of these; it is NOT
+    #: the pin, because the census in the docstring is 5517's and a pin names
+    #: the install the numbers came FROM, not one that happens to agree.
+    #: `covers` names `map/map`, because THE NUMBER IS A FILE COUNT: 181 maps.
+    #: The `ini/` digest alone cannot move when a map is added or removed, and
+    #: an added map is precisely what would falsify the census. The manifest
+    #: is (path, size) rather than contents -- 402 MB of DMap hashed per run
+    #: is not viable, and the stride figures it also guards live inside those
+    #: bytes, so an equal-size edit to `2009-7x.DMap` would slip past. Stated,
+    #: not hidden: see `docs/pin_fingerprinting_2026-09-07.md`.
+    PIN = DeclaredInstall(
+        "5517",
+        why="the 181-map census, the ten-map star family, the stride "
+            "validation on 2009-7x/icecrypt-lev5 and KNOWN_DANGLING were all "
+            "measured on 5517 -- see this class's docstring",
+        fingerprint="76c7f4499934-49e1a666", covers=("map/map",))
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def _root(self):
+        return self.PIN.path()
+
+    #: The LOOSE files, deliberately, and not `dmap.map_names`.
+    #: `C-2026-08-11-claude-explorer-scenery-counts` retired the `*.DMap` walk
+    #: as a *corpus*, and it is still the wrong corpus -- 20 of 5517's 201 maps
+    #: a glob cannot see. It is kept here because `181` is what these figures
+    #: were taken over and swapping the corpus would silently re-open every one
+    #: of them. The registry corpus is walked by `DMapTrailerModelRange`, which
+    #: finds 5517 clean over all 192 it can parse.
+    def _maps(self):
+        return sorted((self._root() / "map" / "map").glob("*.DMap"))
+
     def test_extra_count_agrees_with_the_rows_actually_read(self):
         """The parser holds proof of its own miss in two fields.
 
@@ -10040,7 +11085,6 @@ class DMapTrailingSection(unittest.TestCase):
                if d.extra_count != len(d.extra)]
         self.assertEqual(bad, [])
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_no_map_leaves_a_byte_of_its_trailer_unread(self):
         """The wrongness test. Ten maps failed this before the group model."""
         import dmap
@@ -10051,7 +11095,6 @@ class DMapTrailingSection(unittest.TestCase):
                          "maps leaving bytes unread: the group walk no longer "
                          "lands on EOF, so the trailer model has drifted")
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_star_family_recovers_every_plane_it_used_to_drop(self):
         """The size of the recovery, as numbers so it cannot drift quietly.
 
@@ -10059,7 +11102,7 @@ class DMapTrailingSection(unittest.TestCase):
         grows by one per map to 16 on `star10`.
         """
         import dmap
-        root = Path(__import__("coroot").default_root())
+        root = self._root()
         for i in range(1, 11):
             name = f"star{i:02d}.DMap"
             with self.subTest(name):
@@ -10076,7 +11119,6 @@ class DMapTrailingSection(unittest.TestCase):
     #: Pinned rather than tolerated, so a *second* one is a failure.
     KNOWN_DANGLING = {("hq.DMap", "map\\puzzle\\hqbg.pul")}
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_every_recovered_path_is_a_pul_and_all_but_one_resolve(self):
         """Recovered CONTENT, not slack space read as if it were content.
 
@@ -10086,7 +11128,7 @@ class DMapTrailingSection(unittest.TestCase):
         second has an exception, and it is enumerated.
         """
         import dmap
-        root = Path(__import__("coroot").default_root())
+        root = self._root()
         not_pul, missing = [], set()
         for f in self._maps():
             for e in dmap.parse(f, verify=False).extra:
@@ -10101,7 +11143,6 @@ class DMapTrailingSection(unittest.TestCase):
                          "changed; a new one is content rot worth chasing, and "
                          "a vanished one means KNOWN_DANGLING is stale")
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_a_single_plane_group_reads_exactly_as_the_old_record_did(self):
         """CONTROL. 171 of 181 maps must be untouched by this change.
 
@@ -10164,7 +11205,6 @@ class DMapTrailingSection(unittest.TestCase):
         self.assertEqual(planes[0]["path"], "map\\puzzle\\x.pul")
         self.assertEqual(planes[0]["values"], [0, 4, 30, 30, 1, 8])
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_declared_stride_is_still_right_where_it_was_validated(self):
         r"""Guards the tempting wrong fix — which I nearly made.
 
@@ -10180,7 +11220,7 @@ class DMapTrailingSection(unittest.TestCase):
         theory.
         """
         import dmap
-        root = Path(__import__("coroot").default_root())
+        root = self._root()
         self.assertEqual(dmap.EXTRA_RECORD, 284)
         for name in ("2009-7x.DMap", "icecrypt-lev5.DMap"):
             with self.subTest(name):
@@ -10191,6 +11231,722 @@ class DMapTrailingSection(unittest.TestCase):
                 for r in d.extra:
                     p = root / str(r["path"]).replace("\\", "/")
                     self.assertTrue(p.is_file(), r["path"])
+
+
+class DMapPlaneGroups1005(unittest.TestCase):
+    r"""The plane-group section at map versions 1005 and 1006.
+
+    `core/dmap.py` version-branched its LAYER table at 1005 and 1006
+    (`layer_payload`, `COVER_1005`, `COVER_TAG_1006`) and did **not** version-
+    branch the section after it. `DMapTrailingSection` above could not have
+    caught that: it is pinned to 5517, which ships no loose v1005/v1006 map at
+    all and whose single archived v1005 has `n_groups == 0`, so it passes that
+    format vacuously. See `docs/why_the_ambient_install_disagrees_2026-08-29.md`
+    for the corpus census that establishes it and
+    `docs/dmap_plane_groups_1005_2026-08-29.md` for the layout derived here.
+
+    WHAT WAS WRONG, in three separate places:
+
+    * the group header is **32 bytes at 1005**, not 20 -- `v0..v3`, then three
+      unnamed words, then `n_items` -- so the pre-1005 reader found `160`
+      where the count belongs, asked for 160 x 264 bytes and refused the tail;
+    * a group's count is `n_items`, not `n_planes`, and the items are
+      **tag-dispatched records** -- tag 8 is the `char[260]` plane path, and a
+      group can hold a tag-19 effect beside it;
+    * 1006 writes a **second counted record list** between the layer table and
+      this section.
+
+    MEASURED 2026-08-29, every map on ten installs, loose and archived, read
+    through `dmap.map_names`/`dmap.open_map` so the registry decides which form
+    is opened -- 2,026 maps:
+
+        version        maps    maps leaving a byte unread    bytes unread
+        pre-1005      1,831    1 -> 0                        360 -> 0
+        1005             19    18 -> 0                    37,676 -> 0
+        1006            176    176 -> 0               12,015,396 -> 0
+
+    and **1,830 of the 1,831 pre-1005 maps parse byte-for-byte identically**,
+    field for field, before and after. The one that moves is `7878 newbie`,
+    which the doc above recorded as "not version-explained": it is v1004 and
+    its group's second item is a tag-19 effect, not a second plane.
+
+    CONTENT, because closure is not evidence: the 360 recovered plane paths
+    are `.pul` 360 of 360 and resolve through `AssetRoot` 356 of 360, the four
+    being `newplain01/02-bg0{1,2}.pul` on 7878 -- shipped-content rot of the
+    `KNOWN_DANGLING` kind, following the same `<stem>-bgNN.pul` convention as
+    the 356 that resolve.
+    """
+
+    #: 6609 is the first client to ship v1005 maps and it ships 15 of them
+    #: (plus 2 v1006), all inside `map/map/<stem>.7z`. It is a shipped TQ
+    #: build, so it does not move; the ambient CCO install has the only LOOSE
+    #: v1005/v1006 maps on this box but is a live, modded install.
+    PIN_1005 = DeclaredInstall(
+        "6609",
+        why="the first client shipping v1005 maps -- 15 of them, all "
+            "archived; 5517's single v1005 has n_groups == 0 and cannot "
+            "exercise a group header at all",
+        fingerprint="9db5fd413a52-8b304290", covers=("map/map",))
+
+    #: 1006 is overwhelmingly a 7878 format: 162 of the 176 v1006 maps on this
+    #: box are 7878's, and it is the only install with enough of them for the
+    #: second record list to be measured rather than guessed.
+    #: Both of these pins count MAPS -- 15 v1005 on 6609, 162 v1006 on 7878 --
+    #: so `map/map` is in `covers` for the same reason as the census above:
+    #: the quantity IS the claim, and only a manifest of that tree can move
+    #: when the quantity does.
+    PIN_1006 = DeclaredInstall(
+        "7878",
+        why="162 of the 176 v1006 maps on this box are 7878's, including "
+            "every one whose second record list is non-empty",
+        fingerprint="1811ce9379b5-976e78fb", covers=("map/map",))
+
+    def _maps(self, root, versions):
+        r"""(name, DMap) for each map of `versions`, through the registry.
+
+        A `glob("*.DMap")` is the wrong instrument here and it is the exact
+        instrument that hid this: from 5517 on these maps ship only as
+        `map/map/<stem>.7z`, so a loose walk sees none of them.
+
+        Deliberately compares `d.version` to the plain ints rather than
+        going through `dmap.numeric_version`, so that every corpus test
+        below fails on the MEASUREMENT when it is run against a parser
+        that predates this change, instead of erroring on a name that does
+        not exist there yet.
+        """
+        import dmap
+        out = []
+        for name in dmap.map_names(root):
+            d, _why = dmap.parse_map(root, name, want_cells=False,
+                                     verify=False)
+            if d is not None and d.version in versions:
+                out.append((name, d))
+        return out
+
+    # -- unit, no install: controls that cannot skip ------------------------
+
+    def test_the_header_widens_at_1005_and_the_tagged_form_is_not_above_1006(self):
+        r"""The width, and the negative that nearly shipped beside it.
+
+        `DMAP1xx`-tagged maps leave the u32 at +0 holding `DMAP_TAG` --
+        1,346,456,900 -- so **every `>= 1005` test sorts them above 1006**.
+        `layer_payload` never noticed because it tests `== 1005`. Measured
+        while writing this: handing the tagged maps 1005's 32-byte header
+        makes 62 of the 184 on this box start leaving bytes unread. That is
+        the positive control for `numeric_version` existing at all.
+        """
+        import dmap
+        self.assertEqual(dmap.group_header(1003), dmap.GROUP_HEADER)
+        self.assertEqual(dmap.group_header(1004), dmap.GROUP_HEADER)
+        self.assertEqual(dmap.group_header(1005), dmap.GROUP_HEADER_1005)
+        self.assertEqual(dmap.group_header(1006), dmap.GROUP_HEADER_1005)
+        self.assertEqual(dmap.GROUP_HEADER_1005, 32)
+        self.assertEqual(dmap.group_header(dmap.DMAP_TAG), dmap.GROUP_HEADER,
+                         "the DMAP1xx-tagged form is NOT a version above "
+                         "1006 -- it has no numeric version at all")
+        self.assertEqual(dmap.numeric_version(dmap.DMAP_TAG), 0)
+        self.assertEqual(dmap.numeric_version(1006), 1006)
+
+    def test_a_group_item_is_tag_dispatched_and_a_short_group_is_refused(self):
+        r"""The item walk and its refusal, on crafted bytes.
+
+        Three claims, none of which needs a game install:
+
+        * a group's items are records with a leading tag, and tag 8 is the
+          plane path -- so a group holding a tag-19 effect reads BOTH items;
+        * read at the pre-1005 width, a 1005 body claims 160 items and is
+          refused -- the exact shape `magictower01_new` reported;
+        * the refusal survives the rewrite, and the honest body still parses,
+          or the refusal would be passing for the wrong reason.
+        """
+        import dmap
+        import struct
+        plane = struct.pack("<I", 8) + b"map\\puzzle\\x.pul".ljust(260, b"\0")
+        effect = (struct.pack("<I", 19) + b"daycrane".ljust(64, b"\0")
+                  + struct.pack("<II", 3521, 2186))
+        head = struct.pack("<4I", 0, 4, 30, 30)
+
+        # v1004: 20-byte header, one group, a plane AND an effect.
+        body = (struct.pack("<I", 1) + head + struct.pack("<I", 2)
+                + plane + effect)
+        n, items, declared, end = dmap.parse_trailer_items(body, 0, 1004)
+        self.assertEqual((n, declared, len(items)), (1, 2, 2))
+        self.assertEqual(end, len(body), "the walk must land on EOF")
+        self.assertEqual([i["tag"] for i in items], [8, 19])
+        self.assertEqual(items[0]["path"], "map\\puzzle\\x.pul")
+        self.assertEqual(items[1]["name"], "daycrane")
+        # ...and `parse_trailer` still hands its callers planes only.
+        n, planes, declared, end = dmap.parse_trailer(body, 0, 1004)
+        self.assertEqual(len(planes), 1)
+        self.assertEqual(planes[0]["values"], [0, 4, 30, 30, 2, 8])
+
+        # v1005: 32-byte header, and the effect is 24 bytes wider -- if it is
+        # built at the 1004 width here the walk refuses it, which is the
+        # `EFFECT_1005` claim showing up as a fixture that has to change.
+        effect5 = effect + struct.pack("<3I3f", 0, 0, 0, 1.0, 1.0, 1.0)
+        self.assertEqual(len(effect5), 4 + dmap.EFFECT_1005)
+        head5 = struct.pack("<7I", 0, 4, 30, 30, 160, 5, 6)
+        body5 = (struct.pack("<I", 1) + head5 + struct.pack("<I", 2)
+                 + plane + effect5)
+        n, items, declared, end = dmap.parse_trailer_items(body5, 0, 1005)
+        self.assertEqual((n, declared, len(items)), (1, 2, 2))
+        self.assertEqual(end, len(body5))
+        self.assertEqual(items[0]["head_extra"], [160, 5, 6])
+
+        # The defect, stated as bytes: the same body at the old width.
+        n, _p, declared, end = dmap.parse_trailer_items(body5, 0, 1004)
+        self.assertEqual((declared, end), (160, 4),
+                         "at the pre-1005 width a 1005 body claims 160 items "
+                         "and is refused -- magictower01_new's own numbers")
+
+        # The refusal, at the new width.
+        lying = struct.pack("<I", 1) + head5 + struct.pack("<I", 9) + plane
+        n, items, declared, end = dmap.parse_trailer_items(lying, 0, 1005)
+        self.assertEqual((n, declared, items, end), (1, 9, [], 4))
+
+    def test_there_is_no_tag_0_layer_and_the_effect_record_is_wider(self):
+        r"""The superseded model, pinned so it cannot come back.
+
+        1005's effect record is 96 bytes of payload, not 72 followed by a
+        20-byte "tag 0" record. The two consume the SAME 100 bytes, so no byte
+        offset separates them -- what separates them is that the declared
+        layer count counts RECORDS, and splitting one record in two spends the
+        count twice and stops the walk early.
+
+        The falsifier, measured over every v1005/v1006 map on this box: all
+        **144 of 144** tag-0 records fall immediately after a tag-19 record
+        and none falls anywhere else.
+        """
+        import dmap
+        self.assertEqual(dmap.EFFECT_1005, 96)
+        self.assertEqual(dmap.LAYER_PAYLOAD[19], 72,
+                         "<=1004 keeps the narrow effect")
+        for v in (1005, 1006):
+            with self.subTest(v):
+                self.assertNotIn(0, dmap.layer_payload(v),
+                                 "tag 0 is the tail of the tag-19 record")
+                self.assertEqual(dmap.layer_payload(v)[19], dmap.EFFECT_1005)
+        self.assertEqual(dmap.EFFECT_1005,
+                         dmap.LAYER_PAYLOAD[19] + 4 + dmap.LAYER_TAG0_1005,
+                         "the two readings consume the same bytes, which is "
+                         "why only the COUNT could tell them apart")
+
+    def test_1006_holds_tag_4_covers_and_they_are_420(self):
+        r"""The other superseded claim, and why it could not have been found.
+
+        `COVER_TAG_1006` used to record that a 1006 map holding a tag-4 record
+        "would read 416 and go loud, which is the correct failure". 1006 does
+        hold them -- 25,308 of them -- but not in the layer table: they are in
+        the second record list nothing walked. At 416 the walk desynchronises
+        inside the first map that has one.
+        """
+        import dmap
+        self.assertEqual(dmap.layer_payload(1006)[4], dmap.COVER_1005)
+        self.assertEqual(dmap.layer_payload(1006)[dmap.COVER_TAG_1006],
+                         dmap.COVER_1005)
+        self.assertEqual(dmap.LAYER_PAYLOAD[4], 416,
+                         "<=1004 keeps the narrow cover")
+        self.assertNotIn(dmap.COVER_TAG_1006, dmap.layer_payload(1005),
+                         "1005 does not get 1006's renumbered tag")
+
+    # -- the corpus ---------------------------------------------------------
+
+    def test_no_1005_map_leaves_a_byte_of_its_trailer_unread(self):
+        """The wrongness test for 1005. 15 of 15 failed it before."""
+        maps = self._maps(self.PIN_1005.path(), (1005,))
+        self.assertEqual(len(maps), 15, "6609 ships 15 v1005 maps")
+        left = {n: d.bytes_unconsumed for n, d in maps if d.bytes_unconsumed}
+        self.assertEqual(left, {})
+
+    def test_no_1006_map_leaves_a_byte_of_its_trailer_unread(self):
+        """The wrongness test for 1006. 162 of 162 failed it before."""
+        maps = self._maps(self.PIN_1006.path(), (1006,))
+        self.assertEqual(len(maps), 162, "7878 ships 162 v1006 maps")
+        left = {n: d.bytes_unconsumed for n, d in maps if d.bytes_unconsumed}
+        self.assertEqual(left, {})
+
+    def test_the_declared_item_count_agrees_with_the_items_read(self):
+        r"""The parser's own audible channel, on both pinned installs.
+
+        `extra_count` is the file's claim and `extra_items` is what was
+        walked; a wrong header or a wrong item width makes them disagree.
+        Compared against `extra_items` and NOT `extra`, because `extra` is
+        planes only and a group may hold an effect -- 34 maps on this box do.
+        """
+        for pin, versions in ((self.PIN_1005, (1005,)),
+                              (self.PIN_1006, (1006,))):
+            with self.subTest(str(pin)):
+                maps = self._maps(pin.path(), versions)
+                bad = [(n, d.extra_count, len(d.extra_items))
+                       for n, d in maps
+                       if d.extra_count != len(d.extra_items)]
+                self.assertEqual(bad, [])
+
+    def test_every_recovered_plane_is_a_pul_and_the_planes_are_not_zero(self):
+        r"""Recovered CONTENT, and the positive control that it is non-empty.
+
+        `assertEqual([], [])` over an empty corpus is the failure mode the
+        second assertion exists to refuse -- an empty work list is not a clean
+        result, and that is precisely how 5517 passed this format. Before the
+        fix both pins recovered **0** planes from these versions.
+        """
+        for pin, versions, least in ((self.PIN_1005, (1005,), 25),
+                                     (self.PIN_1006, (1006,), 250)):
+            with self.subTest(str(pin)):
+                planes = [p for _n, d in self._maps(pin.path(), versions)
+                          for p in d.extra]
+                self.assertGreaterEqual(
+                    len(planes), least,
+                    "no planes recovered at all -- this assertion would pass "
+                    "vacuously, which is how the gap survived on 5517")
+                bad = [p["path"] for p in planes
+                       if not str(p["path"]).lower().endswith(".pul")]
+                self.assertEqual(bad, [])
+
+    def test_a_group_item_is_not_always_a_plane_and_newbie_proves_it(self):
+        r"""The pre-1005 map the version story does NOT explain.
+
+        `7878 newbie` is v1004 and left 360 bytes unread. Its one group
+        declares 2 items: a tag-8 plane (`map\puzzle\newbiebg.pul`) and a
+        tag-19 effect named `daycrane`. The old plane-only model demanded
+        2 x 264 bytes, could not have them and refused the tail -- so this is
+        a defect in the ITEM model, not in the 1005 header, and it is the one
+        pre-1005 map whose parse this change moves.
+        """
+        import dmap
+        d, why = dmap.parse_map(self.PIN_1006.path(), "newbie",
+                                want_cells=False, verify=False)
+        self.assertIsNotNone(d, why)
+        self.assertEqual(d.version, 1004)
+        self.assertEqual(d.bytes_unconsumed, 0)
+        self.assertEqual(d.extra_groups, 1)
+        self.assertEqual(d.extra_count, 2)
+        self.assertEqual([i["tag"] for i in d.extra_items], [8, 19])
+        self.assertEqual([p["path"] for p in d.extra],
+                         ["map\\puzzle\\newbiebg.pul"])
+        self.assertEqual(d.extra_items[1]["name"], "daycrane")
+
+    def test_the_second_record_list_is_1006_only(self):
+        r"""1006's extra counted list, and the negative that gates it.
+
+        It must be walked on 1006 and must NOT be looked for anywhere else:
+        reading a count that is not there desynchronises every 1005 and
+        pre-1005 map immediately, which is why this is version-gated rather
+        than "read a count if one looks plausible".
+        """
+        import dmap
+        maps = self._maps(self.PIN_1006.path(), (1006,))
+        self.assertEqual(dmap.LATE_LAYERS_MIN_VERSION, 1006)
+        total = sum(len(d.late_layers) for _n, d in maps)
+        self.assertGreater(total, 30000,
+                           "the list is empty -- a gate that never fires")
+        self.assertEqual([n for n, d in maps if d.late_layer_error], [])
+        self.assertEqual([n for n, d in maps
+                          if d.late_layer_count != len(d.late_layers)], [])
+        # The negative: no 1005 map has one, and none is read for one.
+        for name, d in self._maps(self.PIN_1005.path(), (1005,)):
+            with self.subTest(name):
+                self.assertEqual(d.late_layer_count, 0)
+                self.assertEqual(d.late_layers, [])
+
+    def test_the_trailing_eight_bytes_are_consumed_only_when_they_are_zero(self):
+        r"""The tail, and the reason it is not "consume whatever is left".
+
+        1005/1006 leave eight bytes after the last group and they are zero on
+        194 of the 194 maps that have them; the 195th, 5517's
+        `icecrypt-lev3`, ends at `n_groups == 0` with no tail at all. A rule
+        that swallowed any eight trailing bytes could not report a miss, so
+        `parse` requires them to be zero and leaves anything else audible in
+        `bytes_unconsumed`.
+        """
+        import dmap
+        self.assertEqual(dmap.TRAILER_TAIL_1005, 8)
+        seen = 0
+        for pin, versions in ((self.PIN_1005, (1005,)),
+                              (self.PIN_1006, (1006,))):
+            for name, d in self._maps(pin.path(), versions):
+                with self.subTest(name):
+                    self.assertIn(len(d.trailer_tail), (0, 8))
+                    self.assertEqual(d.trailer_tail.strip(b"\0"), b"")
+                seen += 1 if d.trailer_tail else 0
+        self.assertGreater(seen, 150, "no map exercised the tail at all")
+
+    def test_a_refused_group_walk_does_not_get_its_tail_eaten(self):
+        r"""CONTROL for the tail rule, on crafted bytes, and it needs no
+        install because no shipped map is truncated this way.
+
+        A 1005 body claiming a group whose 32-byte header runs off the end
+        with exactly eight zero bytes to spare would, under a bare "consume
+        eight trailing zeros" rule, come back with `bytes_unconsumed == 0`
+        AND `extra_count == len(extra_items) == 0` -- **both audible channels
+        silent on the same truncated file**. The tail is therefore consumed
+        only when the walk got past the group headers.
+
+        The positive half is the same body one group shorter, which is not
+        truncated and does get its tail consumed -- otherwise this test would
+        pass on a parser that never consumes a tail at all.
+        """
+        import dmap
+        import struct
+        head5 = struct.pack("<7I", 0, 4, 30, 30, 160, 5, 6)
+        plane = struct.pack("<I", 8) + b"map\\puzzle\\x.pul".ljust(260, b"\0")
+        tail = bytes(dmap.TRAILER_TAIL_1005)
+
+        good = (struct.pack("<I", 1) + head5 + struct.pack("<I", 1)
+                + plane + tail)
+        n, items, declared, end = dmap.parse_trailer_items(good, 0, 1005)
+        self.assertEqual((n, declared, len(items)), (1, 1, 1))
+        self.assertEqual(len(good) - end, dmap.TRAILER_TAIL_1005)
+
+        # A body claiming one group and holding only eight zero bytes: the
+        # 32-byte header overruns, the walk refuses, and what is left is
+        # EXACTLY a tail-shaped run of zeros.
+        truncated = struct.pack("<I", 1) + tail
+        n, items, declared, end = dmap.parse_trailer_items(truncated, 0, 1005)
+        self.assertEqual((n, declared, items), (1, 0, []))
+        self.assertEqual(end, 4, "a refused walk returns to the start")
+        self.assertEqual(len(truncated) - end, dmap.TRAILER_TAIL_1005)
+        self.assertEqual(truncated[end:], tail,
+                         "...and it is all zeros, so nothing about the BYTES "
+                         "distinguishes this from a real tail")
+
+        # `parse`'s guard is `end >= start + 4 + n_groups * header`. Asserted
+        # as the arithmetic rather than through a synthetic .DMap, so the two
+        # cases above are what separate a walked section from a refused one.
+        self.assertLess(end, 0 + 4 + n * dmap.group_header(1005),
+                        "the refused walk must fail the `walked` test")
+        n2, _i, _d, end2 = dmap.parse_trailer_items(good, 0, 1005)
+        self.assertGreaterEqual(end2, 0 + 4 + n2 * dmap.group_header(1005),
+                                "and the honest one must pass it")
+
+
+class DMapTrailerModelRange(unittest.TestCase):
+    r"""WHICH INSTALLS the group-walk model closes on -- measured on all nine.
+
+    `DMapTrailingSection` pins the model on 5517. This class asks the question
+    that class could not: **where else is it true?** It walks the registry
+    corpus (`dmap.map_names`, not a `*.DMap` glob) of whatever install is
+    configured, and holds it to a figure measured for that install by name.
+
+    MEASURED 2026-08-26 over every declared install on this machine, each map
+    loaded the way the client loads it (`dmap.parse_map`), and RE-MEASURED
+    the same way on 2026-09-07 -- both columns below are real runs:
+
+        install      parsed  v1005+   leave bytes unread   2026-09-07
+        patch5017       142       0                    0            0
+        patch5065       144       0                    0            0
+        patch5165       154       0                    0            0
+        patch5517       192       1                    0            0
+        patch6090       247       0                    0            0
+        cco             136       7                    7            0
+        patch6609       297      17                   17            0
+        zephyr1057      305      31                   41           16
+        patch7878       470     163                  164            0
+
+    **THE GAP CLOSED, AND THE ONLY REASON TO BELIEVE THAT IS THAT THE
+    INSTRUMENT WAS SHOWN ALIVE FIRST.** A parser that reads the trailer
+    correctly and a parser that stopped COUNTING unconsumed bytes report the
+    identical zero, so the zero above was not accepted on its own. Three
+    independent checks, all run 2026-09-07:
+
+      1. **Differential against the pre-fix parser.** `core/dmap.py` from
+         `2ee16bfa^` -- the commit before `dmap: the plane-group section at
+         1005/1006` (2026-08-29) -- run over the same CCO corpus with today's
+         `coroot`, reproduces the pinned row EXACTLY: parsed 136, v1005+ 7,
+         gap 7, and **134,908 bytes unread**, the same seven map names. The
+         old figure was right when it was taken; a later commit closed it.
+      2. **The counter still fires on shipped data.** zephyr1057 reports 16
+         maps with a non-zero tail today, 10 of them v1003/v1004 -- the same
+         ten `residue` names this class already pinned, unmoved.
+      3. **Synthetic ablation on a map that now closes.** `ninja01_new`
+         (v1006, 330 late layers, 3 groups, 0 unread) re-parsed from mutated
+         bytes: +1 / +8 / +64 / +4096 appended junk gives 9 / 16 / 72 / 4104
+         unread (the extra 8 is the zero tail correctly REFUSED once it is no
+         longer the last eight bytes), 8 appended ZERO bytes gives 16 not 8,
+         and truncating by 64 / 1024 bytes gives 832 / 43,572 with the group
+         walk and the late-layer walk refusing in turn. The install is never
+         touched: `dmap.open_map` returns bytes, the mutation is written to a
+         temp file.
+
+    **What closed it: the 1006 second counted list.** `parse` now walks
+    `late_layers` (`LATE_LAYERS_MIN_VERSION`) before the plane groups, and on
+    all seven CCO v1005+ maps it walks the list whole -- 123/123, 135/135,
+    40/40, 12/12, 0/0, 330/330, 0/0 -- then the groups, then the eight zero
+    bytes. The `135` is the same u32 this docstring described below as "a
+    SECOND counted list between the layers and the backdrops", **recorded as
+    an observation, not modelled**. It is modelled now, and the paragraphs
+    below that treat it as unmodelled are history, not current state.
+
+    **Where it did NOT close: zephyr1057, 6 v1005 maps.** `Asgard` (37,604
+    unread), `crystalcave02` (175,652) and `religion001`..`religion004`
+    (2,712 / 1,724 / 2,860 / 3,996), all with `n_groups = 0` and no
+    late-layer error -- the trailer is a shape the group walk declines rather
+    than one it misreads. Pinned by name in `GAP` so it stays a live report
+    and not a tolerance.
+
+    ------------------------------------------------------------------
+    EVERYTHING BELOW THIS LINE IS THE 2026-08-26 READING, KEPT BECAUSE IT
+    IS WHY THE MODEL CHANGED AND NOT BECAUSE IT STILL DESCRIBES THE
+    PARSER. Its counts (219 late maps, 229 gap maps, 41 on zephyr1057,
+    164 on 7878) are all PRE-`2ee16bfa`. The live counts are `GAP` above.
+    ------------------------------------------------------------------
+
+    **The boundary is the map's VERSION, not the `_new` suffix, and not the
+    client.** 218 of the fleet's 219 v1005/v1006 maps leave their tail unread;
+    the single exception is 5517's `icecrypt-lev3`, which declares
+    **`n_groups = 0`**: it ships no background-plane section at all, so it ends
+    at EOF with nothing to read rather than with the section read correctly.
+    (Not "the one 1005 map with no cover records" -- it carries two. Its
+    *trailer* is what is empty.) Every v1003/v1004 map on all six official
+    clients and on CCO closes exactly at EOF, so the `181/181, 0 misfits` of
+    `map_scenery.md` §5 is not wrong; it is **bounded**, and nothing said so.
+
+    **The `_new` name was the wrong unit, and this is the refutation.** It
+    holds on CCO (7 of 7) and on 6609 (17 of 17), which is exactly why it
+    looked like a family. It fails on the two clients that were never asked:
+    **29 of zephyr1057's 41** gap maps carry no `_new` at all -- `canyon1`,
+    `desert1`, `crystalcave02`, `Asgard`, `godes-church`, `magic`,
+    `southgate` -- and 2 of 7878's 164 do. A predicate that survives only on
+    the corpus it was coined from is a description of that corpus.
+
+    **And it is a different SECTION, not a wrong stride** -- the same shape of
+    answer this file reached for the star family, one version later. Scanning
+    all 229 gap maps for a group walk that lands on EOF recovers one in 142 of
+    them, and **140 of those 142 need a 32-byte group header, not the
+    modelled 20**: the four `values` u32s, then three more (`160` on every
+    recovered group, the other two drawn from `{3,5}` and `{1,6}`), then
+    `n_planes`. The section ends either exactly at EOF or 8 zero bytes short,
+    and **302 of the 311 recovered paths are `.pul` files that exist on
+    disk** -- a content check, not closure. The two exceptions are Zephyr's
+    `desert1` and `southgate`, both v1004 residue, where the modelled shape
+    fits and only the section's START had moved.
+
+    **Nor does the section begin where the layer walk ends.** On CCO's
+    `bp-flandlords-y_new` the group walk starts exactly `4 + 135 * 424` bytes
+    later, where 135 is the u32 sitting there and 424 is 1005/1006's cover
+    record -- a SECOND counted list between the layers and the backdrops.
+    `ninja01_new` carries 43,696 such bytes. And the tag on its first record
+    is **4**, the tag 1006 renumbered to 24 for the list `parse` already
+    walks (`dmap.COVER_TAG_1006`), naming `ani\mapscene-new.ani`. Recorded
+    as an observation, not modelled: two readings fitted 1006's first record
+    once already and only a stride separated them.
+
+    (`parse_trailer` WAS changed after this was written -- `2ee16bfa`. The
+    paragraph below is the reasoning that held on 2026-08-26.)
+
+    `parse_trailer` is therefore deliberately NOT changed. The 20-byte header
+    is right for every version it was measured on, 87 of the 229 gap maps fit
+    no reading I can defend, and `C-2026-08-11-claude-explorer-1005-tag0` is
+    the standing record of what a plausible wrong reading of an unmodelled
+    1005 structure costs. What changes here is that the gap is **named,
+    bounded and audible** rather than arriving as five failures that report
+    identically to a broken parser.
+
+    `C-2026-08-26-claude-vibeco-dx-camera`.
+    """
+
+    #: Per install: (maps parsed, v1005+ maps, maps leaving bytes unread, of
+    #: those the ones NOT named `*_new`, **v1005+ maps that STILL leave bytes
+    #: unread**, gap maps that are NOT v1005+).
+    #:
+    #: **RE-PINNED 2026-09-07, and the fifth field was INVERTED in the same
+    #: pass.** It used to hold `late - gap`, the v1005+ maps that closed
+    #: anyway -- the interesting minority when almost no v1005+ map closed.
+    #: `2ee16bfa` (2026-08-29) turned that round: the informative set is now
+    #: the v1005+ maps that DO NOT close, and `late - gap` would be 163
+    #: literal map names on 7878 saying nothing. It holds `late & gap`
+    #: instead. The two are equivalent in strength -- `len(self.late)` is
+    #: pinned on the line above, so pinning either half of the partition
+    #: pins the other -- and this half is six names instead of two hundred.
+    #:
+    #: Keyed by declared kind, so the expectation is derived from the install
+    #: under test rather than from whichever one the reader happens to have
+    #: configured -- the repair `C-2026-08-11-claude-explorer-scenery-counts`
+    #: made to `scene.py`, applied to the suite that still had the defect.
+    #: An install with no row here SKIPS: holding a corpus you cannot identify
+    #: to another client's number is the failure this class exists to stop.
+    GAP = {
+        "patch5017":  (142,   0,   0,  0, (), ()),
+        "patch5065":  (144,   0,   0,  0, (), ()),
+        "patch5165":  (154,   0,   0,  0, (), ()),
+        "patch5517":  (192,   1,   0,  0, (), ()),
+        "patch6090":  (247,   0,   0,  0, (), ()),
+        "cco":        (136,   7,   0,  0, (), ()),
+        "patch6609":  (297,  17,   0,  0, (), ()),
+        "patch7878":  (470, 163,   0,  0, (), ()),
+        "zephyr1057": (305,  31,  16, 16,
+                       ("Asgard", "crystalcave02", "religion001",
+                        "religion002", "religion003", "religion004"),
+                       ("Warzone[TowOnline]", "canyon1", "desert1",
+                        "desertArena", "forum01", "grocery", "n-room",
+                        "smith", "southgate", "waterArena")),
+    }
+
+    #: The map versions whose trailer this model does not describe.
+    #:
+    #: An explicit set rather than `version >= 1005`, and the reason is
+    #: measured: **between 6 and 21 maps on every install have no version at
+    #: all.** `arena`, `brave`, `forum`, `grocery` and their kin begin
+    #: `DMAP101\0`, so the u32 `parse` reads as `version` is the ASCII magic
+    #: `DMAP` -- 1,346,456,900 -- and any `>=` comparison sweeps every one of
+    #: them into the late bucket (28 rather than 7 on CCO, MEASURED). They
+    #: close at EOF like every other map of a version this model covers.
+    #:
+    #: A whitelist cannot go quietly stale here: a v1007 that leaves its tail
+    #: unread lands in `gap - late` and fails
+    #: `test_the_walk_closes_on_every_map_of_a_version_it_was_modelled_on` by
+    #: name, which is the report that is wanted.
+    LATE = (1005, 1006)
+
+    @classmethod
+    def setUpClass(cls):
+        if not HAVE_ROOT:
+            raise unittest.SkipTest("needs the game install")
+        if BASE_KIND not in cls.GAP:
+            raise unittest.SkipTest(
+                f"no trailer figure was measured for an install declared "
+                f"{BASE_KIND or 'nothing'}; declining to hold an unidentified "
+                f"corpus to another client's number")
+        import dmap
+        root = Path(coroot.default_root())
+        cls.parsed, cls.late, cls.gap = 0, set(), set()
+        for name in dmap.map_names(root):
+            d, _how = dmap.parse_map(root, name, verify=False)
+            if d is None:                 # the registry names it, nothing ships it
+                continue
+            cls.parsed += 1
+            if d.version in cls.LATE:
+                cls.late.add(name)
+            if d.bytes_unconsumed:
+                cls.gap.add(name)
+
+    def _want(self):
+        return self.GAP[BASE_KIND]
+
+    def test_the_unread_byte_counter_can_still_report_a_non_zero(self):
+        r"""**THE CONTROL. Added 2026-09-07 with the re-pin, not after it.**
+
+        Every figure this class pins is now ZERO on six of the nine installs,
+        CCO -- the one usually configured -- among them. That is a real
+        closure (see the class docstring's three checks), and it costs this
+        class its ability to notice the one regression it most needs to
+        notice: **a parser that stopped COUNTING unread bytes and a parser
+        that reads the trailer correctly publish the identical zero.** With
+        `gap = 0` pinned, `assertEqual(len(self.gap), 0)` passes just as
+        happily if `bytes_unconsumed` were hardwired to 0.
+
+        Before the re-pin the counter's liveness came for free, because the
+        pinned numbers were non-zero. It does not any more, and the liveness
+        of an instrument must not be a side effect of what it happens to be
+        measuring. So it is asserted directly: take a map this install ships,
+        append bytes that belong to no section, and require the parser to say
+        so. On an install where `gap` is non-zero this is redundant; on the
+        six where it is zero it is the only thing standing between a silent
+        counting regression and a green suite.
+
+        **ABLATED 2026-09-07, and the result is why this is not paranoia.**
+        With `d.bytes_unconsumed = len(b) - o` in `core/dmap.py` replaced by
+        `d.bytes_unconsumed = 0`, on CCO::
+
+            test_the_walk_closes_on_every_map_of_a_version...   ok
+            test_the_unread_tail_belongs_to_version_1005...     ok
+            test_the_new_suffix_is_not_what_divides_them        ok
+            test_the_unread_byte_counter_can_still_report...    FAIL
+
+        A parser that counts nothing at all passes the three pinned tests
+        three for three. This one is the whole of the class's protection on
+        any install whose `gap` is zero.
+
+        The install is READ-ONLY and stays so: `open_map` hands back bytes,
+        the mutation is written to a temp file, and nothing under
+        `coroot.default_root()` is opened for writing.
+        """
+        import tempfile
+        import dmap
+        root = Path(coroot.default_root())
+        pad = 64
+        checked = 0
+        for name in dmap.map_names(root):
+            raw, _why = dmap.open_map(root, name)
+            if raw is None:
+                continue
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / f"{name}.DMap"
+                p.write_bytes(raw + b"\xAB" * pad)
+                d = dmap.parse(p, verify=False)
+            self.assertGreaterEqual(
+                d.bytes_unconsumed, pad,
+                f"{name}: {pad} bytes appended past the end of every section "
+                f"and the parser reports {d.bytes_unconsumed} unread. "
+                f"`bytes_unconsumed` is not counting, so every zero this "
+                f"class pins is uninterpretable")
+            checked += 1
+            if checked == 3:
+                break
+        self.assertEqual(checked, 3,
+                         "fewer than three maps could be read back, so the "
+                         "control did not run -- that is not a pass")
+
+    def test_the_walk_closes_on_every_map_of_a_version_it_was_modelled_on(self):
+        r"""The claim `map_scenery.md` §5 makes, held to its real range.
+
+        This is the assertion that would have reported the drift AS drift: the
+        model is for v1003/v1004, it closes on every such map on every client,
+        and each exception is NAMED rather than absorbed into a tolerance.
+        """
+        parsed, _late, _gap, _plain, _open, residue = self._want()
+        self.assertEqual(self.parsed, parsed,
+                         "the corpus this install offers has changed size, so "
+                         "every figure below is scoped to a different one")
+        self.assertEqual(sorted(self.gap - self.late), sorted(residue),
+                         "a map of a version this model DOES cover stopped "
+                         "closing at EOF (or a named exception started "
+                         "closing); the trailer model has drifted where it "
+                         "was supposed to hold")
+
+    def test_the_unread_tail_belongs_to_version_1005_and_later(self):
+        r"""The gap, bounded in BOTH directions and pinned per install.
+
+        Two halves, kept apart because they fail for different reasons: every
+        v1005+ map leaves bytes unread, so the gap is not a handful of odd
+        files; and every map that leaves bytes unread is v1005+ or named, so
+        the gap is not creeping into the versions the model covers.
+        """
+        _parsed, late, gap, _plain, still_open, _residue = self._want()
+        self.assertEqual(len(self.late), late,
+                         "this install ships a different number of "
+                         "v1005/v1006 maps than was measured")
+        self.assertEqual(len(self.gap), gap,
+                         "the set of maps leaving trailer bytes unread has "
+                         "changed size on this install")
+        self.assertEqual(sorted(self.late & self.gap), sorted(still_open),
+                         "a v1005/v1006 map that closed stopped closing, or "
+                         "one that left its tail unread now closes -- either "
+                         "way the trailer model's reach has moved and the "
+                         "figure it is quoted against is stale")
+
+    def test_the_new_suffix_is_not_what_divides_them(self):
+        r"""THE REFUTATION, and the reason this class walks nine installs.
+
+        `*_new` was a real pattern on the two clients it was coined from and
+        is not the boundary. Asserted as a **count per install**, so it stays
+        a live assertion on the clients where that count is zero and a
+        standing refutation on the ones where it is not.
+
+        **Re-measured 2026-09-07 and the refutation got STRONGER, from one
+        direction nobody aimed at.** It used to read "29 of zephyr1057's 41"
+        and "2 of 7878's 164". After `2ee16bfa` closed the tail on every
+        `*_new` map that had one, 7878's count is 0 of 0 -- and zephyr1057 is
+        **16 of 16**. Every single map still leaving bytes unread on the one
+        install that still has any carries no `_new` at all. The suffix did
+        not merely fail to be the boundary; on today's parser it is
+        anti-correlated with the thing it was coined to name.
+        """
+        _parsed, _late, _gap, plain, _open, _residue = self._want()
+        got = sorted(n for n in self.gap if not n.lower().endswith("_new"))
+        self.assertEqual(len(got), plain,
+                         f"maps leaving bytes unread whose name is not "
+                         f"`*_new`: {got[:12]}")
 
 
 class LooseMapVsArchive(unittest.TestCase):
@@ -10282,7 +12038,7 @@ class LooseMapVsArchive(unittest.TestCase):
             with self.subTest(a.name):
                 out = subprocess.run([seven, "l", "-slt", str(a)],
                                      capture_output=True, text=True,
-                                     errors="replace").stdout
+                                     errors="backslashreplace").stdout
                 size = re.search(r"^Size = (\d+)$", out, re.M)
                 crc = re.search(r"^CRC = ([0-9A-F]+)$", out, re.M)
                 self.assertIsNotNone(size, "7-Zip named no unpacked size")
@@ -10656,7 +12412,16 @@ class SceneSprites(unittest.TestCase):
         """14 of the 2,621 MapScene frames name a `.msk`, and they are every
         piece of both `p-arena` bridges -- so those drew as nothing until this
         was handled. A `.msk` is a 1-bpp mask; the colour is in the `.dds`
-        beside it, whose own alpha already agrees with the mask to 97%."""
+        beside it.
+
+        **This used to end "whose own alpha already agrees with the mask to
+        97%", and that sentence was doing work the measurement does not
+        support.** It reads as "they differ only at antialiased edges"; the
+        disagreement is majority-INTERIOR on every install measured, including
+        the ones scoring 97%. The agreement rate says the two files describe
+        the same OBJECT. It has never said they describe the same SHAPE, and
+        the floor below is written as the former. See the comment on the
+        assertion for the per-install numbers and what moved at 6090."""
         import scene
         import coroot
         from coassets import AssetRoot
@@ -10669,7 +12434,40 @@ class SceneSprites(unittest.TestCase):
         w, h, rgba = fr[0]
         self.assertEqual((w, h), (512, 512))
 
-        # the mask and the .dds alpha really do describe the same shape
+        # The mask and the .dds alpha describe the SAME OBJECT. They do not
+        # describe the same shape, and the 0.95 this used to assert came with
+        # a rationale that does not survive being looked at.
+        #
+        # THE RATIONALE WAS DECORATION. The docstring said the alpha "already
+        # agrees with the mask to 97%", which reads as "they differ only at
+        # antialiased edges". Measured, by whether a disagreeing pixel sits on
+        # a mask boundary or inside a solid region:
+        #
+        #     5517   2.97% disagree   edge 26%   INTERIOR 74%
+        #     6090   7.03% disagree   edge 12%   INTERIOR 88%
+        #
+        # It was ALREADY majority-interior on the build that passed. The
+        # number never meant what the sentence claimed.
+        #
+        # AND THE FLOOR WAS CALIBRATED ON ONE INSTALL. This test takes
+        # `coroot.default_root()`, so it silently measures whichever install
+        # this box is set to. The `.msk` is BYTE-IDENTICAL on all of them;
+        # 6090 re-authored the `.dds` and moved its directory:
+        #
+        #     default / 5165 / 5517   0.9704   mapobj/plain/plain/
+        #     6090 / 6271             0.9300   mapobj/1-plain/plain/
+        #
+        # So `patch6090` failed here for two days over art that changed, not
+        # code that broke. What moved is `art-but-no-mask`, 632 -> 6588: the
+        # `.dds` paints where the mask does not, and THE FALLBACK DRAWS THE
+        # `.dds`, so that is the benign direction.
+        #
+        # 0.85 is below both measurements with room, and it is a CORRELATION
+        # floor -- "this is the same object" -- not a shape-identity claim.
+        # The question "does the fallback actually yield art" is not this
+        # test's to answer and is not weakened here: it is
+        # `test_every_p_arena_bridge_piece_has_art` below, which checks all 16
+        # pieces and passes on 5517, 6090 and 6271.
         ar = AssetRoot(root)
         msk = ar.read(paths[0])
         self.assertEqual(len(msk), w * h // 8)
@@ -10678,7 +12476,77 @@ class SceneSprites(unittest.TestCase):
             bit = (msk[i >> 3] >> (7 - (i & 7))) & 1
             agree += bit == (1 if rgba[i * 4 + 3] > 8 else 0)
             total += 1
-        self.assertGreater(agree / total, 0.95)
+        rate = agree / total
+        print("\n  MSK/DDS agreement %.4f on %s" % (rate, root))
+        self.assertGreater(
+            rate, 0.85,
+            "the .msk and the .dds alpha of %r no longer describe the same "
+            "object on %s (%.4f). Measured elsewhere: 0.9704 on 5165/5517, "
+            "0.9300 on 6090/6271 -- so a reading far below those is the ART "
+            "having changed, and the thing to check first is whether this "
+            "install ships a different `.dds` for the same stem."
+            % (paths[0], root, rate))
+
+    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
+    def test_the_agreement_floor_sits_between_right_and_wrong_pairings(self):
+        """The positive control for the floor above, because a floor nothing
+        can fall below is not a check.
+
+        The old 0.95 had no control at all: it was one number taken from one
+        install, and when 6090 re-authored the art it failed for a reason that
+        had nothing to do with the fallback. Replacing it with a LOWER number
+        is only defensible if the new one still separates a correct pairing
+        from an incorrect one, so that is measured here rather than asserted.
+
+        `bridge05`'s mask against its OWN `.dds`, and against another bridge
+        piece's `.dds` of the same dimensions:
+
+            correct    0.9704 on 5165/5517      0.9300 on 6090/6271
+            WRONG      0.8219 (bridge03)        0.6270 (bridge01)
+
+        0.85 is above every wrong pairing measured and below every right one.
+        """
+        import scene
+        import coroot
+        from coassets import AssetRoot
+        root = Path(coroot.default_root())
+        cache = scene.SpriteCache(root)
+        paths = cache.frame_paths("ani/MapScene.ani", "bridge05.tga")
+        if not paths or not paths[0].endswith(".msk"):
+            self.skipTest("no .msk frame for bridge05 on this install")
+        with AssetRoot(root) as ar:
+            msk = ar.read(paths[0])
+        w, h, own = cache.frames("ani/MapScene.ani", "bridge05.tga")[0]
+
+        def agreement(rgba):
+            a = t = 0
+            for i in range(0, w * h, 7):
+                bit = (msk[i >> 3] >> (7 - (i & 7))) & 1
+                a += bit == (1 if rgba[i * 4 + 3] > 8 else 0)
+                t += 1
+            return a / t
+
+        wrong = []
+        for other in ("bridge03.tga", "bridge01.tga", "bridge04.tga"):
+            fr = cache.frames("ani/MapScene.ani", other)
+            if fr and (fr[0][0], fr[0][1]) == (w, h):
+                wrong.append((other, agreement(fr[0][2])))
+        self.assertTrue(
+            wrong,
+            "no other bridge piece of the same size on this install, so the "
+            "floor has NO control here and this case is measuring nothing")
+        print("\n  own %.4f | wrong %s"
+              % (agreement(own),
+                 ", ".join("%s %.4f" % q for q in wrong)))
+        self.assertGreater(agreement(own), 0.85, "the right pairing is below "
+                           "the floor, so the floor is too high")
+        for name, r in wrong:
+            self.assertLess(
+                r, 0.85,
+                "pairing bridge05's mask with %s's art scores %.4f, which is "
+                "ABOVE the floor -- so the floor no longer separates the "
+                "right art from the wrong art and it is not checking "
+                "anything" % (name, r))
 
     @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_every_p_arena_bridge_piece_has_art(self):
@@ -10824,11 +12692,22 @@ class SceneryExport(unittest.TestCase):
 
 
 class _FakePlacement:
-    """The three attributes `scene.frame_index` reads, and nothing else."""
+    """The attributes `scene.frame_index` and `scene.cover_paint_order` read.
 
-    def __init__(self, title, frame_interval, depth=0):
+    `layer_index` is the cover's position in the `.DMap` list, which is the
+    client's paint order. It was missing until 2026-09-16, and both arms of
+    `CoverCacheKeyIsTheFrameNotTheClock` raised AttributeError from the day
+    paint order moved off depth, because this class is not in the gate that
+    change ran. The real type, `scene.Placed`, always has the field (a
+    dataclass default, set by `scene.gather`), so the fixture was the stale
+    side, not `scene.py`. Defaults to the depth, keeping every arm's order
+    what it was when it was written.
+    """
+
+    def __init__(self, title, frame_interval, depth=0, layer_index=None):
         self.ani, self.title = "ani/MapScene.ani", title
         self.frame_interval, self._depth = frame_interval, depth
+        self.layer_index = depth if layer_index is None else layer_index
 
     def depth(self):
         return self._depth
@@ -11324,8 +13203,20 @@ class MapEditorModel(unittest.TestCase):
         states = {}
         for r in rows:
             states[r["state"]] = states.get(r["state"], 0) + 1
-        self.assertEqual(states.get("pux"), 4, "four maps use the undecoded "
-                                               "TqTerrain .pux format")
+        # THE "pux" STATE IS GONE, ON PURPOSE. Until 9ccb1868 (2026-09-15)
+        # the row builder gave the four TqTerrain maps `state = "pux"` ("not
+        # decoded") while `MapEditor.get()` opened all four with a full
+        # ground -- the row was the lie (see the comment in
+        # `mapedit.MapEditor._row`). This arm asserted that lie until
+        # 2026-09-16. Now the four take the `.pul` path and must come back
+        # ok, which a regression to the refusal branch would break.
+        self.assertIsNone(states.get("pux"))
+        pux = {r["name"]: r["state"] for r in rows
+               if str(r.get("puzzle", "")).lower().endswith(".pux")}
+        self.assertEqual(pux, {"ninja01_new": "ok", "2020love01_new": "ok",
+                               "bp-flandlords-y_new": "ok",
+                               "magictower01_new": "ok"},
+                         "the four TqTerrain maps must build, not report")
         self.assertEqual(states.get("mismatch"), 1)
         mismatched = [r["name"] for r in rows if r["state"] == "mismatch"]
         self.assertEqual(mismatched, ["sky"], "docs/ground_art.md §3.1 names "
@@ -11746,14 +13637,27 @@ class MapEditorUi(unittest.TestCase):
                          "a var() nothing declares resolves to nothing at all")
 
     def test_the_constants_agree_with_the_python(self):
-        """A tile the page asks for and the server cannot render is a blank
-        square with no error, so the three constants are pinned on both sides."""
+        r"""A tile the page asks for and the server cannot render is a blank
+        square with no error, so the three constants are pinned on both sides.
+
+        **THE LAYER ARM COMPARES VALUES, NOT LINE BREAKS.** It used to match
+        one rendered line, and it went red when `interactive` was added and
+        the array wrapped onto two lines -- reporting a stale page when the
+        page was correct. Formatting is not the relation this gate is about;
+        a one-line matcher makes `black`-style rewrapping look like a
+        drifted constant, which costs a real investigation and teaches
+        people to distrust the gate.
+        """
         import mapedit
         js = self.read("mapmodel.js")
         self.assertIn(f"const TILE = {mapedit.TILE};", js)
         self.assertIn("const ZOOMS = [" + ", ".join(str(z) for z in mapedit.ZOOMS) + "];",
                       js)
-        self.assertIn("const LAYERS = ['" + "', '".join(mapedit.LAYERS) + "'];", js)
+        m = re.search(r"const LAYERS = \[(.*?)\];", js, flags=re.S)
+        self.assertIsNotNone(m, "mapmodel.js declares no LAYERS array")
+        self.assertEqual(re.findall(r"'([^']+)'", m.group(1)),
+                         list(mapedit.LAYERS),
+                         "the page's draw order must be the server's layer list")
 
     def test_the_placement_rule_in_the_page_is_the_one_in_puzzle_py(self):
         """`mapmodel.corner()` repeats `puzzle.corner_px` so a click does not
@@ -12151,6 +14055,7 @@ class Curation(unittest.TestCase):
         import collection as _c
         self.mod = _c
         self.dir = Path(tempfile.mkdtemp(prefix="cocol-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.col = _c.Collection(self.dir)
 
     def _keep(self, name, category="Weapons", parts=(), **kw):
@@ -12185,7 +14090,16 @@ class Curation(unittest.TestCase):
         want = {f"{self.mod.PROFILE_NAME}/{rel}".lower()
                 for rel in [e["mesh"], *e["skins"],
                             *[p["file"] for p in e["parts"]]]}
+        # AND the game path each was collected from. Since 063c315b
+        # (2026-09-15) `Collection.publish` also lists every part under the
+        # logical path the client uses, so the Map Editor can find a
+        # collected map. Skins carry no source and are not listed twice.
+        # This arm expected the prefixed pile only, and went red on that.
+        want |= {"c3/weapon/katana.c3", "c3/weapon/100.c3", "effect/aura.ini"}
         self.assertEqual(set(filemap), want)
+        # Both spellings of one part point at the SAME library file.
+        self.assertEqual(filemap["c3/weapon/100.c3"][1],
+                         filemap[f"{self.mod.PROFILE_NAME}/{e['parts'][0]['file']}".lower()][1])
 
     def test_every_published_path_points_at_a_file_that_is_there(self):
         e = self._keep("katana", parts=[
@@ -12216,10 +14130,19 @@ class Curation(unittest.TestCase):
         self._keep("katana", category="Weapons")
         moved = self._keep("katana", category="Headgear")
         filemap, _ = self._published()
-        self.assertEqual(len(filemap), 2)                # mesh + skin, once
+        # mesh + skin on the shelf, once each, plus the mesh's game path
+        # (published since 063c315b; the skin has no source path).
+        self.assertEqual(len(filemap), 3)
+        shelf = [k for k in filemap if k.startswith(self.mod.PROFILE_NAME + "/")]
+        self.assertEqual(len(shelf), 2)
+        self.assertEqual(set(filemap) - set(shelf), {"c3/weapon/katana.c3"})
         for key, ref in filemap.items():
             with self.subTest(path=key):
-                self.assertTrue(key.startswith("collection/headgear/"))
+                if key in shelf:
+                    self.assertTrue(key.startswith("collection/headgear/"))
+                # every row, the game-path one included, resolves on the
+                # NEW shelf -- a stale row would point at the old one
+                self.assertEqual(ref[2], "Headgear")
                 self.assertTrue((self.dir / ref[1]).is_file())
         self.assertEqual(moved["category"], "Headgear")
 
@@ -13003,11 +14926,26 @@ class AniIndexSpelling(unittest.TestCase):
         parts = mapparts.gather_map_parts("2009-7x", DEFAULT_ROOT,
                                           with_shared=False)
         art = [p for p in parts if p.role == "art"]
+        # SCENERY first, then the GROUND. Since 063c315b (2026-09-15) a
+        # collected map also carries its ground and backdrop closure
+        # (`mapparts.ground_closure`): the `.pul`/`.pux` tiles index their
+        # own `.ani` under `Puzzle<N>` keys, so `island`/`skybg`/`sky` are
+        # now parts of 2009-7x as well. This arm asserted only the two
+        # scenery indexes until 2026-09-16 and went red on that change. The
+        # five index files were NOT new on disk (one ctime, 2026-08-25, for
+        # all five), so the expectation was stale, not the collector.
         self.assertEqual([p.rel for p in parts if p.role == "ani"],
-                         ["ani/MapScene.json", "ani/MapScene-snow.json"],
+                         ["ani/MapScene.json", "ani/MapScene-snow.json",
+                          "ani/island.json", "ani/skybg.json", "ani/sky.json"],
                          "the ani part must name the file this install has")
         self.assertEqual([p.rel for p in art if p.missing], [])
-        self.assertEqual(len(art), 35)
+        # The regression itself: the 35 scenery sprites resolve through the
+        # .json spelling. The ground adds 204 more, all found.
+        scenery = [p for p in art if "/mapobj/" in p.rel]
+        ground = [p for p in art if "/puzzle/" in p.rel]
+        self.assertEqual(len(scenery), 35)
+        self.assertEqual(len(ground), 204)
+        self.assertEqual(len(art), len(scenery) + len(ground))
 
 
 @unittest.skipUnless(HAVE_ROOT, "needs the game install")
@@ -13221,7 +15159,12 @@ class MeshTexConfidence(unittest.TestCase):
                       "problem was only ever which one was chosen")
 
 
-@unittest.skipUnless(HAVE_ROOT, "needs the game install")
+# NB: the class-level `skipUnless(HAVE_ROOT, ...)` that used to stand here is
+# GONE, deliberately. `HAVE_ROOT` asks whether the AMBIENT install exists,
+# which after the pin below is a question about a directory this class no
+# longer reads -- so it could stand the whole class down while the install it
+# actually measures was present, and could never fire when the pinned one was
+# missing. That is the skip-instead-of-fail shape the pin exists to close.
 class NpcArtTables(unittest.TestCase):
     """Where an NPC's geometry, texture and motion each come from.
 
@@ -13238,28 +15181,107 @@ class NpcArtTables(unittest.TestCase):
     0.95 confidence, and is simply not the file the client loads.
     """
 
+    #: PINNED 2026-08-28, and this one is a SNAPSHOT pin rather than a base
+    #: pin -- the distinction is the finding.
+    #:
+    #: `CO_ROOT` pointed at the live CCO is not wrong here: this class asserts
+    #: CCO content and it was CCO it ran on. It went red anyway. A mod was
+    #: installed into that install at **2026-08-25T21:07Z**
+    #: (`C:\COMod\Installed\installs\*\manifest.json`,
+    #: `docs/two_reds_one_install_2026-08-26.md`), displacing `ini/npc.json`
+    #: and giving `Storekeeper` a `standby_motion` of `999015100`. So
+    #: `plan_for_mesh("c3/npc/999001100.c3")` now reaches a DIFFERENT NPC and
+    #: the test reports `'Mark.Controller' != 'Storekeeper'` -- a content
+    #: refutation of a resolver that is right.
+    #:
+    #: No base pin can fix that, because the base was already the one it
+    #: wanted. What changed is the install's STATE, so what has to be named is
+    #: a dated snapshot. `tests/test_npcaltskin.py` pins the same one for the
+    #: same reason.
+    #:
+    #: **The owner did nothing wrong**: the mod went in through `comod`, was
+    #: recorded in a manifest, and the original `npc.json` is still on disk
+    #: with its 2023 mtime. The only thing that misbehaved was this test's
+    #: ability to notice, and a control that someone may legitimately write to
+    #: is not a control.
+    #: THE FINGERPRINT IS THE POINT OF THIS ONE. The displacement that forced
+    #: this pin -- `ini/npc.json` and `c3/npc/9990151*.c3`, overwritten in the
+    #: LIVE install at 2026-08-25T21:07Z -- is exactly a content drift under
+    #: an unchanged name. `ini/npc.json` is hashed byte for byte; `c3/npc` is
+    #: in `covers` because the mod also replaced meshes there and only a
+    #: manifest of that tree can see it. If a snapshot is ever taken again
+    #: from a live install, this is the arm that notices.
+    PIN = DeclaredInstall(
+        "CCO-snapshot-2026-08-24",
+        why="asserts CCO's shipped npc tables, from BEFORE the 2026-08-25 "
+            "21:07Z mod displaced ini/npc.json in the live install",
+        fingerprint="3f201d08bbc5-c7a16be8", covers=("c3/npc",))
+
     @classmethod
     def setUpClass(cls):
         import npcart
         from coassets import AssetRoot
         cls.npcart = npcart
-        cls.assets = AssetRoot(ROOT)
+        cls.pin_error = None
+        try:
+            cls.root = cls.PIN.path()
+        except AssertionError as exc:
+            # Stashed, not raised: a `setUpClass` raise records ONE holder and
+            # drops every test in this class out of `testsRun`, so the names
+            # disappear from the report and "it stopped running" reads exactly
+            # like "it got fixed". `setUp` re-raises it once per test, by name.
+            cls.pin_error = exc
+            return
+        cls.assets = AssetRoot(cls.root)
         cls.tables = npcart.Tables(cls.assets.read)
+
+    def setUp(self):
+        if self.pin_error is not None:
+            raise self.pin_error
 
     def _exists(self, p):
         return self.assets.locate(p) is not None
 
     def test_the_storekeeper_resolves_the_way_the_game_does(self):
-        """The one case verified against the running client, end to end."""
+        """The one case verified against the running client, end to end.
+
+        **The NPC's NAME is the only install-specific thing asserted here, and
+        the split is measured.** At c14d1048, `plan_for_mesh` on
+        `c3/npc/999001100.c3` per install:
+
+            5017..6609   Storekeeper       c3/mesh/9990010.c3  c3/texture/9990211.dds
+            cco          Mark.Controller   c3/mesh/9990010.c3  c3/texture/9990211.dds
+            7878, Zephyr None -- the table does not name this mesh at all
+
+        Geometry and texture are the same asset on every install that has the
+        row; only the label differs. That matters, because the chain this test
+        exists to guard -- `npc.json` names the MOTION, geometry comes through
+        `simple_object -> Part0 -> 3dobj.ini`, texture through the tables --
+        is exactly the part that does NOT move. Asserting the name unguarded
+        made a naming difference read as a broken resolver.
+        """
         plan = self.tables.plan_for_mesh("c3/npc/999001100.c3")
-        self.assertIsNotNone(plan)
-        self.assertEqual(plan.name, "Storekeeper")
+        if plan is None:
+            self.skipTest(f"{coroot.base_id()} has no table row for "
+                          f"c3/npc/999001100.c3 -- there is no resolution to "
+                          f"check, which is not a failed one")
+        # The chain FIRST and unguarded, because it is what this test is about
+        # and it is measured identical on every install that has the row. The
+        # name goes last precisely so a label cannot cost the chain its
+        # coverage: the old order asserted the name first and stopped there,
+        # so on CCO these three lines had never run at all.
         self.assertEqual(plan.geometry, "c3/mesh/9990010.c3")
         self.assertEqual(plan.texture, "c3/texture/9990211.dds")
         self.assertEqual(plan.motions, {
             "standby": "c3/npc/999001100.c3",
             "rest": "c3/npc/999001101.c3",
             "blaze": "c3/npc/999001190.c3"})
+        if plan.name != "Storekeeper":
+            self.skipTest(f"the chain above HELD; this NPC is merely LABELLED "
+                          f"{plan.name!r} on {coroot.base_id()} rather than "
+                          f"'Storekeeper' -- a per-install string, not a "
+                          f"resolution failure")
+        self.assertEqual(plan.name, "Storekeeper")
 
     def test_the_texture_is_not_the_transposed_mesh_id(self):
         """The specific wrong answer that cost a whole session. It names a
@@ -13353,7 +15375,8 @@ class NpcIniCaseAndDuplicates(unittest.TestCase):
         import npcart
         from coassets import AssetRoot
         cls.npcart = npcart
-        cls.tables = npcart.Tables(AssetRoot(ROOT).read)
+        with AssetRoot(ROOT) as ar:
+            cls.tables = npcart.Tables(ar.read)
         cls.by_type = {r["type"]: r for r in cls.tables.npcs}
 
     def test_the_named_types_are_present(self):
@@ -13443,7 +15466,8 @@ class NpcIndexIsNotStale(unittest.TestCase):
         on_disk = (rep.get("byKind") or {}).get("npc")
         if on_disk is None:
             self.skipTest("this report carries no byKind.npc to compare")
-        live = len(npcart.Tables(AssetRoot(ROOT).read).npcs)
+        with AssetRoot(ROOT) as ar:
+            live = len(npcart.Tables(ar.read).npcs)
         self.assertEqual(on_disk, live,
                          f"the derived index says {on_disk} npcs and the "
                          f"reader produces {live}. The index was generated by "
@@ -13832,6 +15856,7 @@ class EffectDefinitionsComeFromTheLiveTable(unittest.TestCase):
         import effects as effmod
         cls.eff = effmod
         cls.db = effmod.EffectDB(ROOT)
+        cls.addClassCleanup(cls.db.close)
 
     def test_the_source_of_every_table_is_reported(self):
         """`--coverage` names the file behind every number. A tool that does
@@ -13961,7 +15986,11 @@ class EffectDefinitionsComeFromTheLiveTable(unittest.TestCase):
         if alt is None:
             self.skipTest("needs a second declared install to contaminate with")
         before = {k: dict(v) for k, v in self.db.table_sources.items()}
-        effmod.EffectDB(alt)
+        # Opened purely for the side effect this asserts the absence of --
+        # and it is a whole second install's containers, so it is closed
+        # rather than dropped like every other db in this class used to be.
+        contaminant = effmod.EffectDB(alt)
+        self.addCleanup(contaminant.close)
         self.assertEqual(self.db.table_sources, before)
 
     def test_weaponmotion_twin_does_not_join_under_str_id(self):
@@ -14125,6 +16154,7 @@ class WeaponSkillNameSpelling(unittest.TestCase):
         """
         import effects
         db = effects.EffectDB(ROOT)
+        self.addCleanup(db.close)
         self.assertGreaterEqual(len(db.weapon_type_names), 48)
         self.assertEqual(db.weapon_type_names.get("410"), "Blade")
         self.assertEqual(db.effects_for_weapon("410009").type_name, "Blade",
@@ -14279,6 +16309,13 @@ class WdbResourceDb(unittest.TestCase):
     wherever they occur inside path data and inflated Zephyr's 30,841 real
     rows to 260,897.
 
+    > **SCOPED 2026-09-07.** The inflation is real and the *reason* given for
+    > it was not measured. On today's reader no `RSDB` literal on any of the
+    > six installs falls outside a section header, so a search would not
+    > match path data on this corpus; see
+    > `test_a_literal_search_cannot_stand_in_for_the_walk` for what does
+    > survive and what was retracted.
+
     Both are this project's standing shape: a wrong answer that looks like an
     answer. `malformed` could not catch either, because a garbage offset into
     a multi-megabyte blob always finds *some* NUL and yields *some* string --
@@ -14389,19 +16426,117 @@ class WdbResourceDb(unittest.TestCase):
                 self.assertGreater(small, big * 5, kind)
 
     def test_the_table_walk_is_sequential_not_a_search(self):
-        """Each table's blob ends exactly where the next table begins.
+        r"""Each SECTION ends exactly where the next section begins.
 
-        That zero-byte gap is what makes the walk exact. Searching for the
-        "RSDB" literal instead matches inside path data -- 13 such matches
-        exist in Zephyr's file and only 2 are tables.
+        **CORRECTED 2026-09-07: this asserted contiguity over the wrong
+        collection, and it only ever passed because the reader was
+        incomplete.** It walked `db.sections`, which is the RSDB tables whose
+        ROWS were parsed -- and nothing else. When it was written the reader
+        reached two adjacent row tables and their ends did meet. The reader
+        now walks the whole section table, so the non-row sections (`EFFE`,
+        `MESH`, `SIMO`, `MATR`, `ROPT`, `EMOI`, ...) sit BETWEEN the row
+        tables and read as gaps: 3 of them on 5165/5517/6090/zephyr1057, 4 on
+        6609, 8 on 7878. The reader is right and the assertion was measuring
+        a subsequence.
+
+        The claim is contiguity of the SECTION TABLE, and it is exact.
+        MEASURED on all six declared installs that ship `ini/c3.wdb`
+        (`offset + span == next offset`, zero gaps and zero overlaps):
+
+            install      file bytes   0x08      sections  row tables
+            patch5165     3,325,291   3,323,443       22           6
+            patch5517     3,434,463   3,432,615       22           6
+            patch6090     3,434,463   3,432,615       22           6
+            patch6609    11,011,684  11,009,584       25           7
+            patch7878    20,408,268  20,405,412       34          11
+            zephyr1057   12,192,363  12,190,263       25           6
+
+        **And it lands on the header's own number.** Walking spans from 0x10
+        for `declared_sections` entries ends on exactly the u32 at 0x08, on
+        6 of 6 -- which is what turns "no gaps" from a self-consistency check
+        (a walk that computes the next offset from the previous span cannot
+        disagree with itself) into a check against a figure the FILE states
+        independently. That independence is the whole reason 0x08 is asserted
+        here rather than the contiguity alone.
         """
+        import struct
         from wdb import ResourceDb
         for kind, path in sorted(self.DBS.items()):
             with self.subTest(base=kind):
+                d = path.read_bytes()
                 db = ResourceDb(path)
-                for a, b in zip(db.sections, db.sections[1:]):
-                    self.assertEqual(a["end"], b["offset"],
-                                     f"{kind}: gap between tables")
+                st = db.section_table
+                self.assertIsNone(db.walk_stopped,
+                                  f"{kind}: the walk did not complete")
+                self.assertEqual(len(st), db.declared_sections,
+                                 f"{kind}: walked {len(st)} sections, the "
+                                 f"header at 0x0c declares "
+                                 f"{db.declared_sections}")
+                for a, b in zip(st, st[1:]):
+                    self.assertEqual(
+                        a["offset"] + a["span"], b["offset"],
+                        f"{kind}: {a['tag']} at 0x{a['offset']:x} spans "
+                        f"{a['span']} and does not end where {b['tag']} "
+                        f"begins")
+                # The independent witness: the file's own end-of-sections.
+                self.assertEqual(
+                    st[-1]["offset"] + st[-1]["span"],
+                    struct.unpack_from("<I", d, 0x08)[0],
+                    f"{kind}: the section walk does not land on the u32 at "
+                    f"0x08 -- the walk and the file disagree about where the "
+                    f"sections end")
+
+    def test_a_literal_search_cannot_stand_in_for_the_walk(self):
+        r"""The other half of the old docstring, re-measured and re-scoped.
+
+        **RETRACTED 2026-09-07, and the retracted half was this suite's own
+        artefact.** The claim was: *searching for the "RSDB" literal matches
+        inside path data -- 13 such matches exist in Zephyr's file and only 2
+        are tables.* The 13 is right. **All 13 are genuine section headers.**
+        "Only 2 are tables" was the number the INCOMPLETE reader returned --
+        it stopped at the first foreign magic and the first empty table -- so
+        the file was blamed for a limit that belonged to the reader. Measured
+        today across all six installs, the `RSDB` literal occurs at a
+        non-section offset **zero** times.
+
+        The hazard is real but it is not on `RSDB`: on 7878 the literal
+        `EFFE` occurs 3 times and only 1 is a section header. Reproduced by
+        the scan this test runs, widened from `ROW_TABLES` to every magic in
+        `dbc.section_span` -- offsets found by `bytes.find` that are not in
+        `ResourceDb(path).section_table`. It is left as an observation and
+        NOT pinned: two spurious `EFFE` on one install of nine is a fact
+        about 7878's path data, and pinning it would make this a content pin
+        on whichever client is configured.
+
+        What is asserted here is the reason the walk is not optional, and it
+        holds on every install without pinning any install's content: **a
+        search for row-table magics reaches only a minority of the file's
+        sections** -- 10 of 22, 13 of 25, 15 of 34 -- so it can never produce
+        the end-of-sections figure at 0x08, and cannot see a section whose
+        magic it was not told to look for. `RSDC` on 7878 is exactly that
+        case: a row table nobody searching for `RSDB` would find.
+        """
+        from wdb import ResourceDb, ROW_TABLES
+        for kind, path in sorted(self.DBS.items()):
+            with self.subTest(base=kind):
+                d = path.read_bytes()
+                db = ResourceDb(path)
+                walked = {s["offset"] for s in db.section_table}
+                found = set()
+                for tag in ROW_TABLES:
+                    i = d.find(tag)
+                    while i >= 0:
+                        found.add(i)
+                        i = d.find(tag, i + 1)
+                self.assertLess(
+                    len(found & walked), len(walked),
+                    f"{kind}: a literal search for {ROW_TABLES} reached "
+                    f"every one of the {len(walked)} sections -- if that is "
+                    f"true the sequential walk is no longer load-bearing "
+                    f"and this file's reader can be simplified")
+                self.assertTrue(
+                    found,
+                    f"{kind}: no row-table magic occurs in the file at all")
 
 
 class TqDatTables(unittest.TestCase):
@@ -14637,6 +16772,7 @@ class CommunityJsonTablesHaveAnOfficialTwin(unittest.TestCase):
         and the caller keys weapon sets three wide."""
         import effects as effects_mod
         db = effects_mod.EffectDB(ROOT)
+        self.addCleanup(db.close)
         names = db.weapon_type_names
         self.assertTrue(names, "no weapon-skill name table loaded at all")
         self.assertTrue(all(len(k) == 3 for k in names),
@@ -15848,7 +17984,8 @@ class CcoIsTheReferenceInstall(unittest.TestCase):
             motion = partsmod.idle_motion(app, root, "410", action)
             if mesh is None or motion is None:
                 return None
-            raw = AssetRoot(root).read(mesh)
+            with AssetRoot(root) as ar:
+                raw = ar.read(mesh)
             best = None
             for f in range(0, 31):
                 try:
@@ -16094,7 +18231,8 @@ class SocketCorrectionIsViewerOnly(unittest.TestCase):
         mesh = cat.appearance_mesh("armor.ini", app) or cat.mesh_path(app)
         if not mesh:
             self.skipTest("body mesh not resolvable on this install")
-        raw = AssetRoot(ROOT).read(mesh)
+        with AssetRoot(ROOT) as ar:
+            raw = ar.read(mesh)
         for action, frame in (("100", 0), ("403", 12), ("403", 24)):
             motion = partsmod.idle_motion(app, ROOT, "410", action)
             if motion is None:
@@ -16252,7 +18390,8 @@ class SocketCorrectionIsViewerOnly(unittest.TestCase):
             motion = partsmod.idle_motion(app, ROOT, "410", "100")
             if not mesh or motion is None:
                 continue
-            raw = AssetRoot(ROOT).read(mesh)
+            with AssetRoot(ROOT) as ar:
+                raw = ar.read(mesh)
             a = partsmod.socket_anchors(raw, motion_set=motion, frame=0)
             self.assertIsNone(plug.socket_correction("v_l_weapon", app),
                               f"{app} is male and must not be corrected")
@@ -16309,7 +18448,8 @@ class SocketCorrectionIsViewerOnly(unittest.TestCase):
             motion = partsmod.idle_motion(body, ref, "410", "100")
             if not mp or motion is None:
                 continue
-            mesh = attach.PartMesh.parse(AssetRoot(ref).read(mp), mp)
+            with AssetRoot(ref) as ar:
+                mesh = attach.PartMesh.parse(ar.read(mp), mp)
             names = [c.phy.name for c in motion.chunks if c.phy is not None]
             if not any(names):
                 continue           # this install's motions are nameless too
@@ -16459,7 +18599,8 @@ class CorrectionsRegister(unittest.TestCase):
             f"is silent")
         try:
             rc = subprocess.run([sys.executable, str(self.GATE)],
-                                capture_output=True, text=True, timeout=120)
+                                capture_output=True, text=True,
+                                errors="backslashreplace", timeout=120)
         except Exception as exc:                  # could-not-run != passed
             self.fail(f"the register gate could not run: {exc!r}. That is not "
                       f"a pass -- it means nothing checked the register.")
@@ -17479,6 +19620,39 @@ class MonsterArtResolution(unittest.TestCase):
         self.assertEqual(a.mesh_dir, 103)
 
 
+class TheCcoFlatFamilyBody(unittest.TestCase):
+    """`plugins/cco.py` `flat_family_base`, hermetic: which stem is a flat
+    NPC look's real body. CCO keeps looks 264-277's body at ``999<g>0.c3``
+    (inside the archives), and the plugin tried only ``999<g>.c3`` until
+    2026-10-03, so the viewer posed ten looks over a 3-4 vertex shard."""
+
+    def _base(self, paths, geometry):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from plugins.cco import ClassicConquer                  # noqa: PLC0415
+        return ClassicConquer().flat_family_base(
+            "271", set(paths), lambda p: p in geometry)
+
+    def test_the_zero_suffixed_stem_is_the_body_when_it_is_the_only_one(self):
+        paths = {"c3/npc/9992710.c3", "c3/npc/999271100.c3"}
+        self.assertEqual(self._base(paths, paths), "c3/npc/9992710.c3")
+
+    def test_the_short_stem_still_wins_when_both_exist(self):
+        paths = {"c3/npc/999271.c3", "c3/npc/9992710.c3"}
+        self.assertEqual(self._base(paths, paths), "c3/npc/999271.c3")
+
+    def test_a_stem_without_geometry_is_not_a_body(self):
+        paths = {"c3/npc/9992710.c3"}
+        self.assertIsNone(self._base(paths, set()))
+
+    def test_MUST_FIRE_the_old_single_stem_misses_the_zero_suffixed_body(self):
+        """The rule as it stood (only ``999<g>.c3``) on the same paths: it
+        must return None, or the first arm above proves nothing."""
+        paths = {"c3/npc/9992710.c3", "c3/npc/999271100.c3"}
+        old = [s.format(g="271") for s in ("c3/npc/999{g}.c3",)]
+        self.assertEqual([c for c in old if c in paths], [])
+        self.assertIsNotNone(self._base(paths, paths))
+
+
 class NpcModelArtPins(unittest.TestCase):
     """The model page's NPC/mount art, pinned to the author's verified scan.
 
@@ -17541,9 +19715,12 @@ class NpcModelArtPins(unittest.TestCase):
         self.assertEqual(m.mesh, "c3/mesh/9990010.c3")
         self.assertEqual(m.texture, "c3/texture/9990211.dds")
 
-    @requires_base("patch6090", "patch5517",
+    @requires_base("patch6090", "patch5517", "cco",
                    why="MEASURED on all six declared installs 2026-08-09: "
-                       "passes on 6090 AND on 5517; red on CCO. The former "
+                       "passes on 6090 AND on 5517; red on CCO until "
+                       "2026-10-03, when `plugins/cco.py` learned the "
+                       "999<g>0.c3 stem (looks 264-277 keep their body "
+                       "there, inside the archives). The former "
                        "text said 'red on 5517' and that was never measured. "
                        "Widened to 5517 only, NOT to the whole official "
                        "lineage: 5017/5065/5165 are red here too, but their "
@@ -17834,6 +20011,13 @@ class NpcModelArtPins(unittest.TestCase):
         non-wildcard row on 6090, which silenced every weapon and body
         effect in the builder."""
         import effects as fx
+        # DELIBERATELY NOT CLOSED, and the only db in this file that is not:
+        # `assets=` is passed, so this BORROWS `self.cat`'s root and
+        # `_owns_assets` is False.  `db.close()` would be a no-op today, but
+        # writing one here would read as "this site was missed" to the next
+        # sweep and invite someone to make it close a root its owner is still
+        # reading through -- the worse bug `EffectDB.close()` is shaped to
+        # avoid.  `self.cat` closes it.
         db = fx.EffectDB(ROOT, self.cat.assets)
         self.assertEqual(fx.EffectDB._field_matches("0100", "100"), True)
         self.assertEqual(fx.EffectDB._field_matches("100", "0100"), True)
@@ -19980,8 +22164,10 @@ class ServerViewParseProfile(unittest.TestCase):
         of the class mean something.
         """
         import npcart                                     # noqa: PLC0415
-        a = npcart.detect_profile(coassets.AssetRoot(self.base_plain).read)
-        b = npcart.detect_profile(coassets.AssetRoot(self.base_compiled).read)
+        with coassets.AssetRoot(self.base_plain) as plain:
+            a = npcart.detect_profile(plain.read)
+        with coassets.AssetRoot(self.base_compiled) as compiled:
+            b = npcart.detect_profile(compiled.read)
         self.assertEqual(a.name, "plaintext")
         self.assertEqual(b.name, "official")
         self.assertNotEqual(a.name, b.name)
@@ -20193,9 +22379,99 @@ class CoreBoundary(unittest.TestCase):
     #: The declared members. Kept here rather than globbed so that *adding* a
     #: module to COre is a deliberate act with a test change attached.
     MEMBERS = {"coroot", "safepath", "tqhash", "wdf", "dds", "c3phy",
+               "c3ccfl",
+               "gltfread",   # stdlib glTF 2.0 reader (buffers, accessors, nodes, skins, one
+                             # LINEAR animation): the donor side of tools/c3retarget.py.
+               # The CO Blowfish port (`director/re-cipher-static`). It sits
+               # in core/ and COre must equal the core/ directory -- a SUBSET
+               # is a broken package that fails its own test, which is exactly
+               # how this arrived: merged without registering, and
+               # test_comod_extraction went red on master.
+               #
+               # NOTHING IMPORTS IT YET and it has no test of its own. It is
+               # registered because it SHIPS, not because it is covered; the
+               # coverage is owed separately.
+               "coblowfish",
                "dmap", "tpd", "coassets", "colibrary", "collection", "wdb",
+               # The `.ani` frame manifest as an ORDERED SEQUENCE -- read and
+               # write. `dmap` imports it (it is `read_ani`'s body now), so
+               # COre is not closed under its own imports without it, and the
+               # extracted package would fail on `import dmap`. Registered in
+               # all THREE lists in the same commit as the module.
+               "ani",
+               # The c3.wdb CONTAINER (the obfuscated member index the u32 at
+               # 0x08 points at), beside `wdb` which walks its SECTIONS.
+               # Registered in all THREE lists in one commit -- CORE,
+               # CoreBoundary.MEMBERS and core/pyproject.toml -- because
+               # test_comod_extraction names all three and a partial
+               # registration is the failure this triple exists to catch.
+               "wdbpack",
+               # The client's string table plus the format-SIGNATURE gate that
+               # makes it safe to read a table from a build other than the one
+               # the calling code was written against. 103 keys move their
+               # printf slots across the lineage and zero keys use positional
+               # specs, so a shifted slot renders wrong values rather than
+               # failing. It SHIPS because reading a table is an asset
+               # operation a COre consumer does; it has its own tests
+               # (tests/test_strtable.py, 23 arms incl. a must-fire).
+               # Registered in all THREE lists in one commit -- CORE,
+               # CoreBoundary.MEMBERS and core/pyproject.toml.
+               "strtable",
+               # Where a C3 bone belongs, derived from the skin. A .c3 stores
+               # no rest skeleton, so the Blender importer places each bone
+               # along the principal axis of its own weighted vertices. Pure
+               # stdlib, duck-typed on PhyVertex, imports nothing of ours --
+               # and it SHIPS in core/, which is the only test COre applies.
+               # Covered by tests/test_boneplace.py (14 arms, 3 must-fire).
+               #
+               # Registered in all THREE lists in one commit -- CORE,
+               # CoreBoundary.MEMBERS and core/pyproject.toml. IT WAS NOT, on
+               # the first push of director/comod-bone-placement, and the gate
+               # caught it on two tests at once. See the note above `strtable`:
+               # this is the second time the same omission has reached a gate
+               # by a different seat, because the pre-commit hook runs only the
+               # tools/ partition and is structurally silent about a new core/
+               # module.
+               "boneplace",
+               # The bone HIERARCHY for that placement. A .c3 stores no
+               # parent indices -- MotionKey.matrices is flat and every MOTI
+               # matrix is ABSOLUTE -- but a vertex blended between two bones
+               # sits at the joint between them, so the skin IS an adjacency
+               # graph. Measured on v_body: 25 bones, 26 pairs, 0 isolated.
+               # Covered by tests/test_bonetree.py (14 arms, 3 must-fire).
+               #
+               # Registered in all THREE lists in one commit, per the note
+               # above `boneplace` -- which was NOT, and cost a gate STOP.
+               "bonetree",
+               # The skeleton SOLVED from a multi-frame motion set. Two
+               # bones are joined at the point both matrices carry to the
+               # same place in EVERY frame; a residual at the float floor is
+               # an articulation and anything else is not, however close the
+               # bones sit. This is what the skin-derived tree was a proxy
+               # for. Covered by tests/test_bonejoint.py.
+               #
+               # Registered in all THREE lists in one commit.
+               "bonejoint", "bonelabel",
+               # WHICH motion clips that solve is measured on -- the
+               # half `bonejoint` cannot check. It declares the shape's
+               # clips through `ini/3dmotion.ini` + the compiled twin
+               # and ranks them for ARTICULATION COVERAGE, because a
+               # clip that holds a pair rigid is silence about that
+               # pair and not agreement: CCO body 0003 has 262 of its
+               # 290 clips inside c3.wdf and none of the unarmed set
+               # loose, and taking them in name order instead of by
+               # coverage inverts the head and neck.
+               #
+               # It takes the MOTI parse as a CALLABLE precisely so it
+               # stays inside this boundary -- `effects.parse_moti` is
+               # in tools/ and importing it here is the failure this
+               # class exists to catch. Covered by
+               # tests/test_motionpool.py.
+               #
+               # Registered in all THREE lists in one commit.
+               "motionpool",
                "dbc", "dbcshadow", "npcart", "tqdat", "inidat", "provenance",
-               "monsterart", "cosettings", "dcache", "weaponparts", "weaponswap", "swapplan", "npcalloc",
+               "monsterart", "cosettings", "dcache", "tpdcache", "weaponparts", "weaponswap", "swapplan", "npcalloc",
                # The tri-state safety answer -- "I could not look" that cannot
                # be read as "nothing to worry about". Arrived with
                # claude/integrate-final.
@@ -20204,7 +22480,24 @@ class CoreBoundary(unittest.TestCase):
                # Each was registered in ONE of the three lists that must
                # agree -- pyproject for two, none for the third -- and in
                # this one, none of them.
-               "npcaltskin", "swapsides", "weaponcollect"}
+               "npcaltskin", "swapsides", "weaponcollect",
+               # The local overlay layer: tag / bookmark / rename any asset,
+               # keyed on BOTH logical path AND content hash so a tag survives
+               # a patch (path breaks, hash holds -> MOVED) and a lossy
+               # re-encode (hash breaks, path holds -> CHANGED). Rename is an
+               # overlay, never a disk write. Imports only coroot + stdlib, so
+               # COre stays extractable. Registered in all THREE lists
+               # (CORE, this, pyproject) in one commit, per the note above.
+               "tags",
+               # The 6907..7878 block96 .dat reader. Registered here in the
+               # same commit as the module, because this list, pyproject and
+               # extract_comod.CORE are three statements of one fact and a
+               # module in two of them is a broken distributable package.
+               "block96",
+               # The export/import FOUNDATION (backlog item 5): the transform
+               # dispatch and the three format guards. Registered in all THREE
+               # lists in the same commit as the module, for the reason above.
+               "portage"}
 
     def test_the_directory_holds_exactly_the_declared_modules(self):
         on_disk = {p.stem for p in self.CORE.glob("*.py")}
@@ -20243,34 +22536,126 @@ class CoreBoundary(unittest.TestCase):
             "COre ships whole -- add the module to BOTH, or COMod ships a "
             "package that fails its own boundary test.")
 
+    #: The names a handler re-imports bare under an `ImportError` catch, i.e.
+    #: the second arm of the vendor/source fallback documented in
+    #: `tests/test_import_fallback_idiom.py`.
+    @staticmethod
+    def _fallback_pairs(tree):
+        """The `from core import X` nodes that are the FIRST arm of the idiom.
+
+        MIRRORED, NOT COPIED. `build_addon._absolute_repo_imports` and
+        `tests/test_vendor_sync.py` carry the same exemption pointing the OTHER
+        WAY: they report the bare `import X` in the handler, so they exempt the
+        HANDLER arm. This instrument reports `from core import X` in the `try`
+        arm, so it exempts the TRY arm. Lifting either of their walkers verbatim
+        would exempt the arm this test never objects to and leave the red one
+        red -- the same wrong-instrument mistake the idiom file records.
+
+        Narrow on the same two conditions they use, plus one this direction
+        needs: the handler must catch `ImportError`/`ModuleNotFoundError`, and
+        EVERY name the `from` arm binds must be re-imported bare there. The
+        caller still checks those names against `MEMBERS`, so the exemption
+        moves the boundary question onto the real dependency -- it does not
+        drop it.
+        """
+        import ast
+        exempt = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            rescued = set()
+            for h in node.handlers:
+                caught = h.type
+                if isinstance(caught, ast.Name):
+                    ids = {caught.id}
+                elif isinstance(caught, ast.Tuple):
+                    ids = {e.id for e in caught.elts if isinstance(e, ast.Name)}
+                elif caught is None:
+                    ids = {"ImportError"}             # a bare `except:` catches it
+                else:
+                    ids = set()
+                if not ids & {"ImportError", "ModuleNotFoundError"}:
+                    continue
+                for stmt in ast.walk(h):
+                    if isinstance(stmt, ast.Import):
+                        rescued |= {a.name for a in stmt.names if "." not in a.name}
+            if not rescued:
+                continue
+            for stmt in node.body:
+                if (isinstance(stmt, ast.ImportFrom) and stmt.level == 0
+                        and stmt.names
+                        and all(a.name in rescued for a in stmt.names)):
+                    exempt.add(stmt)
+        return exempt
+
     def test_no_core_module_imports_anything_outside_core(self):
         """The load-bearing assertion. Parsed with `ast`, not grepped, so a
-        conditional or function-local import cannot slip past."""
+        conditional or function-local import cannot slip past.
+
+        The one exemption is the vendor/source fallback, whose charter is
+        `tests/test_import_fallback_idiom.py`. `core/block96.py` is vendored
+        into the Blender addon and so must write both arms; `core/` has no
+        `__init__.py`, so `from core import tqdat` resolves here as a namespace
+        package and raises `ImportError` in a flat `co-core` install, which is
+        exactly what the `except` arm is for. Reading the `try` arm alone calls
+        the correct idiom broken -- this was the THIRD instrument to do it, and
+        the only one that walks function bodies, which is why the other two
+        went quiet in 2026-09 and this one stayed red.
+        """
         import ast
-        stdlib = set(sys.stdlib_module_names)
         for path in sorted(self.CORE.glob("*.py")):
             tree = ast.parse(path.read_text("utf-8"), filename=str(path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    names = [a.name.split(".")[0] for a in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    # `from . import x` would mean COre became a package;
-                    # level>0 is therefore also a boundary change.
-                    self.assertEqual(node.level, 0,
-                                     f"{path.name}: relative import implies a package")
-                    names = [(node.module or "").split(".")[0]]
-                else:
+            for name, kind in self._outside_imports(tree):
+                with self.subTest(module=path.name, imports=name):
+                    self.assertNotEqual(
+                        kind, "package",
+                        f"{path.name}: relative import implies a package")
+                    self.fail(
+                        f"core/{path.name} imports {name!r}, which is outside "
+                        f"COre. Either it belongs in COre too, or the "
+                        f"dependency points the wrong way.")
+
+    def _outside_imports(self, tree) -> list:
+        """Everything one parsed COre module imports from outside COre.
+
+        SPLIT OUT OF THE TEST DELIBERATELY, and the split is the point. The
+        exemption is decided HERE, in the consumer, not in `_fallback_pairs`
+        alone -- so controls that only exercise the helper cannot see a
+        widening applied at this line. Measured: rewriting the node-keyed check
+        below as a name-keyed one (`node.module == "core"`, the obvious and
+        wrong shortcut) left every helper-level control green. The controls now
+        call this, so that plant reddens
+        `test_a_name_keyed_exemption_is_caught_at_the_use_site`.
+        """
+        import ast
+        stdlib = set(sys.stdlib_module_names)
+        paired = self._fallback_pairs(tree)
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                # `from . import x` would mean COre became a package;
+                # level>0 is therefore also a boundary change.
+                if node.level != 0:
+                    out.append(((node.module or "."), "package"))
                     continue
-                for name in names:
-                    if not name:
-                        continue
-                    with self.subTest(module=path.name, imports=name):
-                        self.assertTrue(
-                            name in stdlib or name in self.MEMBERS
-                            or name in ("numpy", "PIL"),
-                            f"core/{path.name} imports {name!r}, which is outside "
-                            f"COre. Either it belongs in COre too, or the "
-                            f"dependency points the wrong way.")
+                if node in paired:
+                    # The fallback's `try` arm. The dependency this states is
+                    # the NAMES, not the `core` package the addon will never
+                    # see -- so they are what gets checked.
+                    names = [a.name.split(".")[0] for a in node.names]
+                else:
+                    names = [(node.module or "").split(".")[0]]
+            else:
+                continue
+            for name in names:
+                if not name:
+                    continue
+                if not (name in stdlib or name in self.MEMBERS
+                        or name in ("numpy", "PIL")):
+                    out.append((name, "outside"))
+        return out
 
     def test_optional_third_party_stays_optional(self):
         """numpy and Pillow may be *used* but never required: COre has to be
@@ -20361,6 +22746,201 @@ class CoreBoundary(unittest.TestCase):
             with self.subTest(module=path.name):
                 self.assertNotIn("shutil", names,
                                  f"{path.name} imports shutil; COre reads")
+
+    def _outside(self, src: str) -> list:
+        import textwrap
+        return [n for n, _kind in
+                self._outside_imports(ast.parse(textwrap.dedent(src)))]
+
+    def test_the_boundary_check_can_actually_fire(self):
+        """The control for the whole use site. Asserted only against `core/`,
+        which is clean, this test passes whether or not it works -- the same
+        gap `test_the_write_gate_can_actually_fire` exists to close for the
+        write gate."""
+        self.assertEqual(self._outside("import parts"), ["parts"])
+        self.assertEqual(self._outside("from core import tqdat"), ["core"],
+                         "an UNPAIRED from-core import is the defect this "
+                         "guard exists for and it must still be reported")
+        self.assertEqual(self._outside("import json, tqdat"), [],
+                         "stdlib and a MEMBER must both be accepted, or the "
+                         "checker cannot say yes and proves nothing by saying no")
+
+    def test_a_name_keyed_exemption_is_caught_at_the_use_site(self):
+        """MUST-FIRE, and it is here because it was MISSING.
+
+        The first cut of these controls exercised `_fallback_pairs` only. A
+        plant that rewrote the use site's node-keyed test as `node.module ==
+        "core"` -- exempting the name wherever it appeared -- left all eight
+        of them green. The helper was never wrong in that plant; the line that
+        consumes it was. Two identical statements, one paired and one not, is
+        the shape that separates them, and it only works through `_outside`.
+        """
+        self.assertEqual(self._outside("""
+            try:
+                from core import tqdat
+            except ImportError:
+                import tqdat
+
+            def later():
+                from core import tqdat
+                return tqdat
+        """), ["core"],
+            "the unpaired `from core import tqdat` in `later()` was exempted "
+            "by its NAME rather than by its NODE, so the fallback in one "
+            "function now licenses the same import everywhere in the file")
+
+    def test_the_exempted_arm_is_checked_against_MEMBERS_at_the_use_site(self):
+        """MUST-FIRE: the exemption repoints the boundary question, it does not
+        drop it. `parts` lives in `tools/`, so an extracted COre takes the
+        `except` arm and dies on the bare `import parts` anyway."""
+        self.assertEqual(self._outside("""
+            try:
+                from core import parts
+            except ImportError:
+                import parts
+        """), ["parts", "parts"],
+            "a non-member rode in on a well-formed fallback")
+
+    def test_a_relative_import_is_still_a_package_change(self):
+        """MUST-FIRE: preserved from before the split, and easy to lose in it."""
+        import textwrap
+        kinds = [k for _n, k in self._outside_imports(
+            ast.parse(textwrap.dedent("from . import tqdat")))]
+        self.assertEqual(kinds, ["package"])
+
+    # ---- the fallback exemption, and the controls that keep it narrow -------
+    #
+    # AN EXEMPTION IS A HOLE IN A GUARD. Widened by one careless step this one
+    # stops reporting the defect the boundary test exists for: a `from core
+    # import X` with no fallback, which works in this tree and raises
+    # ImportError in an extracted `co-core`. `tests/test_import_fallback_idiom.py`
+    # holds the same controls for the two instruments pointing the other way;
+    # these are this one's, because a shared charter with no local control is a
+    # claim, not a check.
+
+    def _pairs(self, src: str) -> list:
+        """The exempted `try` arms, as their own source text, in file order.
+
+        Keyed on the LINE, not `lineno`: `dedent` on a leading-newline literal
+        shifts every number by one, and hand-counted linenos made the first cut
+        of these controls fail for a reason that had nothing to do with the
+        helper under test.
+
+        A LIST, not a set, and that is load-bearing. The leak control below
+        writes the same statement twice -- once paired, once not -- so a set
+        would collapse them and pass whether or not the exemption leaked. A
+        control that cannot fail is not evidence.
+        """
+        import textwrap
+        body = textwrap.dedent(src)
+        lines = body.split(chr(10))
+        return [lines[n.lineno - 1].strip()
+                for n in sorted(self._fallback_pairs(ast.parse(body)),
+                                key=lambda n: n.lineno)]
+
+    def test_the_canonical_fallback_is_exempted(self):
+        """The positive. Without this the controls below could all pass on a
+        helper that exempts nothing at all."""
+        self.assertEqual(self._pairs("""
+            def _tqdat():
+                try:
+                    from core import tqdat
+                except ImportError:
+                    import tqdat
+                return tqdat
+        """), ["from core import tqdat"])
+
+    def test_ModuleNotFoundError_and_a_bare_except_count_too(self):
+        for handler in ("except ModuleNotFoundError:", "except:"):
+            with self.subTest(handler=handler):
+                self.assertEqual(self._pairs(f"""
+                    try:
+                        from core import tqdat
+                    {handler}
+                        import tqdat
+                """), ["from core import tqdat"])
+
+    def test_an_unpaired_from_core_import_is_still_reported(self):
+        """MUST-FIRE: the defect the boundary test exists for, unchanged."""
+        self.assertEqual(self._pairs("""
+            def go():
+                from core import tqdat
+                return tqdat
+        """), [])
+
+    def test_a_handler_that_does_not_catch_ImportError_gets_no_exemption(self):
+        """MUST-FIRE: the exemption is about import resolution, not about
+        being inside any `try` at all."""
+        self.assertEqual(self._pairs("""
+            try:
+                from core import tqdat
+            except ValueError:
+                import tqdat
+        """), [])
+
+    def test_a_name_the_handler_never_rescues_is_still_reported(self):
+        """MUST-FIRE: exempting the whole `try` arm rather than the paired
+        NAMES would let an unrelated import ride in on someone else's
+        fallback. `dbc` has no second arm, so the statement is not the idiom."""
+        self.assertEqual(self._pairs("""
+            try:
+                from core import tqdat, dbc
+            except ImportError:
+                import tqdat
+        """), [])
+
+    def test_the_exemption_does_not_leak_past_the_try_arm(self):
+        """MUST-FIRE: scope. Exempt in the `try` body, reported again after."""
+        self.assertEqual(self._pairs("""
+            try:
+                from core import tqdat
+            except ImportError:
+                import tqdat
+
+            def later():
+                from core import tqdat
+                return tqdat
+        """), ["from core import tqdat"],
+            "the second, unpaired `from core import tqdat` was exempted too. "
+            "This is the case a NAME-keyed exemption gets wrong: the name is "
+            "rescued once, so a rewrite that collected exempt NAMES rather "
+            "than exempt NODES would wave the later one through as well.")
+
+    def test_an_exempted_arm_still_answers_to_MEMBERS(self):
+        """MUST-FIRE, and the one that says the exemption REPOINTS the boundary
+        question instead of dropping it. A fallback is not a licence to depend
+        on a non-member: `parts` lives in `tools/`, so an extracted COre would
+        take the `except` arm and still die on the bare `import parts`."""
+        src = """
+            try:
+                from core import parts
+            except ImportError:
+                import parts
+        """
+        self.assertEqual(self._pairs(src), ["from core import parts"],
+                         "the fixture is not the idiom, so it proves nothing")
+        import textwrap
+        names = set()
+        for stmt in self._fallback_pairs(ast.parse(textwrap.dedent(src))):
+            names |= {a.name.split(".")[0] for a in stmt.names}
+        self.assertTrue(names - self.MEMBERS - set(sys.stdlib_module_names),
+                        "a non-member rode in on the fallback and MEMBERS "
+                        "never saw it")
+
+    def test_the_real_block96_fallback_is_what_this_exemption_is_for(self):
+        """Against the tree, not a fixture. If the idiom is rewritten away the
+        exemption is dead code and should go with it -- this is the line that
+        says so out loud."""
+        p = self.CORE / "block96.py"
+        if not p.is_file():
+            self.skipTest("NOTEST: core/block96.py absent")
+        paired = self._fallback_pairs(ast.parse(p.read_text("utf-8")))
+        self.assertTrue(
+            any(n.module == "core" and {a.name for a in n.names} == {"tqdat"}
+                for n in paired),
+            "core/block96.py no longer carries the vendor/source fallback for "
+            "tqdat -- see tests/test_import_fallback_idiom.py before changing "
+            "it; the Blender addon needs both arms.")
 
 
 class ConfinementIsActuallyWired(unittest.TestCase):
@@ -20473,9 +23053,176 @@ class TileSetForTheClient(unittest.TestCase):
         pm = self._pm()
         manifest, _ = tileset.build(pm)
         raw = base64.b64decode(manifest["slots"])
-        slots = st.unpack(f"<{len(raw) // 2}H", raw)
+        self.assertEqual(len(raw), len(pm.tiles) * tileset.SLOT_BYTES)
+        slots = st.unpack(f"<{len(raw) // tileset.SLOT_BYTES}"
+                          f"{tileset._SLOT_CODE}", raw)
         self.assertEqual(list(slots), pm.tiles)
         self.assertEqual(manifest["empty"], 0xFFFF)
+        # The width is published, so a client reads it rather than assuming
+        # it -- a silently mis-decoded slot grid draws a plausible wrong map.
+        self.assertEqual(manifest["slotBits"], tileset.SLOT_BYTES * 8)
+
+    def test_a_slot_id_above_the_old_u16_ceiling_survives_the_round_trip(self):
+        """The widening, as a property of the encoder rather than of a map.
+
+        `puzzle.PuzzleLibrary` mints synthetic ids at ``1 << 20`` for a
+        `.pux` tile's layer stack, and `struct.pack("<H")` refused them --
+        four maps on the ambient install could not be built at all. The ids
+        here are the two real maxima, so this fails for the real reason if
+        the width is ever narrowed back.
+
+        RE-MEASURED 2026-09-06, same install (`Classic Conquer 2.0`,
+        `cco-f69b81f9e8a1`): `ninja01_new` reaches **1,049,543** and
+        `bp-flandlords-y_new` **1,048,852**. The values carried here until
+        then -- 1,049,296 and 1,048,780, from `0a129752` -- were wrong, and
+        that commit message contradicts itself on them. Its over-ceiling
+        SLOT counts reproduce exactly today (968 of 1,485 on `ninja01_new`,
+        278 of 960 on `bp-flandlords-y_new`), and the minted ids are
+        CONTIGUOUS from ``1 << 20`` -- measured, `sorted({t for t in pm.tiles
+        if t > 0xFFFF}) == list(range(1 << 20, (1 << 20) + n))` on both maps.
+        That forces the maximum to ``(1 << 20) + distinct - 1``; a max of
+        1,049,296 would need 721 distinct ids, not 968. Both old values are
+        still above 0xFFFF, so the assertion never failed for it -- only the
+        provenance claim was false. `docs/CORRECTIONS.md`
+        `C-2026-09-06-u16pin-tripwire`.
+
+        `EMPTY` is checked in the same grid on purpose: 0xFFFF is no longer
+        the top of the range it lives in, and a sentinel that is merely the
+        largest representable value would have quietly stopped being one.
+        """
+        import base64
+        import struct as st
+        import puzzle
+        import tileset
+        pm = self._pm()
+        pm.tiles = [5, puzzle.EMPTY, 1049543, 5, 1048852, (1 << 20)]
+        manifest, _ = tileset.build(pm)
+        raw = base64.b64decode(manifest["slots"])
+        slots = list(st.unpack(f"<{len(raw) // tileset.SLOT_BYTES}"
+                               f"{tileset._SLOT_CODE}", raw))
+        self.assertEqual(slots, pm.tiles)
+        self.assertEqual(slots[1], 0xFFFF)
+        # And the wide ids resolve to no art, so they ship no entry -- which
+        # is the honest report, not a defect of this encoding. A dense index
+        # would have had to write them as EMPTY and claim nothing is painted.
+        self.assertEqual([e["i"] for e in manifest["entries"]], [5])
+
+    def test_the_js_decoder_reads_the_width_the_encoder_writes(self):
+        """The encoder and its ONLY consumer, pinned against drift.
+
+        There is no JS runtime on this box, so this reads the source rather
+        than running it -- which is weaker than the tests above and is said
+        plainly here rather than left to be assumed. It is worth having
+        anyway: `tilebake.js decodeSlots` is the only thing that decodes
+        either grid, and a slot grid read at the wrong width does not throw.
+        It draws a **plausible wrong map**, so the failure has no symptom on
+        either side.
+
+        Asserted on the code forms, not on the strings "u16"/"u32": both
+        files DESCRIBE the old width in prose, so a bare `assertNotIn` on
+        the name would fail on the explanation instead of on the code.
+        """
+        import tileset
+        js = (Path(__file__).resolve().parent / "webui"
+              / "tilebake.js").read_text("utf-8", errors="replace")
+        arr, stride = {2: ("Uint16Array", 2),
+                       4: ("Uint32Array", 4)}[tileset.SLOT_BYTES]
+        self.assertIn(f"new {arr}(raw.length / {stride})", js,
+                      "decodeSlots does not allocate at the encoder's width")
+        self.assertIn(f"raw.charCodeAt(i * {stride})", js,
+                      "decodeSlots does not stride at the encoder's width")
+        # The top byte must be unsigned. `<< 24` on a byte >= 0x80 is
+        # NEGATIVE in JS, and Uint32Array stores the wrap without complaint.
+        if tileset.SLOT_BYTES == 4:
+            self.assertIn("<< 24)) >>> 0", js,
+                          "the high byte is shifted signed and never coerced")
+
+    def test_the_u16_overflow_pin_cannot_outlive_the_overflow(self):
+        """A MERGE TRIPWIRE, and it exists because the pin it guards **cannot
+        fire on its own.**
+
+        `tests/test_ground_animation.py` on branch
+        `claude/dmap-planegroup-1005-2026-08-29@2ee16bfa` declares
+        `GROUND_TILESET_U16_OVERFLOW` and has `CONTROL 4` skip exactly those
+        maps, with a comment saying the assertion is what fails "the day
+        somebody widens the slot table". **It does not.** Its guard is
+
+            def _ground_fits_u16(pm): return all(t <= 0xFFFF for t in pm.tiles)
+
+        which asks whether the MAP'S DATA fits u16, not whether
+        `tileset.build` can encode it. Widening the encoder does not move
+        `pm.tiles`, so the guard still answers False, `CONTROL 4` still skips
+        both maps, and the assertion still passes.
+
+        MEASURED 2026-08-29, two trees, two processes: on that branch alone
+        the two maps read `fits=False build=REFUSED`; with this change's
+        `tileset.py` copied on top they read `fits=False build=BUILDS` -- and
+        `CONTROL 4` passed in both. So the arm is not one that expires as a
+        fail; it is one that **cannot fire**, and left alone it would keep two
+        buildable maps out of the separation control silently and for good.
+
+        This test is the arm that can.
+
+        IT FIRED, AND THE DELETION LANDED. `origin/master` 19a4dd82 carried
+        the pin and the widening in one tree and was red here; `bfae66e3`
+        retired the constant, the guard, the `overflowed` list and its
+        assertion, and `c787c680` closed the docs out. CONTROL 4 went from 2
+        maps to 4, with the fifth (`icecrypt-lev6`, 0 scenes / 0 covers)
+        NAMED in `NO_SCENERY_MAPS` rather than skipped silently.
+
+        So this is VACUOUS on `master` again, and that is the normal state --
+        said plainly rather than counted as a pass over something.
+
+        IT IS NOT DEAD, THOUGH, AND THE REMAINING TRIP IS NAMED. As of
+        2026-09-06 exactly ONE ref in the repo still carries the pin:
+        **`claude/gm-lanextend`** (tip `6121982d`, 2026-08-29 16:51), which
+        branched four minutes after `bfae66e3` without it. Measured -- of the
+        135 refs containing the pin's introduction `2ee16bfa`, 134 contain
+        the retirement `bfae66e3` and that one does not; its
+        `tests/test_ground_animation.py` still names the constant 4 times
+        while its `tools/tileset.py` already has `SLOT_BYTES = 4`, so this
+        test is RED on that branch right now and will go red on master the
+        day it merges. That is the tripwire working, not a defect.
+
+            git branch -a --contains 2ee16bfa   # 135
+            git branch -a --contains bfae66e3   # 134 -- diff is gm-lanextend
+
+        ABLATED 2026-09-06 (`C-2026-09-06-u16pin-tripwire`):
+        this test PASSES on master, FAILS with `claude/gm-lanextend`'s
+        `tests/test_ground_animation.py` copied in unmodified, and PASSES
+        again on restore. The planted defect was that branch's real content,
+        not a synthetic one.
+        """
+        import tileset
+        ga = (Path(__file__).resolve().parent.parent / "tests"
+              / "test_ground_animation.py")
+        self.assertTrue(ga.is_file(),
+                        "the file this tripwire watches is gone -- it would "
+                        "pass by watching nothing")
+        src = ga.read_text("utf-8", errors="replace")
+        if tileset.SLOT_BYTES > 2 and "GROUND_TILESET_U16_OVERFLOW" in src:
+            self.fail(
+                "tileset.py packs slots at %d bytes, so no map overflows a "
+                "u16 slot table any more, but tests/test_ground_animation.py "
+                "still declares GROUND_TILESET_U16_OVERFLOW and CONTROL 4 "
+                "still skips the maps it names. Delete the constant, the "
+                "`_ground_fits_u16` guard, the `overflowed` list and the "
+                "closing assertEqual over it, and let CONTROL 4 check all "
+                "five ANIMATED_MAPS. Note the guard tests pm.tiles, not the "
+                "encoder, so it will NOT fail on its own." % tileset.SLOT_BYTES)
+
+    def test_every_plane_slot_grid_uses_the_same_width_as_the_ground(self):
+        """One decoder serves both grids (`tilebake.js decodeSlots`), so the
+        two encoders drifting apart is the failure mode with no symptom on
+        the producing side at all."""
+        import base64
+        import tileset
+        pm = self._pm()
+        rec = tileset._grid_manifest(pm)
+        ground, _ = tileset.build(pm)
+        self.assertEqual(len(base64.b64decode(rec["slots"])),
+                         len(pm.tiles) * tileset.SLOT_BYTES)
+        self.assertEqual(rec["slots"], ground["slots"])
 
     def test_the_full_bundle_extends_the_ground_bundle_in_place(self):
         import tileset
@@ -20496,6 +23243,10 @@ class TileSetForTheClient(unittest.TestCase):
                 self.ani, self.title = ani, title
                 self._xy, self._d = (x, y), d
                 self.frame_interval = 0
+                # `.DMap` list position, which `scene.cover_paint_order`
+                # sorts by; see `_FakePlacement`. Equal to d so the order
+                # this arm was written against is unchanged.
+                self.layer_index = d
             def depth(self): return self._d
             def sprite_origin(self, pm): return self._xy
 
@@ -20604,12 +23355,14 @@ def _measured_on() -> str:
     try:
         _r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                             cwd=str(PROJECT), capture_output=True, text=True,
+                            errors="backslashreplace",
                             timeout=10)
         if _r.returncode == 0 and _r.stdout.strip():
             rev = _r.stdout.strip()
             _d = subprocess.run(["git", "status", "--porcelain"],
                                 cwd=str(PROJECT), capture_output=True,
-                                text=True, timeout=15)
+                                text=True,
+                                errors="backslashreplace", timeout=15)
             if _d.returncode == 0 and _d.stdout.strip():
                 rev += "+dirty"
     except Exception:
@@ -20625,9 +23378,31 @@ def _measured_on() -> str:
     # lines named their base and neither reader could tell them apart, so the
     # install travels by NAME as well.  Basename only: the full path is what
     # `tests/test_sanitization.py` exists to keep out of this repo.
+    #
+    # And HOW it was resolved, because that is the axis two rigs differ on.
+    # `base_id` says *which* client; it does not say whether anybody CHOSE it.
+    # A count taken at `user-config` is a count taken at whatever
+    # `%APPDATA%\co-client-re\config.json` happened to say that hour --
+    # `docs/routeb_install_pinning_2026-08-15.md` recorded that answer moving
+    # *within a single day* -- while a count taken at `explicit`/`env` is one
+    # the runner asked for and another rig can reproduce by asking for the
+    # same thing. So the transcript carries the difference instead of leaving
+    # the next reader to assume the two are comparable.
     where = ""
     try:
-        where = f" ({Path(ROOT).name})"
+        via = ""
+        try:
+            if PINNED_INSTALL:
+                # `--install` sets CO_ROOT, so `Found.source` says "env" and
+                # would hide the one thing worth saying: a human named this
+                # install on the command line rather than inheriting it.
+                via = " via --install"
+            else:
+                got = coroot.find()
+                via = f" via {got.source}" if got else " via nothing-found"
+        except Exception:
+            via = " via refused"
+        where = f" ({Path(ROOT).name}{via})"
     except Exception:
         pass
     _MEASURED_ON = f"{rev} on {base}{where}"
@@ -20776,7 +23551,8 @@ def _verdict_record(result, collected: int, elapsed: float,
         try:
             _v = subprocess.run(
                 ["git", "rev-parse", "--verify", f"{rev_short}^{{commit}}"],
-                cwd=str(PROJECT), capture_output=True, text=True, timeout=10)
+                cwd=str(PROJECT), capture_output=True, text=True,
+                errors="backslashreplace", timeout=10)
             if _v.returncode == 0 and _v.stdout.strip():
                 rev_full = _v.stdout.strip()
         except Exception:
@@ -20851,7 +23627,7 @@ class TheRunsOwnProvenance(unittest.TestCase):
         import subprocess
         head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                               cwd=str(PROJECT), capture_output=True,
-                              text=True, timeout=10)
+                              text=True, errors="backslashreplace", timeout=10)
         if head.returncode != 0:
             self.skipTest("not a git checkout; the stamp degrades to 'unknown'")
         first = _measured_on()
@@ -20909,7 +23685,8 @@ class TheRunsOwnProvenance(unittest.TestCase):
 
         def git(cwd, *a):
             return subprocess.run(["git", *a], cwd=cwd, capture_output=True,
-                                  text=True, timeout=20)
+                                  text=True,
+                                  errors="backslashreplace", timeout=20)
         with tempfile.TemporaryDirectory() as tmp:
             env = ["-c", "user.email=t@t", "-c", "user.name=t"]
             if git(tmp, "init", "-q").returncode != 0:
@@ -21194,7 +23971,55 @@ class MeshCopyEquivalence(unittest.TestCase):
     refactor happens on. The lesson is C21's: the guard that should have caught
     it skipped unless two bases had an index, and so was silent in exactly the
     situation the bug needed. A skipped test is not a passing test.
+
+    That holds for every test here except `test_it_holds_across_real_shipped_
+    meshes`, which by definition needs shipped meshes -- and it does NOT skip
+    either. It names its corpus (`PIN` below) and FAILS if that corpus is not
+    on the machine, which is the only outcome that keeps "never skip" true
+    once an install is involved.
     """
+
+    #: PINNED 2026-08-28. `test_it_holds_across_real_shipped_meshes` demands
+    #: "several PHY variants" and read whatever `coassets.DEFAULT_ROOT`
+    #: resolved to, so whether it could prove anything was decided by a
+    #: machine's configuration. MEASURED here, same strided sample the test
+    #: takes, 250 meshes per install:
+    #:
+    #:      install    PHY_    PHY4     variants
+    #:      cco (live)  252       0      1   <- the ambient red: nothing to compare
+    #:      4274        252       0      1
+    #:      5017        252       0      1
+    #:      5065        252       1      2   <- passes on a sample of ONE PHY4
+    #:      5165        237      16      2
+    #:      5517        189      69      2   <- pinned
+    #:      6090        123     136      2
+    #:      6609         46     206      2
+    #:      7878          0     252      1
+    #:
+    #: The `1 not >= 2` failure was therefore the test refusing to certify the
+    #: copy over a single-variant corpus -- **correct behaviour, reported as a
+    #: defect in `apply_matrix_copy`**. 5065 is the cautionary entry: it is
+    #: green on one PHY4 mesh out of 253, which is a pass that proves about as
+    #: much as the red did. 5517 is the earliest install carrying both
+    #: variants in quantity, and it is the same corpus the map and status
+    #: fixtures elsewhere in this file are pinned to.
+    #: **THE WEAKEST OF THE SEVEN, AND SAID SO HERE.** The subject is meshes
+    #: reached through `coviewer.Catalog`, which resolves them out of
+    #: `c3.wdf`/`data.wdf` as well as loose `c3/`. Neither the `ini/` digest
+    #: nor a `covers` manifest sees inside an archive, and content-hashing
+    #: 5.7 GB of `c3/` per run (MEASURED on 7878) is not viable. So the 189
+    #: PHY_ / 69 PHY4 census is fingerprint-guarded only to the extent that a
+    #: client which re-shipped its archives also re-shipped its tables -- true
+    #: of every repack this corpus has seen, and not a guarantee. `covers` is
+    #: empty deliberately rather than by omission; a manifest over loose `c3/`
+    #: would cost 619 ms and still miss the archives, buying the appearance of
+    #: coverage over the same blind spot.
+    PIN = DeclaredInstall(
+        "5517",
+        why="the only claim is that the copy agrees with deepcopy across the "
+            "PHY variants really shipped, so the corpus has to be one that "
+            "ships more than one; 5517 samples 189 PHY_ / 69 PHY4",
+        fingerprint="76c7f4499934")
 
     @staticmethod
     def _mesh(n_verts=37, n_faces=23, matrix=None):
@@ -21302,14 +24127,15 @@ class MeshCopyEquivalence(unittest.TestCase):
         self.assertEqual([self._fields(v) for v in m.vertices], before)
         self.assertEqual(m.faces, faces_before)
 
-    @unittest.skipUnless(HAVE_ROOT, "game install not present")
     def test_it_holds_across_real_shipped_meshes(self):
         """The synthetic mesh proves the arithmetic; this proves it against
-        the PHY variants the configured client actually ships."""
+        the PHY variants the PINNED client actually ships -- `PIN` above, not
+        whichever install the box happens to be configured for."""
         import coviewer
-        cat = coviewer.Catalog(ROOT)
+        cat = coviewer.Catalog(self.PIN.path())
         try:
-            paths = sorted(p for p in cat.all_paths if p.endswith(".c3"))
+            all_c3 = sorted(p for p in cat.all_paths if p.endswith(".c3"))
+            paths = all_c3
             # Strided, not the first N: the corpus is sorted by path and the
             # first few hundred meshes are all one PHY variant, so taking a
             # prefix would have tested a fifth of the parser and looked
@@ -21331,10 +24157,33 @@ class MeshCopyEquivalence(unittest.TestCase):
                     break
         finally:
             cat.close()
+        # The corpus and the SAMPLE are both reported, not merely bounded.
+        # A floor answers "is this catastrophically small" and is structurally
+        # unable to answer "did this change": 668 -> 477 body meshes did not
+        # trip a floor of 50, and the disappearance was only ever inferable
+        # from a test that stopped failing. Carrying the numbers means a
+        # shrink is visible IN THE RUN -- and it names the pin, because a
+        # count without its install is how two people measured the same
+        # install and got 668 and 477.
+        census = (f"pin={self.PIN.name} corpus={len(all_c3)} "
+                  f"sampled={len(paths)} stride={stride} parsed={checked} "
+                  f"variants={sorted(variants)}")
+        # A WITNESS on the corpus, not just a floor on the sample. This is the
+        # assertion 668 -> 477 would have tripped and `checked >= 50` did not:
+        # the flag shrank the CORPUS while the sample stayed comfortably above
+        # any floor. Measured 2026-08-29 on the pin: corpus=10279, sampled=412,
+        # stride=25, parsed=258. The band is wide because content may legitimately
+        # be added to an install; it is narrow enough that losing a third of the
+        # corpus -- the measured size of the fallback effect -- fails loudly here
+        # instead of surfacing as a test that quietly stopped failing elsewhere.
+        self.assertGreater(len(all_c3), 9000,
+                           f"the pinned corpus itself has shrunk -- {census}")
         self.assertGreaterEqual(checked, 50,
-                                "too few real meshes reached to mean anything")
+                                f"too few real meshes reached to mean "
+                                f"anything -- {census}")
         self.assertGreaterEqual(len(variants), 2,
-                                f"only saw {variants}; want several PHY variants")
+                                f"only saw {variants}; want several PHY "
+                                f"variants -- {census}")
 
 
 class TextureBundle(unittest.TestCase):
@@ -21456,6 +24305,42 @@ class CoverAnchorConvention(unittest.TestCase):
     multi-cell covers, which are the only ones that can answer.
     """
 
+    #: PINNED 2026-08-28. `68 placements / 35 sprites` for map 1002 at
+    #: (430, 380) r18 is not a property of the exporter; it is a count of what
+    #: **5517** ships in that box. `docs/routeb_cover_layer_2026-08-15.md`
+    #: says so in its own header -- *"Install `coroot` kind patch5517, map
+    #: 1002"*, *"Measured first, before any code was written (install 5517)"*
+    #: -- and then the test read `coassets.DEFAULT_ROOT` instead. MEASURED on
+    #: this box, same tree, same region, only the root changing:
+    #:
+    #:      install                  placements   sprites
+    #:      5517                             68        35   <- what the number is OF
+    #:      5165                             68        35
+    #:      5017 / 5065                      67        34
+    #:      7878                             60        27
+    #:      cco (live) / CCO-snapshot        36        20   <- the ambient red
+    #:      4274                             36        20
+    #:      6090 / 6609                       8         8
+    #:
+    #: Every one of those is a correct export of a different install's Twin
+    #: City. The spread is the point: 68 is not a property of
+    #: `export_scenery.py` at all, and an install that paves fewer streets was
+    #: reading as a broken exporter.
+    #: The residual this class's docstring recorded is CLOSED by the
+    #: fingerprint below, 2026-09-07. It is the same install and the same
+    #: twelve characters `routeb/corpus.py` records as `RECORDED_FINGERPRINT`
+    #: -- `tests/test_pin_fingerprint.py` asserts that equality, so the two
+    #: mechanisms can no longer disagree silently about one install.
+    PIN = DeclaredInstall(
+        "5517",
+        why="docs/routeb_cover_layer_2026-08-15.md measured 68 covers for map "
+            "1002 at (430,380) r18 on 5517, and both the newbie cover census "
+            "and the twin-city export assert that install's content",
+        fingerprint="76c7f4499934-49e1a666", covers=("map/map",))
+
+    def _root(self):
+        return self.PIN.path()
+
     def _cover_mod(self):
         import importlib.util
         p = PROJECT / "routeb" / "verify_cover.py"
@@ -21512,7 +24397,6 @@ class CoverAnchorConvention(unittest.TestCase):
         # a crash there reads as a failed measurement, not an overwhelming one.
         self.assertLess(vc.sign_p(1573, 586), 1e-90)
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_bottom_right_wins_and_1x1_covers_cannot_tell_the_difference(self):
         """The measurement, on `newbie` -- small, and it goes 6-0.
 
@@ -21524,7 +24408,7 @@ class CoverAnchorConvention(unittest.TestCase):
         import puzzle as puzzlemod
         import scene as scenemod
         vc = self._cover_mod()
-        plib = puzzlemod.PuzzleLibrary()
+        plib = puzzlemod.PuzzleLibrary(self._root())
         pm = plib.get("newbie")
         self.assertIsNotNone(pm, plib.reason)
         sc = scenemod.for_map(pm.name, root=plib.root)
@@ -21547,13 +24431,39 @@ class CoverAnchorConvention(unittest.TestCase):
                          "bottom-right must be nearer on every multi-cell "
                          "cover of newbie")
 
-    @unittest.skipUnless(HAVE_ROOT, "needs the game install")
     def test_the_twin_city_cover_export_round_trips_with_its_layer_tag(self):
         """The bytes the DX11 renderer is handed, read back.
 
         The layer tag is the part worth a test: TERRAIN and COVER are drawn at
         different points in §7's order, and a cover table loaded into the
         terrain slot is a mis-ordered picture rather than a visible error.
+
+        **`68` and `35` are `routeb/corpus.py`'s numbers, and this is the only
+        place outside `routeb/` that asserts them.** It used to be gated on
+        `HAVE_ROOT`, so on any install but 5517 it did not report *"different
+        client"* -- it reported *"got 36, want 68"*, which is what a genuine
+        regression reports. That is verbatim the false-regression
+        `routeb/corpus.py` was written to abolish, still live one directory
+        away.
+
+        Closed by this class's `PIN`, which aims the test at 5517 rather than
+        standing it down elsewhere: `_root` cannot return another client's
+        Twin City, so the `36 != 68` reading is unreachable. The 2026-08-26
+        repair for this was a `requires_recorded_corpus` gate comparing
+        `coroot.base_fingerprint(ROOT)` to `RECORDED_FINGERPRINT`; it was NOT
+        ported, because it fingerprints the AMBIENT root while this class now
+        reads the PINNED one -- over a pin it would skip a test the pin had
+        just made correct. See `C-2026-08-26-claude-vibeco-dx-camera-ambient-
+        install`.
+
+        **THE RESIDUAL IS CLOSED, 2026-09-07.** It read: *the pin matches a
+        directory NAME, so a `5517` whose content had drifted would satisfy
+        it and not the fingerprint.* `DeclaredInstall` now carries a recorded
+        `coroot.pin_fingerprint` and REFUSES a drifted root, so the name and
+        the content are both checked and the two mechanisms agree on this
+        install by construction. The port was still the wrong move and the
+        paragraph above still explains why: the fix was not to fingerprint the
+        AMBIENT root but to fingerprint the PINNED one.
         """
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -21561,21 +24471,45 @@ class CoverAnchorConvention(unittest.TestCase):
         ex = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ex)
 
+        root = self._root()
         pm, meta, sprites, pl, dang = ex.gather_region(
-            "1002", 430, 380, 18, layer="cover")
+            "1002", 430, 380, 18, root=root, layer="cover")
         got = ex.parse(ex.serialise(meta, sprites, pl, dang))
         self.assertEqual(got["layerTag"], 4)
         self.assertEqual(got["version"], 2)
         self.assertEqual(got["bytesUnconsumed"], 0)
         self.assertEqual(len(got["placements"]), 68)
         self.assertEqual(len(got["sprites"]), 35)
+        # PAINT ORDER IS `.DMap` LIST ORDER, not anchor depth: the client has
+        # no depth sort of covers (`scene.cover_paint_order` has the RVAs).
+        # This arm asserted depth order until 2026-09-16 and went red when
+        # the rule changed, because this class was not in that change's gate.
+        # Checked against the covers' OWN `layer_index` -- read here from the
+        # scene library, not through `cover_paint_order`, which would test
+        # the function against itself.
+        sys.path.insert(0, str(PROJECT / "tools"))
+        import puzzle as puzzlemod
+        import scene as scenemod
+        plib = puzzlemod.PuzzleLibrary(root)
+        sc = scenemod.for_map(plib.by_id(1002).name,
+                              lib=scenemod.SceneLibrary(plib.root))
+        by_list = [tuple(c.anchor) for c in
+                   sorted(sc.covers, key=lambda c: c.layer_index)]
+        exported = [tuple(p["anchor"]) for p in got["placements"]]
+        it = iter(by_list)
+        self.assertTrue(all(a in it for a in exported),
+                        "exported covers are not in .DMap list order")
+        # CONTROL: the export must NOT also be in anchor-depth order, or the
+        # arm above cannot tell the two rules apart on this region.
         depths = [p["depth"] for p in got["placements"]]
-        self.assertEqual(depths, sorted(depths), "not in painter's order")
+        self.assertNotEqual(depths, sorted(depths),
+                            "this region no longer separates list order "
+                            "from depth order; pick one that does")
         # The same region on the TERRAIN layer is EMPTY, which is why the
         # renderer got a cover consumer before a terrain one. Asserted so the
         # justification stays measured rather than remembered.
         _pm, meta2, spr2, pl2, dang2 = ex.gather_region(
-            "1002", 430, 380, 18, layer="terrain")
+            "1002", 430, 380, 18, root=root, layer="terrain")
         self.assertEqual(len(pl2), 0,
                          "a TERRAIN part appeared in Twin City's rendered "
                          "region; the reason COVER went first no longer holds")
@@ -22622,6 +25556,134 @@ class SettingsDirectoryManagement(unittest.TestCase):
                       if "addEventListener" in head else "",
                       "the declare POST is not inside a click handler")
 
+
+
+class TheBuildDiffPageSaysWHICHThingIsMissing(unittest.TestCase):
+    r"""`/api/diff/*` when the reader or the dictionary is absent.
+
+    **WHY THIS ARM HAS TO EXIST, and it is the reason the obvious gate is not
+    enough.** `tools/coviewer.py` used to `import patchlook` at module scope,
+    which made the extracted COMod package ship a viewer importing a module the
+    manifest does not publish. `test_comod_extraction` caught that -- correctly
+    -- and the cure was to move the import inside the methods that use it.
+
+    **But that gate walks `ast.parse(...).body`: MODULE SCOPE ONLY.** Once the
+    import is inside a function the scanner cannot see it at all, so after the
+    fix the gate goes green -- and it would go *equally* green if the guard
+    caught the wrong exception, if one of the two call sites were left
+    unguarded, or if the reason string never fired. **The gate stops verifying
+    the fix and starts failing to notice the construct, and those two produce
+    an identical verdict.**
+
+    So the question that matters -- *does the guarded path actually work when
+    `patchlook` is absent* -- needs its own arm, and this is it.
+
+    **Both directions, because the two facts are separable and must stay so.**
+    A missing READER and a missing DICTIONARY are different problems with
+    different cures. An arm checking only the first passes a version that
+    always reports `DIFF_NO_TOOL`, which would tell a user with a perfectly
+    good install to go install something they already have -- a
+    correct-sounding instruction pointing at the wrong missing thing, which is
+    worse than no message because it spends their time and ends in the same
+    place.
+    """
+
+    def _conn(self):
+        """`_diff_conn` with the class standing in for `self`.
+
+        It reads only `DIFF_NO_TOOL` and `DIFF_NO_DB`, which are class
+        attributes -- a stub rather than a socket, matching `_effects_api`.
+        """
+        import coviewer
+        return coviewer.Handler._diff_conn(coviewer.Handler)
+
+    def test_the_reader_being_absent_reports_NO_TOOL_and_not_NO_DB(self):
+        import coviewer
+        keep = sys.modules.get("patchlook", "<absent>")
+        # `None` in `sys.modules` is what makes `import x` raise ImportError,
+        # which is exactly the state an extracted install would be in.
+        sys.modules["patchlook"] = None
+        try:
+            conn, why = self._conn()
+        finally:
+            if keep == "<absent>":
+                sys.modules.pop("patchlook", None)
+            else:
+                sys.modules["patchlook"] = keep
+        self.assertIsNone(conn)
+        self.assertEqual(why, coviewer.Handler.DIFF_NO_TOOL)
+        self.assertNotEqual(why, coviewer.Handler.DIFF_NO_DB)
+
+    def test_the_dictionary_being_absent_reports_NO_DB_and_not_NO_TOOL(self):
+        """The other direction, and the one that stops a lazy implementation.
+
+        `patchlook.connect` raises `SystemExit` when the dictionary is not
+        there -- an ordinary state for a box that has not built one, and one
+        that must never reach the request handler as an exit.
+        """
+        import coviewer
+        import patchlook
+        keep = patchlook.connect
+
+        def _no_db(*a, **k):
+            raise SystemExit("no change dictionary at <nowhere>")
+
+        patchlook.connect = _no_db
+        try:
+            conn, why = self._conn()
+        finally:
+            patchlook.connect = keep
+        self.assertIsNone(conn)
+        self.assertEqual(why, coviewer.Handler.DIFF_NO_DB)
+        self.assertNotEqual(why, coviewer.Handler.DIFF_NO_TOOL)
+
+    def test_the_two_reasons_are_different_strings(self):
+        """Guards the arms above: if these collapsed, both would pass on any
+        implementation that returned either one."""
+        import coviewer
+        self.assertNotEqual(coviewer.Handler.DIFF_NO_TOOL,
+                            coviewer.Handler.DIFF_NO_DB)
+        self.assertTrue(coviewer.Handler.DIFF_NO_TOOL.strip())
+        self.assertTrue(coviewer.Handler.DIFF_NO_DB.strip())
+
+    def test_a_SystemExit_never_escapes_the_handler(self):
+        """`SystemExit` does not inherit from `Exception`.
+
+        A bare `except Exception` would not catch it, and letting it out of a
+        request handler takes the SERVER down rather than the request -- the
+        page would not degrade, the viewer would stop.
+        """
+        self.assertFalse(issubclass(SystemExit, Exception))
+        import coviewer
+        import patchlook
+        keep = patchlook.connect
+        patchlook.connect = lambda *a, **k: (_ for _ in ()).throw(SystemExit("x"))
+        try:
+            conn, why = self._conn()          # must return, not exit
+        finally:
+            patchlook.connect = keep
+        self.assertIsNone(conn)
+
+    def test_the_page_never_reaches_the_catalogue(self):
+        """The build-diff page is NOT per-install, and that is load-bearing.
+
+        Every other data page goes through `self.cat`, the catalogue of the one
+        configured base, which carries a measured ~52 s cold start on an
+        un-indexed client. The moment a diff query reaches it for convenience
+        the page acquires that. Asserted on the source, because the property is
+        "does not call", which no passing request can demonstrate.
+        """
+        import ast
+        import inspect
+        import textwrap
+        import coviewer
+        for name in ("_diff_conn", "api_diff_steps", "api_diff_step"):
+            fn = getattr(coviewer.Handler, name)
+            src = inspect.getsource(fn)
+            tree = ast.parse(textwrap.dedent(src))
+            hits = [n for n in ast.walk(tree)
+                    if isinstance(n, ast.Attribute) and n.attr == "cat"]
+            self.assertEqual(hits, [], f"{name} reaches self.cat")
 
 class SettingsHealthManagement(unittest.TestCase):
     """The Settings page's Health Management, and the cost it states."""

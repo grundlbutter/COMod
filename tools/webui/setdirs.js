@@ -812,6 +812,17 @@
     if (r.current) head.appendChild(mk('span', 'set-tag', 'configured root'));
     li.appendChild(head);
     li.appendChild(mk('div', 'set-path', r.root));
+    // A DIRECTORY NAME IS NOT A PATCH NUMBER. 6716 is 6271, 7632 and 7682
+    // are both 7622, ThroneOfKings7939 is 7938. The tools resolve the patch
+    // from version.dat, so the folder is what misleads a reader; print the
+    // stamp beside it, and say so when the two disagree.
+    if (r.patchNote) {
+      li.appendChild(mk('div', 'set-note', 'patch ' + r.patch + ' — ' +
+                                           r.patchNote));
+    } else if (r.patch) {
+      li.appendChild(mk('div', 'set-help', 'patch ' + r.patch +
+                                           '  (version.dat)'));
+    }
     if (r.serverName) {
       li.appendChild(mk('div', 'set-help',
         'Private server: ' + r.serverName + ' — parsed with ' + r.label));

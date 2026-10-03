@@ -61,6 +61,31 @@ const app = {
   pick: null,          // last /api/mapedit/pick payload
   editable: null,      // /api/mapedit/editable
   tiles: new Map(),    // key -> {img, ok}
+  //: `.OtherData` per-cover tint. Remembered per viewer because it is a way
+  //: of LOOKING at the map rather than a property of the map, and a reader
+  //: comparing two maps wants the same setting on both. Read defensively:
+  //: `localStorage` throws outright in some embedded contexts, and the
+  //: correct behaviour with no stored value is the default, not an error.
+  tint: (() => {
+    try { return localStorage.getItem('mapedit.tint') !== '0'; }
+    catch (e) { return true; }
+  })(),
+  //: The map's ANIMATED effects (`tools/webui/mapfx.js`). Remembered like
+  //: the tint, and for the same reason: it is a way of LOOKING at the map.
+  //: Default ON -- these are part of the map's authored art and every other
+  //: layer defaults to drawn.
+  fx: (() => {
+    try { return localStorage.getItem('mapedit.fx') !== '0'; }
+    catch (e) { return true; }
+  })(),
+  //: TEST MODE -- see the 'untextured -> glow' row in `renderLayers`.
+  fxGlow: (() => {
+    try { return localStorage.getItem('mapedit.fxglow') === '1'; }
+    catch (e) { return false; }
+  })(),
+  fxClock: 0,          // ms on the effect clock; see `animate()`
+  fxLast: 0,           // performance.now() at the previous tick
+  fxRunning: false,    // is a continuous rAF loop armed?
   pending: [],         // staged-but-not-sent passability edits
   paint: false,        // passability edit mode
   previewToken: null,
@@ -196,8 +221,37 @@ function drawGL(state, r) {
   gl.viewport(0, 0, w, h);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
+  // `order` as well as `layers`: the panel's order IS the draw order, and
+  // handing over only the booleans is how a reorder would appear to work in
+  // the panel and change nothing on screen.
   return app.baker.drawInto(viewRect(state, r),
-                            { layers: state.layers, timeMs: state.t });
+                            { layers: state.layers, timeMs: state.t,
+                              order: M.activeLayers(state, app.info) });
+}
+
+/** The animated effects, over whatever the ground pass just put down.
+ *
+ *  **NOT INSIDE `drawGL`, and that is the whole point of it being here.**
+ *  It was, and the effects vanished on two of the three maps I tested:
+ *  `drawGL` runs only when `bakerLive()` -- the GPU tile set resident and
+ *  matching -- and the very next line is `clearGL()`, which wipes the canvas
+ *  when it does not. So a map whose tile set was still loading, or that had
+ *  fallen back to PNG tiles, built all 93 of its instances and issued ZERO
+ *  draw calls. `built` looked right; `drawn` was 0.
+ *
+ *  Called after the branch, so the effects survive a ground pass that did
+ *  not happen. **On the PNG fallback they are then OCCLUDED rather than
+ *  absent**: `#mapcanvas` sits on top of `#glcanvas` and the fallback paints
+ *  its tiles there. That is a consequence of the page's existing two-canvas
+ *  split, not something this pass should quietly restructure -- and the
+ *  status object reports `drawn` either way, so the two cases are
+ *  distinguishable instead of both reading as "no effects".
+ */
+function drawMapFx(state, r) {
+  if (typeof MapFx === 'undefined' || !app.gl) return 0;
+  // `uFlipY` is -1 for the same reason tilebake passes -1 here: this is a
+  // framebuffer, not a texture bake.
+  return MapFx.draw(viewRect(state, r), -1);
 }
 
 function clearGL() {
@@ -212,7 +266,24 @@ function clearGL() {
 
 async function api(url, opts) {
   const r = await fetch(url, opts);
-  if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+  if (!r.ok) {
+    /* THE SENTENCE, NOT THE ENVELOPE. `coviewer._error` answers every
+     * failure as `{"error": "..."}` -- 4 sites, 0 `send_error` -- so
+     * rethrowing the raw body put JSON punctuation in front of the reader at
+     * the moment something had already gone wrong: `pick failed: {"error":
+     * "no map named newbie2"}`. Nine display sites in this file print
+     * `e.message` directly.
+     *
+     * Parsed defensively: a proxy, a 502 or a traceback page is not JSON,
+     * and the raw text is a better message than "undefined". */
+    const body = await r.text().catch(() => '');
+    let msg = body || r.statusText;
+    try {
+      const d = JSON.parse(body);
+      msg = d.error || d.detail || d.headline || msg;
+    } catch (_) { /* not JSON: the body itself is the best sentence we have */ }
+    throw new Error(msg);
+  }
   return r.json();
 }
 
@@ -245,9 +316,10 @@ async function boot() {
 }
 
 function wire() {
+  railSections();
   $('#map-search').addEventListener('input', renderPicker);
-  $('#btn-zoom-in').addEventListener('click', () => zoom(+1));
-  $('#btn-zoom-out').addEventListener('click', () => zoom(-1));
+  $('#btn-zoom-in').addEventListener('click', () => zoom(+M.BUTTON_NOTCHES));
+  $('#btn-zoom-out').addEventListener('click', () => zoom(-M.BUTTON_NOTCHES));
   $('#btn-fit').addEventListener('click', fitMap);
   $('#btn-shot').addEventListener('click', () => savePage());
   $('#btn-mods').addEventListener('click', openDrawer);
@@ -255,7 +327,7 @@ function wire() {
     () => $('#drawer').classList.add('hidden'));
   $('#btn-dry').addEventListener('click', () => runMod('/api/install?dry=1'));
   $('#btn-install').addEventListener('click', () => {
-    if (!confirm('This copies mods/stage/ into the game install. ' +
+    if (!confirm('This copies Installed/stage/ into the game install. ' +
                  'comod.py takes backups and writes a revert manifest. Continue?')) return;
     runMod('/api/install?dry=0');
   });
@@ -290,8 +362,8 @@ function onKey(e) {
     return;
   }
   if (e.key === 'f' || e.key === 'F') fitMap();
-  else if (e.key === '+' || e.key === '=') zoom(+1);
-  else if (e.key === '-' || e.key === '_') zoom(-1);
+  else if (e.key === '+' || e.key === '=') zoom(+M.BUTTON_NOTCHES);
+  else if (e.key === '-' || e.key === '_') zoom(-M.BUTTON_NOTCHES);
   else if (e.key === 'p' || e.key === 'P') setLayer('passability', !app.state.layers.passability);
   else if (e.key === 'c' || e.key === 'C') CardPanels.toggleAll();
 }
@@ -302,11 +374,28 @@ function renderPicker() {
   const rows = M.pickerRows(app.maps, $('#map-search').value);
   const host = $('#map-list');
   host.innerHTML = '';
+  // WHICH ROWS SHARE A NAME. The registry has more rows than maps because one
+  // map is reused under several DocumentIds -- `mapedit.rows()` documents that
+  // as data rather than a defect -- but the picker drew them as IDENTICAL
+  // lines, so `gsjx03_new` appeared four times with nothing to tell the four
+  // apart. The id was in the payload the whole time and was never shown.
+  const dupes = new Set();
+  const once = new Set();
+  for (const r of rows) {
+    if (once.has(r.name)) dupes.add(r.name); else once.add(r.name);
+  }
   for (const r of rows) {
     const n = el('div', 'maprow' + (r.drawable ? '' : ' undrawable') +
                         (app.info && app.info.name === r.name ? ' sel' : ''));
     n.title = r.note || `${r.name} — ${r.size} cells`;
     n.appendChild(el('span', 'nm', r.name));
+    // Only on the rows it disambiguates: an id beside every unique name is
+    // noise in a 730-row list, and noise is what hid the duplicates.
+    if (dupes.has(r.name) && r.documentId != null) {
+      const d = el('span', 'docid', '#' + r.documentId);
+      d.title = 'DocumentId — this map is registered under several ids';
+      n.appendChild(d);
+    }
     if (r.state !== 'ok') n.appendChild(el('span', 'badge ' +
       (r.state === 'missing' || r.state === 'broken' ? 'stage' : 'arc'), r.state));
     n.appendChild(el('span', 'sz', r.size));
@@ -318,51 +407,253 @@ function renderPicker() {
 
 // ------------------------------------------------------------------ layers
 
+/**
+ * One row per layer THIS MAP HAS, in the current draw order, furthest first.
+ *
+ * NOT `M.LAYERS`. That constant is the five layer KINDS and the panel used to
+ * draw one checkbox per kind on every map, which is wrong in both directions:
+ * of the 150 drawable maps in this install only 15 have those five. 89 have no
+ * backdrop plane at all (a checkbox that could not change the picture), 121
+ * have no TERRAIN and 22 no COVER, while `star10` has SIXTEEN separately drawn
+ * backdrop planes behind the single "Background" box. `mapedit.MapArt.layers()`
+ * measures each layer's population per map and omits the empty ones; this
+ * renders exactly what it returns. 625 real layers instead of 750 rows.
+ *
+ * The ▲/▼ buttons reorder, and the order reaches BOTH renderers (`drawGL`
+ * passes it to `tilebake.drawInto`, `M.visibleTiles` orders the PNG fallback).
+ * That is the point of the panel now: the owner wants to arrive at a draw
+ * order by eye and hand it back, so the order is also printed below the rows
+ * in a form that can be selected and copied.
+ */
 function renderLayers() {
   const host = $('#layers');
   host.innerHTML = '';
-  for (const id of M.LAYERS) {
-    const on = app.state ? app.state.layers[id] : true;
-    const row = el('label', 'lrow' + (on ? ' on' : ''));
+  const rows = app.state ? M.orderedLayers(app.state, app.info) : [];
+  if (!rows.length) {
+    host.appendChild(el('div', 'mut small',
+      app.info ? 'this map draws nothing' : 'no map open'));
+    return;
+  }
+  rows.forEach((r, i) => {
+    const on = app.state.layers[r.id] !== false;
+    const row = el('div', 'lrow' + (on ? ' on' : ''));
+    const lab = el('label', 'ltoggle');
     const box = el('input');
     box.type = 'checkbox';
     box.checked = on;
-    box.addEventListener('change', () => setLayer(id, box.checked));
-    row.appendChild(box);
-    row.appendChild(el('span', 'name', LAYER_LABEL[id]));
-    row.appendChild(el('span', 'count', layerCount(id)));
-    row.title = LAYER_HELP[id];
+    box.addEventListener('change', () => setLayer(r.id, box.checked));
+    lab.appendChild(box);
+    lab.appendChild(el('span', 'name', r.title || r.id));
+    row.appendChild(lab);
+    row.appendChild(el('span', 'count', String(r.count)));
+    for (const [d, glyph, what] of [[-1, '▲', 'further back'],
+                                    [+1, '▼', 'further forward']]) {
+      const b = el('button', 'ghost tiny move', glyph);
+      b.title = `draw ${r.id} one step ${what}`;
+      b.disabled = (d < 0 && i === 0) || (d > 0 && i === rows.length - 1);
+      b.addEventListener('click', () => moveLayer(r.id, d));
+      row.appendChild(b);
+    }
+    row.title = `${r.id} — ${r.detail || ''}\n${r.help || ''}`;
     host.appendChild(row);
+  });
+
+  // THE ORDER, READABLE. A draw order that only exists as the sequence of
+  // nodes in this panel cannot be told to anyone, and telling us is the
+  // reason the reordering was asked for.
+  // THE `.OtherData` TINT TOGGLE. It is not a layer -- it changes how the
+  // COVER and INTERACTIVE layers are PAINTED rather than whether they are --
+  // so it sits beside the order controls instead of in the list, where a
+  // checkbox means "is this drawn".
+  const tintRow = el('div', 'lrow' + (app.tint === false ? '' : ' on'));
+  const tlab = el('label', 'ltoggle');
+  const tbox = el('input');
+  tbox.type = 'checkbox';
+  tbox.checked = app.tint !== false;
+  tbox.addEventListener('change', () => {
+    app.tint = tbox.checked;
+    try { localStorage.setItem('mapedit.tint', tbox.checked ? '1' : '0'); }
+    catch (e) { /* private window: the toggle still works for this session */ }
+    app.tiles.clear();          // the tint is baked server-side, per tile
+    renderLayers();
+    schedule();
+  });
+  tlab.appendChild(tbox);
+  tlab.appendChild(el('span', 'name', '.OtherData tint'));
+  tintRow.appendChild(tlab);
+  // The tooltip says NO CLIENT DRAWS THIS on purpose. It used to say only
+  // that nothing in OUR project read the file, which left the reader to
+  // assume the game did -- and the owner did assume it, for a week. RE
+  // bisected all 38 installs (1064..7952) on 2026-09-16: the per-cover colour
+  // keys have no format string anywhere. This toggle shows what the MAP
+  // declares; it is not a view of the game.
+  tintRow.title = 'Per-cover Alpha/Red/Green/Blue authored in the .OtherData '
+                + 'sidecar beside the .DMap. NO shipped client draws these -- '
+                + 'RE checked all 38 installs, 1064 to 7952 -- so this shows '
+                + 'what the MAP declares, not what the GAME shows. 43 of 323 '
+                + 'maps carry a real per-cover ALPHA; the rest that carry '
+                + 'anything carry a colour tint. The ground tint and the '
+                + 'cover binding are separate, and both are real.';
+  host.appendChild(tintRow);
+
+  // THE ANIMATED-EFFECTS TOGGLE. Like the tint it is not a layer -- it is a
+  // whole second renderer on top of the art -- and like the tint it is a way
+  // of looking at the map rather than a property of it, so it is remembered.
+  // THREE STATES, NOT TWO. The row used to render identically whether the map
+  // had 267 animated effects or none, and **290 of 7878's 470 maps have
+  // none** -- so on 62% of the install this was a live-looking checkbox that
+  // could not change anything. A control that does nothing teaches you to
+  // distrust it on the maps where it does something.
+  //
+  // `MapFx.status().ready` is what separates "this map has none" from "they
+  // have not loaded yet"; both are `count: 0`, and without it the row either
+  // flashes "none" on every map while the effects fetch or never says it.
+  const fstat = (typeof MapFx !== 'undefined') ? MapFx.status() : null;
+  const fxReady = !!(fstat && fstat.ready && fstat.map === (app.info && app.info.name));
+  const fxNone = fxReady && !fstat.count;
+  const fxRow = el('div', 'lrow' + (fxNone ? ' off' : (app.fx === false ? '' : ' on')));
+  const flab = el('label', 'ltoggle');
+  const fbox = el('input');
+  fbox.type = 'checkbox';
+  fbox.checked = app.fx !== false && !fxNone;
+  if (fxNone) fbox.disabled = true;
+  fbox.addEventListener('change', () => {
+    app.fx = fbox.checked;
+    try { localStorage.setItem('mapedit.fx', fbox.checked ? '1' : '0'); }
+    catch (e) { /* private window: the toggle still works for this session */ }
+    if (typeof MapFx !== 'undefined') MapFx.setEnabled(app.fx);
+    renderLayers();
+    renderMapCard();
+    schedule();
+    armAnimation();
+  });
+  flab.appendChild(fbox);
+  // The label says which of the three states you are in, so the disabled
+  // checkbox is never a mystery.
+  flab.appendChild(el('span', 'name',
+    fxNone ? 'animated effects — none on this map' : 'animated effects'));
+  fxRow.appendChild(flab);
+  const fst = fstat;
+  if (fst && fst.count) {
+    // THREE DIFFERENT REASONS A PLACEMENT IS NOT DRAWN, and they are not
+    // interchangeable: its NAME has no definition anywhere (a fact about the
+    // client's data), its definition failed to LOAD (a fact about this
+    // session), or it is past the instance cap (a choice made here). I read
+    // "376 of 392" off this row myself and assumed the third when it was the
+    // first.
+    // SHORT ON THE ROW, FULL IN THE TOOLTIP. The long form -- `61 of 63 (2
+    // undefined) (106 layers: no texture ships)` -- wrapped, grew the row to
+    // three lines and printed itself over the checkbox. The reasons are
+    // still distinguished, just not all at once in 180 px of rail.
+    const undef = Math.max(0, fst.count - fst.resolved);
+    const why = [];
+    if (undef) why.push(undef + ' name(s) not defined in c3.wdb');
+    if (fst.noScene) why.push(fst.noScene + ' definition(s) failed to load');
+    if (fst.overCap) why.push(fst.overCap + ' past the instance cap');
+    if (fst.untexturedLayers)
+      why.push(fst.untexturedLayers + ' layer(s) with no resolvable texture');
+    const m = el('span', 'lmeta',
+                 fst.built + '/' + fst.count + (why.length ? ' · !' : ''));
+    m.title = fst.built + ' of ' + fst.count + ' placements drawn'
+            + (why.length ? ' — ' + why.join('; ') : '')
+            + (fst.why ? ' — ' + fst.why : '');
+    fxRow.appendChild(m);
   }
+  fxRow.title = fxNone
+    ? 'This map declares no EFFECT records, so there is nothing to toggle. '
+      + '290 of this install\u2019s 470 maps are in that state \u2014 the '
+      + 'control is disabled rather than hidden so it is clear the feature is '
+      + 'present and the map is not.'
+    : 'The EFFECT records in the .DMap \u2014 its layer lists and its group '
+      + 'array \u2014 played with the same fx.js the model viewer uses. They '
+      + 'are defined in ini/c3.wdb, not 3DEffect.ini: 41 of 436 map-effect '
+      + 'names are in the ini, which is why reading only that table drew '
+      + 'nothing. Placement is exact; the HEIGHT scale is inferred '
+      + '(mapfx.js KZ).';
+  host.appendChild(fxRow);
+
+  // THE UNTEXTURED-GLOW TEST. Off by default and labelled, because it paints
+  // something the client did not specify.
+  //
+  // **ITS ORIGINAL JUSTIFICATION IS RETRACTED.** This comment used to say 19
+  // of `sary02_new`'s 27 layers name a texture that ships in no form on any
+  // modern client. That was false: an RSDB id is a row in eleven typed
+  // tables, the `.dds` was always there, and `sary02_new` is 27/27 textured.
+  // What survives is small and real -- 21 texture rows across the corpus name
+  // a file 7878 genuinely does not ship, and the map placements still point
+  // at them -- so the switch keeps its use and loses its number. The SHAPE is
+  // a guess worth looking at; the COLOUR is ours. See `mapfx.js` `glowOn`.
+  const gwRow = el('div', 'lrow' + (app.fxGlow ? ' on' : ''));
+  const glab = el('label', 'ltoggle');
+  const gbox = el('input');
+  gbox.type = 'checkbox';
+  gbox.checked = !!app.fxGlow;
+  gbox.addEventListener('change', () => {
+    app.fxGlow = gbox.checked;
+    try { localStorage.setItem('mapedit.fxglow', gbox.checked ? '1' : '0'); }
+    catch (e) { /* private window: the toggle still works for this session */ }
+    if (typeof MapFx !== 'undefined') MapFx.setGlow(app.fxGlow);
+    renderLayers();
+    schedule();
+    armAnimation();
+  });
+  glab.appendChild(gbox);
+  glab.appendChild(el('span', 'name', 'untextured → glow (test)'));
+  gwRow.appendChild(glab);
+  gwRow.title = 'Draw a soft circle where a layer has no texture, instead of '
+              + 'skipping it. The texture for these does not ship on any '
+              + 'client we have, and nothing in the data gives them a colour '
+              + '-- not the EFFE layer, not vertex colours, not the '
+              + '.OtherData sidecar (which has no per-effect section: 113 of '
+              + '115 maps bind one to the COVER list, 4 to the effect count '
+              + 'by coincidence). So the shape is a hypothesis and the colour '
+              + 'is invented. A test, not a restoration.';
+  host.appendChild(gwRow);
+
+  const foot = el('div', 'lorder');
+  const txt = el('code', 'ordertext', M.orderText(app.state, app.info));
+  txt.title = 'the current draw order, furthest first; (brackets) = switched off';
+  foot.appendChild(txt);
+  const btns = el('div', 'lorderbtns');
+  const copy = el('button', 'ghost tiny', 'copy');
+  copy.title = 'copy this order to the clipboard';
+  copy.addEventListener('click', () => copyOrder(txt));
+  btns.appendChild(copy);
+  const reset = el('button', 'ghost tiny', 'reset');
+  reset.title = 'back to the composite order the game draws in';
+  reset.addEventListener('click', () => {
+    app.state = M.resetOrder(app.state, app.info);
+    renderLayers();
+    schedule();
+  });
+  btns.appendChild(reset);
+  foot.appendChild(btns);
+  host.appendChild(foot);
 }
 
-const LAYER_LABEL = {
-  background: 'Background', ground: 'Base puzzle', terrain: 'TERRAIN',
-  cover: 'COVER', passability: 'Passability',
-};
-
-const LAYER_HELP = {
-  background: 'The map’s background puzzle planes, from the .DMap’s trailing ' +
-    'section. They are what turns the void around an island into sea and sky.',
-  ground: 'The painted ground: map/puzzle/*.pul cut into PuzzleGridSize tiles.',
-  terrain: 'TERRAIN layers — map/Scene objects. These carry their own ' +
-    'passability and it REPLACES the cell grid underneath them.',
-  cover: 'COVER layers — sprites the game draws in front of the player.',
-  passability: 'Green: walkable in the .DMap’s own grid. Cyan: walkable only ' +
-    'because a TERRAIN layer says so. Red: the grid says yes and a TERRAIN ' +
-    'says no.',
-};
-
-function layerCount(id) {
-  const i = app.info;
-  if (!i) return '';
-  if (id === 'terrain') return String(i.sceneParts || 0);
-  if (id === 'cover') return String(i.covers || 0);
-  if (id === 'background') return String((i.backdrops || []).length);
-  if (id === 'ground') return i.pul ? `${i.pul[0]}×${i.pul[1]}` : '—';
-  if (id === 'passability') return i.mapSize ? `${i.mapSize[0]}²` : '';
-  return '';
+/** `navigator.clipboard` is not there on a plain-HTTP origin in every
+ *  browser, and a copy button that silently does nothing is worse than none.
+ *  Falls back to selecting the text so Ctrl+C works, and says which happened. */
+function copyOrder(node) {
+  const s = node.textContent;
+  const select = () => {
+    const rng = document.createRange();
+    rng.selectNodeContents(node);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(rng);
+    toast('selected — press Ctrl+C');
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(s)
+      .then(() => toast('layer order copied'))
+      .catch(select);
+  } else select();
 }
+
+/** The same string, from the console, for an owner who would rather paste
+ *  than click. `window.saveShot` above is the same convention. */
+window.layerOrder = () => M.orderText(app.state, app.info);
 
 function setLayer(id, on) {
   if (!app.state) return;
@@ -371,6 +662,15 @@ function setLayer(id, on) {
   if (id === 'passability' && !on) setPaint(false);
   renderLayers();
   renderPassCard();
+  schedule();
+}
+
+function moveLayer(id, delta) {
+  if (!app.state) return;
+  const next = M.moveLayer(app.state, app.info, id, delta);
+  if (next === app.state) return;             // already at the end
+  app.state = next;
+  renderLayers();
   schedule();
 }
 
@@ -396,9 +696,17 @@ async function openMap(name) {
   }
   app.info = info;
   location.hash = name;
+  // Carry the toggles across maps, but only for ids the NEW map has: layer
+  // ids are per map now (`background:7` exists on `star02` and nowhere else)
+  // and a state carrying another map's ids would keep them in `state.order`
+  // for as long as the tab lives. The ORDER is not carried -- the set of
+  // layers is different, so a position in the old one means nothing here.
   const keep = app.state ? app.state.layers : null;
   app.state = M.create(info);
-  if (keep) app.state.layers = Object.assign({}, keep);
+  if (keep) {
+    for (const id of Object.keys(app.state.layers))
+      if (id in keep) app.state.layers[id] = keep[id];
+  }
   sizeCanvas();
   const r = viewSize();
   // A pane that has not been laid out yet reports 0x0, and fitting to that
@@ -409,6 +717,7 @@ async function openMap(name) {
   renderPicker();
   renderLayers();
   renderMapCard();
+  loadMapFx(name);
   renderInspector();
   renderTexCard();
   renderPassCard();
@@ -417,6 +726,10 @@ async function openMap(name) {
   // click. The card offers the button.
   co.closure = null;
   renderCollectCard();
+  // The cover palette lives in its own file and listens rather than being
+  // called, so it can be absent without this function knowing. One event,
+  // dispatched where every other card is refreshed, is the whole contract.
+  window.dispatchEvent(new CustomEvent('co-map-opened', { detail: { name } }));
   loadEntries();
   // The one fetch this map's art costs. Not awaited: the grid, the HUD and
   // the inspector are usable immediately, and the art appears when it lands.
@@ -445,6 +758,149 @@ function sizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   c.width = Math.max(1, Math.round(r.w * dpr));
   c.height = Math.max(1, Math.round(r.h * dpr));
+}
+
+// ------------------------------------------------- the animated effects
+//
+// THE PAGE HAD NO CLOCK AT ALL BEFORE THIS. `state.t` was initialised to 0
+// and never advanced by anything, so `timeMs` reached the baker as 0 on
+// every frame and the ground's own rolling planes were static too. Adding a
+// clock therefore starts those moving as well -- a change to an existing
+// layer, not only to the new one, and worth knowing when comparing a
+// screenshot taken before this.
+//
+// The loop runs ONLY while there is something to animate and the toggle is
+// on, so a map with no effects costs exactly what it used to: one redraw per
+// interaction, no rAF churn, and nothing running in a backgrounded tab.
+//
+// **THAT TIES THE GROUND'S ANIMATION TO THE EFFECTS TOGGLE, and it is worth
+// saying rather than discovering.** `state.t` is the only clock on the page,
+// the baker reads it as `timeMs`, and this loop is the only thing that
+// advances it -- so turning the effects off also stops a rolling backdrop
+// plane. Both were frozen before today, so nothing REGRESSES; the coupling is
+// new and slightly wrong, and the honest fix is a clock that runs when
+// anything on the page is animated rather than when effects are. Not done
+// here because the only animation this branch has verified end to end is the
+// effects, and arming a loop for a layer I have not measured would be
+// asserting something I have not checked.
+
+function fxLive() {
+  return app.fx !== false && typeof MapFx !== 'undefined' && MapFx.count() > 0;
+}
+
+function animate() {
+  app.fxRunning = false;
+  if (!fxLive()) return;
+  const now = (window.performance && performance.now) ? performance.now()
+                                                      : Date.now();
+  // WALL-CLOCK DELTA, NOT A FIXED STEP PER FRAME. A fixed step ties playback
+  // speed to the display's refresh rate, so the same effect runs at half
+  // speed on a 30 Hz panel and double on 120 Hz -- and the frame interval
+  // these effects declare (33 ms) is a real authored number that the client
+  // honours in milliseconds.
+  const dt = app.fxLast ? Math.min(250, now - app.fxLast) : 16;
+  app.fxLast = now;
+  app.fxClock += dt;
+  MapFx.tick(app.fxClock);
+  if (app.state) app.state.t = app.fxClock;
+  schedule();
+  armAnimation();
+}
+
+function armAnimation() {
+  if (app.fxRunning || !fxLive()) return;
+  // A hidden tab gets no rAF, which is correct here: there is nothing to
+  // see, and the clock picks up from wherever it left off because `fxLast`
+  // is reset on the next visible frame rather than accumulating the gap.
+  if (document.hidden) {
+    app.fxLast = 0;
+    // **BUT IT STILL NEEDS ONE TICK, AND WITHOUT IT THE EFFECTS ARE ABSENT
+    // RATHER THAN MERELY STILL.** A placement has no frame state until it is
+    // ticked, so `MapFx.draw` skips every one of them: on a hidden tab the
+    // map rendered its ground, its planes and its covers and drew ZERO of 61
+    // built effects. Not a theory -- measured on `sary02_new` from the
+    // Collection, `built: 61, drawn: 0`, and one hand-driven tick took it to
+    // 219.
+    //
+    // `schedule()` two functions up already learnt this lesson in the other
+    // direction ("a backgrounded tab does not fire rAF at all, which is
+    // right for an animation and wrong for 'render once so a screenshot has
+    // something in it'") and falls back to a timer. The effect pass is the
+    // same picture and was never taught. A still frame of this map is not
+    // "the map without its animation"; it is the map with pieces missing.
+    //
+    // ONE tick, not a loop: the point is a POSE, not playback. `fxClock` is
+    // left where it was so becoming visible resumes rather than restarts.
+    if (!app.fxPosed) {
+      app.fxPosed = true;
+      MapFx.tick(app.fxClock || 0);
+      schedule();
+    }
+    return;
+  }
+  app.fxPosed = false;
+  app.fxRunning = true;
+  requestAnimationFrame(animate);
+}
+
+async function loadMapFx(name) {
+  if (typeof MapFx === 'undefined') return;
+  const gl = glContext();
+  if (!gl || !MapFx.init(gl)) { renderMapCard(); return; }
+  MapFx.setEnabled(app.fx !== false);
+  MapFx.setGlow(!!app.fxGlow);
+  app.fxClock = 0;
+  app.fxLast = 0;
+  try {
+    await MapFx.load(name, () => { schedule(); armAnimation(); });
+  } catch (e) { /* the status object carries the reason; the map still draws */ }
+  // RE-RENDER THE LAYER ROWS. `renderLayers` runs during `openMap`, which is
+  // BEFORE the effects have loaded, so the effects row's count read 0 and the
+  // row rendered with no meta at all -- the number only appeared if you
+  // happened to toggle something afterwards.
+  renderLayers();
+  renderMapCard();
+  schedule();
+  armAnimation();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { app.fxLast = 0; armAnimation(); }
+});
+
+/** Collapsible left-rail sections.
+ *
+ *  The rail fills up: a map with many layers (`star10` has 19) plus the two
+ *  effect rows pushed the View controls off the bottom -- measured at 78 px
+ *  below the rail on `sary02_new` -- on exactly the maps where the layer
+ *  list is most worth reading. Each section remembers its own state, so a
+ *  reader who never wants the map list open does not close it again on
+ *  every load.
+ *
+ *  **It refuses to operate a section it cannot** -- the rule `cards.js` was
+ *  written to enforce after the asset page shipped a pointer cursor on
+ *  eight headers that had no listener. A `.railsec` missing its head or
+ *  body is skipped rather than half-wired.
+ */
+function railSections() {
+  const KEY = 'mapedit.rail';
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; }
+  catch (e) { state = {}; }
+  for (const sec of document.querySelectorAll('.railsec[data-rail]')) {
+    const head = sec.querySelector('label.railhead');
+    const body = sec.querySelector('.railbody');
+    if (!head || !body) continue;
+    const name = sec.dataset.rail;
+    if (state[name]) sec.classList.add('collapsed');
+    head.addEventListener('click', () => {
+      const now = !sec.classList.contains('collapsed');
+      sec.classList.toggle('collapsed', now);
+      state[name] = now;
+      try { localStorage.setItem(KEY, JSON.stringify(state)); }
+      catch (e) { /* private window: it still works for this session */ }
+    });
+  }
 }
 
 function schedule() {
@@ -477,6 +933,7 @@ function draw() {
   // on the tile path in both cases.
   const onGpu = bakerLive() && drawGL(app.state, r);
   if (!onGpu) clearGL();
+  drawMapFx(app.state, r);
   // `undefined` means "every enabled layer", which is the original behaviour.
   const layers = onGpu
     ? ['passability'].filter(l => app.state.layers[l])
@@ -502,7 +959,8 @@ function tile(t) {
   const img = new Image();
   img.onload = schedule;
   img.onerror = () => {};
-  img.src = '/api/mapedit/tile?' + M.tileQuery(app.info.name, t);
+  img.src = '/api/mapedit/tile?' + M.tileQuery(app.info.name, t)
+          + (app.tint === false ? '&tint=0' : '');
   ent = { img };
   if (app.tiles.size > 900) app.tiles.clear();
   app.tiles.set(t.key + (t.t ? '|' + t.t : ''), ent);
@@ -557,8 +1015,11 @@ function drawPending(g) {
 
 function updateHud() {
   const s = app.state;
-  $('#hud-z').textContent = s ? `${(s.zoom * 100).toFixed(0)}% (level ${M.tileLevel(s.zoom)})` : '—';
-  $('#zoom-label').textContent = s ? `${(s.zoom * 100).toFixed(0)}%` : '—';
+  // `M.zoomPercent`, not `toFixed(0)`: at a 5% notch a whole-number percentage
+  // repeats for up to ten consecutive ticks near MIN_ZOOM, which reads as a
+  // dead wheel. See the measurement beside zoomPercent in mapmodel.js.
+  $('#hud-z').textContent = s ? `${M.zoomPercent(s.zoom)}% (level ${M.tileLevel(s.zoom)})` : '—';
+  $('#zoom-label').textContent = s ? `${M.zoomPercent(s.zoom)}%` : '—';
   const a = $('#hud-art');
   if (a) { a.textContent = artStatus(); a.title = artStatusDetail(); }
 }
@@ -600,7 +1061,11 @@ function onWheel(e) {
   if (!app.state) return;
   e.preventDefault();
   const [x, y] = localPoint(e);
-  app.state = M.zoomAt(app.state, e.deltaY > 0 ? -1 : +1, x, y);
+  // NOT `e.deltaY > 0 ? -1 : +1`. That counted one notch per EVENT, and the
+  // number of events a physical detent produces is a property of the mouse,
+  // not of this file -- a high-resolution wheel made one tick several notches
+  // and no value of M.WHEEL could have delivered the 5% that was asked for.
+  app.state = M.zoomAt(app.state, M.wheelNotches(e.deltaY, e.deltaMode), x, y);
   schedule();
 }
 
@@ -660,8 +1125,12 @@ function onUp(e) {
 
 async function doPick(ax, ay) {
   if (!app.info || !app.info.ok) return;
-  const layers = M.LAYERS.filter(l => app.state.layers[l] && l !== 'passability' &&
-                                      l !== 'background');
+  // `pick` hit-tests SPRITES and the puzzle underneath, so it only ever takes
+  // the three kinds it knows -- never a `background:N` id, which names a
+  // plane it cannot hit-test and the server would reject.
+  const hittable = ['terrain', 'cover', 'ground'];
+  const layers = M.activeLayers(app.state, app.info)
+    .filter(l => hittable.indexOf(l) >= 0);
   try {
     app.pick = await api('/api/mapedit/pick?name=' +
       encodeURIComponent(app.info.name) +
@@ -854,7 +1323,7 @@ function renderTexCard() {
       const r = await api(`/api/stage?path=${encodeURIComponent(path)}` +
                           `&token=${app.previewToken}`, { method: 'POST' });
       toast('staged → ' + r.logical);
-      // The map draws through mods/stage, so every cache of this texture is
+      // The map draws through Installed/stage, so every cache of this texture is
       // now wrong. Drop them and let the art come back changed.
       refreshArt();
       schedule();
@@ -950,7 +1419,7 @@ function renderPassCard() {
 async function stagePassability() {
   const ok = confirm(
     `${app.info.dmap} is one of the files integrity.json lists.\n\n` +
-    `Staging this writes mods/stage/${app.info.dmap} — the game install is ` +
+    `Staging this writes Installed/stage/${app.info.dmap} — the game install is ` +
     `NOT touched until you run Install. The original is copied byte for byte ` +
     `apart from the ${app.pending.length} cell mask(s) and the row checksums ` +
     `that cover them.\n\nProceed?`);
@@ -1108,13 +1577,50 @@ window.saveShot = savePage;
 //   * the .DMap alone can be hashed by the install's integrity manifest.
 //
 // `co.shared` is the expensive one: resolving who else uses each file walks
-// every map on the install (~13 s). It defaults on, because without it the
-// entry cannot record what it shares and export cannot warn -- but it is a
-// toggle, because a quick look should not cost a full walk.
+// every map on the install (~9 s, measured after `mapparts._ani_table` was
+// cached -- following the ground made that walk resolve a 1.1 MB index once
+// per map, and the cache took it from minutes to under the old figure). It
+// defaults on, because without it the entry cannot record what it shares and
+// export cannot warn -- but it is a toggle, because a quick look should not
+// cost a full walk.
 
+// `roles` IS DERIVED FROM THE CLOSURE, NOT LISTED HERE, and the difference
+// is not cosmetic. It used to read `{puzzle: true, ani: true, art: true}`
+// and `chosenCount` drops any part whose role is not in it -- so the day the
+// collector learned to follow the backdrop planes, the `.OtherData` sidecar,
+// the scene and sound records, the registry rows and the effect art, the
+// page went on collecting three roles and silently leaving the rest. A
+// hard-coded list of what exists is a list that is wrong the moment
+// something new exists, and it fails by QUIETLY COLLECTING LESS.
+//
+// `roleLabel` still names them, because "otherdata" is not a thing to show a
+// person; an unnamed role falls back to its own key rather than vanishing.
 const co = { closure: null, busy: false, shared: true,
-             roles: { puzzle: true, ani: true, art: true },
-             withShared: true, entries: [] };
+             roles: {}, withShared: true, entries: [] };
+
+//: role -> what to call it, and a note where the role is not self-evident.
+const ROLE_LABEL = {
+  puzzle: ['Ground surface (.pux/.pul)', ''],
+  plane: ['Backdrop planes (.pul)', 'the sky and the far scenery'],
+  ani: ['Scenery index (.ani)', 'cut to this map’s own keys'],
+  art: ['Tiles', ''],
+  scene: ['Scene objects (.scene)', ''],
+  sound: ['Positional sound (.wav)', ''],
+  otherdata: ['Tints (.OtherData)', 'per-cover and ground colour'],
+  config: ['Config snippets', 'GameMap rows, 3DEffect sections — merged, not overwritten'],
+  effectart: ['Effect art (.c3/.dds)', 'what the animated layers actually draw'],
+};
+
+/** Every role the closure produced that is a FILE, defaulting to on.
+ *  `dmap` is not a choice (it is what the map is) and `effect` is a name. */
+function syncRoles() {
+  const c = co.closure;
+  if (!c || !c.parts) return;
+  for (const p of c.parts) {
+    if (p.role === 'dmap' || p.role === 'effect') continue;
+    if (!(p.role in co.roles)) co.roles[p.role] = true;
+  }
+}
 
 async function loadClosure() {
   const i = app.info;
@@ -1126,6 +1632,7 @@ async function loadClosure() {
   } catch (e) {
     co.closure = { error: e.message };
   }
+  syncRoles();
   co.busy = false;
   renderCollectCard();
 }
@@ -1204,16 +1711,20 @@ function renderCollectCard() {
   const opts = el('div', 'co-opts');
   opts.appendChild(el('div', 'note',
     'The .DMap always travels — it is what the map is.'));
-  opts.appendChild(coCheck(`Background (.pul) ×${byRole.puzzle || 0}`,
-    co.roles.puzzle, v => { co.roles.puzzle = v; renderCollectCard(); }));
-  opts.appendChild(coCheck(`Scenery index (.ani) ×${byRole.ani || 0}`,
-    co.roles.ani, v => { co.roles.ani = v; renderCollectCard(); }));
-  opts.appendChild(coCheck(`Tiles ×${byRole.art || 0}`,
-    co.roles.art, v => { co.roles.art = v; renderCollectCard(); }));
+  // One checkbox per role the closure ACTUALLY produced, in a stable order
+  // so the panel does not reshuffle between maps.
+  for (const role of Object.keys(ROLE_LABEL).concat(
+         Object.keys(co.roles).filter(r => !(r in ROLE_LABEL)))) {
+    if (!(role in co.roles)) continue;
+    const [label, note] = ROLE_LABEL[role] || [role, ''];
+    opts.appendChild(coCheck(`${label} ×${byRole[role] || 0}`,
+      co.roles[role],
+      v => { co.roles[role] = v; renderCollectCard(); }, note));
+  }
   opts.appendChild(coCheck('Include art shared with other maps',
     co.withShared, v => { co.withShared = v; renderCollectCard(); },
     'off leaves it behind; the map still draws from the install’s own copies'));
-  opts.appendChild(coCheck('Resolve sharing (walks every map, ~13 s)',
+  opts.appendChild(coCheck('Resolve sharing (walks every map, ~9 s)',
     co.shared, v => { co.shared = v; loadClosure(); }));
   b.appendChild(opts);
 
@@ -1296,7 +1807,7 @@ function renderExportCard() {
 
   const opts = el('div', 'co-opts');
   opts.appendChild(el('div', 'note',
-    'Staged into mods/stage/ only. Nothing touches the install until you ' +
+    'Staged into Installed/stage/ only. Nothing touches the install until you ' +
     'press Install in Mod staging.'));
   const policy = document.createElement('select');
   for (const [v, t] of [

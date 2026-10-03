@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+r"""bonetree.py -- a bone hierarchy DERIVED from the skin, not guessed at.
+
+A `.c3` stores no skeleton and no parent indices: `MotionKey.matrices` is a
+flat list and every `MOTI` matrix is an ABSOLUTE skinning matrix.  So a
+Blender armature built from one has no hierarchy, and posing it means moving
+one bone at a time -- rotating a shoulder does not carry the arm.
+
+THE SKIN ALREADY ENCODES ADJACENCY.  A vertex blended between bone A and bone
+B sits at the joint between them; that is what a two-influence skin IS.  So
+the bone pairs that share blended vertices form an adjacency graph, and the
+hierarchy is a spanning forest of that graph.  **This is derived from shipped
+data.  Only three things are chosen, and each is chosen by a stated rule.**
+
+MEASURED on `003188495.c3` v_body (CCO), 25 bones and 846 vertices:
+
+    single-influence vertices   428
+    blended vertices            418
+    distinct bone pairs          26
+    bones with no neighbour       0
+    connected components          4   sizes [18, 3, 2, 2]
+
+The pairs are visibly anatomical -- `016-017-018` and `008-009-010` are limb
+chains, `001-002-003` a spine, and `001-042` joins them.  26 edges over 25
+bones in 4 components means 21 tree edges and 5 that close cycles, so the
+spanning rule has real work to do and is not just relabelling a tree.
+
+WHAT IS CHOSEN, STATED RATHER THAN BURIED
+-----------------------------------------
+1. **Which edges.**  Maximum-weight spanning forest, weight being the summed
+   blend weight over the pair.  A joint that 38 vertices blend across is a
+   better structural claim than one that 2 do.
+2. **Which bone roots a component.**  The one carrying the most total skin
+   weight -- the heaviest bone is the torso-like one, and rooting at a
+   fingertip would give a skeleton that poses backwards.
+3. **Edge direction.**  Implied by the root once it is picked: BFS outward.
+
+Components stay separate.  Four roots is the honest answer for a mesh whose
+skin does not connect them, and joining them by proximity would be exactly
+the guess this module exists to avoid.
+
+WHY IT MUST BE PERSISTED AND NEVER RE-DERIVED
+---------------------------------------------
+The importer conjugates each pose by its PARENT's matrix
+(``B = L^-1 . M_parent^-1 . M . L``) and the exporter undoes that walking
+root-first.  Both ends must use the SAME tree or the reconstruction is
+wrong.  Re-deriving at export would re-run this rule against a mesh the user
+may have edited, so the tree is stored on the armature at import and read
+back, never recomputed.  A stored tree cannot drift; a re-derived one can.
+
+HOW CLOSELY THE ROUND TRIP ACTUALLY RETURNS, AND WHAT PINS IT
+-------------------------------------------------------------
+This used to claim 6.2e-12 -- "~7 orders below float32 resolution, so even a
+re-baked key writes identical bytes" -- and to credit `tests/test_bonetree.py`
+with pinning it.  Both halves were wrong.  **`test_bonetree.py` never calls
+`moti_to_view` or `build_motion` at all**; the parented round trip is gated by
+`tests/test_moti_parented.py` (10 tests), whose bound is `< 1e-6` on a
+SYNTHETIC 6-bone motion (`:135`).  No test asserts 6.2e-12, and nothing
+measures the parented path over the corpus -- `control_rebake_fidelity` in
+`tests/test_moti_action.py` never passes `parents`.
+
+MEASURED 2026-09-25 on the live CCO install, forced full re-bake
+(``src_view=None``) on two real 84-bone shape-3 tracks, each with a tree
+derived from its own frames (82 edges, 2 roots, depth 8 and 10).  Worst
+absolute element error over every key and bone:
+
+    track                            flat+ident  flat+ladder  parented+ident
+    c3/0003/One-Handed/Sword/403.c3    5.86e-07     1.57e-04       5.93e-05
+      (KKEY, 30 keys)
+    c3/0003/500/131.c3                 1.54e-06     2.12e-05       9.87e-06
+      (ZKEY, 31 keys)
+
+That is five to seven orders LOOSER than the retracted figure, and **the
+conclusion it carried is false: a full re-bake does not write identical
+bytes.**  Re-serialised, the best configuration above still differs from the
+original chunk in 14,001 of 161,420 bytes (KKEY) and 3,934 of 72,994 (ZKEY).
+Byte-exactness comes from the REUSE path -- "prefer the source when the view is
+unchanged", gated byte-for-byte by `test_moti_action.py`, 16,841 chunks over
+6,565 containers on this install, PASS 2026-09-25 -- and not from re-bake
+precision.  An edited key is re-baked and will differ;
+that is by design, and `docs/blender_animation_2026-09-06.md` §4 carries the
+per-encoding relative bounds the tests assert.
+"""
+from __future__ import annotations
+
+#: Below this, a "blend" is a rounding artefact rather than a joint.
+MIN_BLEND = 1e-4
+
+
+def adjacency(vertices, *, min_blend: float = MIN_BLEND) -> dict:
+    """``{(lo, hi): summed blend weight}`` -- the joints the skin declares.
+
+    Duck-typed on `c3phy.PhyVertex` so this module imports nothing of ours.
+
+    A pair counts only when the two slots name DIFFERENT bones and both carry
+    weight: `bone0 == bone1` on 27% of corpus vertices and says nothing about
+    adjacency.  The weight contributed is ``min(w0, w1)`` -- a vertex 99/1
+    between two bones is barely a joint, and summing the raw pair would let a
+    large flat region outvote a real articulation.
+    """
+    out: dict = {}
+    for v in vertices:
+        a, b = int(v.bone0), int(v.bone1)
+        if a == b:
+            continue
+        w0, w1 = float(v.weight0), float(v.weight1)
+        if w0 <= min_blend or w1 <= min_blend:
+            continue
+        key = (a, b) if a < b else (b, a)
+        out[key] = out.get(key, 0.0) + min(w0, w1)
+    return out
+
+
+def bone_mass(vertices, *, min_blend: float = MIN_BLEND) -> dict:
+    """``{bone: total skin weight}`` -- used only to pick a root."""
+    out: dict = {}
+    for v in vertices:
+        a, b = int(v.bone0), int(v.bone1)
+        w0, w1 = float(v.weight0), float(v.weight1)
+        if w0 > min_blend:
+            out[a] = out.get(a, 0.0) + w0
+        if b != a and w1 > min_blend:
+            out[b] = out.get(b, 0.0) + w1
+    return out
+
+
+def _components(bones, adj):
+    nbr: dict = {b: set() for b in bones}
+    for (a, b) in adj:
+        if a in nbr and b in nbr:
+            nbr[a].add(b)
+            nbr[b].add(a)
+    seen, comps = set(), []
+    for s in bones:
+        if s in seen:
+            continue
+        stack, comp = [s], []
+        seen.add(s)
+        while stack:
+            x = stack.pop()
+            comp.append(x)
+            for y in nbr[x]:
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+        comps.append(sorted(comp))
+    return comps, nbr
+
+
+def bone_centroids(vertices, *, min_blend: float = MIN_BLEND, transform=None):
+    """``{bone: weighted centroid}`` -- only used to BRIDGE A SEAM."""
+    acc: dict = {}
+    for v in vertices:
+        p = tuple(v.position)
+        if transform is not None:
+            p = tuple(transform(p))
+        a, b = int(v.bone0), int(v.bone1)
+        w0, w1 = float(v.weight0), float(v.weight1)
+        pairs = [(a, w0)]
+        if b != a:
+            pairs.append((b, w1))
+        for bi, w in pairs:
+            if w <= min_blend:
+                continue
+            s = acc.setdefault(bi, [0.0, 0.0, 0.0, 0.0])
+            for i in range(3):
+                s[i] += p[i] * w
+            s[3] += w
+    return {bi: tuple(s[i] / s[3] for i in range(3))
+            for bi, s in acc.items() if s[3] > 0.0}
+
+
+def _reroot(parent, a):
+    """Make `a` the root of its own component, reversing the path up to it."""
+    path, x, guard = [], a, 0
+    while parent.get(x) is not None and guard <= len(parent):
+        path.append(x)
+        x = parent[x]
+        guard += 1
+    path.append(x)
+    for i in range(1, len(path)):
+        parent[path[i]] = path[i - 1]
+    parent[a] = None
+
+
+def _root_of(parent, b):
+    x, guard = b, 0
+    while parent.get(x) is not None and guard <= len(parent):
+        x = parent[x]
+        guard += 1
+    return x
+
+
+def link_components(parent, centroids):
+    """Attach every orphan component to the nearest bone already rooted.
+
+    **THIS IS THE ONE INFERRED STEP IN THIS MODULE AND IT IS LABELLED AS ONE.**
+    Everything above is derived from blend weights the file ships; this is
+    proximity, and proximity is a guess.
+
+    IT IS HERE BECAUSE THE ALTERNATIVE IS MEASURABLY WORSE.  A mesh has hard
+    seams -- a sleeve ends and a hand begins as separate geometry with no
+    vertex blended across the join -- so skin adjacency CANNOT see past one,
+    and the limb beyond it becomes its own root.  MEASURED on 003188495
+    v_body: the forearm-to-hand seam leaves `[11, 12, 14]` and `[19, 22]`
+    orphaned and the knee-to-foot seam leaves `[44, 45]`, so rotating a
+    shoulder moved neither hand.  That is what the owner reported, and it is
+    also why the two hands appeared to have different bone counts: they are
+    separate components of different sizes, not a left/right mismatch.
+
+    The bridges this picks on that mesh, and each is the anatomically right
+    one: 011 -> 010 (hand to forearm, 18.0), 019 -> 018 (19.7), 044 -> 043
+    (foot to knee, 32.3).
+
+    Component order is by SIZE, largest first, so a small component can never
+    become the anchor that a larger one hangs off.
+    """
+    if not centroids:
+        return parent
+    comps: dict = {}
+    for b in parent:
+        comps.setdefault(_root_of(parent, b), []).append(b)
+    if len(comps) < 2:
+        return parent
+    order = sorted(comps.values(), key=lambda c: (-len(c), min(c)))
+    linked = set(order[0])
+    for comp in order[1:]:
+        best = None
+        for a in comp:
+            ca = centroids.get(a)
+            if ca is None:
+                continue
+            for t in linked:
+                ct = centroids.get(t)
+                if ct is None:
+                    continue
+                d = sum((ca[i] - ct[i]) ** 2 for i in range(3))
+                if best is None or d < best[0]:
+                    best = (d, a, t)
+        if best is None:
+            linked.update(comp)          # nothing to measure against
+            continue
+        _d, a, t = best
+        _reroot(parent, a)
+        parent[a] = t
+        linked.update(comp)
+    return parent
+
+
+def build_tree(bone_indices, vertices, *, min_blend: float = MIN_BLEND,
+               bridge_seams: bool = True, transform=None):
+    """-> ``{bone: parent_or_None}``, a maximum-weight spanning FOREST.
+
+    Every bone in `bone_indices` appears as a key.  A bone with no blended
+    neighbour is its own root rather than being attached to something by
+    proximity; that is the guess this module refuses to make.
+
+    The result is acyclic by construction (Kruskal over a disjoint set), which
+    matters beyond tidiness: Blender rejects a bone that is its own ancestor,
+    and a cycle here would fail at `edit_bone.parent =` with no useful message.
+    """
+    bones = sorted({int(b) for b in bone_indices})
+    adj = adjacency(vertices, min_blend=min_blend)
+    adj = {(a, b): w for (a, b), w in adj.items()
+           if a in set(bones) and b in set(bones)}
+    mass = bone_mass(vertices, min_blend=min_blend)
+
+    # --- 1. maximum-weight spanning forest, heaviest joint first ---------
+    up = {b: b for b in bones}
+
+    def find(x):
+        while up[x] != x:
+            up[x] = up[up[x]]
+            x = up[x]
+        return x
+
+    keep: dict = {b: set() for b in bones}
+    for (a, b), _w in sorted(adj.items(), key=lambda kv: (-kv[1], kv[0])):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue                      # would close a cycle
+        up[ra] = rb
+        keep[a].add(b)
+        keep[b].add(a)
+
+    # --- 2. root each component at its heaviest bone ---------------------
+    comps, _nbr = _components(bones, {k: 1.0 for k in adj})
+    parent: dict = {}
+    for comp in comps:
+        root = max(comp, key=lambda b: (mass.get(b, 0.0), -b))
+        parent[root] = None
+        # --- 3. direct the kept edges outward from that root -------------
+        queue, seen = [root], {root}
+        while queue:
+            x = queue.pop(0)
+            for y in sorted(keep[x]):
+                if y not in seen:
+                    seen.add(y)
+                    parent[y] = x
+                    queue.append(y)
+        for b in comp:                    # unreachable => its own root
+            parent.setdefault(b, None)
+    for b in bones:
+        parent.setdefault(b, None)
+
+    # --- 4. bridge the SEAMS the skin cannot see across -------------------
+    # Derived edges are exhausted by this point; what is left is components
+    # separated by geometry with no blend across it. See `link_components`
+    # for why this is here and why it is the one inferred step.
+    if bridge_seams:
+        link_components(parent, bone_centroids(
+            vertices, min_blend=min_blend, transform=transform))
+    return parent
+
+
+def order_root_first(parent):
+    """Bones ordered so every parent precedes its children.
+
+    Both the import conjugation and the export reconstruction need this: a
+    child's matrix is only meaningful once its parent's is known.
+    """
+    out, seen = [], set()
+
+    def visit(b, guard=0):
+        if b in seen or guard > len(parent) + 1:
+            return
+        p = parent.get(b)
+        if p is not None:
+            visit(p, guard + 1)
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+
+    for b in sorted(parent):
+        visit(b)
+    return out
+
+
+def flatten(parent, bone_indices):
+    """-> a flat ``[parent_or_-1, ...]`` aligned to `bone_indices`, for
+    stashing on the armature.  ``-1`` is "root": a custom property list cannot
+    hold ``None``, and a sentinel that round-trips is worth more than one that
+    reads nicely."""
+    return [(-1 if parent.get(int(b)) is None else int(parent[int(b)]))
+            for b in bone_indices]
+
+
+def unflatten(flat, bone_indices):
+    """The inverse of `flatten`, for reading a stashed tree back."""
+    out = {}
+    for b, p in zip(bone_indices, flat):
+        out[int(b)] = None if int(p) < 0 else int(p)
+    return out

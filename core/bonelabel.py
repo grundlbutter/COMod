@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+r"""bonelabel.py -- name a solved C3 skeleton's bones by what they ARE.
+
+`bonejoint` recovers the hierarchy and the joint positions of a `.c3` body, but
+every bone it hands back is called `bone_000` .. `bone_083`.  Nothing can
+retarget onto that.  A retargeter -- Blender's own constraints, Rokoko,
+Auto-Rig Pro -- matches on MEANING: hips, spine, upper arm, hand.  So does a
+person trying to pose a shoulder.
+
+This derives those names from the TOPOLOGY plus the joint geometry, which is
+all a `.c3` gives us: the file stores no bone names, no rest skeleton and no
+parent indices at all.
+
+WHY THE CLASSIFICATION IS STRUCTURAL AND NOT POSITIONAL
+-------------------------------------------------------
+The obvious rule -- "the branch whose joint is highest is the neck" -- needs to
+know which way is up, and that is exactly the kind of assumption that survives
+every test written by the person who made it and then fails on the next mesh.
+The importer transforms C3 positions into Blender space through `to_blender`,
+which NEGATES Z; `boneplace` shipped bones mirrored below the mesh for precisely
+this reason.
+
+So the branch roles are decided WITHOUT a vertical axis:
+
+* the **spine** is the branch with the largest subtree that forks below it --
+  the only branch that must lead to two legs;
+* the **arms** are the two remaining branches whose joints sit furthest out on
+  the lateral axis, with OPPOSITE signs -- which is also the measurement that
+  decides `.L` from `.R`, so it has to be right anyway;
+* the **neck** is what is left.
+
+The lateral axis is a parameter (`lateral=0`) rather than a constant, and the
+only geometric fact relied upon is that a body is mirror-symmetric across it.
+
+WHICH SIDE IS WHICH
+-------------------
+**+x is the CHARACTER'S LEFT**, so a bone whose joint sits at positive
+`lateral` is suffixed `.L`.  That is the game's own naming, not ours: the PHY
+order of the shape-3 body and every shape-3 clip is `v_armet, v_l_weapon,
+v_r_weapon, v_body`, PHY<->MOTI binding is positional (docs/modding.md 11.1),
+so socket ordinal 1 IS `v_l_weapon` -- and `tools/bonerig.py` measures it
+rigid to bone 11, the hand on the +x chain (joint 10-11 at x +71).  The
+owner's Phase-0 screenshots showed the same thing from the other end:
+rotating bone 9 lifted the bow, on the character's left arm.
+
+Until 2026-09-30 `SIDE` read `{1: ".R", -1: ".L"}` and every `.R` this module
+wrote was a left limb (backlog item 43; `docs/animation_import_plan_2026-09-30.md`
+1c).  `tests/test_bonelabel_side.py` checks the suffix against the socket's
+host bone, never against a table.
+
+WHAT IT CANNOT DO, STATED RATHER THAN DISCOVERED
+-------------------------------------------------
+* A skeleton whose root has fewer than three branches cannot be assigned spine,
+  arms and neck; it returns what it can and leaves the rest unlabelled.  An
+  unlabelled bone is ABSENT from the result -- never guessed at, and never
+  given a neighbour's name.
+* Chains longer than their name list keep repeating the last name with a
+  numeric suffix, so a six-link arm does not silently become a hand twice.
+* It says nothing about the 59 unweighted bones of a player body; those have no
+  skin and no place in this tree.  `docs/motion_policy_2026-09-21.md` covers
+  which of them are sockets.
+"""
+from __future__ import annotations
+
+#: Names down an arm, shortest plausible chain first.  `008` on body 0003 spans
+#: x 3.1 -> 15.9, which is a CLAVICLE, not an upper arm -- the prototype
+#: classifier was off by one along the whole chain because it started at
+#: "upper_arm".  A four-link arm is shoulder/upper_arm/forearm/hand.
+ARM = ("shoulder", "upper_arm", "forearm", "hand", "finger")
+
+#: A four-link arm uses these; a five-link one uses all of `ARM`.
+ARM_SHORT = ARM[:4]
+
+LEG = ("thigh", "shin", "foot", "toe")
+NECK = ("neck", "head")
+
+#: Blender's own side convention, and what every retargeter matches on.
+#: +lateral is `.L` because +x IS THE CHARACTER'S LEFT: socket ordinal 1 is
+#: `v_l_weapon` (PHY order v_armet, v_l_weapon, v_r_weapon, v_body) and it
+#: rides bone 11, the hand on the +x chain -- the game's naming, not ours.
+#: Read {1: ".R", -1: ".L"} until 2026-09-30 (backlog 43), so every `.R` it
+#: wrote was a left limb. `tests/test_bonelabel_side.py` checks this dict
+#: against the socket host, never against a table.
+SIDE = {1: ".L", -1: ".R"}
+
+
+def _children(parents):
+    """``(kids, root)`` -- and `root` is the root of the LARGEST component.
+
+    `tree_from_joints` can return a FOREST, not a tree: a bone whose joints all
+    fell below the residual threshold becomes its own root.  Taking "the bone
+    whose parent is None" then depends on dict order and can land on a lone
+    bone with no children -- which labels the root and nothing else.  Measured:
+    body 0002's `188495` skeleton comes back as several components, and this
+    function returned 1 of 25 until it counted them.
+    """
+    kids: dict = {}
+    roots = []
+    for b, p in parents.items():
+        b = int(b)
+        if p is None:
+            roots.append(b)
+        else:
+            kids.setdefault(int(p), []).append(b)
+    for v in kids.values():
+        v.sort()
+    if not roots:
+        return kids, None
+    root = max(roots, key=lambda r: (_subtree(kids, r), -r))
+    return kids, root
+
+
+def _chain(kids, start):
+    """Follow single-child links from `start`; stop at a fork or an end."""
+    out = [start]
+    while len(kids.get(out[-1], ())) == 1:
+        nxt = kids[out[-1]][0]
+        if nxt in out:                      # a cycle cannot be walked
+            break
+        out.append(nxt)
+    return out
+
+
+def _subtree(kids, start):
+    n, stack, seen = 0, [start], set()
+    while stack:
+        x = stack.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        n += 1
+        stack.extend(kids.get(x, ()))
+    return n
+
+
+def _joint(joints, a, b):
+    if not joints:
+        return None
+    v = joints.get((a, b))
+    if v is None:
+        v = joints.get((b, a))
+    if v is None:
+        return None
+    #: `bonejoint.joint_graph` stores ``(residual, point)``; a caller that has
+    #: already unpacked it passes the bare point.  Accept both rather than
+    #: make the importer reshape a dict it got from us.
+    if len(v) == 2 and hasattr(v[1], "__len__"):
+        return v[1]
+    return v
+
+
+def _where(joints, centroids, a, b):
+    """The best position we have for the joint between `a` and `b`."""
+    p = _joint(joints, a, b)
+    if p is not None:
+        return p
+    if centroids and b in centroids:
+        return centroids[b]
+    if centroids and a in centroids:
+        return centroids[a]
+    return None
+
+
+def _name_chain(chain, names, side=""):
+    """Assign `names` down `chain`, suffixing repeats past the end."""
+    out, over = {}, 0
+    for i, b in enumerate(chain):
+        if i < len(names):
+            out[b] = names[i] + side
+        else:
+            over += 1
+            out[b] = "%s_%d%s" % (names[-1], over + 1, side)
+    return out
+
+
+def _adjacency(parents):
+    adj: dict = {}
+    for b, p in parents.items():
+        adj.setdefault(int(b), set())
+        if p is not None:
+            adj.setdefault(int(p), set()).add(int(b))
+            adj[int(b)].add(int(p))
+    return adj
+
+
+def _walk_out(adj, hub, first):
+    """From `hub` into `first`, until a leaf or another junction."""
+    out, prev, cur = [first], hub, first
+    while True:
+        nxt = [n for n in adj.get(cur, ()) if n != prev]
+        if len(nxt) != 1:
+            return out
+        prev, cur = cur, nxt[0]
+        out.append(cur)
+
+
+def _reroot_at(parents, root):
+    """Re-point `parents` so `root` has no parent, reversing the path to it."""
+    out = dict(parents)
+    path, x, guard = [], root, 0
+    while out.get(x) is not None and guard <= len(out):
+        path.append(x)
+        x = out[x]
+        guard += 1
+    path.append(x)
+    for i in range(1, len(path)):
+        out[path[i]] = path[i - 1]
+    out[root] = None
+    return out
+
+
+def find_chest(parents, joints=None, centroids=None, *, lateral: int = 0):
+    """Which junction is the CHEST -- measured, not assumed to be the root.
+
+    `tree_from_joints` roots a skeleton whereever its own traversal starts, and
+    that is not always the chest: on body 0002's `188495` it comes back rooted
+    at the PELVIS, which labelled the legs as arms and the chest as the pelvis
+    -- 20 confidently wrong names, with the coverage number still reading 20/25.
+
+    With the head attached, the chest is obvious (it carries the neck).  On
+    0002 the neck/head is a SEPARATE COMPONENT, so both junctions look alike:
+    each carries two mirrored four-link limbs and the spine.
+
+    The discriminator that survives that is reach: **a humanoid's arms extend
+    further from the midline than its legs do.** So the chest is the junction
+    whose mirrored limb pair has the widest lateral span. That is one geometric
+    assumption, it is stated, and it is the kind a person can check by looking.
+    """
+    adj = _adjacency(parents)
+    if not adj:
+        return None
+    best, best_span = None, -1.0
+    for hub, nbrs in adj.items():
+        if len(nbrs) < 3:
+            continue
+        limbs = []
+        for n in nbrs:
+            chain = _walk_out(adj, hub, n)
+            if len(chain) < 3:
+                continue
+            pos = _where(joints, centroids, chain[-2], chain[-1])
+            if pos is None:
+                continue
+            limbs.append(float(pos[lateral]))
+        pos_side = [v for v in limbs if v > 0]
+        neg_side = [v for v in limbs if v < 0]
+        if not pos_side or not neg_side:
+            continue
+        span = max(pos_side) - min(neg_side)
+        if span > best_span:
+            best, best_span = hub, span
+    return best
+
+
+def label_tree(parents, joints=None, centroids=None, *, lateral: int = 0):
+    """``{bone: label}`` for a solved skeleton.  Unlabelled bones are ABSENT.
+
+    `parents` is ``{bone: parent_or_None}`` as `bonejoint.tree_from_joints`
+    returns it.  `joints` is ``{(lo, hi): (residual, point)}`` from
+    `joint_graph` -- or ``{(lo, hi): point}``; both are accepted.  `centroids`
+    is ``{bone: point}``, used only where a joint is missing.  `lateral` is the
+    axis index across which the body is mirror-symmetric.
+    """
+    parents = {int(b): (None if p is None else int(p))
+               for b, p in parents.items()}
+    chest = find_chest(parents, joints, centroids, lateral=lateral)
+    if chest is not None and parents.get(chest) is not None:
+        parents = _reroot_at(parents, chest)
+    kids, root = _children(parents)
+    if root is None:
+        return {}
+
+    label = {root: "chest"}
+    branches = []
+    for c in kids.get(root, ()):
+        pos = _where(joints, centroids, root, c)
+        branches.append({"head": c, "chain": _chain(kids, c),
+                         "size": _subtree(kids, c),
+                         "lat": None if pos is None else float(pos[lateral])})
+
+    if not branches:
+        return label
+
+    # --- the spine: largest subtree that forks below it ----------------------
+    forking = [b for b in branches if len(kids.get(b["chain"][-1], ())) > 1]
+    spine = max(forking or branches, key=lambda b: b["size"])
+
+    # --- the arms: furthest out laterally, opposite signs --------------------
+    rest = [b for b in branches if b is not spine and b["lat"] is not None]
+    rest.sort(key=lambda b: -abs(b["lat"]))
+    arms = []
+    for b in rest:
+        if not arms:
+            arms.append(b)
+        elif (b["lat"] > 0) != (arms[0]["lat"] > 0):
+            arms.append(b)
+            break
+    if len(arms) < 2:
+        arms = []
+
+    # --- the neck: whatever is left ------------------------------------------
+    neck = [b for b in branches if b is not spine and b not in arms]
+
+    for b in arms:
+        side = SIDE[1 if b["lat"] > 0 else -1]
+        chain = b["chain"]
+        names = ARM if len(chain) >= len(ARM) else ARM_SHORT
+        label.update(_name_chain(chain, names, side))
+        # A fork below the hand is fingers: siblings ordered laterally so the
+        # same digit gets the same number on both arms.
+        tip = chain[-1]
+        sibs = list(kids.get(tip, ()))
+        if len(sibs) > 1:
+            base = ARM[-1]
+            ordered = sorted(
+                sibs,
+                key=lambda c: (_where(joints, centroids, tip, c) or (0, 0, 0))[lateral])
+            for n, c in enumerate(ordered, 1):
+                for i, d in enumerate(_chain(kids, c)):
+                    label[d] = ("%s_%d%s" % (base, n, side) if i == 0
+                                else "%s_%d_%d%s" % (base, n, i + 1, side))
+
+    for b in neck:
+        label.update(_name_chain(b["chain"], NECK))
+
+    # --- the spine chain, then the legs off its far end -----------------------
+    chain = spine["chain"]
+    for i, b in enumerate(chain):
+        label[b] = "spine_%d" % (i + 1)
+    pelvis = chain[-1]
+    label[pelvis] = "pelvis"
+
+    legs = list(kids.get(pelvis, ()))
+    if len(legs) >= 2:
+        for c in legs:
+            pos = _where(joints, centroids, pelvis, c)
+            if pos is None:
+                continue
+            side = SIDE[1 if float(pos[lateral]) > 0 else -1]
+            label.update(_name_chain(_chain(kids, c), LEG, side))
+    return label
+
+
+def coverage(label, bones):
+    """``(labelled, total, [unlabelled...])`` -- what the caller reports."""
+    bs = sorted({int(b) for b in bones})
+    missing = [b for b in bs if b not in label]
+    return len(bs) - len(missing), len(bs), missing

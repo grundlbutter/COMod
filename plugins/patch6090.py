@@ -136,7 +136,8 @@ from plugins import Plugin                            # noqa: E402
 from plugins.catalog import (  # noqa: E402
     npc_specs,                         # noqa: E402
     TableSpec, KIND_AT_ROWS, KIND_CSV_ROWS, KIND_SECTIONS, KIND_GAMEMAP,
-    MEASURED_SECTION_LABELS)
+    KIND_FLAT_KEYS, KIND_SPACE_ROWS, MEASURED_SECTION_LABELS)
+from dataclasses import replace                       # noqa: E402
 
 
 #: Tables 6090 declares, censused from ITS OWN `ini/` with `core/inidat.py`.
@@ -156,11 +157,54 @@ SPECS_6090 = (
     TableSpec("item", "itemtype.dat", KIND_AT_ROWS, "tq-stream"),
     TableSpec("item:sub", "ItemtypeSub.dat", KIND_AT_ROWS, "tq-stream"),
     TableSpec("item:value", "item_value_type.dat", KIND_AT_ROWS, "tq-stream"),
-    TableSpec("magic", "MagicType.dat", KIND_AT_ROWS, "tq-stream"),
+    # **The NAME is column 3, MEASURED, and the plugin-wide `ITEM_COLUMNS`
+    # puts it on column 1.** Column 1 is a numeric group id, so `browse magic`
+    # listed a column of numbers where the skill names are -- the same defect
+    # `MEASURED_SECTION_LABELS` exists to prevent, one grammar over. Column 3
+    # is the ONLY column of the 48-53 that is non-numeric on every row
+    # (`Thunder`, `Fire`, `Tornado`), which is what makes this a measurement
+    # rather than a preference. The 5165 file has one fewer leading id and
+    # puts the same field at column 2; see `patch5165`.
+    TableSpec("magic", "MagicType.dat", KIND_AT_ROWS, "tq-stream",
+              columns={"id": 0, "name": 3}),
     TableSpec("magic:ex", "magictypeex.dat", KIND_AT_ROWS, "tq-stream"),
     TableSpec("magic:op", "magictypeop.dat", KIND_CSV_ROWS, "tq-stream"),
     TableSpec("magic:auto", "AutoUseMagic.dat", KIND_SECTIONS, "tq-stream"),
     TableSpec("map:dest", "MapDestination.dat", KIND_SECTIONS, "tq-stream"),
+    # **NAMED, MEASURED, AND NOT DECLARED.** An undeclared subject is
+    # not merely unread, it is INVISIBLE -- the tool's silence about
+    # levexp.dat read exactly like its silence about a file that is not
+    # there. The refusal carries the measurement instead.
+    # **The codec is `unknown` and that is `core/inidat.py`'s own word,
+    # not a shrug.** The classifier tries the lineage's seed 9527 and
+    # this file is the one table that takes 1234, so it recognises
+    # nothing -- MEASURED, `inidat.classify(...).family == "unknown"` on
+    # every tq-stream build that ships it. Declaring `tq-stream` here
+    # would be a claim the classifier contradicts, and
+    # `TheSpecsMatchTheDisk.test_the_declared_codec_is_what_inidat_
+    # classifies` says so out loud.
+    TableSpec("levexp", "levexp.dat", KIND_SPACE_ROWS,
+              "unknown", label_key=None, refusal=(
+        "levexp.dat OPENS on this install and its grammar is still not "
+        "declared, and those are different sentences. "
+        "core/tqdat.decrypt(raw, 1234) -- the one seed in the lineage that "
+        "is not 9527 -- returns 100.0% printable text from this build's OWN "
+        "bytes: 203 rows of 5 space-separated fields, 4,030 B, every field "
+        "numeric. What is missing is not the cipher and not the row shape, "
+        "it is the COLUMNS: the file carries no header, every one of the 5 "
+        "fields is a bare number, "
+        "refs/conquer-online-wiki-mdbook/src/files/content/levexp.dat.md is "
+        "an empty stub, and no table on this install holds those values. "
+        "That is the Action.dat refusal word for word -- a settled row shape "
+        "whose row means nothing anything here can check -- so declaring it "
+        "would hand a user 203 rows of anonymous numbers to edit with no "
+        "control at all. Whoever settles the columns will also need a "
+        "per-spec seed: Plugin.load_table's tq-stream branch calls "
+        "tqdat.decrypt with the default 9527, and TableSpec has no seed "
+        "field. Byte-identical (sha256 df41c576) on 5517, 6090, 6609 and the "
+        "six unstamped siblings 6652-6868, and NOT the file 6907 and later "
+        "ship (4482cfaa) -- same length, different ciphertext, which is why "
+        "the block96 builds refuse it for a different reason entirely.")),
     TableSpec("action", "Action.dat", KIND_SECTIONS, "binary-plain"),
     TableSpec("gamemap", "GameMap.dat", KIND_GAMEMAP, "binary-plain"),
 )
@@ -168,7 +212,106 @@ SPECS_6090 = (
 SPECS_6090 = SPECS_6090 + npc_specs(('npc.ini', 'NpcX.ini', 'terrainnpc.ini', 'npcex.ini', 'SlotNpc.ini'))
 
 
+# ---------------------------------------------------------------------------
+# Action3DEffect.ini changes SHAPE inside this plugin's range
+# ---------------------------------------------------------------------------
+#
+# **The census is per PLUGIN and the shape is per INSTALL, and this is the one
+# table where those two disagree.**
+#
+# `Action3DEffect.ini` is flat dotted keys on 5017-6090 and `[wing]`-style
+# SECTIONS from 6609. The censused spec for `patch6090` says `flat-keys`,
+# which is right about 5517 and 6090 -- their files carry zero section
+# headers. It is wrong about the six UNSTAMPED installs this plugin also
+# serves at 0.45, whose files open with `[wing]` on line 1:
+#
+#     install   size      section headers   was
+#     5517      278,713   0                 ok, 10,611 flat keys
+#     6090      289,537   0                 ok, 10,259 flat keys
+#     6652       38,642   4                 REFUSED "[wing] -- this file has
+#     6680          ...   4                  section headers"
+#     6707          ...   4                 REFUSED
+#     6772          ...   4                 REFUSED
+#     6805          ...   4                 REFUSED
+#     6868       45,060   4                 REFUSED
+#
+# So the fix is NOT to change the declared kind -- that would break 5517 and
+# 6090 to fix the other six. The shape is measured on the install in front of
+# us, which is what `table_specs(root)` takes a root for.
+#
+# **The refusal was doing its job and is not what changed.**
+# `flat_keys_from_text` raises on a section header rather than skipping it, on
+# purpose ("a header appearing in a table declared flat is a REAL finding"),
+# and that refusal is exactly how this was found. What changes is that the
+# spec now agrees with the file before the reader ever sees it.
+#
+# Measured on the bytes rather than inferred from a version stamp because
+# these six installs are unstamped -- being unstamped is why `patch6090`
+# claims them at 0.45 in the first place, so a stamp rule could not work here.
+
+#: `(path, size, mtime_ns)` -> kind. One `read_bytes` per install per process.
+#: `table_specs` is called once per `browse`, and this table is 40-370 KB.
+_A3DE_SHAPE: dict = {}
+
+#: **`$` in MULTILINE matches before a `\n`, not before the `\r\n` these
+#: files actually use** -- so the first draft of this pattern found no
+#: header in a file whose very first line is `[wing]`, and all six
+#: installs kept the wrong kind while the probe reported a clean read.
+#: The `\r?` is the whole fix and it is load-bearing.
+_A3DE_SECTION = re.compile(rb"^[ \t]*\[[^\]\r\n]+\][ \t]*\r?$", re.M)
+
+
+def action3deffect_kind(root) -> Optional[str]:
+    """`KIND_SECTIONS` or `KIND_FLAT_KEYS`, MEASURED on this install's file.
+
+    `None` when the file is absent, which leaves the censused spec alone: a
+    build that does not ship the table has nothing to re-declare.
+    """
+    ini = Path(root) / "ini"
+    if not ini.is_dir():
+        return None
+    path = ini / "Action3DEffect.ini"
+    if not path.is_file():
+        want = "action3deffect.ini"
+        path = next((p for p in ini.iterdir()
+                     if p.is_file() and p.name.lower() == want), None)
+        if path is None:
+            return None
+    try:
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+    except OSError:                                   # pragma: no cover
+        return None
+    if key in _A3DE_SHAPE:
+        return _A3DE_SHAPE[key]
+    try:
+        raw = path.read_bytes()
+    except OSError:                                   # pragma: no cover
+        return None
+    kind = (KIND_SECTIONS if _A3DE_SECTION.search(raw) else KIND_FLAT_KEYS)
+    _A3DE_SHAPE[key] = kind
+    return kind
+
+
+def with_action3deffect_shape(specs: tuple, root) -> tuple:
+    """`specs` with `Action3DEffect.ini` set to this install's shape."""
+    kind = action3deffect_kind(root)
+    if kind is None:
+        return specs
+    return tuple(
+        replace(s, kind=kind, label_key=None)
+        if s.filename.lower() == "action3deffect.ini" and s.kind != kind else s
+        for s in specs)
+
+
 class Patch6090(Plugin):
+    #: PER-TABLE encoding, MEASURED 2026-09-19 by a strict decode of the
+    #: whole file (see `TableSpec.encoding`). `OperateActivity.ini`: 21,907
+    #: bytes, 4,538 high, 2 of them 0x85 (GBK trail bytes, which latin1 plus
+    #: `splitlines()` turned into phantom lines); strict GBK OK, strict UTF-8
+    #: fails at byte 18. Its names are GBK, not the plugin-wide latin1.
+    TABLE_ENCODING = {"operateactivity.ini": "gbk"}
+
     name = "patch6090"
     #: **(5517-6090), not (5017-6090).** The old label claimed the whole
     #: official lineage and was wrong at both ends of its range: 5017, 5065
@@ -189,11 +332,63 @@ class Patch6090(Plugin):
     #: rather than inherited, so a build that measures otherwise says so.
     ROW_LABEL_KEY = MEASURED_SECTION_LABELS
 
+    #: **The positional twin, measured on 6090's own `ini/`.** The censused
+    #: `.ini` specs carry no `columns`, so every positional one of them took
+    #: `ITEM_COLUMNS` -- "the name is column 1", which is a fact about
+    #: `itemtype.dat`. On these five it names a column of numbers.
+    #:
+    #: Each entry is the column that is non-numeric on EVERY row, with the
+    #: count that says so; the id is re-measured too where column 0 turned
+    #: out not to be one.
+    #:
+    #:   region.ini          190 rows, 14 fields. Column 6 is a place name on
+    #:                       190/190 (77 distinct: `TwinCity`, `SkyAltar`);
+    #:                       column 1 is numeric on all 190. Column 7 is a
+    #:                       SECOND name field, non-numeric on all 190 and
+    #:                       differing from column 6 on most rows (23 distinct
+    #:                       against 82 on 6907) -- 6 is declared as the finer
+    #:                       of the two, and the ambiguity is stated rather
+    #:                       than hidden. Column 0 is a MAP id and repeats
+    #:                       (81 distinct over 190 rows): a region row is a
+    #:                       named rectangle within a map, so the id is not
+    #:                       unique here and was not before this change.
+    #:   EventTypeName.ini   24 rows, 3 fields. Column 2 is the name on 24/24
+    #:                       (`Pheasant`, `Turtledove`). **Column 0 is not an
+    #:                       id either** -- it is `1` on every row, one
+    #:                       distinct value; column 1 is `01`..`24`, 24
+    #:                       distinct. So the id moves as well as the name.
+    #:   VipTrans.ini        31 rows, 3 fields. Column 2 is a city name on
+    #:                       31/31; column 1 is 1 or 2 on every row.
+    #:   restrain.ini        5 rows, 3 fields. Column 2 is a DESCRIPTION, not
+    #:                       a short name -- declared because it is the only
+    #:                       text in the row and five distinct sentences beat
+    #:                       five copies of the literal `2`, which is what
+    #:                       column 1 holds.
+    #:   GoldenLeagueShop.ini 10 rows, 3 fields. Column 2 again a description
+    #:                       (3 distinct over 10 rows); column 1 is a price.
+    #:
+    #: NOT declared, measured and refused: `Dynarank.ini` -- see
+    #: `PositionalLabelsAreMeasuredPerBuild.UNDECLARED` for why. `Font.ini`,
+    #: `Cursor.ini` and `ItemtypeSub.dat` are left alone because column 1 is
+    #: already the right answer on each.
+    ROW_COLUMNS = {
+        "region": {"id": 0, "name": 6},
+        "eventtypename": {"id": 1, "name": 2},
+        "viptrans": {"id": 0, "name": 2},
+        "restrain": {"id": 0, "name": 2},
+        "goldenleagueshop": {"id": 0, "name": 2},
+    }
+
     def table_specs(self, root):
         # Curated specs plus every `.ini` the grammar census
         # settled -- see `plugins/catalog/censused.py`. A curated spec
         # always wins on subject and filename.
-        return censused.extend(SPECS_6090, self.name)
+        #
+        # `Action3DEffect.ini` is the one table whose SHAPE varies across the
+        # installs this plugin serves, so it is measured on the install rather
+        # than taken from the census -- see `action3deffect_kind`.
+        return with_action3deffect_shape(
+            censused.extend(SPECS_6090, self.name), root)
     notes = (
         "Compiled .dbc tables (RSDB/SIMO/MESH) beside stale plaintext "
         "decoys, TQ-cipher .dat item and monster tables, u32-wrapped "

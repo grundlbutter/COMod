@@ -12,15 +12,50 @@ Layout, re-measured 2026-08-09 on every client that ships one -- 5165, 5517,
 
     0x00  char[4]  "BDMG"          (magic; 'GMDB' read as LE)
     0x04  u32      file size       (equals len(data) on all four)
-    0x08  u32      ?               (a little under the file size)
-    0x0c  u32      ?               25 on Zephyr, 22 on 5165/5517/6090.
-                                   NOT the table count -- there are 2.
-    -- then one or more tables, laid out back to back: --
-    0x10  char[4]  "RSDB"
-    0x14  u32      rowCount
-    0x18  ...      rowCount x { u32 id, u32 stringOffset }
-    ...            NUL-terminated latin-1 paths, packed back to back,
-                   starting at the byte the row table ends on (zero gap)
+    0x08  u32      END OF SECTIONS (a little under the file size, and now
+                                   explained: the walk of a complete file
+                                   lands on this byte EXACTLY, 7 of 7
+                                   clients, 3 MB to 16 MB)
+    0x0c  u32      SECTION COUNT   22 on 5165/5517/6090, 25 on Zephyr,
+                                   26/31/34 on later clients.
+    -- then that many sections, laid out back to back: --
+    0x10  char[4]  magic           RSDB EFFE SIMO SIMX MATR EMOI ROPT ...
+    0x14  u32      recordCount
+    0x18  ...      records, in a shape that DEPENDS ON THE MAGIC
+                   (RSDB: rowCount x { u32 id, u32 stringOffset }, then
+                    NUL-terminated paths packed back to back, starting at the
+                    byte the row table ends on -- zero gap)
+
+    > **CORRECTED 2026-09-05, and the wrong version was this docstring's own
+    > conclusion from its own defect.** The line above used to read *"NOT the
+    > table count -- there are 2"*. The field IS the section count; the reader
+    > found two because it stopped early, twice over -- at the first foreign
+    > magic and empty table, and again on any path carrying a non-ASCII byte
+    > (5517 row 3890 is `c3/effect/laser2/1\xa3\xad1.dds`, CP936 for a
+    > full-width hyphen, and one such row discarded a 9,567-row table).
+    > Fixing both took 5517 from 5,225 rows to 14,792 and Zephyr from 30,841
+    > to 68,588, `malformed` 0 on all 30 clients. **A reader that stops early
+    > and a file that ends early are indistinguishable from inside the reader**
+    > -- which is how a measured 2 became a documented fact about the format.
+    > Found via the vendor authoring tool in `docs/c3tools_discovery_2026-09-05.md`.
+
+    **The walk is still incomplete and says so.** A magic with no known record
+    shape leaves `walk_stopped` naming it and the walk ends there rather than
+    guessing a span. `section_table` is every section reached;
+    `declared_sections` is what the header promised. When those differ,
+    `walk_stopped` is never None.
+
+    > **CORRECTED 2026-09-06, and the correction is that the list was stale
+    > rather than wrong-in-principle.** This paragraph used to name `ROPT`,
+    > `FE32` and `RSDC` as the three magics with no known record shape. All
+    > three are handled now: `RSDC` is a `ROW_TABLES` member (see below), and
+    > `dbc.section_span` grew branches for `ROPT` and `FE32`. The sentence
+    > outlived its own examples -- the general statement above stays, because
+    > `UnknownSection` is still reachable for a magic nobody has met.
+    >
+    > `ROPT` is now not merely spanned but DECODED, into `role_parts` --
+    > **the install's own declaration of which parts exist and which table
+    > backs each one.**
 
 **A string offset is relative to its own table's start, not to the file.**
 That is the whole of the correction below, and it matters because reading it
@@ -85,8 +120,56 @@ import sys
 from pathlib import Path
 from typing import Iterator, Optional
 
+import dbc   # record shapes for the non-RSDB sections; see dbc.section_span
+
 MAGIC = b"BDMG"
 TABLE = b"RSDB"
+#: Magics whose section body is an id->path ROW TABLE, parsed here rather
+#: than spanned by `dbc.section_span`. `RSDC` is one letter from `RSDB` and
+#: is the same structure: 7878's section decodes at stride 12 with ids
+#: 1, 2, 11, 12 ... and paths c3/effect/exit.dds, c3/effect/accession/2.dds.
+#: It appears on the FOUR newest clients -- 7867, 7878, ThroneOfKings7939 and
+#: DuueWanderer7952 -- where it is the SECOND section. (This note used to say
+#: "only on 7867/7878"; the other two landed later and carry it too.)
+#:
+#: **`RSDC` IS THE TEXTURE TABLE, and the split is the generation change.**
+#: Measured across all 32 clients that ship a `c3.wdb`:
+#:
+#:     28 older clients   NO RSDC.  Their textures sit INSIDE the RSDB
+#:                        sections -- 9,539 to 54,707 `.dds` rows each.
+#:      4 newest clients  exactly ONE RSDC, holding 74,013-83,347 `.dds`
+#:                        plus 26 `.png` -- and **ZERO `.dds` in any RSDB
+#:                        section**.
+#:
+#: The split is total in both directions, which is what makes it a finding
+#: rather than a tendency: no modern client keeps a texture in RSDB and no
+#: older one has anywhere else to put one. So `RSDB -> RSDC` is a real
+#: generation step and specifically a SPLIT -- the vendor moved textures out
+#: of the resource table into their own.
+#:
+#: **A CONSUMER WANTING A TEXTURE SHOULD ASK BY SUFFIX, NOT BY SECTION**
+#: (`rows_for(id, ".dds")`): that reads correctly on both generations, where
+#: "the RSDC section" only exists on four clients and "the second section"
+#: is an accident of layout. An id is entered once per table it belongs to,
+#: so on 7878 the effect-mesh table and RSDC share 66,876 ids -- an effect's
+#: mesh and its texture ARE one id, and `path_for` returns only the mesh.
+#:
+#: **THE MIDDLE COLUMN OF AN `RSDC` ROW IS THE HIGH DWORD OF A 64-BIT ID,
+#: and `RSDB`'s two-column row is the same id with the high half zero.**
+#: DECODED 2026-09-06 from `Env_DX9/GraphicData.dll`: one function reads both
+#: magics into one map, writing the key's high dword as the literal `0` on the
+#: stride-8 branch and taking it from the row on the stride-12 branch.  The
+#: data agrees falsifiably -- on the 34 corpus rows whose high dword is
+#: non-zero, `(hi << 32) | lo` is the number the row's own path spells 30
+#: times (`c3/body/9995102000.dds` from `hi=2, lo=1405167408`), while the same
+#: arithmetic on the 150,021 rows with `hi == 0` matches the filename only
+#: 4.0% of the time.  `py -3 tools/matrloader.py key`.
+#:
+#: The same widening is what `SIM6` added to the `SIMO` part struct
+#: (`dbc.SIM6_FIELDS`) -- `RSDC` and `SIM6` ship on exactly the same two
+#: builds.  `3dmotion.dbc`'s standalone 3-column row (see the module
+#: docstring, "the meaning of `extra` is unestablished") is this same field.
+ROW_TABLES = (b"RSDB", b"RSDC")
 
 
 class WdbError(ValueError):
@@ -94,12 +177,68 @@ class WdbError(ValueError):
 
 
 class ResourceDb:
-    """``ini/c3.wdb`` -- asset id -> resource path."""
+    r"""``ini/c3.wdb`` -- asset id -> resource path**s**.
+
+    **AN ID IS NOT A PATH. IT IS A ROW IN SEVERAL TYPED TABLES**, and the
+    tables share one id space.  `path_for` returns the FIRST row, which is
+    what made a map effect's mesh and texture resolve to the same `.c3` and
+    sent a consumer off reconstructing the texture by swapping file
+    extensions.  Use `rows` (or `rows_for`) when the KIND of asset matters.
+
+    THE SECTION LAYOUT, measured on 7878's ``ini/c3.wdb`` -- 11 sections,
+    1,043,138 rows, 794,476 distinct ids::
+
+        sec  rows      holds   domain
+          0    3,106   .c3     body / weapon / hair meshes
+          1   69,724   .c3     EFFECT meshes -- 100% under `effect/`
+          2   76,038   .dds    THE TEXTURE TABLE (76,010 dds + 26 png)
+          3  105,065   .c3     monster and numbered-body meshes
+          4   14,402   .c3     armetmotion
+          5      210   .c3     capemotion
+          6  143,275   .c3     miscmotion
+          7   73,667   .c3     mount
+          8  104,231   .c3     pelvismotion
+          9       75   .c3     spirit
+         10  453,345   .c3     weaponmotion / weaponmountmotion (+25 .c1)
+
+    **SECTION 2 IS THE ONLY SECTION THAT HOLDS A TEXTURE.**  Every other one
+    is meshes or motion tracks, by category.  So "the `.dds` row of this id"
+    and "this id's row in the texture table" are the same statement on this
+    corpus, and a consumer that wants a texture should say which it means.
+
+    Sections 1 and 2 **share 66,876 ids**.  That overlap IS the "one id, two
+    assets" relation -- an effect mesh and its texture are one id, entered
+    once in the mesh table and once in the texture table.  Reading only the
+    first row gets you the mesh every time and silently never the texture.
+    """
 
     #: Longest path accepted from the blob. The real maximum measured across
     #: every shipped file is well under this; it exists to stop a wrong base
     #: scanning to the end of a 12 MB file looking for a NUL.
     MAX_PATH = 260
+
+    def rows_for(self, ident, suffix: str = "") -> list:
+        """Every path this id carries, optionally filtered by suffix.
+
+        `path_for` answers "a path for this id"; this answers "which ones".
+        Built once, lazily, because the caller that needs it is resolving
+        thousands of ids and the caller that does not should pay nothing.
+        """
+        idx = getattr(self, "_by_id_multi", None)
+        if idx is None:
+            idx = {}
+            for rid, rpath in self.rows:
+                idx.setdefault(rid, []).append(rpath)
+            self._by_id_multi = idx
+        try:
+            key = int(str(ident).strip() or 0)
+        except (TypeError, ValueError):
+            return []
+        out = idx.get(key) or []
+        if not suffix:
+            return list(out)
+        s = suffix.lower()
+        return [q for q in out if q.lower().endswith(s)]
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -108,6 +247,7 @@ class ResourceDb:
             raise WdbError(f"{self.path}: not a BDMG database")
         if d[0x10:0x14] != TABLE:
             raise WdbError(f"{self.path}: no RSDB table at 0x10")
+        (declared,) = struct.unpack_from("<I", d, 0x0c)
         # The file holds several RSDB tables laid out SEQUENTIALLY, each
         # {"RSDB", u32 rowCount, rowCount x (u32 id, u32 stringOffset)}
         # followed immediately by its own string blob. Two things about that
@@ -123,46 +263,161 @@ class ResourceDb:
         #     occurs inside string data: on Zephyr that inflated 30,841 real
         #     rows to 260,897, of which the extras were garbage.
         #
+        #     > **SCOPED 2026-09-07. The inflation is real; the REASON given
+        #     > for it was never measured.** The stated cause -- the literal
+        #     > occurring inside path data -- is false on the shipped corpus:
+        #     > across all six declared installs, EVERY "RSDB" occurrence is a
+        #     > genuine section header, zero spurious. The companion claim
+        #     > "13 matches in Zephyr and only 2 are tables" had the 13 right
+        #     > and the 2 wrong: all 13 are headers, and "2" was what the
+        #     > INCOMPLETE reader returned before it learned to step over a
+        #     > foreign magic and an empty table. A reader's shortfall and a
+        #     > file full of decoys predict the same observation; the decoy
+        #     > was the one written down.
+        #     >
+        #     > The walk is still not optional, for a reason that IS measured:
+        #     > a search for the row-table magics reaches only 10 of 22, 13 of
+        #     > 25, 15 of 34 sections, so it can never reach the 0x08
+        #     > end-of-sections figure and cannot see a magic it was not told
+        #     > to look for (`RSDC` on 7878). The decoy hazard is real on
+        #     > another tag: 7878's `EFFE` occurs 3 times, 1 is a section.
+        #     > `WdbResourceDb` in `tools/test_viewer.py` asserts both halves;
+        #     > `C-2026-09-07-worktree-agent-a1b45eeb59c461193`.
+        #
         # The blob starts at exactly the byte the row table ends on -- measured
         # as a zero-byte gap on every client that ships one -- which is what
         # makes the sequential walk exact rather than heuristic.
+        #: EVERY section header in the file, in order, whatever its magic:
+        #: {"offset", "tag", "count", "span"}. `sections` below stays what it
+        #: always was -- the RSDB tables whose ROWS were parsed -- because
+        #: `malformed` and every existing caller are defined against that.
+        self.section_table: list[dict] = []
+        #: The u32 at 0x0c. It IS the section count; see the note above.
+        self.declared_sections: int = declared
+        #: None when the walk consumed exactly `declared_sections`; otherwise
+        #: (offset, tag, why) naming what stopped it. NEVER silently short.
+        self.walk_stopped: Optional[tuple] = None
+
+        #: The `ROPT` section decoded -- the install's DECLARED part list:
+        #: ``[{"part", "mesh_ini", "motion_ini"}, ...]`` in file order, or
+        #: **None** when this file has no ROPT (or the walk never reached it).
+        #:
+        #: None and `[]` are different answers and callers depend on the
+        #: difference: None is "this file does not declare a part list, use the
+        #: plaintext `ini/RolePart.ini`", `[]` would be "it declares an empty
+        #: one". MEASURED 2026-09-06: 30 of the 36 directories under
+        #: `coroot.clients_dir()` ship an `ini/c3.wdb`, all 30 carry a ROPT,
+        #: and no ROPT seen anywhere declares zero records -- so the `[]` arm
+        #: is unexercised by shipped data and is not relied on.
+        self.role_parts: Optional[list[dict]] = None
+        #: The ROPT dumy (socket) vocabulary, same None-vs-empty rule.
+        self.role_dumies: Optional[list[dict]] = None
+        #: None when there was no ROPT and when the ROPT decoded. A string ONLY
+        #: when a ROPT section was PRESENT and would not decode -- a defect in
+        #: us or in the file, and not the same event as shipping no ROPT.
+        self.role_parts_error: Optional[str] = None
+
         self.rows: list[tuple[int, str]] = []
         self.sections: list[dict] = []
         pos = 0x10
-        while pos + 8 <= len(d) and d[pos:pos + 4] == TABLE:
-            (n,) = struct.unpack_from("<I", d, pos + 4)
-            row_end = pos + 8 + n * 8
-            if n <= 0 or row_end > len(d):
+        while pos + 8 <= len(d):
+            # THE HEADER'S COUNT IS THE TERMINATION CONDITION, not EOF.
+            # Walking on past it reaches whatever follows the last section --
+            # on 5165/5517/Zephyr that is trailing bytes which are not a tag,
+            # so the walk reported itself stopped on a file it had in fact read
+            # completely. The count is the file telling us when to stop; using
+            # EOF instead turns a complete read into a reported failure.
+            if len(self.section_table) >= declared:
                 break
+            tag = bytes(d[pos:pos + 4])
+            if not all(32 <= c < 127 for c in tag):
+                self.walk_stopped = (pos, repr(tag), "not an ascii section tag")
+                break
+            (n,) = struct.unpack_from("<I", d, pos + 4)
+            if tag not in ROW_TABLES or n <= 0:
+                # A foreign or empty table: advance by its own length and keep
+                # walking. THIS IS THE FIX. The old loop stopped here -- on the
+                # first non-RSDB tag AND on the first empty RSDB -- and reported
+                # whatever it had as the whole file. Every shipped client came
+                # back as "2 tables" against a header declaring 22 to 34.
+                try:
+                    span = dbc.section_span(d, pos)
+                except dbc.UnknownSection as e:
+                    self.walk_stopped = (pos, tag.decode("latin-1"), str(e))
+                    break
+                except Exception as e:                          # noqa: BLE001
+                    self.walk_stopped = (pos, tag.decode("latin-1"),
+                                         f"{e.__class__.__name__}: {e}")
+                    break
+                self.section_table.append({"offset": pos, "tag": tag.decode(),
+                                           "count": n, "span": span})
+                if tag == b"ROPT" and self.role_parts is None:
+                    # DECODED HERE rather than left to the caller, because the
+                    # offset is the only thing the caller would need and it is
+                    # already in `section_table` -- a second walk to recover it
+                    # is a second place to get the walk wrong. Cheap: the
+                    # widest ROPT on any shipped client is 15 records.
+                    #
+                    # A malformed ROPT is NOT allowed to sink the whole file:
+                    # the id->path rows are what every existing caller of this
+                    # class wants, and they are in a different section. It
+                    # leaves `role_parts` None -- the same answer as "this file
+                    # has no ROPT" -- and those two events must not be
+                    # indistinguishable, which is the `PartIni.twin_error`
+                    # lesson: `role_parts_error` is written ONLY by the second.
+                    # `walk_stopped` is deliberately NOT reused for this. It
+                    # means "the section walk ended here", the walk did not end
+                    # here, and overloading it would suppress the
+                    # short-walk check at the bottom of this constructor.
+                    try:
+                        r = dbc.read_ropt(d, pos)
+                        self.role_parts = r["parts"]
+                        self.role_dumies = r["dumies"]
+                    except Exception as e:                      # noqa: BLE001
+                        self.role_parts_error = (
+                            f"ROPT at 0x{pos:x} spanned but not decoded: "
+                            f"{e.__class__.__name__}: {e}")
+                pos += span
+                continue
+            # THE ROW STRIDE IS PER TABLE AND IS DETECTED, NOT ASSUMED.
+            #
+            # This read 8 -- {u32 id, u32 stringOffset} -- for every table.
+            # `dbc.py` had already documented the other form,
+            # {u32 id, u32 extra, u32 stringOffset}, and said in as many words
+            # that the stride "is detected, not assumed"; this reader simply
+            # never carried that over. 5517's ninth table declares 178,996 rows
+            # at stride 12, and under stride 8 exactly a third of them resolve:
+            # every third row lands on a real path and the two between it do
+            # not. A THIRD IS THE SIGNATURE OF A WRONG STRIDE, not of a corrupt
+            # table -- the rows that "work" are the ones whose last field
+            # happens to line up.
+            #
+            # Detection is the existing accept-whole-or-nothing rule with the
+            # stride as a parameter: the right stride is the one where EVERY
+            # row resolves, and a partial match is a rejection. That is why a
+            # third resolving cannot be mistaken for success here.
             rows: list[tuple[int, str]] = []
-            blob_end = row_end
-            for i in range(n):
-                ident, soff = struct.unpack_from("<II", d, pos + 8 + i * 8)
-                at = pos + soff                     # TABLE-relative, not absolute
-                if not (row_end <= at < len(d)):
-                    rows = []
+            blob_end = row_end = pos + 8
+            for stride in (8, 12):
+                rows, blob_end, row_end = self._read_rows(d, pos, n, stride)
+                if rows:
                     break
-                end = d.find(b"\x00", at)
-                if end < 0 or end - at > self.MAX_PATH:
-                    rows = []
-                    break
-                raw = d[at:end]
-                # Every byte of every path is printable in the shipped files.
-                # This is the check the old `half the offsets are < len(d)`
-                # test could not make: a wrong base still yields a string, so
-                # only the CONTENT can refuse it.
-                if not raw or not all(32 <= c < 127 for c in raw):
-                    rows = []
-                    break
-                rows.append((ident, raw.decode("latin-1").replace("\\", "/")))
-                blob_end = max(blob_end, end + 1)
             if not rows:
+                self.walk_stopped = (
+                    pos, tag.decode("latin-1"),
+                    f"{n} rows declared, none resolved at stride 8 or 12")
                 break
             self.sections.append({"offset": pos, "rows": n, "end": blob_end})
+            self.section_table.append({"offset": pos, "tag": tag.decode(),
+                                       "count": n, "span": blob_end - pos})
             self.rows.extend(rows)
             pos = blob_end
-        self.count = len(self.rows)
+        if self.walk_stopped is None and len(self.section_table) != declared:
+            self.walk_stopped = (
+                pos, "-", f"walked {len(self.section_table)} sections, header "
+                          f"at 0x0c declares {declared}")
 
+        self.count = len(self.rows)
         self.by_id: dict[int, str] = {}
         self.by_path: dict[str, list[int]] = {}
         for ident, p in self.rows:
@@ -172,6 +427,65 @@ class ResourceDb:
         #: accepted whole or not at all, so this is the shortfall against the
         #: row counts in the accepted headers -- 0 on every shipped file.
         self.malformed = sum(s["rows"] for s in self.sections) - len(self.rows)
+
+    def _read_rows(self, d: bytes, pos: int, n: int, stride: int):
+        """One RSDB table at `stride`, or ([], ...) if any row fails.
+
+        All or nothing on purpose: a partially-resolving table is the signature
+        of a wrong stride or a wrong base, and accepting the part that works is
+        how a reader reports a confident subset of a file it has misread.
+        """
+        row_end = pos + 8 + n * stride
+        if row_end > len(d):
+            return [], row_end, row_end
+        rows: list[tuple[int, str]] = []
+        blob_end = row_end
+        nu = stride // 4
+        for i in range(n):
+            fields = struct.unpack_from("<%dI" % nu, d, pos + 8 + i * stride)
+            ident, soff = fields[0], fields[-1]
+            at = pos + soff                     # TABLE-relative, not absolute
+            if not (row_end <= at < len(d)):
+                rows = []
+                break
+            end = d.find(b"\x00", at)
+            if end < 0 or end - at > self.MAX_PATH:
+                rows = []
+                break
+            raw = d[at:end]
+            # CONTROL bytes refuse; HIGH bytes do not, and the difference
+            # is the whole of the 2026-09-05 correction.
+            #
+            # This used to require every byte be printable ASCII, on the
+            # reasoning that a wrong base still yields a string so only
+            # CONTENT can refuse it. That reasoning is sound and the
+            # threshold was wrong: real paths carry GBK. 5517 row 3890 is
+            #     c3/effect/laser2/1\xa3\xad1.dds
+            # where \xa3\xad is CP936 for a full-width hyphen -- vendor
+            # data, not corruption. A table is accepted whole or not at
+            # all, so ONE such path killed a 9,567-row table, the walk
+            # stopped there, and the reader reported 2 tables on a file
+            # declaring 22. Relaxing it took 5517 from 5,225 rows to
+            # 14,792 and Zephyr from 30,841 to 68,588.
+            #
+            # The wrong-base defence is not weakened: a wrong base lands
+            # mid-string and yields printable ASCII, which this rule never
+            # caught anyway. What actually refuses it is the offset range,
+            # the NUL, MAX_PATH and the sequential walk. Control bytes stay
+            # refused because no path contains one.
+            #
+            # Decoding stays latin-1 ON PURPOSE -- it round-trips every
+            # byte, so a GBK path compares equal to the same bytes read
+            # from disk. Decoding CP936 here would change what every
+            # existing caller receives.
+            if not raw or any(c < 32 or c == 127 for c in raw):
+                rows = []
+                break
+            rows.append((ident, raw.decode("latin-1").replace("\\", "/")))
+            blob_end = max(blob_end, end + 1)
+            if not rows:
+                return [], row_end, row_end
+        return rows, blob_end, row_end
 
     # -- lookups -----------------------------------------------------------
     def path_for(self, ident: int | str) -> Optional[str]:

@@ -39,6 +39,7 @@ from .c3phy import (                                              # noqa: E402
 __all__ = [
     "serialize_phy", "build_c3", "replace_phy_chunks",
     "recompute_bounds", "PhyWriteError",
+    "motion_restore_report", "restore_motion", "MotionRestoreRefused",
 ]
 
 
@@ -239,7 +240,13 @@ def serialize_phy(m: PhyMesh, *, tag: bytes | None = None) -> bytes:
 
     # ---- optional trailing tags, in the loader's probe order --------------
     if m.step is not None:
-        out += b"STEP" + _u32(m.step[0]) + _u32(m.step[1])
+        # TWO f32 (M8). This wrote `_u32` until 2026-09-16 and was
+        # byte-exact only because `c3phy` read them wrongly the same
+        # way. `tests/test_roundtrip.py` is the detector and it stays
+        # at 4,781 / 4,781 across the change -- moving ONE side reds
+        # 1,193 chunks, which is how that was confirmed rather than
+        # assumed.
+        out += b"STEP" + _f(m.step[0]) + _f(m.step[1])
     if m.two_sided:
         out += b"2SID"
     if m.billboard:
@@ -390,7 +397,7 @@ def _slot_plan(chunks, n_new: int, n_old: int):
 
 
 def rebuild_c3(original: bytes, meshes, *, allow_structural: bool = False,
-               moti_for_new=None) -> bytes:
+               moti_for_new=None, moti_override=None) -> bytes:
     """Rebuild a container, optionally adding or removing whole meshes.
 
     Each mesh's `source_index` says which original PHY slot it came from;
@@ -401,6 +408,16 @@ def rebuild_c3(original: bytes, meshes, *, allow_structural: bool = False,
     With `allow_structural=False` (the default) any change to the mesh count is
     refused, so the ordinary export path cannot restructure a container by
     accident.
+
+    `moti_override` is ``{source_index: body}`` -- an already-serialized MOTI
+    body to write in place of the original for that slot.  The default of
+    ``None`` keeps the historical behaviour of carrying every motion track
+    through verbatim, which is what an exporter that does not understand
+    animation must do; the Blender addon supplies it only for the tracks it
+    actually decoded into an action, so a container the user did not open the
+    animation of is bit-for-bit untouched.  The bodies are NOT validated here:
+    `effects.serialize_moti` is the writer and it refuses what it cannot
+    express, so a body reaching this function has already been vouched for.
     """
     chunks = list(iter_chunks(original))
     phy_bodies = [b for t, b in chunks if t in VARIANTS]
@@ -444,7 +461,9 @@ def rebuild_c3(original: bytes, meshes, *, allow_structural: bool = False,
             seen.add(si)
         out_phy.append(serialize_phy(m))
         if si is not None and si < len(moti_bodies):
-            out_moti.append(moti_bodies[si])        # its own motion, verbatim
+            # its own motion: the edited body if the caller decoded one, else
+            # the original bytes verbatim
+            out_moti.append((moti_override or {}).get(si, moti_bodies[si]))
         elif moti_bodies:
             bones = m.bones
             need = (max(bones) + 1) if bones else 1
@@ -464,6 +483,194 @@ def rebuild_c3(original: bytes, meshes, *, allow_structural: bool = False,
         else:
             result.append((s[1], s[2]))
     return build_c3(result)
+
+
+# --------------------------------------------------------------------------
+# restoring an original's MOTI onto a donor that has none
+#
+# THE MEASUREMENT THIS RESTS ON, AND THE THING IT REFUSES TO DO
+# -------------------------------------------------------------
+# You cannot decide, from a `.c3` alone, which MOTI belongs to a given PHY.
+# The container carries no skeleton: `parse_moti` reads `boneCount`,
+# `frameCount`, an encoding tag and a flat array of matrices, and there are no
+# bone names, no parent indices and no inverse-bind matrices anywhere in it.
+# The only thing tying PHY bone index `b` to MOTI matrix `b` is the artist's
+# rig, and the rig is not in the file.
+#
+# So the MOTI is NOT a function of the PHY, and that is measurable.  Over
+# `7205/c3/monster`, taking pairs of shipped containers whose PHY chunks are
+# BYTE-IDENTICAL slot for slot and cross-applying one's MOTI to the other:
+# 169 of 219 chunk comparisons (77.2%) move the median vertex by more than 1%
+# of that mesh's own bounding-box diagonal, the worst by 1.85x the diagonal.
+# Same geometry, different animation, and nothing computable from the geometry
+# says which is right.  Every weaker structural test does worse -- the
+# engine's own covering constraint (`max(palette) + 1 <= boneCount`) refuses
+# 23 of 5,400 cross-applications while 34.8% of the ones it accepts are
+# visibly wrong.  `docs/moti_retarget_2026-09-06.md` has the commands.
+#
+# What is left is the one case where nothing has to be decided: a donor whose
+# PHY chunks agree with the original's on **every input the skinning function
+# reads**.  `Phy_Calculate` (RVA 0x5629B) and the vertex declaration at
+# 0x5A774..0x5A796 consume, per vertex, only the position, `bone0`, `bone1`
+# and `weight0`/`weight1`; and the chunk matrix is applied to the positions
+# before any of that (RVA 0x5A735).  A donor that matches on those produces
+# BIT-IDENTICAL skinned output under the original's track, at every bone and
+# every frame -- so the animation is provably unchanged, whatever else the
+# chunk carries.  UVs, normals, faces, name, label, bounding box and the
+# C3Key channels are all outside that set and may differ freely.
+#
+# Note what this deliberately does NOT permit, because both look tempting and
+# both were measured wrong:
+#   * equal bone palettes / equal boneCount / equal chunk names -- accepted
+#     400 of 400 unrelated shipped mesh pairs (6609/c3/mesh);
+#   * equal per-vertex BINDING with positions free -- vacuous on a rigid chunk,
+#     where every vertex is bone 0 with weight1 0, so any two rigid chunks
+#     match; 33 of 316 such pairs on 6609/c3/mesh are visibly wrong, up to
+#     1.33x the diagonal (`001111210.C3` vs `002111210.C3`, `v_l_weapon`).
+# Requiring the POSITIONS too is what closes that hole.
+# --------------------------------------------------------------------------
+
+#: Per vertex, everything the skinning path reads.  `unknown4`, `u0/v0`,
+#: `u1/v1`, the normal and the 36-byte legacy gap are all absent on purpose --
+#: none of them reaches `Phy_Calculate`.
+_SKIN_FIELDS = ("px", "py", "pz", "bone0", "bone1", "weight0", "weight1")
+
+
+def _skin_key(m: PhyMesh):
+    return [tuple(getattr(v, f) for f in _SKIN_FIELDS) for v in m.vertices]
+
+
+class MotionRestoreRefused(PhyWriteError):
+    """The donor cannot be given the original's MOTI, with the reason why."""
+
+
+def motion_restore_report(original: bytes, donor: bytes):
+    """Can `donor` inherit `original`'s MOTI chunks?  -> (ok, lines).
+
+    `lines` is the whole verdict, one entry per precondition and one per PHY
+    ordinal, phrased so the caller can print it verbatim.  Every accepted
+    ordinal says WHY it was accepted; every refusal names the ordinal and the
+    field that differed.  Nothing is silent.
+    """
+    lines: list[str] = []
+    try:
+        o_chunks = list(iter_chunks(original))
+        d_chunks = list(iter_chunks(donor))
+    except Exception as e:                                      # noqa: BLE001
+        return False, [f"container will not walk: {e}"]
+
+    o_phy = [(t, b) for t, b in o_chunks if t in VARIANTS]
+    d_phy = [(t, b) for t, b in d_chunks if t in VARIANTS]
+    o_moti = [b for t, b in o_chunks if t == MOTI_TAG]
+    d_moti = [b for t, b in d_chunks if t == MOTI_TAG]
+
+    if not o_phy:
+        return False, ["the original has no PHY chunk, so it has no motion "
+                       "track to lend"]
+    if len(o_moti) != len(o_phy):
+        return False, [f"the original is itself unpaired: {len(o_phy)} PHY "
+                       f"but {len(o_moti)} MOTI. Refusing to guess which "
+                       f"track belongs to which mesh."]
+    if d_moti:
+        return False, [f"the donor already carries {len(d_moti)} MOTI "
+                       f"chunk(s). This restores motion only to a donor that "
+                       f"has NONE -- with some tracks present there is no way "
+                       f"to tell which ordinals they claim."]
+    if len(d_phy) != len(o_phy):
+        return False, [f"the donor has {len(d_phy)} PHY chunk(s), the "
+                       f"original {len(o_phy)}. The i-th PHY is bound to the "
+                       f"i-th MOTI by ordinal and external motion sets are "
+                       f"bound the same way (docs/modding.md 11.3), so a "
+                       f"count change shears the pairing and no track can be "
+                       f"carried across it."]
+
+    lines.append(f"donor and original both hold {len(o_phy)} PHY chunk(s); "
+                 f"the donor holds no MOTI, the original {len(o_moti)}")
+
+    ok = True
+    for i, ((ot, ob), (dt, db)) in enumerate(zip(o_phy, d_phy)):
+        if ob == db:
+            om = parse_phy(ot, ob)
+            lines.append(f"  [{i}] {om.name!r}: PHY chunk is byte-identical to "
+                         f"the original -- the track is being returned to the "
+                         f"mesh it was authored for")
+            continue
+        if ot != dt:
+            ok = False
+            lines.append(f"  [{i}] REFUSED: variant {dt.decode('latin-1')} vs "
+                         f"the original's {ot.decode('latin-1')}. The variant "
+                         f"selects the on-disk vertex record, so the two are "
+                         f"not comparable vertex for vertex.")
+            continue
+        try:
+            om, dm = parse_phy(ot, ob), parse_phy(dt, db)
+        except Exception as e:                                  # noqa: BLE001
+            ok = False
+            lines.append(f"  [{i}] REFUSED: will not parse -- {e}")
+            continue
+        if om.name != dm.name:
+            ok = False
+            lines.append(f"  [{i}] REFUSED: chunk name {dm.name!r} vs the "
+                         f"original's {om.name!r}. A socket is looked up by "
+                         f"name (graphic.dll 0x266D0), so a renamed chunk is "
+                         f"a different slot.")
+            continue
+        if len(om.vertices) != len(dm.vertices):
+            ok = False
+            lines.append(f"  [{i}] REFUSED: {len(dm.vertices)} vertices vs the "
+                         f"original's {len(om.vertices)}. A new vertex has a "
+                         f"bone binding nothing in this file can vouch for.")
+            continue
+        if tuple(om.matrix) != tuple(dm.matrix):
+            ok = False
+            lines.append(f"  [{i}] REFUSED: the chunk matrix differs. It is "
+                         f"applied to every position before skinning (RVA "
+                         f"0x5A735), so the motion would act on a different "
+                         f"space than it was authored in.")
+            continue
+        ok_key, dk_key = _skin_key(om), _skin_key(dm)
+        if ok_key != dk_key:
+            bad = next((j for j in range(len(ok_key))
+                        if ok_key[j] != dk_key[j]), 0)
+            ok = False
+            lines.append(
+                f"  [{i}] REFUSED: vertex {bad} differs in a field the "
+                f"skinning path reads -- original "
+                f"{dict(zip(_SKIN_FIELDS, ok_key[bad]))}, donor "
+                f"{dict(zip(_SKIN_FIELDS, dk_key[bad]))}. Position and bone "
+                f"binding are the motion's inputs; they may not move.")
+            continue
+        lines.append(
+            f"  [{i}] {dm.name!r}: {len(dm.vertices)} vertices, every "
+            f"position and bone binding identical to the original -- the "
+            f"skinned output under this track is bit-identical at every bone "
+            f"and every frame. (Only UV/normal/face/label data differs.)")
+    return ok, lines
+
+
+def restore_motion(original: bytes, donor: bytes) -> bytes:
+    """Return `donor` with `original`'s MOTI chunks spliced in by ordinal.
+
+    Raises `MotionRestoreRefused` -- carrying the whole report -- unless
+    `motion_restore_report` says every ordinal is safe.  See the block comment
+    above for what "safe" is measured to mean, and what it refuses.
+
+    The i-th MOTI is written immediately after the i-th PHY.  Both the
+    interleaved and the grouped layout ship in bulk and the engine treats them
+    identically (docs/modding.md 11.1, evidence 2): `sub_28D5B` appends each
+    chunk to its own tag's list, so only the order WITHIN a tag matters.
+    """
+    ok, lines = motion_restore_report(original, donor)
+    if not ok:
+        raise MotionRestoreRefused("\n".join(lines))
+    o_moti = [b for t, b in iter_chunks(original) if t == MOTI_TAG]
+    out, i = [], 0
+    for tag, body in iter_chunks(donor):
+        out.append((tag, body))
+        if tag in VARIANTS:
+            out.append((MOTI_TAG, o_moti[i]))
+            i += 1
+    return build_c3(out)
 
 
 # --------------------------------------------------------------------------

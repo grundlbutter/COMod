@@ -241,10 +241,10 @@ def local_list_is_tracked() -> bool:
         return False
 
 
-#: Any absolute path into a user profile.  `Public` is a shared, non-personal
-#: Windows account and is not a leak.
-USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-]+)",
-                          re.IGNORECASE)
+#: `USER_PATH_RE` used to be bound here AND again below, identically --
+#: take-both merge residue, backlog item 26. The surviving binding is the one
+#: beside `PLACEHOLDER_HEAD_RE` and the rest of the path vocabulary, which is
+#: where a reader looks for it.
 
 # ---------------------------------------------------------------------------
 # Check 3 -- hardcoded install paths.
@@ -332,6 +332,12 @@ USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-
 # in this tree; all of them would pass.
 # ---------------------------------------------------------------------------
 
+#: RESTORED 2026-09-10 during integration. Two seats each deleted one of
+#: two byte-identical copies -- both correct alone -- and git applied
+#: BOTH deletions, leaving zero. 2 -> 1 -> 1 -> 0, no conflict raised.
+#: A redundancy removed independently on two branches becomes the
+#: removal of the last copy. Caught by the accumulated run, which is
+#: the only place it is visible.
 #: Any absolute path into a user profile.  `Public` is a shared, non-personal
 #: Windows account and is not a leak.
 USER_PATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b)([A-Za-z0-9._-]+)",
@@ -404,6 +410,27 @@ INSTALL_PATH_ALLOWED = {"core/coroot.py",
 #: says so in the refusal.  A check that reddens those is a check somebody
 #: turns off.
 CHECK3_CONTROLS: "tuple[tuple[str, str, bool, str], ...]" = (
+    # -- POSITIVE: assembled from literals, 2026-09-10 -------------------
+    # Both were PASSING with 0 findings before this date, in a check whose own
+    # controls bit in both directions every run. A control set that bits both
+    # ways still only covers the shapes it contains.
+    ("tools/_control.py",
+     'P = os.path.join("C:", os.sep, "COMod", "ConquerAssets", "Clients")',
+     True, "the tree path, assembled -- check 3 reads text and never saw it"),
+    ("tools/_control.py",
+     'H = os.path.join("C:", os.sep, "Users", "TestUser", "AppData")',
+     True, "the PII path, assembled -- USER_PATH_RE is a regex over text"),
+    ("tools/_control.py",
+     r'C = os.path.join("d:", "COMod\\ConquerAssets", "x")',
+     True, "lower-case drive, and a COMPOUND sibling -- contains, not equals"),
+    ("tools/_control.py", 'B = Path("C:/Users") / user / "AppData"',
+     True, "Path() as the joiner, and the head literal carries the name"),
+    # -- NEGATIVE: the assembled rule must not bite these ------------------
+    ("tools/_control.py", 'R = os.path.join(root, "ConquerAssets", "Clients")',
+     False, "no drive literal -- a resolved root joined to tree names is the "
+            "CORRECT pattern and reddening it is how a check gets turned off"),
+    ("tools/_control.py", 'D = os.path.join("C:", os.sep, "temp", "scratch")',
+     False, "a drive literal with no guarded name -- out of scope by design"),
     # -- POSITIVE: it must still bite --------------------------------------
     ("tools/_control.py", 'CLIENTS = Path(r"C:\\COMod\\ConquerAssets\\Clients")',
      True, "a newly hardcoded COMod asset tree, the layout the old check missed"),
@@ -591,8 +618,14 @@ def install_path_findings(rel: str, text: str, vocab: "set[str]",
         return [f"hardcoded install path {p!r} -- {advice}"
                 for _a, _b, p in install_paths_in(text, vocab)]
 
+    # ASSEMBLED PATHS FIRST. The reject below asks for a drive-rooted path in
+    # the TEXT, and a path built from separate literals never has one -- so
+    # running it first would skip every file the assembled check exists to
+    # read, and return clean. That ordering IS the bug, in miniature.
+    assembled = assembled_path_findings(rel, text, vocab)
+
     if not install_paths_in(text, vocab):
-        return []                       # cheap reject before paying for a parse
+        return assembled                # cheap reject before paying for a parse
     try:
         literals = _python_string_literals(text)
     except SyntaxError as e:
@@ -606,7 +639,128 @@ def install_path_findings(rel: str, text: str, vocab: "set[str]",
             if _is_whole_literal(value, a, b):
                 bad.append(f"line {lineno}: hardcoded install path {p!r} "
                            f"-- {advice}")
-    return bad
+    return bad + assembled
+
+#: Names that make an assembled path a finding, beside `RESOLVED_TREE_NAMES`.
+#: `Users` is here and NOT in coroot's vocabulary because coroot resolves game
+#: trees, not the user profile -- so before this, `Users` was missed by the
+#: check-3 vocabulary AND by `USER_PATH_RE`, which is a regex over text and
+#: never sees a path that exists only as separate literals.
+ASSEMBLED_EXTRA_NAMES = ("Users",)
+
+#: Call targets that build a path out of pieces.
+_JOINERS = ("join", "Path", "PurePath", "PureWindowsPath", "WindowsPath")
+
+#: A literal that is or begins a drive-rooted head: "C:", "C:/", "C:\\Users".
+_DRIVE_HEAD_RE = re.compile(r"^[A-Za-z]:[\\/]*")
+
+
+def assembled_path_findings(rel: str, text: str,
+                            vocab: "set[str]") -> "list[str]":
+    """Check 3 and the PII check, for paths that exist only as PIECES.
+
+    **Both checks read TEXT, so a path assembled from separate literals walks
+    through both of them.** Demonstrated in both directions, 2026-09-10, by two
+    seats independently:
+
+        literal    "C:/COMod/ConquerAssets/Clients/6271/ini/3DEffect.ini"
+                   -> FAIL, named
+        assembled  os.path.join("C:", os.sep, "COMod", "ConquerAssets", ...)
+                   -> PASS, 0 findings, not mentioned once
+
+        literal    "<drive>:/Users/<name>/AppData/Local/thing"   (written with
+                   placeholders HERE because check 2 scans this file too, and
+                   a doc example of a leak is still a leak)
+                   -> FAIL, named
+        assembled  os.path.join("C:", os.sep, "Users", "TestUser", ...)
+                   -> PASS, 0 findings, not mentioned once
+
+    Same path, opposite verdicts. A file passing that way passes by DODGING the
+    check, not by being right, and the caller that found this had done exactly
+    that without knowing.
+
+    **The two halves are not the same severity, and that decided the pace.**
+    A dodged check 3 costs PORTABILITY -- a path that will not resolve on
+    another machine, discovered on use. A dodged `USER_PATH_RE` costs PRIVACY:
+    a real person's username in a file this tree publishes by extraction, with
+    no later step that catches it. A false positive costs an argument with a
+    scanner; that false negative is irreversible.
+
+    THE RULE, deliberately narrow:
+
+        A  some literal argument matches ``^[A-Za-z]:[\\/]*``
+        B  some literal argument CONTAINS a guarded name
+        -> flag when A and B hold in the SAME path-joining call
+
+    `contains` rather than `equals` because ``join("C:", "COMod/ConquerAssets")``
+    would otherwise reopen the hole one join deeper. Any drive, any case,
+    because `USER_PATH_RE` already accepts `[A-Za-z]:` and a backstop narrower
+    than the check it backstops is not a backstop.
+
+    **DECLARED LIMIT, a choice and not an oversight:** a drive held in a
+    VARIABLE (``drive = "C:"; join(drive, ...)``) is not caught. Following
+    values through assignments means modelling dataflow, and a scanner that
+    guesses at expressions buys its coverage with false positives on every
+    legitimate dynamic path. The rule above models almost none of Python: it
+    asks only whether two literals sit in one call.
+    """
+    if not rel.endswith(".py"):
+        return []
+    guarded = tuple(vocab) + tuple(n.lower() for n in ASSEMBLED_EXTRA_NAMES)
+    # Cheap reject BEFORE paying for a parse. This must not reuse check 3's
+    # own reject: that one asks for a drive-rooted path in the TEXT, which an
+    # assembled path never has -- so reusing it would skip every file this
+    # function exists to read, and report clean.
+    if not re.search(r"""['"][A-Za-z]:""", text):
+        return []
+    if not any(g in text.lower() for g in guarded):
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []                    # check 3 proper already reports the parse
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = getattr(f, "attr", None) or getattr(f, "id", None)
+        if name not in _JOINERS:
+            continue
+        lits = [a.value for a in node.args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        if not any(_DRIVE_HEAD_RE.match(s) for s in lits):
+            continue
+        hit = next((s for s in lits
+                    if any(g in s.lower() for g in guarded)), None)
+        if hit is None:
+            continue
+        # PLACEHOLDERS ARE NOT MACHINE PATHS, and this check must honour the
+        # same convention the rest of the file does -- check 3's own advice
+        # tells people to write `path/to/...` or `<name>`, so a check that
+        # reddens those is a check somebody turns off. Both mechanisms are
+        # mirrored rather than reinvented:
+        #   * `install_paths_in` exempts a PLACEHOLDER FIRST SEGMENT
+        #   * `USER_PATH_RE` never matches `Users/<owner>`, because `<` and
+        #     `>` are outside its username class
+        segs = [s for s in _SEP_RE.split("/".join(lits)) if s.strip()]
+        segs = [s for s in segs if not _DRIVE_HEAD_RE.fullmatch(s + "/")
+                and not re.fullmatch(r"[A-Za-z]:", s)]
+        if segs and PLACEHOLDER_HEAD_RE.match(segs[0]):
+            continue
+        low = [s.lower() for s in segs]
+        if "users" in low:
+            k = low.index("users")
+            if k + 1 < len(segs) and PLACEHOLDER_HEAD_RE.match(segs[k + 1]):
+                continue
+        out.append(
+            f"line {node.lineno}: a drive-rooted path ASSEMBLED from literals "
+            f"({name}(...), containing {hit!r}) -- it evades check 3 and "
+            f"USER_PATH_RE, both of which read text. Resolve it through "
+            f"core/coroot.py, or os.environ for a user profile; never build "
+            f"a machine path out of pieces")
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Decompiled source material.

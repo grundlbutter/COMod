@@ -54,13 +54,27 @@
              title="Hide the entries the taxonomy files under ‘motion’ — the per-body-type motion sets under c3/0001…3004, which ini/3dmotion.dbc names and which carry no geometry. They cannot be previewed in the Asset Viewer; the character builder and the model view play them. Counts update to match.">
         <input type="checkbox" id="chk-hide-motion"> hide animation assets</label>
       <div id="motion-note" class="filter-note hidden"></div>
+      <div id="cat-since" class="small">
+        <label title="Show only files another install you have declared does not ship (new) or ships with different bytes (changed)">Since
+          <select id="cat-since-base"><option value="">(everything)</option></select></label>
+        <select id="cat-since-mode">
+          <option value="new">new</option><option value="changed">changed</option><option value="both">new or changed</option></select>
+      </div>
       <div id="cat-tree" class="list"></div>
       <div id="cat-controls" class="hidden">
         <div id="cat-crumbs" class="small mut"></div>
         <div id="cat-facets"></div>
         <input id="cat-search" type="search" placeholder="filter path…">
+        <button id="cat-clear-filters" class="ghost tiny" type="button" disabled
+                title="Untick every filter on this list: kind of file, group, the path filter and Since">No filters</button>
         <div id="cat-list" class="list"></div>
         <div id="cat-more" class="mut small"></div>
+        <!-- Prev/Next for the category list. `/api/catfiles` has always taken
+             `offset` (`rows[offset:offset + limit]`) and nothing sent it, so a
+             category showed its first 300 rows behind the line "narrow with
+             the filters". MEASURED on Classic Conquer 2.0: Maps 300 of 55,849.
+             Hidden while one page holds the category. -->
+        <div id="cat-pager" class="fx-pager" hidden></div>
         <div class="mut small keyhint">↑↓ move · <b>?</b> for keys</div>
       </div>
     </div>
@@ -122,6 +136,12 @@
       <input id="file-search" type="search" placeholder="filter path…">
       <div id="file-list" class="list" tabindex="0"></div>
       <div id="file-more" class="mut small"></div>
+      <!-- Prev/Next for the file list. The server has always paged this route
+           (`/api/files` takes `offset`); nothing sent it, so a folder showed
+           its first 300 entries and said "narrow with the filter". MEASURED on
+           Classic Conquer 2.0: c3/effect 300 of 3,470, the install root 300 of
+           71,453. Hidden while one page holds the folder. -->
+      <div id="file-pager" class="fx-pager" hidden></div>
       <div class="mut small keyhint">↑↓ move · <b>?</b> for keys</div>
     </div>
   </aside>
@@ -239,6 +259,16 @@
     <section class="card hidden" id="card-related" data-card="related">
       <h2>What goes with this</h2>
       <div id="related-body" class="cardbody mut"></div>
+    </section>
+
+    <!-- WHICH EFFECT USES THIS FILE -- the reverse of the Effects Viewer.
+         The data already existed (`depclose.DepGraph.impact().effect_refs`,
+         served by /api/assetroot) and nothing rendered it, so a file found in
+         the Files tab named no effect and there was no way back. See
+         `usedByShow` in app.js. -->
+    <section class="card hidden" id="card-usedby" data-card="usedby">
+      <h2>Which effect uses this</h2>
+      <div id="usedby-body" class="cardbody mut"></div>
     </section>
 
     <section class="card hidden" id="card-effects" data-card="effects">

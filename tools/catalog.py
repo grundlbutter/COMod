@@ -327,13 +327,34 @@ RULES: list[Rule] = [
          "names it and its files carry no geometry", 1),
     Rule("c3/body/", "character", "body", "c3/body/ character body art"),
     Rule("c3/hair/", "character", "hair", "c3/hair/ hair meshes and skins"),
+    Rule("data/hair/", "character", "hair",
+         "2D hair frames; the interface manifests name them on 7867/7878"),
     Rule("data/playerface/", "character", "face", "player portrait art"),
+    # `data/playerface/` above needs its trailing slash (a bare prefix would
+    # swallow this one), so the COP variant needs its own rule rather than
+    # widening that one -- widening would also swallow anything else that
+    # starts with the same eleven characters.
+    Rule("data/playerfacecop/", "character", "face",
+         "COPS-era player portrait art; named by the face manifests"),
 
     # ---- other actors ----
     Rule("c3/monster/", "monster", "mesh", "c3/monster/<type>/ monster art", 2),
     Rule("c3/npc/", "npc", "mesh", "c3/npc/<id>/ NPC art", 2),
     Rule("data/npcface/", "npc", "face", "NPC portrait art"),
     Rule("c3/mount/", "mount", "mesh", "c3/mount/ mount art"),
+    # SADDLES ARE MOUNT ART AND WERE FILED UNDER CHARACTERS. There was no
+    # rule for this directory, so every saddle fell through to the generic
+    # `c3/` rule at the bottom and landed in `character/misc`. The client's
+    # own tables say otherwise: `coassets.AssetRoot.ROLE_FAMILIES` has listed
+    # `mountsaddle` beside `mount` since the declared-index work, because
+    # `c3.wdb` names `c3/mountsaddle/801/8010012.c3` for the saddle of the
+    # mount whose body is `c3/mount/801/8010000.c3`, and neither path is
+    # derivable from its id. MEASURED across the corpus: 50 loose files on
+    # 7205/7867/7878, and 25 ids on each of 7205/7867/7878/Zephyr and 12 on
+    # 6090 in `c3.wdb` -- small, and wrong in a category a user browses.
+    Rule("c3/mountsaddle/", "mount", "mesh", "c3/mountsaddle/ saddle art; "
+         "c3.wdb names it beside the mount body and coassets.ROLE_FAMILIES "
+         "already accepts it", 2),
     Rule("c3/ghost/", "monster", "mesh", "c3/ghost/ ghost models"),
 
     # ---- weapons ----
@@ -346,11 +367,32 @@ RULES: list[Rule] = [
     Rule("ini/3deffect", "effect", "mesh", "effect definition table"),
 
     # ---- UI ----
+    #
+    # THE SIX ADDITIONS BELOW CAME FROM THE CLIENT'S OWN `.ani` MANIFESTS,
+    # not from a directory walk, and that is why they were missed. A frame
+    # manifest names every 2D file the client draws; reading all 2,312 loose
+    # `ani/*.ani` in the corpus and grouping the frame targets by directory
+    # turns up six prefixes no rule here covered -- `data/main1/`,
+    # `data/mapminicon/`, `data/mapicon/`, `data1/interface/`,
+    # `data3/interface/` and `data/playerfacecop/`. Every reference to them
+    # was classified `other/other`, i.e. "art that matched no rule", which is
+    # exactly the bucket's job and exactly what it is meant to be emptied of.
+    # `tools/framesets.py --coverage` is where the frame counts live.
     Rule("data/itemminicon/", "ui", "itemicon", "inventory item icons"),
     Rule("data/mapitemicon/", "ui", "mapicon", "ground/drop item icons"),
+    Rule("data/mapminicon/", "ui", "mapicon",
+         "ground/drop icons, the later spelling; named by MapItemIcon.Ani"),
+    Rule("data/mapicon/", "ui", "mapicon",
+         "ground/drop icons, third spelling; named by the icon manifests"),
     Rule("data/emotionico/", "ui", "emotion", "chat emote icons"),
     Rule("data/interface/", "ui", "interface", "window and widget art"),
+    Rule("data1/interface/", "ui", "interface",
+         "a second interface tree the manifests name on 7878"),
+    Rule("data3/interface/", "ui", "interface",
+         "a third interface tree the manifests name on 7878"),
     Rule("data/main/", "ui", "interface", "main UI art"),
+    Rule("data/main1/", "ui", "interface",
+         "a second main-UI tree; Control.Ani and friends name it"),
     Rule("data/pic/", "ui", "misc", "assorted UI pictures"),
     Rule("data/cursor/", "ui", "cursor", "mouse cursors"),
     Rule("graphics/cosmetics/", "ui", "cosmetics", "cosmetic shop art"),
@@ -1086,8 +1128,10 @@ class AssetCatalog:
                 self._effect_names = set()
             else:
                 try:
-                    db = effects.EffectDB(self.root)
-                    self._effect_names = {k.lower() for k in db.effects}
+                    # `with`: this builds its OWN root for one set of section
+                    # names and then drops it, so it must hand it back.
+                    with effects.EffectDB(self.root) as db:
+                        self._effect_names = {k.lower() for k in db.effects}
                 except Exception:                          # pragma: no cover
                     self._effect_names = set()
         return self._effect_names or None

@@ -1,17 +1,22 @@
-# Keep LF in the tree. Something in the local environment rewrites Python
-# sources to CRLF on save, which silently breaks byte-level edits and shows up
-# as phantom whole-file diffs.
+# PREPENDED, NOT APPENDED, AND THE ORDER IS LOAD-BEARING. Later lines win, so
+# a trailing `*` rule silently destroys every pin below it. Measured, not
+# reasoned: appending flips co_retail_hosts_block.txt from `text: unset` to
+# `text: auto`, unpinning it; prepending leaves it byte-identical (142 CRLF
+# lines, same md5). Why this exists at all: `core.autocrlf` is per-machine and
+# unversioned, and this box carries 19 separate clones of this repo -- a
+# setting each of them must remember is the kind of rule that decays.
 * text=auto eol=lf
 
-# Binary, never touched.
-*.png binary
-*.dds binary
-*.wdf binary
-*.c3  binary
-*.dll binary
-*.exe binary
+co_retail_hosts_block.txt -text
 
-# Windows-only launchers genuinely want CRLF.
-*.cmd text eol=crlf
-*.bat text eol=crlf
-*.ps1 text eol=crlf
+# `tools/build_addon.py` GENERATES this tree and writes it LF (see `_write_lf`
+# and `tests/test_build_addon_eol.py`). Without these two lines the build's
+# output and the checkout disagree under every `core.autocrlf` setting, and the
+# disagreement is invisible on exactly the machine that produces it:
+#   autocrlf=false -- 17 files really differ, 11,892 insertions and 11,892
+#                     deletions, nothing surviving `--ignore-cr-at-eol`
+#   autocrlf=true  -- 17 files read MODIFIED with an EMPTY patch, because the
+#                     expected checked-out form is CRLF and the build wrote LF
+# Nothing else pinned them: `git check-attr text eol` answered `unspecified`.
+blender/io_scene_c3/vendor/** text eol=lf
+blender/io_scene_c3/blender_manifest.toml text eol=lf

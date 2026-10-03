@@ -1,0 +1,265 @@
+/* effects.css -- the Effects Viewer's own layout.
+ *
+ * Three columns: pick on the left, watch in the middle, read the facts on the
+ * right. The middle column is the only one that is allowed to grow, because
+ * the thing this page exists for is the picture.
+ *
+ * THE APPROXIMATION RAIL IS NOT STYLED AS A WARNING.
+ *   It sits directly under the transport, in the same column as the picture,
+ *   in ordinary text. It is not a yellow banner and not a dismissible toast:
+ *   those are both read as "an unusual condition you can clear", and this is a
+ *   permanent property of the tool. Making it look like an alert would train
+ *   people to stop seeing it, which is the exact failure it exists to prevent.
+ *
+ * THE MERGE'S OWN LAYOUT LIVES HERE NOW, NOT IN A <style> BLOCK IN THE PAGE.
+ *   When `/effects` and `/fxview` became one page on 2026-09-08 the shell
+ *   rules were parked inline in `effects.html`, deliberately, because this
+ *   file and `fxview.css` were both moving underneath the merge. The merge
+ *   has settled and they are folded in below. That is not tidiness: the two
+ *   layout bugs the owner filed on 2026-09-08 were a rule in one place
+ *   fighting a rule in the other, and they are not diagnosable while the
+ *   page's geometry is split across an inline block and a stylesheet.
+ */
+
+/* ---------------------------------------------------------------- the shell
+ *
+ * THE HOUSE GEOMETRY, AND IT IS COPIED FROM `models.html`, NOT INVENTED.
+ *
+ * MEASURED on this build at 1782x950 and 1280x800, `/builder`, `/models` and
+ * `/mapedit` all hold the same three properties, and `/effects` held none of
+ * them:
+ *
+ *   1. `body` never scrolls (`style.css` sets `overflow: hidden` on it) and
+ *      `documentElement.scrollHeight == innerHeight`. The PANES scroll.
+ *   2. every `main > aside` ends exactly at the bottom of the viewport --
+ *      measured `bot == 950` at 950 and `bot == 800` at 800.
+ *   3. the right column is `overflow-y: auto` and actually scrolls when its
+ *      cards are taller than it (mapedit: scrollHeight 1058 in 867).
+ *
+ * `/effects` before this: `#fx-left` ran to y=1102 in a 950-tall viewport --
+ * 152px of the effect list below the fold with no scrollbar anywhere,
+ * because `body` cannot scroll and the rail was not a scroll container
+ * either. That is the owner's first report verbatim.
+ *
+ * `align-items: start` was the mechanism. It opts every column out of the
+ * grid's default stretch, so each track sizes to its own CONTENT and grows
+ * past a `main` whose height is already fixed by `flex: 1`. Removing it is
+ * what makes rule 2 true; the `overflow-y` below is what makes rule 3 true.
+ *
+ * WHICH PAGE THIS FOLLOWS, since they are not all identical: `models.html`.
+ * Its `#model-rail` is the same shape as this rail -- a stack of filters over
+ * one long searchable list of assets -- and it solves the same problem the
+ * same way: the RAIL scrolls as a last resort, the LIST scrolls first, and
+ * `#model-list { min-height: 120px }` stops the list being squeezed to
+ * nothing by the filters above it. `index.html` and `mapedit.html` use
+ * `overflow: hidden` on their left rail with no floor, which clips the
+ * filters unreachably in a short window; `builder.html`'s rail has no list in
+ * it at all. Where they disagree, this follows models.
+ */
+
+#fx-main {
+  display: grid;
+  /* The right column carries the Effects Viewer's cards now, not just three
+     key/value panes, so 300px is too narrow to read a connection row in. */
+  grid-template-columns: 260px minmax(0, 1fr) 400px;
+  gap: 10px;
+  padding: 10px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+@media (max-width: 1280px) {
+  #fx-main { grid-template-columns: 240px minmax(0, 1fr) 340px; }
+}
+
+/* Narrow: the three columns stack, and `#fx-main` becomes the scroll
+ * container ITSELF.
+ *
+ * It cannot fall back to a document scroll the way a normal page would --
+ * `style.css` puts `overflow: hidden` on `body` for every page in this
+ * toolkit, so a stacked layout that relies on the document scrolling is
+ * simply unreachable below the fold. MEASURED before this rule: at 900x700
+ * the right column started at y=857 in a 700px viewport with
+ * `documentElement.scrollHeight` 1370 and no scrollbar on anything.
+ *
+ * `display: block`, NOT a one-column grid, and that is a measured choice
+ * rather than a stylistic one. A grid with three auto rows in a container of
+ * definite height stretches them to EQUAL shares: the first attempt at this
+ * rule kept `grid-template-columns: 1fr` and gave each of the three stacked
+ * columns exactly 188px of a 605px viewport, with the subject panel
+ * collapsed to a clientHeight of ZERO. In block flow each section is as tall
+ * as its content and `#fx-main` scrolls past them, which is the behaviour
+ * the stacked layout was always supposed to have. */
+@media (max-width: 1100px) {
+  #fx-main { display: block; overflow-y: auto; }
+  #fx-left, #fx-right, #fx-centre {
+    overflow: visible; min-height: auto; margin-bottom: 10px;
+  }
+  #fx-list { flex: 0 0 auto; max-height: 46vh; }
+  #fx-right .fx-subject { overflow: visible; }
+}
+
+#fx-left, #fx-right {
+  display: flex; flex-direction: column; gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* The picker pane takes the leftover height so the list can flex into it.
+ * `.pane` in `style.css` is `flex: 1` for the three-pane viewer shell, which
+ * would otherwise split this rail exactly in half down the middle.
+ *
+ * "This install" GIVES SPACE BACK rather than being rigid, and that is worth
+ * the extra rule. MEASURED at 1782x950 with the census populated: the pane is
+ * 235px of an 835px rail, and pinning it at `flex: 0 0 auto` left the effect
+ * list -- the control this page is FOR -- with 149px. Letting both panes
+ * shrink in proportion to their size, with the list's own 120px floor still
+ * standing, hands most of that back to the list. The census keeps its own
+ * scrollbar so nothing in it is lost, only folded. */
+#fx-left > .pane { flex: 0 1 auto; }
+#fx-left > .pane:first-child { flex: 1 1 auto; }
+#fx-census { overflow-y: auto; min-height: 60px; }
+
+/* Cards that can be wider than the column scroll INSIDE it. The alternative
+   is the page scrolling sideways, which moves the stage off screen. */
+#fx-right .fx-card, #fx-right .fx-cmp-out, #fx-right .fx-connlist { min-width: 0; }
+#fx-right .fx-cmp-out, #fx-right .fx-cmp-heads { overflow-x: auto; }
+#fx-right .fx-path, #fx-right .fx-file { word-break: break-all; }
+
+/* The library half's cards are `.card[data-card]` now so `cards.js` can
+ * operate them, which brings `.card h2`'s 11px uppercase with it. These
+ * headers carry a sentence of explanation after the title and read badly in
+ * caps, so the TYPE is kept and only the BEHAVIOUR is adopted. */
+#fx-right .fx-card > h2 {
+  font-size: 0.92rem; text-transform: none; letter-spacing: 0;
+  color: var(--fg); margin: 0 0 0.45rem;
+}
+#fx-right .fx-card > h2 .mut { font-weight: normal; font-size: 0.82rem; }
+#fx-right .fx-card.collapsed > h2 { margin-bottom: 0; }
+/* `.fx-subject` is `overflow-y: auto` in fxview.css, from when it was the
+ * scrolling half of a two-pane page. In this column `#fx-right` is the
+ * scroller and a nested one would trap the cards in a second scrollbar.
+ *
+ * `flex: 0 0 auto` IS LOAD-BEARING and the reason is not obvious. As a scroll
+ * container it had an automatic minimum size of ZERO, so as a flex item in a
+ * column shorter than its content it was shrunk to a clientHeight of 0 --
+ * MEASURED at 1280x800: `.fx-subject` 0px tall holding 2,815px of cards,
+ * painting outside its own box. Turning the overflow off is not enough on its
+ * own; the item also has to decline to shrink. */
+#fx-right .fx-subject { overflow: visible; flex: 0 0 auto; }
+
+#fx-centre { display: flex; flex-direction: column; gap: 8px; min-width: 0;
+             min-height: 0; overflow-y: auto; }
+
+.fx-kindrow { display: flex; gap: 6px; }
+.fx-kindrow button { flex: 1; }
+.fx-kindrow button[aria-pressed="true"] {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: var(--panel2);
+}
+
+/* THE EFFECT LIST TAKES THE LEFTOVER RAIL AND SCROLLS INSIDE IT.
+ *
+ * It was `max-height: 46vh`, which is a height that has nothing to do with
+ * how much room is actually left under the filters -- at 1782x950 it made the
+ * rail 997px tall inside an 855px `main`. `flex: 1` plus the 120px floor is
+ * `#model-list`'s rule on the models page, and it is the one that keeps the
+ * filters above it on screen: the list gives up its space first, and only
+ * when it is down to 120px does the rail itself start to scroll. */
+#fx-list { flex: 1 1 auto; min-height: 120px; overflow-y: auto; }
+#fx-list .row {
+  display: flex; justify-content: space-between; gap: 6px;
+  padding: 3px 6px; cursor: pointer; border-radius: 3px;
+}
+#fx-list .row:hover { background: var(--panel2); }
+#fx-list .row[aria-selected="true"] { background: var(--panel2); color: var(--fg); }
+#fx-list .row .n { color: var(--mut); font-family: var(--mono); font-size: 11px; }
+/* A row whose frames this install does not ship. Not hidden: the table row is
+   the modding surface, and "declared but absent" is a fact about the install
+   that a picker which silently dropped it would destroy. */
+#fx-list .row.gone .name { color: var(--warn); }
+
+#fx-stage {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  min-height: 320px;
+  display: flex; align-items: center; justify-content: center;
+}
+#fx-canvas { max-width: 100%; height: auto; image-rendering: auto; }
+#fx-msg {
+  position: absolute; left: 10px; top: 10px;
+  color: var(--mut); font-size: 12px; pointer-events: none;
+}
+
+#fx-transport {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; padding: 6px 8px;
+}
+#fx-transport input[type="range"] { flex: 1; min-width: 80px; }
+#fx-clock { color: var(--mut); white-space: nowrap; }
+
+.approx {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--mut);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+.approx-h {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--mut); margin-bottom: 4px;
+}
+.approx ul { margin: 0; padding-left: 18px; }
+.approx li { font-size: 12px; margin: 3px 0; line-height: 1.45; }
+/* The one item that is never absent: it names the whole class of divergence
+   rather than one instance of it. */
+.approx li.always { color: var(--fg); }
+
+#fx-declared .kv, #fx-camera .kv, #fx-census .kv {
+  display: grid; grid-template-columns: 108px minmax(0, 1fr);
+  gap: 2px 8px; font-size: 12px;
+}
+#fx-declared .kv b, #fx-camera .kv b, #fx-census .kv b {
+  color: var(--mut); font-weight: 400;
+}
+#fx-declared .kv span, #fx-camera .kv span, #fx-census .kv span {
+  font-family: var(--mono); word-break: break-word;
+}
+
+#fx-frames ol { margin: 0; padding-left: 22px; }
+#fx-frames li { font-size: 11px; font-family: var(--mono); margin: 2px 0; }
+#fx-frames li.gone { color: var(--warn); }
+#fx-frames li.on { color: var(--accent); }
+
+.fx-note { color: var(--mut); font-size: 11px; line-height: 1.45; margin-top: 6px; }
+
+/* ---------------------------------------- folded in from effects.html's
+ * inline <style>, 2026-09-08. The merge parked these in the page because
+ * this file and fxview.css were both moving; they are not moving now.
+ *
+ * DEVELOPER NOTES. The census band is hidden by DEFAULT and the ATTRIBUTE is
+ * what hides it -- `[hidden]` is honoured by the browser, so a page whose CSS
+ * failed to load still opens with the band closed rather than with the whole
+ * measured top band unrolled above the tool. */
+#fx-devnotes { padding: 0 10px; flex: 0 0 auto; max-height: 40vh; overflow-y: auto; }
+#fx-devnotes[hidden] { display: none; }
+#btn-devnotes[aria-expanded="true"] {
+  color: var(--fg); border-color: var(--accent); background: var(--panel2);
+}
+#fx-devnotes-note { padding: 0 10px 6px; }
+
+/* The state filter sits with the other list filters, full width like the
+   search box above it. */
+#fx-state { width: 100%; }
+
+/* The effect list's pager. Only rendered when there is more than one page. */
+.fx-pager { display: flex; align-items: center; gap: .4rem; margin: .35rem 0 0; }
+.fx-pagebtn { padding: .15rem .55rem; font-size: .85em; cursor: pointer; }
+.fx-pagebtn[disabled] { opacity: .45; cursor: default; }
+.fx-reset { margin-top: 6px; padding: .2rem .6rem; font-size: .85em;
+            cursor: pointer; }

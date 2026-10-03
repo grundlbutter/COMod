@@ -183,6 +183,7 @@ html, body { height: auto; overflow: visible; display: block; }
   <nav class="set-nav">
     <a href="#sec-dirs">Directory management</a>
     <a href="#sec-health">Health management</a>
+    <a href="#sec-tpd">Texture cache</a>
     <a href="#sec-dev">Developer options</a>
     <a href="#sec-prefs">Preferences</a>
   </nav>
@@ -210,6 +211,19 @@ html, body { height: auto; overflow: visible; display: block; }
     <div id="health-body">loading…</div>
   </section>
 
+  <!-- ================================================== texture cache -->
+  <section class="set-section" id="sec-tpd">
+    <h3>Texture cache</h3>
+    <p class="set-lede">
+      Clients that pack their textures in <code>.tpd</code> archives unpack
+      every texture each time it is read. This keeps the unpacked copy on
+      disk so the next read skips that step. It costs disk space, so it is
+      off until you switch it on, one client at a time, and the space each
+      client uses is shown beside it.
+    </p>
+    <div id="tpd-body">loading…</div>
+  </section>
+
   <!-- ================================================ 3. developer options -->
   <section class="set-section" id="sec-dev">
     <h3>Developer options</h3>
@@ -220,6 +234,16 @@ html, body { height: auto; overflow: visible; display: block; }
       because this page keeps a list of names.
     </p>
     <div class="set-dev" id="dev-body">loading…</div>
+    <!-- THE WAY IN. `/builddiff` was routed and linked from nowhere, so the
+         only way to reach it was to know the URL. It sits here rather than in
+         the bar because it is a flow, not a section, and because the page is
+         unavailable without `<assets>/derived/patchdict/` -- see `UNDER` in
+         nav.js. -->
+    <p class="set-lede">
+      <a href="/builddiff">Build diff</a> — what changed between one client
+      build and the next, read from the change dictionary. Says so plainly
+      when that dictionary is not on this box.
+    </p>
   </section>
 
   <!-- ========================================================= preferences -->
@@ -240,5 +264,6 @@ html, body { height: auto; overflow: visible; display: block; }
 <script src="/ui/settings.js"></script>
 <script src="/ui/setdirs.js"></script>
 <script src="/ui/sethealth.js"></script>
+<script src="/ui/settpd.js"></script>
 </body>
 </html>

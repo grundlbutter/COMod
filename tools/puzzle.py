@@ -86,6 +86,12 @@ if str(_REPO) not in sys.path:
 import coroot                                            # noqa: E402
 from coassets import AssetRoot, DMap, Pul                 # noqa: E402
 import dds                                               # noqa: E402
+#: The `.pux` reader, for `pux_layer_mask` / `pux_mask_field`. Module level
+#: rather than the lazy `from dmap import ...` the loader below uses, because
+#: `_composite_rgba` runs per LAYER and an import inside it would be a dict
+#: lookup per layer on every tile of every stacked map. `dmap` imports only
+#: `coroot` from this tree, so there is no cycle back to here.
+import dmap as _dmap                                     # noqa: E402
 
 try:                                    # speed only -- see dds.py's docstring
     import numpy as _np
@@ -144,6 +150,16 @@ class PuzzleMap:
     #: other tile. A map reuses a few dozen stacks thousands of times,
     #: so the cache still does its job.
     stacks: dict = field(repr=False, default_factory=dict)
+    #: WHERE `grid` CAME FROM, because one of the two answers is a
+    #: DERIVATION and a reader must not have to guess which. ``"registry"``
+    #: means this map has a row in `ini/GameMap.dat` (or `.json`) and `grid`
+    #: is that row's ``PuzzleGridSize``, read. ``"derived"`` means the map has
+    #: NO row and `grid` was solved out of the map's own bytes by
+    #: `derive_grid_size` -- see that function for how often the solution
+    #: agrees with a registry row where one exists to check against. Nothing
+    #: downstream branches on this; it exists so a caller can refuse a derived
+    #: figure if it wants one the client itself would have read.
+    grid_source: str = "registry"
     _tile_rgb: dict = field(repr=False, default_factory=dict)
     _layer_cache: dict = field(repr=False, default_factory=dict)
 
@@ -284,7 +300,7 @@ class PuzzleMap:
         cache[row] = out
         return out
 
-    def composite_rgba(self, idx: int) -> Optional[bytes]:
+    def composite_rgba(self, idx: int, *, mask: bool = True) -> Optional[bytes]:
         """A stack as ``grid*grid*4`` RGBA, ALPHA KEPT, or None.
 
         Public because there are two ground renderers and they need
@@ -292,19 +308,75 @@ class PuzzleMap:
         VOID for a finished still, and `mapedit` keeps the alpha so a layer
         can let the background through.  Sharing the composite rather than
         writing it twice -- the second copy is how one of them stays wrong.
+
+        `mask=False` is the pre-2026-09-06 full-tile blend, kept as an
+        ABLATION rather than as an option anyone should pass: it is what the
+        render comparison in `docs/pux_mask_composite_2026-09-06.md` measures
+        against, and a test that cannot turn the mask off cannot show the mask
+        is doing anything.
         """
         rows = self.stacks.get(idx)
         if not rows:
             return None
-        return self._composite_rgba(rows)
+        return self._composite_rgba(rows, mask=mask)
 
-    def _composite_rgba(self, rows) -> Optional[bytes]:
-        """Alpha-composite terrain rows, bottom first. RGBA out."""
+    def _composite_rgba(self, rows, *, mask: bool = True) -> Optional[bytes]:
+        """Alpha-composite terrain rows, bottom first. RGBA out.
+
+        Accepts either a bare terrain row or a full layer tuple whose first
+        element is that row.
+
+        **THE LAYER MASK IS APPLIED HERE SINCE 2026-09-06.**  A `.pux` layer
+        entry is ``(terrain row, i16, i16)`` and the two `i16` are the low 16
+        and high 9 bits of ONE 25-bit per-vertex alpha mask over the 5x5
+        vertices bounding a 4x4 subdivision of the tile
+        (`docs/pux_f1_f2_attribution_2026-09-06.md`; the client's own
+        ``AlphaAt`` at `Clients/7878/Env_DX9/Conquer.exe` RVA `0x872A68`).
+        Each layer's own alpha is multiplied by
+        `dmap.pux_mask_field(mask, grid)` -- the mask bilinearly interpolated
+        across the quads -- before the layer is composited.
+
+        Until this change every layer was stacked FULL-TILE, so the topmost
+        opaque layer of a stack covered everything under it and the mask, which
+        is the entire mechanism by which a `.pux` ground blends one terrain
+        into another, drew nothing.  **MEASURED against the shipped minimap
+        renders, per stacked tile, median Pearson r of my tile against the
+        shipped one:**
+
+            ninja01_new (CCO, 45.5 px/tile)  full +0.011  MASK +0.160
+            ninja01_new (7878, 11.4 px/tile) full +0.011  MASK +0.230
+            bp-flandlords-y_new (7878)       full +0.051  MASK +0.208
+
+        against a DEPTH-MATCHED shuffled-mask control that scores with `full`
+        (+0.016 / +0.016 / +0.077) and a registration arm -- the same masked
+        tile scored one tile to the right -- at +0.065 / +0.088 / +0.110.
+        `docs/pux_mask_composite_2026-09-06.md` has the method and the limits.
+
+        A bare terrain row (no tuple) carries no mask and is composited
+        full-tile, which is what a `.pul` tile and a single-layer `.pux` tile
+        have always been.  Passing `mask=False` restores the old blend for
+        every layer; nothing in the tree does except the ablation arm.
+
+        **The interpolation is an ASSUMPTION, and it is the one to attack
+        first if a rendered map still looks wrong.**  The disassembly pins
+        alpha 255/0 AT THE VERTICES and hands them to `m_pPuzzleTriangle` as
+        vertex colours; how the raster fills between them was not traced
+        (`docs/pux_f1_f2_attribution_2026-09-06.md` 9).  `dmap.pux_mask_field`
+        is where a different reading would go, and it is the only place.
+        """
         base = None
-        for row in rows:
+        for layer in rows:
+            # The `isinstance` is spelled out twice rather than hoisted into a
+            # local: `tests/test_pux_stackkey.py` pins this exact expression as
+            # a source guard -- the projection is one of three coupled sites and
+            # dropping it hands a 3-tuple to `_layer_rgba`.
+            row = layer[0] if isinstance(layer, tuple) else layer
             lay = self._layer_rgba(row)
             if lay is None:
                 continue
+            if mask and isinstance(layer, tuple) and len(layer) >= 3:
+                lay = _apply_mask(lay, self.grid,
+                                  _dmap.pux_layer_mask(layer[1], layer[2]))
             if base is None:
                 base = bytearray(lay)
                 continue
@@ -315,8 +387,31 @@ class PuzzleMap:
         """Alpha-composite a stack of terrain rows, BOTTOM FIRST, onto VOID.
 
         The stack order is the file's order.  The two `i16` that follow each
-        layer's row index are NOT applied, and they are now characterised
-        rather than merely unnamed.  Measured over 155,404 layer entries:
+        layer's row index ARE applied, by `_composite_rgba`, which this
+        delegates to -- see its docstring for the blend and for the render
+        comparison behind it.  The sentence this paragraph used to end with,
+        "the two `i16` ... are NOT applied", was true until 2026-09-06.
+
+        **THEY ARE NOW NAMED, AND THIS PARAGRAPH'S DECOMPOSITION WAS WRONG.**
+        `docs/pux_f1_f2_attribution_2026-09-06.md`: they are not two fields.
+        They are the low 16 and high 9 bits of **one 25-bit per-vertex alpha
+        mask** over the 5x5 grid of vertices bounding a 4x4 subdivision of the
+        tile -- read as ONE u32 by the client and consumed by
+        ``alpha(i) = 255 if i < 25 and (mask >> i) & 1 else 0`` at
+        `Clients/7878/Env_DX9/Conquer.exe` RVA `0x872A68`.  `core/dmap.py`'s
+        `pux_layer_mask` / `pux_mask_alpha` are the accessors.
+
+        So a compositor should mask each layer by that alpha, bilinearly
+        interpolated across the 4x4 quads, instead of stacking full tiles.
+        **THAT CHANGE IS MADE NOW** -- `docs/pux_mask_composite_2026-09-06.md`,
+        and `dmap.pux_mask_field` is the expansion.  This paragraph used to end
+        "that change is NOT made here", and the two sentences after it recorded
+        the full-tile stack as a known-wrong blend.  It is no longer the blend.
+
+        What follows is the characterisation that preceded the name, kept
+        because it is what the field looks like from the data side and because
+        one of its two conclusions was a real refutation.  Measured over
+        155,404 layer entries:
 
             field B   bounded 0..511 on EVERY entry -- 9 bits, never more.
                       Its popcount distribution is a clean U: 26.3% zero,
@@ -338,17 +433,26 @@ class PuzzleMap:
         persuasive and the hypothesis is still wrong; only the neighbour
         test could show that.
 
-        The surviving reading, UNTESTED and named as such, is intra-tile
-        coverage -- which ninths of its own tile a layer paints.  That is
-        consistent with everything above (a base layer covering all nine, a
-        ring painting the border) and it would NOT correlate with
-        neighbours, which is why the negative does not touch it.  Proving
-        it needs a render comparison against the client, not another
-        statistic.
+        The surviving reading -- intra-tile coverage, "which parts of its own
+        tile a layer paints" -- **is the right one, at the wrong resolution**.
+        It was called UNTESTED here and it stayed untested because the two
+        halves were treated as two fields: 9 bits of a 25-bit mask is the top
+        row and a bit, so "3x3 shapes" were the top 9 vertices of a 5x5 grid
+        read as if they were a grid of their own.  *A field split at the wrong
+        boundary produces coherent-looking structure in both halves*, and the
+        3x3 ring at 495 is that artefact.
 
-        So the layers are stacked FULL-TILE.  That is the standard terrain
-        model and it is an assumption -- if a map renders with the wrong
-        blend, this is where to look first.
+        **The autotile refutation still stands and is now explained**: the
+        mask describes THIS tile's own vertices, so a set bit was never going
+        to predict a neighbour's terrain id.  48.5% was the right answer.  Run
+        on the whole 25 bits the neighbour question becomes a different one --
+        does my vertex column 4 equal my right neighbour's column 0, the same
+        seam -- and that answers 98.8% against a 60.2% control.
+
+        So the layers WERE stacked FULL-TILE, and that was the known-wrong
+        blend.  `core/dmap.pux_mask_alpha` was named as the fix and it is the
+        fix that landed; `dmap.pux_mask_field` is it, applied per layer in
+        `_composite_rgba`.
         """
         out = self._composite_rgba(rows)
         if out is None:
@@ -444,6 +548,50 @@ def _resample_rgba(rgba: bytes, w: int, h: int, grid: int) -> bytes:
     return bytes(out)
 
 
+#: (mask, grid) -> the interpolated alpha field. A map has a few hundred
+#: distinct masks and reuses each across thousands of tiles, so this is the
+#: same shape of cache as `_layer_cache` and for the same reason. Bounded
+#: because the key space is the map's own mask vocabulary, not 2**25.
+def _full_mask(layer) -> bool:
+    """Is this layer's per-vertex mask the full 0x1FFFFFF?
+
+    Only a FULL-masked single-layer tile may be flattened to a bare terrain
+    row: a bare row carries no mask, so flattening a PARTIAL one silently
+    promotes it to fully opaque in both renderers.
+    """
+    if not isinstance(layer, (tuple, list)) or len(layer) < 3:
+        return True                     # no mask carried: the old flat shape
+    m = _dmap.pux_layer_mask(layer[1], layer[2]) & _dmap.PUX_MASK_FULL
+    return m == _dmap.PUX_MASK_FULL
+
+
+_MASK_FIELDS: dict = {}
+
+
+def _apply_mask(rgba: bytes, grid: int, mask: int) -> bytes:
+    """One layer's RGBA with its per-vertex alpha mask multiplied in.
+
+    Returns `rgba` UNCHANGED when the mask is the full 0x1FFFFFF, which is the
+    single most common value on three of the four installs -- so the common
+    case costs one comparison and no copy.
+    """
+    if mask & _dmap.PUX_MASK_FULL == _dmap.PUX_MASK_FULL:
+        return rgba
+    key = (mask, grid)
+    fld = _MASK_FIELDS.get(key)
+    if fld is None:
+        fld = _MASK_FIELDS[key] = _dmap.pux_mask_field(mask, grid)
+    if _np is not None:
+        a = _np.frombuffer(rgba, dtype=_np.uint8).reshape(-1, 4).copy()
+        f = _np.frombuffer(fld, dtype=_np.uint8).astype(_np.uint16)
+        a[:, 3] = ((a[:, 3].astype(_np.uint16) * f + 127) // 255).astype(_np.uint8)
+        return a.tobytes()
+    out = bytearray(rgba)
+    for i in range(grid * grid):
+        out[i * 4 + 3] = (out[i * 4 + 3] * fld[i] + 127) // 255
+    return bytes(out)
+
+
 def _over(base: bytearray, top: bytes, grid: int) -> None:
     """Source-over composite `top` onto `base`, both ``grid*grid`` RGBA.
 
@@ -532,6 +680,78 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
 # reach-across has nowhere to land (C-2026-08-09-ani-json-spelling).
 
 
+def derive_grid_size(map_width: int, pul_w: int, pul_h: int,
+                     alphabet) -> Optional[int]:
+    r"""``PuzzleGridSize`` solved out of a map's OWN bytes, or ``None``.
+
+    **Why this exists.** ``PuzzleGridSize`` -- the tile edge in pixels -- is
+    carried in exactly one place, the map's row in ``ini/GameMap.dat`` (or the
+    community client's ``ini/GameMap.json``), and a map with no row therefore
+    had no grid and could not be assembled at all. MEASURED 2026-09-03 over
+    all 34 installs under ``Clients/``: that single missing integer is
+    **1,777 of the 2,079 whole-map build failures the oracle's `map.build`
+    dimension counts, 85.5%** -- every other byte of those maps is present and
+    parses.
+
+    **The solution.** `PuzzleMap.consistent` already states the identity the
+    shipped maps satisfy::
+
+        map_width == map_height == PxW/64 + PxH/32
+                  == grid*pul_w/64 + grid*pul_h/32
+
+    which inverts to a closed form with no free parameter::
+
+        grid == map_width * 64 / (pul_w + 2*pul_h)
+
+    `map_width` is the ``.DMap``'s own declared width and `pul_w`/`pul_h` are
+    the ``.pul``'s own declared extent, so the answer is read out of the two
+    files the caller already holds.
+
+    **What it is allowed to return, and why it refuses rather than rounds.**
+    A non-integral solution means the map's ``.DMap`` and its art DISAGREE
+    about the map's size -- `consistent` is False for it -- and there is then
+    no grid that satisfies the identity. Rounding to the nearest plausible
+    value there would manufacture a number for exactly the maps whose geometry
+    is known to be odd. So the solution is accepted only when it is an exact
+    integer AND a member of `alphabet`, which is *this install's own set of
+    ``PuzzleGridSize`` values as actually registered* -- not a constant. Every
+    other case returns ``None`` and the caller refuses the map as before.
+
+    **HOW OFTEN IT IS RIGHT, measured against the answer.** Run over the maps
+    that DO have a registry row, on 7 installs (5017, 5517, 6090, 6609, 7205,
+    7878, Zephyr), 1,459 registered ``.pul`` maps:
+
+        accepted and equal to the registry     1,439
+        accepted and DIFFERENT from it             5
+        refused (non-integral / not in the set)   15
+
+    The five disagreements are `2013ganenjie` (4 installs) and 7878's
+    `2015valentine`, and they are worth stating precisely rather than
+    averaging away: in **all five** the registry's value makes the map
+    INCONSISTENT (2013ganenjie's row says 256, which implies a 416-cell map
+    against the ``.DMap``'s 208) and the derived value makes it consistent.
+    That is not evidence the derivation is better -- the client reads the
+    registry, so on those maps the registry is what the client draws with.
+    It is the reason this function is **only ever called where there is no row
+    to read**: where the client has an answer, the client's answer wins, and
+    this one is never consulted.
+
+    Over the whole corpus the rule accepts 1,672 of the 1,777 unregistered
+    maps (94.1%) and refuses 105.
+    """
+    # `CELL_PX_W // CELL_PX_H` rather than a literal 2: the identity above is
+    # `PxW/CELL_PX_W + PxH/CELL_PX_H`, and writing the ratio out means the two
+    # constants cannot drift apart from the arithmetic that assumes them.
+    den = int(pul_w) + (CELL_PX_W // CELL_PX_H) * int(pul_h)
+    if den <= 0 or not alphabet or CELL_PX_W % CELL_PX_H:
+        return None
+    num = int(map_width) * CELL_PX_W
+    if num % den:
+        return None                      # the identity has no integral solution
+    g = num // den
+    return g if g in alphabet else None
+
+
 class PuzzleLibrary:
     """`GameMap.json` + `map/map/*.DMap` + `map/puzzle/*.pul`, joined.
 
@@ -569,21 +789,27 @@ class PuzzleLibrary:
         return self._root
 
     def _unregistered_count(self) -> int:
-        """Shipped `.DMap` files with no row in this install's registry.
+        """Shipped maps with no row in this install's registry.
 
         Computed once, on the install that is loaded, because the number
         varies by client and a quoted one is a different install's fact:
         **MEASURED 2026-08-11 -- 5517: 21 of 181, 6090: 21 of 184, 6609: 20 of
         184.** Those are recorded here as provenance, not consulted.
+
+        **IT COUNTED THE LOOSE DIRECTORY, AND ON EVERY 7632-AND-LATER CLIENT
+        THAT MADE IT REPORT ZERO** -- ``sum(... for p in map/map.iterdir())``,
+        over a tree whose maps ship inside archives. 7878 has 146 unregistered
+        maps and this number said "0 of this install's shipped maps have
+        none", inside the very message that exists to tell a reader how common
+        their situation is. Counted over `names()` -- the registry UNION the
+        archives UNION the loose tree, which is the same population every
+        other figure about this install uses -- it is 146. A count that is
+        zero exactly where the thing it counts is most common is worse than no
+        count at all, because it reads as reassurance.
         """
         if self._unregistered is None:
-            self._unregistered = 0
-            d = (self._root / "map" / "map") if self._root else None
-            if d and d.is_dir():
-                self._unregistered = sum(
-                    1 for p in d.iterdir()
-                    if p.suffix.lower() == ".dmap"
-                    and p.stem.lower() not in self._grid_size)
+            self._unregistered = sum(1 for n in self.names()
+                                     if str(n).lower() not in self._grid_size)
         return self._unregistered
 
     def _load_gamemap(self) -> None:
@@ -716,7 +942,22 @@ class PuzzleLibrary:
         self._cache[key] = pm
         return pm
 
+    #: A machine-readable companion to `reason`, set by `_build` on the paths
+    #: a CALLER has to tell apart. Empty everywhere else, including success.
+    #:
+    #: `reason` is prose for a human and it stays prose. `routeb/oracle.py`
+    #: needs to separate "this map cannot be built because our rule is
+    #: incomplete" from "this map cannot be built because the bytes disagree
+    #: with each other", and the only handle it had was a substring match on
+    #: that prose. The block just above `_build`'s grid solve records what
+    #: happened when the previous parse of a reason string pulled out the
+    #: literal `"a .7z"` and excluded 48 maps on it: a prose parse is wrong
+    #: only in the case the check exists to catch. So the fact is published
+    #: rather than re-derived.
+    reason_code: str = ""
+
     def _build(self, name: str) -> Optional[PuzzleMap]:
+        self.reason_code = ""
         if self._root is None:
             self.reason = self.reason or "no game install found (core/coroot.py)"
             return None
@@ -770,10 +1011,40 @@ class PuzzleLibrary:
             for t in px["tiles"]:
                 if not t:
                     tiles.append(EMPTY)
-                elif len(t) == 1:
+                elif len(t) == 1 and _full_mask(t[0]):
+                    # The flat-tile shortcut, and it is now CONDITIONAL.
+                    #
+                    # It used to be `elif len(t) == 1: tiles.append(t[0][0])`,
+                    # which keeps the terrain row and DROPS THE TWO i16 that
+                    # carry the mask -- the same defect the comment below
+                    # describes for the multi-layer branch, fixed there and
+                    # missed here. A single-layer tile can carry a PARTIAL
+                    # mask, and flattening it made the tile draw FULL-TILE
+                    # OPAQUE: `_composite_rgba` skips `_apply_mask` for a bare
+                    # row, and `tileset.py` emits no stack entry so the page
+                    # reads a FULL mask too. Both renderers, one cause.
+                    #
+                    # Found from `sary02_new`, where tile (19,12) is
+                    # `[(231, 16, 0)]` -- mask 0x10, ONE of 25 vertices -- and
+                    # drew as a solid red rectangle. Single-layer tiles
+                    # carrying a partial mask: **166 on sary02, 91 on
+                    # 2024thx, 93 on 2024xmas**.
                     tiles.append(t[0][0])
                 else:
-                    key = tuple(e[0] for e in t)
+                    # THE FULL LAYER TUPLE, not the terrain rows alone.
+                    # Keying on rows collapsed tiles that differ only in the two
+                    # discarded per-layer fields onto ONE synthetic id, so a
+                    # correct compositor fed by this key would still draw some
+                    # tiles wrong. MEASURED on 7878, distinct stacks:
+                    #     ninja01          721 ->  968   1.34x
+                    #     bp-flandlords-y  205 ->  277   1.35x
+                    #     2020love01_new    15 ->  224  14.93x
+                    #     magictower01       5 ->   42   8.40x
+                    # The aggregate 1.60x understates it: the two maps where most
+                    # slots already draw are the two where the collapse is worst.
+                    # Id space is not a constraint -- 1,511 against the ~4.29
+                    # billion the u32 slot widening left above SYNTH.
+                    key = tuple(tuple(e) for e in t)
                     sid = by_key.get(key)
                     if sid is None:
                         sid = SYNTH + len(by_key)
@@ -786,6 +1057,11 @@ class PuzzleLibrary:
                 grid=PUX_GRID, pul_w=px["width"], pul_h=px["height"],
                 tiles=tiles, ani="", pul_path=rel.lower(), assets=self.assets,
                 stacks=stacks,
+                # NEITHER read nor solved: `dmap.PUX_GRID` is a constant this
+                # repo asserts for TqTerrain. Labelled as its own third answer
+                # rather than left wearing the default "registry", which would
+                # be a false claim about where the number came from.
+                grid_source="pux-constant",
             )
             # Every row any tile OR any stack names -- a stack's rows never
             # appear in `tiles` (they are replaced by the synthetic index),
@@ -793,7 +1069,12 @@ class PuzzleLibrary:
             # texture and the map renders as its single-layer tiles only.
             wanted = {i for i in tiles if i != EMPTY and i < SYNTH}
             for key in stacks.values():
-                wanted.update(key)
+                # `key` is now a tuple of LAYER TUPLES, so the terrain row has to
+                # be projected out. Before the widening this read
+                # `wanted.update(key)` and key was a tuple of row ints; leaving it
+                # would have put 3-tuples into a set that is indexed against
+                # `px["terrain"]` two lines below.
+                wanted.update(e[0] for e in key)
             for idx in wanted:
                 if idx >= len(px["terrain"]):
                     continue
@@ -819,6 +1100,28 @@ class PuzzleLibrary:
             return None
         stem = str(name).lower()
         g = self._grid_size.get(stem)
+        grid_source = "registry"
+        if g is None:
+            # NO ROW -- so solve the grid out of the map's own two files.
+            #
+            # This branch used to be the end of the road, and it is by a wide
+            # margin the biggest single hole in the ground pipeline: MEASURED
+            # 2026-09-03 across all 34 installs, 1,777 of 2,079 whole-map
+            # failures (85.5%) are maps that ship every byte, parse, name a
+            # `.pul` that is present, and were refused for one missing
+            # integer. `derive_grid_size` recovers 1,672 of them; its
+            # docstring carries the measurement of how often the recovered
+            # value equals the registry's where a registry value exists.
+            #
+            # ORDER MATTERS AND IS NOT AN OPTIMISATION: the registry is
+            # consulted FIRST and the derivation is reached only when there is
+            # nothing to read. On the five registered maps where the two
+            # disagree, the client draws with the registry's value, so a
+            # derivation that could override it would be a wrong answer with a
+            # plausible justification. It cannot: it is unreachable there.
+            g = derive_grid_size(m.width, z.width, z.height,
+                                 set(self._grid_size.values()))
+            grid_source = "derived"
         if g is None:
             # Two defects used to wear this one string, and it named the wrong
             # file for both.  The registry is `GameMap.json` on the community
@@ -835,20 +1138,60 @@ class PuzzleLibrary:
             # verbatim at anyone running 6090, which is the same defect one
             # install over as naming the wrong registry file.  It is now
             # counted against the install that is actually loaded.
+            #
+            # THE SECOND HALF OF THE MESSAGE IS NEW AND IS THE PART THAT NOW
+            # MATTERS. Reaching here means BOTH sources failed: no row to read
+            # AND no integral solution in this install's own set of grid
+            # sizes. Saying only "no row" would send a reader to the registry
+            # for a map whose real problem is that its `.DMap` and its art
+            # disagree about how big the map is, which no registry edit fixes.
+            den = z.width + (CELL_PX_W // CELL_PX_H) * z.height
+            solved = (m.width * CELL_PX_W / den) if den else float("nan")
+            alpha = sorted(set(self._grid_size.values()))
+            # TWO DIFFERENT FACTS WEAR THIS ONE MESSAGE, and only one of them
+            # is about us. MEASURED 2026-09-04 over all 34 installs, on the
+            # 105 unregistered maps `derive_grid_size` refuses:
+            #
+            #   unsatisfiable   105   `map_width*64` is not divisible by
+            #                         `pul_w + 2*pul_h`, so NO positive
+            #                         integer grid satisfies the identity --
+            #                         not "none we would accept", none.
+            #   not-in-alphabet   0   an exact integer this install has never
+            #                         registered. None occur; the branch is
+            #                         kept because it is the case where the
+            #                         refusal IS a choice of ours.
+            #
+            # The first is a statement about the two shipped files. The
+            # second would be a statement about our willingness to trust a
+            # number. `oracle.map.build` excludes the first and counts the
+            # second, and it can only do that if they are told apart here.
+            if grid_source == "derived" and den:
+                num = m.width * CELL_PX_W
+                self.reason_code = ("unregistered-unsatisfiable"
+                                    if num % den else
+                                    "unregistered-not-in-alphabet")
             self.reason = (f"{name} has no row in {self._registry_rel} "
                            f"({self._unregistered_count()} of this install's "
-                           f"shipped maps have none), so no PuzzleGridSize"
+                           f"shipped maps have none), and no PuzzleGridSize "
+                           f"could be derived either: "
+                           f"{m.width}*{CELL_PX_W}/({z.width}+"
+                           f"{CELL_PX_W // CELL_PX_H}*{z.height}) = "
+                           f"{solved:.4f}, which is not an integer in this "
+                           f"install's registered set {alpha} -- the .DMap "
+                           f"and its art disagree about the map's size"
                            if self._registry_rel else
                            f"{name} has no PuzzleGridSize: this install "
                            f"ships no map registry at all (neither "
-                           f"ini/GameMap.json nor ini/GameMap.dat)")
+                           f"ini/GameMap.json nor ini/GameMap.dat), so there "
+                           f"is neither a row to read nor a set of registered "
+                           f"grid sizes to solve within")
             return None
         pm = PuzzleMap(
             name=str(name), map_id=self._doc_id.get(stem),
             map_width=m.width, map_height=m.height,
             grid=g, pul_w=z.width, pul_h=z.height, tiles=z.tiles,
             ani=rel_ani(z.ani_path), pul_path=rel.lower(),
-            assets=self.assets,
+            assets=self.assets, grid_source=grid_source,
         )
         table = self._ani_table(z.ani_path)
         for idx in set(z.tiles):
@@ -917,6 +1260,15 @@ class PuzzleLibrary:
         `rate`; see `Backdrop.roll` and `docs/ground_animation.md` 10.10.
         values[1] is 4 on every record and values[5] is 8 on every record;
         neither is named here.
+
+        REFINED 2026-08-29, and it does not change what this method returns.
+        `values[4]` is the group's ITEM count, not its plane count, and
+        `values[5]` is the item's TAG -- 8, which is `PUZZLE` in
+        `dmap.LAYER_TYPES`, which is why "8 on every record" held: this list
+        is filtered to tag-8 items. The two readings coincide on every map on
+        this box but one (`7878 newbie`, whose group holds a plane and a
+        tag-19 effect), and `dmap.parse_trailer` still hands this method
+        planes only. See `docs/dmap_plane_groups_1005_2026-08-29.md`.
         """
         out: list[Backdrop] = []
         if self._root is None:
@@ -932,7 +1284,9 @@ class PuzzleLibrary:
                 return out
         except Exception:                                   # noqa: BLE001
             return out
-        g = self._grid_size.get(str(name).lower()) or 256
+        g = self._grid_size.get(str(name).lower())
+        gsrc = "registry" if g is not None else "default-256"
+        g = g or 256
         for e in d.extra:
             rel = str(e.get("path", "")).replace("\\", "/")
             # Three maps have a desynchronised trailer; a record whose path is
@@ -951,7 +1305,7 @@ class PuzzleLibrary:
                            map_width=d.width, map_height=d.height,
                            grid=g, pul_w=z.width, pul_h=z.height, tiles=z.tiles,
                            ani=rel_ani(z.ani_path), pul_path=rel.lower(),
-                           assets=self.assets)
+                           assets=self.assets, grid_source=gsrc)
             table = self._ani_table(z.ani_path)
             for idx in set(z.tiles):
                 if idx == EMPTY:

@@ -247,6 +247,24 @@ class SuperFxDB:
             for v in q.vertices:
                 yield attach.transform_vertex(v, c.motion, anchor, frame)
 
+    # -- lifecycle ---------------------------------------------------------
+    def close(self) -> None:
+        """Hand back the install, IF the `EffectDB` below opened it.
+
+        `SuperFxDB` always builds its own `EffectDB`, but that `EffectDB` owns
+        a root only when no `assets=` reached it -- so the ownership question
+        is already answered one level down and this just delegates.  Without
+        this there was no reachable `close()` anywhere on the chain, because
+        `self.fx` is private to instances of this class.
+        """
+        self.fx.close()
+
+    def __enter__(self) -> "SuperFxDB":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
 
 def family_of(logical: str) -> str:
     """`c3/effect/blade/410009.C3` -> `blade`."""
@@ -755,19 +773,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--limit", type=int)
     a = ap.parse_args(argv)
 
-    db = SuperFxDB(a.root)
-    if a.weapon:
-        cmd_weapon(db, a.weapon)
-        return 0
-    if a.anchor:
-        cmd_anchor(db, a.anchor[0], a.anchor[1], a.slot, a.frame)
-        return 0
-    if a.families:
-        cmd_families(db)
-        return 0
-    if a.validate:
-        return validate(db, a.limit)
-    ap.print_help()
+    # `with`, and the FIVE `return`s below are the reason.
+    with SuperFxDB(a.root) as db:
+        if a.weapon:
+            cmd_weapon(db, a.weapon)
+            return 0
+        if a.anchor:
+            cmd_anchor(db, a.anchor[0], a.anchor[1], a.slot, a.frame)
+            return 0
+        if a.families:
+            cmd_families(db)
+            return 0
+        if a.validate:
+            return validate(db, a.limit)
+        ap.print_help()
     return 1
 
 

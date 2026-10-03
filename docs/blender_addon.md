@@ -1,8 +1,14 @@
-# Blender addon — Conquer Online C3 meshes
+# Blender addon — Conquer Online C3 meshes and animations
 
-Import and export the game's `.c3` meshes in Blender, with a hard guarantee:
-**import a mesh, export it without touching anything, and you get back the same
-bytes.** That is what makes it safe to edit one vertex and ship the result.
+Import and export the game's `.c3` meshes **and their `MOTI` animation tracks**
+in Blender, with a hard guarantee: **import, export without touching anything,
+and you get back the same bytes.** That is what makes it safe to edit one
+vertex — or one bone key — and ship the result.
+
+The animation half landed 2026-09-06 and has its own document:
+`docs/blender_animation_2026-09-06.md`, which also names the claims that
+**still need a Blender to check** (its section 6). Read that before trusting
+the animation path in anger.
 
 Tested on **Blender 5.2.0 LTS** on Windows 11. Requires Blender 4.2 or newer
 (it installs as an Extension). No Python packages to install — the addon is
@@ -21,7 +27,8 @@ That writes `build\io_scene_c3.zip`. Then, in Blender:
 1. **Edit → Preferences → Add-ons**
 2. Click the **▾** button (top right of the Add-ons list) → **Install from Disk…**
 3. Pick `build\io_scene_c3.zip`
-4. Tick the checkbox next to **Conquer Online C3 (mesh)** if it is not already on
+4. Tick the checkbox next to **Conquer Online C3 (mesh + animation)** if it is
+   not already on
 5. Expand it and check **Game install root**. It is filled in automatically by
    the same auto-detection the command-line tools use (`core/coroot.py`:
    `CO_ROOT`, a saved config, the conventional paths, then the Windows
@@ -66,7 +73,8 @@ names are the `Dumy` entries from `ini\RolePart.ini`.
 | option | default | notes |
 |---|---|---|
 | **Materials and textures** | on | resolves the DDS through the appearance tables and wires it into a Principled BSDF, so you see the textured model |
-| **Armature and vertex groups** | on | rebuilds the 2-bone skin as a real armature |
+| **Armature and vertex groups** | on | rebuilds the 2-bone skin as a real armature, **one per mesh** |
+| **Animation (MOTI)** | on | imports the mesh's motion track as an armature action |
 | **Bone spacing** | 4.0 | spacing of the placeholder bone ladder — cosmetic only |
 
 ### What you get
@@ -77,17 +85,30 @@ names are the `Dumy` entries from `ini\RolePart.ini`.
   is what converts Direct3D's clockwise-front winding to Blender's.
 - **UV map `uv0`** (and `uv1` on `PHY5`, which nothing in this build ships).
 - **Vertex colours** in a colour attribute called `C3Color`.
-- **An armature** named `<file>_skeleton` with one bone per palette entry, and
-  matching vertex groups `bone_000`, `bone_001`, …
+- **An armature per mesh**, named `<file>_<n>_skeleton`, with one bone per
+  palette entry (widened to every bone the motion track names) and matching
+  vertex groups `bone_000`, `bone_001`, …  One per mesh and not one per file,
+  because bone 3 of mesh 0 and bone 3 of mesh 1 index *different* `MOTI` chunks.
+- **An action** named `<file>_<n>_motion` on that armature, with LINEAR keys —
+  the engine lerps the matrix elements between keys, so Bezier ease would
+  display and bake something it never shows.
 - **A material** pointing at the real DDS.
 
-### Two things to know about the armature
+### Three things to know about the armature
 
-The bone **rest positions are placeholders** — a labelled ladder up the Z axis.
-The real skeleton lives in the `MOTI` chunks, which are still undecoded. The
-bones are there so the weights are visible and paintable, not so you can pose
-the character. In rest pose an armature modifier is the identity no matter
-where the bones sit, so this cannot distort your mesh.
+The bone **rest positions are a labelled ladder up the Z axis, deliberately.**
+This used to say the real skeleton was in the undecoded `MOTI` chunks. `MOTI`
+is decoded and now editable, and there turns out to be no rest skeleton to
+recover: a `MOTI` matrix is a *skinning* matrix, so the rest pose it implies
+puts every bone on the origin, coincident and unselectable. The ladder is kept
+and each pose is conjugated by the bone's own rest matrix
+(`B = L^-1 . M . L`), which makes the **deformation** exactly the engine's
+wherever the bones sit. In rest pose an armature modifier is still the identity
+no matter where the bones sit, so this cannot distort your mesh.
+
+**Moving a bone's rest position is an edit.** `L` is an input to that
+reconstruction, so a rest-pose change alters every key — the exporter notices
+and re-bakes the whole track rather than silently discarding the change.
 
 Skinning is **exactly two influences per vertex**, and the engine derives the
 second weight as `255 − weight0`, so the pair always sums to 1. If you paint
@@ -113,6 +134,7 @@ only one C3 collection in the scene) automatically.
 | option | default | notes |
 |---|---|---|
 | **Selected objects only** | off | otherwise the whole collection exports, in the original chunk order |
+| **Rebuild motion tracks** | on | writes each imported `MOTI` back from its action, in the encoding it arrived in. Off carries every track through verbatim and ignores animation edits |
 | **Recompute bounding box** | off | leave off to keep the original bytes; **turn on after moving vertices** |
 | **Allow adding/removing meshes** | off | lets the mesh *count* change. Read the section below before using it |
 
@@ -272,6 +294,8 @@ Current results:
 | delete a mesh → export → re-import | **3 / 3**, PHY and MOTI both drop by one |
 | `tests\test_structural.py` — add/remove across the loose tree | **1,348 containers, PASS** |
 | `tests\test_addon_install.py` | **PASS** |
+| `tests\test_moti_action.py` — MOTI to action and back, headless | **16,600 / 16,600 byte-exact**, all four encodings |
+| whole containers rebuilt with edited tracks spliced in | **40 / 40 byte-identical** |
 
 ---
 
@@ -367,3 +391,34 @@ tells you which field moved, per vertex, instead of just giving you an offset.
 **The model looks inside-out** — make sure you have not *also* flipped the
 normals or reversed the winding by hand. The importer already handles
 handedness with the Z mirror; doing it twice puts you back where you started.
+
+**`test_vendor_sync` fails and the vendored copy "looks identical"** — it is
+supposed to differ. `blender/io_scene_c3/vendor/*.py` are generated copies of
+their `core/` and `tools/` sources with imports rewritten and a generated
+header prepended, so a byte-for-byte or md5 comparison of source against
+vendored copy **differs even when the two are perfectly in sync**. Do not use
+file equality to decide this question.
+
+Run the regeneration and commit the result:
+
+```
+py -3 tools/build_addon.py --no-zip
+```
+
+**And do not hand-edit the vendored copy to make a comparison agree.** That is
+the dangerous branch, because it *works*: forcing byte equality satisfies a
+naive check while creating exactly the second divergent copy the gate exists
+to prevent — a fix that defeats the check by satisfying it. `coroot.py` once
+sat 496 lines behind its source with the build exiting 1 on every run and
+nothing running it (`docs/CORRECTIONS.md`,
+`C-2026-08-09-comod-vendor-drift-gate`).
+
+`tests/test_vendor_sync.py` is the only correct instrument here: it re-runs
+`vendor()` into a temp directory and diffs the *result*, so it knows about the
+header. File equality is the wrong instrument; the sync test is the right one.
+
+*Worth knowing before you edit a shared module at all: `core/coroot.py` has a
+vendored twin, so a change there is two commits — the source and the
+regenerated copy — and a pre-check will stop a merge window on the second one.
+Changing any module under `VENDORED` in `tools/build_addon.py` has the same
+cost.*

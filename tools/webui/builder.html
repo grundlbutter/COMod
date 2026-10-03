@@ -57,6 +57,20 @@
           <select id="anim-action"></select>
         </label>
         <button id="btn-anim-play" class="ghost" title="Play / pause (Space)">▶ play</button>
+        <!-- WHERE THE MOTION COMES FROM. This install declares motions it does
+             not ship -- removed from client 7320 on, still present in the
+             5165-7250 builds -- so a body here can be posed by a motion from
+             another patch level. The BODY is always this install's; only the
+             motion is sourced elsewhere, and nothing is written anywhere. -->
+        <label id="anim-src-wrap" title="Play this action using a motion file from another install. The body is always this install's; nothing is written.">
+          motion from
+          <select id="anim-source"></select>
+        </label>
+        <!-- ITS OWN ELEMENT. The first version wrote this summary into
+             #anim-label, which the frame counter owns and rewrites every
+             frame -- so the count appeared and was gone before it could be
+             read. Two writers, one element, and the faster one wins. -->
+        <span id="anim-delta" class="mut small"></span>
         <label>frame <input type="range" id="anim-frame" min="0" max="0" value="0"></label>
         <label title="The frame rate is NOT in the shipped data. 41 ms is tools/anim.py's reading; 33 ms and 50 ms are the documented alternatives. Move this rather than trusting the default.">
           speed <input type="range" id="anim-speed" min="20" max="80" step="1" value="41"></label>
@@ -137,10 +151,19 @@
       <button id="picker-close" class="ghost" title="Close (Esc)">✕</button>
     </div>
     <input id="picker-search" type="search" placeholder="search by name, id or colour…" autocomplete="off">
+    <div id="picker-since" class="small">
+      <label title="Show only what is new relative to another install you have declared">New since
+        <select id="picker-since-base"><option value="">(show everything)</option></select></label>
+      <select id="picker-since-mode" title="new: ids the other install lacks (by content where a table was renumbered) · changed: same id, different art">
+        <option value="new">new</option><option value="changed">changed</option><option value="both">new or changed</option></select>
+      <span id="picker-since-note" class="mut"></span>
+    </div>
     <div id="picker-facets"></div>
     <div id="picker-list" class="list" tabindex="0"></div>
     <div class="picker-foot">
       <span id="picker-count" class="small mut"></span>
+      <button id="picker-clear-filters" class="ghost tiny" type="button" disabled
+              title="Untick every filter: kind, class and the rest, your tags, the search box and New since">No filters</button>
       <div class="spacer"></div>
       <button id="picker-clear" class="ghost tiny">Leave this slot empty</button>
     </div>
@@ -233,5 +256,6 @@
 <script src="/ui/builder.js"></script>
 <script src="/ui/basepicker.js"></script>
 <script src="/ui/pageshot.js"></script>
+<script src="/ui/portagepanel.js"></script>
 </body>
 </html>

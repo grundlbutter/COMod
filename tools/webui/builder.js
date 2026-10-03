@@ -169,11 +169,16 @@ async function api(path, opts) {
     try {
       r = await fetch(path, opts);
     } catch (first) {
+      // A caller that ABORTED gets its abort back: a retry against a signal
+      // that is already dead fails at once, and the message below would then
+      // blame the viewer for a request the page itself withdrew.
+      if (first && first.name === 'AbortError') throw first;
       // A connection that died in the pool fails this attempt and nothing after it.
       // Chrome retries a POST like that for us; Firefox does not.
       r = await fetch(path, opts);
     }
   } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
     const how = (opts && opts.method) || 'GET';
     throw new Error(
       `${how} ${path} never reached the viewer (${e.message}). Either it is `
@@ -186,7 +191,14 @@ async function api(path, opts) {
     return r;
   }
   const j = await r.json();
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (!r.ok) {
+    // The STATUS travels with the error, so a caller can tell "this id does
+    // not exist on this install" (404) from "the request failed".
+    const err = new Error(j.error || r.statusText);
+    err.status = r.status;
+    err.body = j;
+    throw err;
+  }
   return j;
 }
 
@@ -241,12 +253,32 @@ function setThumb(img, path, size) {
 }
 
 function kv(pairs) {
+  /* NULL IS A VALUE THE SERVER SENT; '' IS THE CALLER CHOOSING TO HIDE.
+   *
+   * This used to skip null, undefined and '' alike, so a row the server
+   * answered as null simply VANISHED -- and "the server said null" was then
+   * indistinguishable from "this panel does not show that field". Three
+   * defects in one night were fields the API returned that no panel
+   * rendered; a helper that drops nulls is that failure built in.
+   *
+   * null/undefined now render an em dash carrying the reason on hover.
+   * '' still omits the row, because that is the caller's own choice and all
+   * 13 call sites pass an explicit key list. The em-dash convention is
+   * borrowed from ui.js field(), not invented here. */
   const d = el('dl', 'kv');
   for (const [k, v] of pairs) {
-    if (v === null || v === undefined || v === '') continue;
+    if (v === '') continue;
     d.appendChild(el('dt', null, k));
     const dd = el('dd');
-    if (v instanceof Node) dd.appendChild(v); else dd.textContent = String(v);
+    if (v === null || v === undefined) {
+      dd.className = 'null';
+      dd.textContent = '—';
+      dd.title = 'returned as ' + (v === null ? 'null' : 'undefined');
+    } else if (v instanceof Node) {
+      dd.appendChild(v);
+    } else {
+      dd.textContent = String(v);
+    }
     d.appendChild(dd);
   }
   return d;
@@ -348,8 +380,10 @@ async function boot() {
   // exist on the Model Viewer -- and would be work done for a figure that
   // page never draws.
   if (!IS_MODELS) {
-    if (!restored || !restored.body) await applyDefaultLoadout();
-    else await refreshLoadoutNames();
+    if (restored && restored.body) await refreshLoadoutNames();
+    if (!B.loadout.body) await applyDefaultLoadout();
+    B.bodyType = (B.loadout.body && B.loadout.body.id || B.bodyType || '002').slice(0, 3);
+    saveLoadout();                 // now this install's own, checked
   }
   restoreModelState();
   await fillActions();
@@ -372,6 +406,50 @@ async function applyDefaultLoadout() {
   }
 }
 
+/** One action's text, wherever it is listed. EVERY row carries its own
+ *  animation number, named or not.
+ *
+ *  Before this, only unidentified rows showed a number, so the list read:
+ *
+ *      Dead (hold of 332)        <- a number, but it is 332's, not this row's
+ *      Die variant               <- no number at all
+ *      Cast / special (919, unidentified)
+ *
+ *  The one number you could read off a named row was somebody else's. The
+ *  owner asked for the number on everything, which also makes the list
+ *  searchable by the code that 3dmotion.ini is actually keyed on.
+ *
+ *  It is a FUNCTION because there are three call sites -- the builder's
+ *  dropdown, the model panel's dropdown and the "not in this install" group.
+ *  The last time a rule here changed it was fixed in one and missed in
+ *  another, and the owner reported the same defect twice from two panels. */
+function actionLabel(a) {
+  const base = a.named ? `${a.label} (${a.code})`
+                       : `${a.label} (${a.code}, unidentified)`;
+  // WHETHER THIS ROW WILL SHOW YOU THIS ACTION AT ALL.
+  //
+  // `MotionIndex.lookup`'s five-step chain ends at the universal idle, so a
+  // code this client ships no motion for still resolves, still reports
+  // frames and chunks, and still plays -- as the IDLE. MEASURED on 5017,
+  // body 3135990 + bow 500218: 45 of the 94 rows in this very menu resolve
+  // through a fallback, and nothing distinguished them.
+  //
+  // The list is where the choice is made, so the warning belongs here and
+  // not only on the panel after playing. Naming an unidentified code from a
+  // fallback clip is a wrong answer that gets written down, and this is the
+  // last point at which it is cheap to avoid.
+  //
+  // `own` IS THE SERVER'S VERDICT; `how` IS ITS WORDING. This used to test
+  // `a.how !== 'exact'`, and `resolve()` suffixes an exact hit when the alias
+  // table answered -- `exact (weapon set 580 animates from set 560)` -- so
+  // every such row read as a fallback: 40 of the 157 rows on a 580 loadout
+  // (5517, body 002135000 + weapon 580001, 2026-09-25) said "no own motion"
+  // while playing the action's own clip. `anim.route_is_own` decides once,
+  // server-side. A row with no verdict at all (an older payload) stays
+  // unmarked rather than reading as a fallback.
+  return a.own === false ? `${base} — no own motion` : base;
+}
+
 /** The action list depends on the equipped weapon: 3dmotion.ini is keyed
  *  <shape><weaponset><action>, and a 410 swing is a different motion from the
  *  unarmed one. So this is re-fetched whenever a hand changes. */
@@ -382,6 +460,13 @@ async function fillActions() {
   if (B.loadout.body) p.set('body', B.loadout.body.id);
   if (B.loadout.r_weapon) p.set('weapon', B.loadout.r_weapon.id);
   if (B.loadout.l_weapon) p.set('offHand', B.loadout.l_weapon.id);
+  // WHEN A FOREIGN SOURCE IS SELECTED, ask which actions actually DIFFER.
+  // The owner's words: "I would like the animation list to show what is
+  // different and what is added." Neither is visible from the action name,
+  // and without it you switch source and have no idea which of ~200 entries
+  // is worth watching.
+  const msrc = (document.getElementById('anim-source') || {}).value || '';
+  if (msrc) p.set('source', msrc);
   let data;
   try { data = await api('/api/actions?' + p.toString()); }
   catch (e) { return; }
@@ -396,10 +481,26 @@ async function fillActions() {
       host.label = group;
       sel.appendChild(host);
     }
-    const o = el('option', null,
-      a.named ? a.label : `${a.label} (${a.code}, unidentified)`);
+    const base = actionLabel(a);
+    // The mark goes in FRONT so the column of them scans down the list; a
+    // suffix would sit at a different x on every row and have to be read.
+    const mark = { added: '+ ', different: '≠ ', onlyhere: '− ' }[a.delta] || '';
+    const o = el('option', null, mark + base);
     o.value = a.code;
-    o.title = a.evidence || '';
+    o.title = ({
+      added: 'ADDED: this install resolves no file for this action; the '
+           + 'selected source has one. These are the motions removed from '
+           + 'client 7320 onward.',
+      different: 'DIFFERENT: both installs have this motion and the BYTES '
+               + 'DIFFER. Same path, different animation -- the name gives '
+               + 'no hint, which is why it is marked.',
+      onlyhere: 'ONLY HERE: this install has it and the source does not. Not '
+              + 'an error -- the source is an older client.',
+      same: 'SAME: both installs have this motion and the bytes are '
+          + 'identical. Switching source will change nothing.',
+      absent: 'Neither install resolves a file for this action.'
+    }[a.delta] || '') + (a.delta && a.evidence ? '\n\n' : '') + (a.evidence || '');
+    if (a.delta) o.dataset.delta = a.delta;
     host.appendChild(o);
   }
   if (!data.actions.some(a => a.code === B.anim.action)) {
@@ -407,6 +508,155 @@ async function fillActions() {
   }
   sel.value = B.anim.action;
   $('#anim-speed').value = String(B.anim.speed || data.defaultFrameMs || 41);
+  // A COUNT BESIDE THE MENU, because 200 options with marks scattered
+  // through them does not answer "is there anything here worth watching".
+  const lbl = document.getElementById('anim-delta');
+  // A SOUL ANIMATES AS THE WEAPON MESH IT PUTS IN YOUR HAND. `804240`
+  // BowSoulLv130 keys motion set 500 (its weapon.ini Mesh0 is a bow), not
+  // the 804 its id splits to; the server resolves that
+  // (`anim.AnimDB.weapon_type_via`, census at `anim.SOUL_TYPE_MIN`) and says
+  // so with `weaponTypeVia === 'mesh'`. Without this the menu lists a bow's
+  // actions under a slot whose id says otherwise and nothing explains the
+  // agreement. This span is the one element beside the menu that nothing
+  // else rewrites (#anim-label is the frame counter's), so the note lives
+  // here and is appended to the source comparison when both apply. An
+  // older payload with no `weaponTypeVia` stays as it was.
+  const soul = data.weaponTypeVia === 'mesh'
+    ? `animates as set ${data.weaponset}` : '';
+  if (lbl && data.source) {
+    const n = (t) => data.actions.filter(a => a.delta === t).length;
+    lbl.textContent = `vs ${data.source}: ${n('added')} added, `
+                    + `${n('different')} different, ${n('same')} same`
+                    + (soul ? ` · ${soul}` : '');
+    lbl.title = 'Compared by BYTES, not by name or size: two motions of '
+              + 'equal length are routine.'
+              + (soul ? `\n\n${data.weaponTypeNote || ''}` : '');
+  } else if (lbl && !data.source) {
+    lbl.textContent = soul;
+    lbl.title = soul ? (data.weaponTypeNote || '') : '';
+  }
+  fillMotionSources();
+}
+
+/** The "motion from" menu: installs that carry motions THIS one declares and
+ *  does not ship.
+ *
+ *  Only installs that actually supply something are listed. One that supplies
+ *  nothing would sit in the menu doing nothing when picked, which reads as
+ *  "I tried it and it looked identical" -- a wrong answer produced by an
+ *  empty option rather than by the data.
+ *
+ *  Refreshed with the action list because it depends on the LOADOUT: which
+ *  motions are missing is a function of shape and weaponset.
+ *
+ *  ONE REQUEST IN FLIGHT, the current loadout's. This is fire-and-forget
+ *  (nothing awaits it) and it used to carry no AbortController, so every body
+ *  switch left the previous body's request running -- and `api()` retried a
+ *  failed one, doubling it. MEASURED 2026-09-29 in the owner's tab, cold
+ *  server: six /api/motionsources outstanding for five bodies already left,
+ *  filling the browser's ~6 connections per origin, and the NEXT body's
+ *  /api/figure queued behind them in the browser. The page said "building
+ *  the figure..." and nothing loaded, in two browsers. The satellites call
+ *  next door already did this right; this now does the same. */
+let motionSrcAbort = null;
+let motionSrcFor = '';
+let motionSrcInflight = false;
+
+async function fillMotionSources() {
+  const sel = document.getElementById('anim-source');
+  if (!sel || B.mode === 'model' || !B.loadout.body) return;
+  const keep = sel.value;
+  const p = new URLSearchParams({ body: B.loadout.body.id });
+  if (B.loadout.r_weapon) p.set('right', B.loadout.r_weapon.id);
+  if (B.loadout.l_weapon) p.set('left', B.loadout.l_weapon.id);
+  const sig = p.toString();
+  // THE SAME LOADOUT ASKED TWICE IS ONE REQUEST. `fillActions` runs for the
+  // default loadout and again for the first rebuild, so the page's own start
+  // asks this twice for one body; aborting the first to start an identical
+  // second threw away 1.6 s of server work and delayed the menu by the whole
+  // second request (MEASURED 2026-09-29: 1.6 s aborted, then 7.3 s). Six
+  // rapid body switches likewise collapsed to one loadout and six requests.
+  if (motionSrcInflight && motionSrcFor === sig) return;
+  if (motionSrcAbort) motionSrcAbort.abort();
+  motionSrcAbort = new AbortController();
+  motionSrcFor = sig;
+  motionSrcInflight = true;
+  // A VISIBLE LOADING STATE, because cold this costs ~154 s: it walks every
+  // install on the box and every archive in them. An empty menu for two and
+  // a half minutes does not read as "still working", it reads as broken --
+  // which is how I first saw it myself.
+  if (!sel.options.length) {
+    sel.innerHTML = '<option value="">checking other installs…</option>';
+    sel.disabled = true;
+  }
+  let d;
+  try {
+    d = await api('/api/motionsources?' + sig, { signal: motionSrcAbort.signal });
+  } catch (e) {
+    // Withdrawn by a newer loadout, or outrun by it: the newer call owns the
+    // menu now and this one says nothing. AN ABORT IS NOT A FAILURE -- the
+    // first cut wrote "this install" here for a request the page itself had
+    // withdrawn, and the menu showed a failure while the real answer was
+    // still on its way.
+    if (motionSrcFor !== sig || (e && e.name === 'AbortError')) return;
+    motionSrcInflight = false;
+    sel.innerHTML = '<option value="">this install</option>';
+    sel.disabled = false;
+    return;
+  }
+  if (motionSrcFor !== sig) return;         // the loadout moved under us
+  motionSrcInflight = false;
+  sel.disabled = false;
+  sel.innerHTML = '';
+  const own = el('option', null,
+    `this install (${d.localCount} motion${d.localCount === 1 ? '' : 's'})`);
+  own.value = '';
+  sel.appendChild(own);
+  for (const s of d.sources || []) {
+    const o = el('option', null, `${s.install} (+${s.supplies})`);
+    o.value = s.install;
+    o.title = `${s.install} carries ${s.supplies} motion file(s) this `
+            + `install declares and does not ship. The BODY stays this `
+            + `install's; only the motion is sourced there.`;
+    sel.appendChild(o);
+  }
+  const wrap = document.getElementById('anim-src-wrap');
+  if (wrap) {
+    // HIDDEN WHEN THERE IS NOTHING TO OFFER, and only then. An empty menu
+    // invites the reading that nothing is missing, which is a different
+    // fact from "nothing elsewhere can supply it".
+    wrap.style.display = (d.sources || []).length ? '' : 'none';
+    wrap.title = `${d.foreignCount} motion(s) this loadout names are not `
+               + `installed here; ${d.nowhereCount} are on no install on `
+               + `this machine.`;
+  }
+  if (keep && Array.prototype.some.call(sel.options, o => o.value === keep)) {
+    sel.value = keep;
+  }
+  sel.onchange = async () => {
+    // Drop the cached clip and re-fetch: the whole point is to SEE the
+    // difference, and a cache hit would show the previous source's frames.
+    //
+    // DRIVEN THROUGH THE SAME PATH THE ACTION MENU USES -- `rebuild` then
+    // `ensureAnim` -- because /api/figure is asked for a pose AT this action
+    // and everything derived from it (the stats line, the socket rows, the
+    // how-it-is-built panel) otherwise keeps describing the previous source.
+    // That panel is the one you read to check WHICH motion is in play, so a
+    // stale answer there is the whole bug this feature exists to avoid.
+    // My first version called `setAction`, a function that does not exist.
+    animPause();
+    B.anim.cache = {};
+    B.anim.frame = 0;
+    // REBUILD THE ACTION LIST FIRST. The marks (+ added, != different) are
+    // computed against the SELECTED source, so a list left as it was would
+    // describe the previous one -- and this control exists to answer "what
+    // is different here", which a stale list answers wrongly rather than
+    // not at all. Setting `.value` from inside does not re-fire change, so
+    // this does not recurse.
+    await fillActions();
+    await rebuild({ reframe: false });
+    await ensureAnim();
+  };
 }
 
 // ---------------------------------------------------------------- slots
@@ -569,15 +819,43 @@ async function equip(slot, id, { silent = false, rebuild: doRebuild = true } = {
  *  plain-language names back before anything is drawn -- nothing on this page
  *  should require knowing what an appearance id is. */
 async function refreshLoadoutNames() {
+  // A part THIS install does not have is left empty and NAMED -- never kept
+  // to 404 silently on every render (the old "keep the id" rule, which is
+  // what made a character from another install fail with nothing on screen).
+  // Any other failure still keeps the id: a flaky request is not a verdict.
+  const missing = [];
+  let total = 0;
   for (const [slot, v] of Object.entries(B.loadout)) {
     if (!v || !v.id) continue;
+    total++;
     try {
       const o = await api(`/api/option?slot=${encodeURIComponent(slot)}` +
                           `&id=${encodeURIComponent(v.id)}`);
       B.loadout[slot] = { ...v, name: o.name || v.id, detail: o.detail || '',
                           mesh: o.mesh, texture: o.texture };
-    } catch (e) { /* keep the id: better than an empty slot */ }
+    } catch (e) {
+      if (e.status === 404) {
+        missing.push(`${(B.slotById[slot] || {}).label || slot} ${v.id}`);
+        delete B.loadout[slot];
+      }
+    }
   }
+  if (missing.length) {
+    const where = restoredFrom === 'link' ? 'This link'
+      : restoredFrom === 'legacy' ? 'Your saved character (from before characters were saved per install)'
+      : 'Your saved character';
+    const here = (B.status && B.status.root) || 'this install';
+    const n = missing.length;
+    const tail = !B.loadout.body
+      // No body, no character: init falls back to the default one, which
+      // replaces the parts that DID exist too -- so say that, not "left empty".
+      ? " The body is one of them, so the builder started from its default character instead."
+      : ` ${n === 1 ? 'That slot was' : 'Those slots were'} left empty.`;
+    toast(`${where}: ${n} of ${total} part${total === 1 ? '' : 's'} ` +
+          `${n === 1 ? "doesn't" : "don't"} exist on ${here} (${missing.join(', ')}).` +
+          tail, 9000);
+  }
+  return missing;
 }
 
 function pickerOptionFor(slot, id) {
@@ -621,10 +899,27 @@ const COLLAPSE_KEY = 'cobuilder.collapsed';
 const ANIM_KEY = 'cobuilder.anim';
 const AURA_KEY = 'cobuilder.aura';
 
+/** THE SAVED CHARACTER IS PER INSTALL (the owner, 2026-09-18: "fix the saved
+ *  loadout issue"). It used to be ONE key for the whole browser, so a
+ *  character saved while browsing 6609 came back on CCO, where its ids do not
+ *  exist, and every part 404'd silently. Now each install remembers its own
+ *  last character, keyed by the root being browsed; the old shared key is
+ *  read once, as a fallback, and CHECKED (see `refreshLoadoutNames`). */
+function loadoutKey() {
+  const norm = x => String(x || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  const root = B.status && B.status.root;
+  return root ? `${LOADOUT_KEY}@${norm(root)}` : LOADOUT_KEY;
+}
+
 function saveLoadout() {
-  try { localStorage.setItem(LOADOUT_KEY, JSON.stringify(B.loadout)); }
+  try { localStorage.setItem(loadoutKey(), JSON.stringify(B.loadout)); }
   catch (e) { /* ignore */ }
 }
+
+/** Where the character being restored came from: `link` (a copied link --
+ *  could be from any install), `install` (this install's own save), or
+ *  `legacy` (the pre-fix shared save -- could be from any install). */
+let restoredFrom = null;
 
 function restoreLoadout() {
   const fromUrl = new URLSearchParams(location.hash.replace(/^#/, ''));
@@ -632,16 +927,20 @@ function restoreLoadout() {
     const out = {};
     for (const [k, v] of fromUrl.entries()) out[k] = { id: v, table: k, name: v };
     B.loadout = out;
+    restoredFrom = 'link';
     return out;
   }
-  try {
-    const s = JSON.parse(localStorage.getItem(LOADOUT_KEY) || 'null');
-    if (s && typeof s === 'object') {
-      B.loadout = Object.fromEntries(
-        Object.entries(s).filter(([, v]) => v && v.id));
-      return B.loadout;
-    }
-  } catch (e) { /* ignore */ }
+  for (const [key, from] of [[loadoutKey(), 'install'], [LOADOUT_KEY, 'legacy']]) {
+    try {
+      const s = JSON.parse(localStorage.getItem(key) || 'null');
+      if (s && typeof s === 'object') {
+        B.loadout = Object.fromEntries(
+          Object.entries(s).filter(([, v]) => v && v.id));
+        restoredFrom = from;
+        return B.loadout;
+      }
+    } catch (e) { /* ignore */ }
+  }
   return null;
 }
 
@@ -777,10 +1076,82 @@ function pickerQuery() {
   if (B.picker.tags.has(' untagged')) p.set('untagged', '1');
   const tags = [...B.picker.tags].filter(t => t !== ' untagged');
   if (tags.length) p.set('tag', tags.join(','));
+  const since = $('#picker-since-base') && $('#picker-since-base').value;
+  if (since) {
+    p.set('newSince', since);
+    p.set('sinceMode', ($('#picker-since-mode') || {}).value || 'new');
+  }
   return p;
 }
 
+/** "New since <install>": fill the picker's comparison list once, from the
+ *  installs the user has declared, and remember the choice per browser. The
+ *  current install is left out -- nothing is new relative to itself. */
+let sinceFilled = false;
+async function fillSinceBases() {
+  const sel = $('#picker-since-base');
+  if (!sel || sinceFilled) return;
+  sinceFilled = true;
+  let d;
+  try { d = await api('/api/bases'); } catch (e) { return; }
+  // The install being browsed is left out -- nothing is new relative to
+  // itself -- matched by its ROOT from /api/status.
+  const norm = x => String(x || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  const here = norm(B.status && B.status.root);
+  for (const b of (d && d.paths) || []) {
+    if (b.kind !== 'install' || (here && norm(b.detail) === here)) continue;
+    const o = document.createElement('option');
+    o.value = b.id;
+    o.textContent = b.label || b.id;
+    sel.appendChild(o);
+  }
+  let saved = '';
+  try { saved = localStorage.getItem('co.picker.newSince') || ''; } catch (e) {}
+  if (saved && [...sel.options].some(o => o.value === saved)) sel.value = saved;
+  sel.addEventListener('change', () => {
+    try { localStorage.setItem('co.picker.newSince', sel.value); } catch (e) {}
+    loadPickerOptions();
+  });
+  const mode = $('#picker-since-mode');
+  if (mode) {
+    let savedMode = '';
+    try { savedMode = localStorage.getItem('co.picker.sinceMode') || ''; } catch (e) {}
+    if (savedMode) mode.value = savedMode;
+    mode.addEventListener('change', () => {
+      try { localStorage.setItem('co.picker.sinceMode', mode.value); } catch (e) {}
+      if (sel.value) loadPickerOptions();
+    });
+  }
+}
+
+/** Say what the filter did -- or why it refused, e.g. a renumbered table. */
+function renderSinceNote(data) {
+  const note = $('#picker-since-note');
+  if (!note) return;
+  const ns = data.newSince;
+  if (!ns) { note.textContent = ''; return; }
+  const what = { new: 'new', changed: 'changed', both: 'new or changed' }[ns.mode] || 'new';
+  if (!ns.comparable) { note.textContent = `not filtered: ${ns.why}`; return; }
+  if (ns.state === 'computing') {
+    // A content comparison reads files on both installs; say so, and ask
+    // again until it lands -- the list below is NOT filtered yet.
+    note.textContent = `comparing with ${ns.label}… ${ns.done} of ${ns.total} ` +
+                       `(list not filtered yet)`;
+    clearTimeout(renderSinceNote.t);
+    renderSinceNote.t = setTimeout(() => {
+      if (B.picker.open) loadPickerOptions();
+    }, 1500);
+    return;
+  }
+  if (ns.state === 'failed') { note.textContent = `comparison failed: ${ns.error}`; return; }
+  const by = ns.how === 'content' ? ' (by content: this table was renumbered)' : '';
+  const unk = ns.unknown ? ` · ${ns.unknown} with no readable art not counted` : '';
+  note.textContent = `showing ${ns.shown} of ${ns.ofTotal} colour variants ` +
+                     `${what} since ${ns.label}${by}${unk}`;
+}
+
 async function loadPickerOptions() {
+  await fillSinceBases();
   const list = $('#picker-list');
   list.innerHTML = '<div class="mut small" style="padding:12px">loading…</div>';
   let data;
@@ -788,6 +1159,7 @@ async function loadPickerOptions() {
   catch (e) { list.innerHTML = ''; list.appendChild(el('div', 'err', e.message)); return; }
   B.picker.data = data;
   renderPickerFacets(data);
+  renderSinceNote(data);
   list.innerHTML = '';
   const items = [];
   for (const g of data.garments) {
@@ -820,25 +1192,34 @@ function renderPickerFacets(data) {
   const host = $('#picker-facets');
   host.innerHTML = '';
   const order = ['kind', 'type', 'class', 'quality', 'gender', 'size'];
-  const axes = order.filter(a => data.facets[a]);
+  // AN ACTIVE FILTER IS ALWAYS DRAWN. The owner, 2026-09-18: "filters will get
+  // stuck or disappear when they shouldn't ... there are things filtered, but
+  // not shown." Counts come from the FILTERED results, so a ticked value whose
+  // count fell to 0 -- or an axis with no counts left -- used to vanish while
+  // still filtering, leaving nothing to untick. Selected values and their
+  // axes are drawn whatever the counts say, at 0 if need be.
+  const selOf = a => B.picker.sel[a] || new Set();
+  const axes = order.filter(a => data.facets[a] || selOf(a).size);
   for (const axis of axes) {
-    const counts = data.facets[axis];
+    const counts = data.facets[axis] || {};
     const box = el('div', 'facet-axis');
-    box.appendChild(el('div', 'axis-name', data.facetLabels[axis] || axis));
-    const pref = data.facetOrder[axis] || [];
+    box.appendChild(el('div', 'axis-name', (data.facetLabels || {})[axis] || axis));
+    const pref = (data.facetOrder || {})[axis] || [];
     const keys = [...pref.filter(k => k in counts),
                   ...Object.keys(counts).filter(k => !pref.includes(k)).sort()];
+    for (const v of selOf(axis)) if (!keys.includes(v)) keys.push(v);
     for (const v of keys) {
       const set = B.picker.sel[axis] || (B.picker.sel[axis] = new Set());
       const on = set.has(v);
-      box.appendChild(chip(lbl(v), counts[v], on, () => {
+      box.appendChild(chip(lbl(v), counts[v] || 0, on, () => {
         on ? set.delete(v) : set.add(v);
         loadPickerOptions();
       }));
     }
     host.appendChild(box);
   }
-  const tc = data.tagCounts || {};
+  const tc = Object.assign({}, data.tagCounts || {});
+  for (const t of B.picker.tags) if (t !== ' untagged' && !(t in tc)) tc[t] = 0;
   if (Object.keys(tc).length || B.picker.tags.size) {
     const box = el('div', 'facet-axis');
     box.appendChild(el('div', 'axis-name', 'Your tags'));
@@ -861,20 +1242,60 @@ function renderPickerFacets(data) {
     host.appendChild(el('div', 'small mut',
       'no filters apply to this slot — everything here fits'));
   }
+  paintPickerClear();
+}
+
+/** How many filters narrow the picker right now: facet values, tags, the
+ *  search box and "New since". */
+function pickerFilterCount() {
+  let n = 0;
+  for (const set of Object.values(B.picker.sel || {})) n += set ? set.size : 0;
+  n += (B.picker.tags || new Set()).size;
+  if ($('#picker-search') && $('#picker-search').value.trim()) n++;
+  if ($('#picker-since-base') && $('#picker-since-base').value) n++;
+  return n;
+}
+
+/** "Clear filters (N)" -- the owner asked for one button that undoes every
+ *  filter; disabled, and saying so, when there is nothing to clear. */
+function paintPickerClear() {
+  const b = $('#picker-clear-filters');
+  if (!b) return;
+  const n = pickerFilterCount();
+  b.disabled = n === 0;
+  b.textContent = n ? `Clear filters (${n})` : 'No filters';
+}
+
+function clearPickerFilters() {
+  B.picker.sel = {};
+  B.picker.tags = new Set();
+  if ($('#picker-search')) $('#picker-search').value = '';
+  const since = $('#picker-since-base');
+  if (since && since.value) {
+    since.value = '';
+    try { localStorage.setItem('co.picker.newSince', ''); } catch (e) {}
+  }
+  loadPickerOptions();
 }
 
 /** One item: the mesh, with its colours as swatches underneath. */
 function garmentRow(g, index) {
-  const wrap = el('div');
+  // THE THUMBNAIL SPANS BOTH LINES (the owner, 2026-09-18: "that thumbnail
+  // could be 4x as big ... 2x2 ... and it would still be the same amount of
+  // lines"). It sits in the entry's left column beside the name line AND the
+  // colour-swatch line, twice as wide and twice as tall as before; the image
+  // requested is the same, only drawn larger.
+  const wrap = el('div', 'garment');
   const row = el('div', 'row-item');
-  const img = setThumb(el('img'), g.mesh || g.texture, 48);
+  const img = setThumb(el('img', 'garment-thumb'), g.mesh || g.texture, 48);
+  img.addEventListener('click', () => highlight(index, 0));
   const lb = el('div', 'lbl');
   lb.appendChild(el('b', null, g.name || g.meshName));
   const bits = [];
   if (g.detail) bits.push(g.detail);
   bits.push(`${g.count} colour${g.count === 1 ? '' : 's'}`);
   lb.appendChild(el('span', null, bits.join(' · ')));
-  row.append(img, lb);
+  row.append(lb);
   const strip = el('div', 'variants');
   g.variants.forEach((v, vi) => {
     const s = el('img');
@@ -886,7 +1307,7 @@ function garmentRow(g, index) {
     strip.appendChild(s);
   });
   row.addEventListener('click', () => highlight(index, 0));
-  wrap.append(row, strip);
+  wrap.append(img, row, strip);
   return { node: wrap, item: { el: row, stripEl: strip, variants: g.variants,
                                mesh: g.mesh, name: g.name } };
 }
@@ -1242,7 +1663,7 @@ async function rebuild({ reframe = false } = {}) {
   p.set('bodyTable', 'body');
   p.set('action', B.anim.action);
   p.set('frame', String(B.anim.frame | 0));
-  $('#gl-msg').textContent = 'building…';
+  $('#gl-msg').textContent = 'building the figure…';
   $('#gl-msg').classList.remove('hidden');
   let fig;
   try { fig = await api('/api/figure?' + p.toString()); }
@@ -1272,14 +1693,29 @@ async function rebuild({ reframe = false } = {}) {
       fig.parts.map(p => ({ key: 'slot:' + p.slot, path: p.texture }))),
     { pngUrl: texUrl, isCurrent: () => stillCurrent(tk) });
   if (!stillCurrent(tk)) return;
-  $('#gl-msg').classList.add('hidden');
+  // The figure is drawn; the animation for a NEW body is still on its way
+  // (MEASURED 0.7-1.0 s for /api/anim the first time each body type is shown),
+  // and before this the page went silent for exactly that stretch.
+  $('#gl-msg').textContent = 'loading the animation…';
   $('#gl-stats').textContent = viewer.stats +
     `\n${fig.body.id}` + fig.parts.map(p => ` + ${p.slot}:${p.id}`).join('');
   renderDetailPanel(fig);
   // the weapon is part of the motion lookup, so the action list is re-derived
   await fillActions();
   await ensureAnim({ silent: true });
+  if (stillCurrent(tk)) $('#gl-msg').classList.add('hidden');
   await refreshWeaponPanel();
+  // The companion set is a property of the LOADOUT, not of the render, so it
+  // is refreshed here and re-fetched only when what is equipped changed --
+  // `compSignature` is what makes a camera nudge free.
+  //
+  // DEBOUNCED, and the stale request CANCELLED. MEASURED 2026-09-18 (owner:
+  // "moving between bodies ... occasional slowdowns that feel awful"): each
+  // body switch fired /api/buildersatellites at once, ~8 s of server work
+  // each, and clicking through bodies stacked them -- 11-17.5 s apiece while
+  // they overlapped, and the switch's own 6 ms /api/option took 5-8 s behind
+  // them. Only the loadout the user STOPS on needs its companions.
+  scheduleCompanions();
   if (anyAuraOn()) await applySuperFx();
   viewer.draw();
 }
@@ -1366,9 +1802,40 @@ function renderAnimPanel() {
     ['speed', `${B.anim.speed} ms/frame`],
     ['evidence', d ? `${d.confidence}` : ''],
   ];
+  // WHICH ROUTE ANSWERED. `resolve()` has always returned it and `/api/anim`
+  // has always sent it as `how`; nothing rendered it, and that silence is a
+  // correctness problem rather than a missing detail.
+  //
+  // `MotionIndex.lookup` has a five-step fallback chain ending at the
+  // universal idle, so an action this client ships NO motion for still comes
+  // back with a clip: frames, aligned, four chunks -- indistinguishable from
+  // a real animation. MEASURED on 5017, body 3135990 + bow 500218: actions
+  // 010, 975 and 984 all resolve to `c3/0003/500/100.c3` via
+  // "action -> 100 (idle)" and every one reports frames=21, aligned=true.
+  //
+  // That matters because the reason to watch an unidentified code is to NAME
+  // it. Watching the idle and labelling it "975" is a wrong answer produced
+  // by a viewer that looked like it worked -- and it would be written down.
+  if (d && d.how) rows.push(['resolved by', d.how]);
   if (d && d.chain) rows.push(['chains with', `action ${d.chain}`]);
   b.appendChild(kv(rows));
   if (d && d.evidence) b.appendChild(el('div', 'small mut', d.evidence));
+  // A FALLBACK IS A WARNING, NOT A ROW. `own` is the server's verdict on
+  // `how` (`anim.route_is_own`, the one predicate); `how` is the route's
+  // WORDING, shown in the row above and never compared here. This used to
+  // test `d.how !== 'exact'`, and `resolve()` suffixes an exact hit when the
+  // alias table answered -- `exact (weapon set 580 animates from set 560)`
+  // -- so the panel said "Do not name 401 from this" over 401's own motion
+  // (5517, body 002135000 + weapon 580001, 2026-09-25). A payload with no
+  // verdict at all (an older server) stays unwarned rather than reading as
+  // a fallback.
+  if (d && d.own === false) {
+    b.appendChild(el('div', 'warn',
+      `⚠ NOT THIS ACTION'S OWN MOTION. Action ${d.action} resolves through ` +
+      `the fallback chain (${d.how}), so what you are watching is ` +
+      `${d.motion} — not a motion this client ships for ${d.action}. ` +
+      `Do not name ${d.action} from this.`));
+  }
   if (d && d.error) b.appendChild(el('div', 'warn', '⚠ ' + d.error));
   if (d && d.chain) {
     b.appendChild(el('div', 'note',
@@ -1399,14 +1866,23 @@ function animParams(action) {
   const p = new URLSearchParams({ body: B.loadout.body.id, action });
   if (B.loadout.r_weapon) p.set('weapon', B.loadout.r_weapon.id);
   if (B.loadout.l_weapon) p.set('offHand', B.loadout.l_weapon.id);
+  // THE MOTION'S SOURCE INSTALL, empty for "this one". The body is never
+  // sourced elsewhere -- only the motion -- so what is on screen is always
+  // this install's character wearing another patch level's animation.
+  const src = (document.getElementById('anim-source') || {}).value || '';
+  if (src) p.set('source', src);
   return p;
 }
 
 async function fetchClip(action) {
   if (B.mode === 'model') return fetchModelClip(action);
+  // THE SOURCE IS PART OF THE CACHE KEY. Without it, switching install
+  // would show the previous install's frames from cache and look like the
+  // two were identical -- which is the exact question being asked.
   const key = `${B.loadout.body.id}:${action}:` +
               `${(B.loadout.r_weapon || {}).id || ''}:` +
-              `${(B.loadout.l_weapon || {}).id || ''}`;
+              `${(B.loadout.l_weapon || {}).id || ''}:` +
+              `${(document.getElementById('anim-source') || {}).value || ''}`;
   if (B.anim.cache[key]) return B.anim.cache[key];
   const d = await api('/api/anim?' + animParams(action).toString());
   B.anim.cache[key] = d;
@@ -2328,7 +2804,7 @@ function fillModelActions() {
       sel.appendChild(host);
     }
     const o = el('option', null,
-      (a.named ? a.label : `${a.label} (${a.code}, unidentified)`) +
+      actionLabel(a) +
       (a.distinct ? '' : ` — same clip as ${a.aliasOf}`));
     o.value = a.code;
     o.title = [a.evidence, a.motion,
@@ -2342,7 +2818,7 @@ function fillModelActions() {
     const og = document.createElement('optgroup');
     og.label = `Not in this install (${missing.length})`;
     for (const a of missing.slice(0, 60)) {
-      const o = el('option', null, `${a.label} (${a.code}) — file missing`);
+      const o = el('option', null, `${actionLabel(a)} — file missing`);
       o.value = a.code;
       o.disabled = true;
       o.title = a.reason;
@@ -2462,6 +2938,530 @@ async function rebuildModel({ reframe = false } = {}) {
 // showing: an ad-hoc mesh opened by path, or a catalogued model's own files.
 let collectionMeta = null;
 
+// ------------------------------------------------------- satellite choosing
+//
+// Backlog section 7: the user chooses what comes with a collected asset.
+// Everything below is driven by `/api/collectoffer`, and the three rules the
+// owner set are honoured HERE ONLY BY DEFERRING TO THE SERVER, which is the
+// point:
+//
+//  1. SELECT ALL DOES NOT REACH ANIMATIONS. `offer.selectAllKinds` is
+//     `collection.select_all_kinds()` -- the single definition of that ruling
+//     -- and `satSelectAll` ticks exactly those names. **This file holds no
+//     list of satellite kinds at all.** Writing one here is how a ruling gets
+//     honoured in the table and broken in the button, so a gate
+//     (`tests/test_collect_checkboxes.py`) asserts that no kind name appears
+//     literally in this file and that the select-all handler decides
+//     membership by asking the server's set.
+//  2. THE COST IS SHOWN BEFORE THE CLICK. Every row carries a count and a
+//     size, and the footer totals the ticked ones, so select-all is not a
+//     blind action.
+//  3. AN ABSENT COMPANION IS SHOWN, NOT DROPPED. A row reads "0 of 3
+//     present"; an absent item renders greyed with why. Section 6: a list of
+//     six silently hiding three is a trap the user cannot detect.
+
+/** How a kind's count reads, and the three states it must not collapse.
+ *
+ *  `available` arrives as the STRING "unknown" whenever nothing could count
+ *  this kind -- either the whole resolve failed, or this particular kind's
+ *  sources are classified-but-not-enumerated (a shared motion set is the
+ *  measured case). Printing "none" for either is the lie this panel exists to
+ *  avoid, and the string is what makes an accidental `0` impossible. */
+function satCountText(row) {
+  if (!row.measured) return 'not measured';
+  if (row.unenumerated || row.available === 'unknown') return 'not enumerated';
+  if (!row.available) return 'none';
+  if (row.absent) return `${row.present} of ${row.available} present`;
+  return String(row.present);
+}
+
+function satCountClass(row) {
+  if (!row.measured || row.unenumerated || row.available === 'unknown') {
+    return 'warn';
+  }
+  return row.available ? '' : 'mut';
+}
+
+/** Bytes, in the units a person uses. */
+function satSize(n) {
+  if (!n) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
+
+/** The offer for one asset, plus which kinds are ticked. Keyed by subject so
+ *  moving the stage and coming back does not resurrect a stale offer. */
+let satState = null;
+
+/** SELECT ALL.
+ *
+ *  The reachable set comes from the SERVER and nothing else. A kind is ticked
+ *  if and only if it is in `selectAllKinds`, so the NOT RECOMMENDED group is
+ *  left exactly as the user had it -- not cleared, not set: untouched, because
+ *  select-all is a statement about the recommended group and says nothing
+ *  about the other one. */
+function satSelectAll(st) {
+  const reach = new Set(st.offer.selectAllKinds || []);
+  for (const row of st.offer.kinds || []) {
+    if (reach.has(row.name)) st.picked[row.name] = true;
+  }
+}
+
+/** SELECT NONE. Unticks everything, the NOT RECOMMENDED group included --
+ *  clearing a deliberate choice is what "none" means, and unlike select-all it
+ *  cannot surprise anyone by taking something extra. */
+function satSelectNone(st) {
+  for (const row of st.offer.kinds || []) st.picked[row.name] = false;
+}
+
+/** What ticking these kinds would cost right now. */
+function satTotals(st) {
+  let files = 0, bytes = 0, absent = 0, unsized = 0, unknown = 0;
+  for (const row of st.offer.kinds || []) {
+    if (!st.picked[row.name]) continue;
+    if (!row.measured || row.unenumerated
+        || typeof row.present !== 'number') { unknown += 1; continue; }
+    files += row.present;
+    bytes += row.bytes;
+    absent += row.absent;
+    unsized += row.unsized;
+  }
+  return { files, bytes, absent, unsized, unknown };
+}
+
+/** One checkbox row. */
+function satRow(st, row, onChange) {
+  const wrap = el('div', 'sat-row' + (row.selectAll ? '' : ' sat-optin'));
+  const lab = el('label', 'chk');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.checked = !!st.picked[row.name];
+  // Disabled only when the whole offer is UNMEASURED. Deliberately NOT
+  // disabled for a kind that is merely `unenumerated`: the offer could not
+  // count it, but a CALLER may still have its own list -- the weapon panel
+  // sends core/weaponcollect's table-resolved motions, which is the only
+  // authority that knows them. Greying the box there would take away a
+  // capability this panel used to have, and would do it in the name of
+  // honesty while actually collecting less.
+  box.disabled = !row.measured;
+  box.addEventListener('change', () => {
+    st.picked[row.name] = box.checked;
+    onChange();
+  });
+  lab.appendChild(box);
+  lab.appendChild(el('b', null, ' ' + row.label));
+
+  // The count, and it never reads as a measurement when it is not one.
+  // `available` is the string "unknown" from the server precisely so that
+  // arithmetic on it fails loudly instead of quietly printing 0.
+  const n = el('span', 'sat-n ' + satCountClass(row));
+  n.textContent = ' ' + satCountText(row);
+  lab.appendChild(n);
+  if (row.bytes) lab.appendChild(el('span', 'sat-b mut', ' · ' + satSize(row.bytes)));
+  if (row.unsized) {
+    lab.appendChild(el('span', 'sat-b mut',
+      ` · ${row.unsized} of unknown size`));
+  }
+  wrap.appendChild(lab);
+
+  if (!row.selectAll && row.whyNot) {
+    wrap.appendChild(el('div', 'sat-why small mut', row.whyNot));
+  }
+  if (row.measured && row.unenumerated) {
+    // The count is unknown; the box still works. Say both, or a user reads
+    // "not enumerated" as "there is nothing here to tick".
+    wrap.appendChild(el('div', 'sat-why small mut',
+      'Nothing here could count these, so the number is unknown rather than '
+      + 'zero. Ticking it still takes whatever this asset’s own tables '
+      + 'name — for a weapon that is the motion rows the collector '
+      + 'resolved — and the entry records the count as unknown.'));
+  }
+  for (const note of row.notes || []) {
+    wrap.appendChild(el('div', 'sat-why small mut', note));
+  }
+
+  // The items, on demand. Absent ones are IN this list, greyed, with the
+  // reason -- that is the whole of the bulletproof rule at row level.
+  if ((row.items || []).length) {
+    const more = el('button', 'ghost tiny', `list ${row.items.length}`);
+    const box2 = el('div', 'sat-items hidden');
+    more.addEventListener('click', () => {
+      box2.classList.toggle('hidden');
+      if (box2.childElementCount) return;
+      for (const it of row.items) {
+        const r = el('div', 'sat-item' + (it.present ? '' : ' absent'));
+        r.appendChild(el('code', null, it.path || '(no file)'));
+        const tail = [];
+        if (!it.present) tail.push('ABSENT from this install');
+        if (it.bytes) tail.push(satSize(it.bytes));
+        if (it.form) tail.push(it.form);
+        if (it.source) tail.push(it.source);
+        if (it.note) tail.push(it.note);
+        if (tail.length) r.appendChild(el('span', 'small mut', ' — ' + tail.join(' · ')));
+        box2.appendChild(r);
+      }
+    });
+    wrap.appendChild(more);
+    wrap.appendChild(box2);
+  }
+  return wrap;
+}
+
+/** The whole chooser: recommended group, NOT RECOMMENDED group, the two
+ *  buttons, the cost line and the honesty carries. */
+function satPanel(host, st, onChange) {
+  host.innerHTML = '';
+  const offer = st.offer;
+
+  if (!offer.measured) {
+    // UNMEASURED is not "nothing to collect". Say which one this is, or the
+    // empty panel reads as a complete answer.
+    host.appendChild(el('div', 'sat-unmeasured warn small',
+      'The companion set could not be resolved for this asset, so what is on '
+      + 'offer is UNKNOWN — not empty. Collecting now takes the mesh and its '
+      + 'primary skin, and the entry will say the offer was never measured.'));
+  }
+
+  const bar = el('div', 'sat-bar');
+  const all = el('button', 'ghost tiny', 'Select all');
+  all.title = 'Tick every recommended kind. It does not reach the '
+            + 'NOT RECOMMENDED group below.';
+  all.addEventListener('click', () => { satSelectAll(st); onChange(); });
+  const none = el('button', 'ghost tiny', 'Select none');
+  none.addEventListener('click', () => { satSelectNone(st); onChange(); });
+  bar.appendChild(all);
+  bar.appendChild(none);
+  host.appendChild(bar);
+
+  const reach = new Set(offer.selectAllKinds || []);
+  const main = el('div', 'sat-group');
+  const optin = el('div', 'sat-group sat-notrec');
+  for (const row of offer.kinds || []) {
+    (reach.has(row.name) ? main : optin).appendChild(
+      satRow(st, row, onChange));
+  }
+  host.appendChild(main);
+  if (optin.childElementCount) {
+    const h = el('div', 'sat-head warn small', 'NOT RECOMMENDED');
+    h.title = 'Exportable, and opt-in only. Select all does not reach this.';
+    host.appendChild(h);
+    host.appendChild(el('div', 'small mut',
+      'Select all does not touch these. Tick one deliberately if you mean it.'));
+    host.appendChild(optin);
+  }
+
+  const t = satTotals(st);
+  const cost = el('div', 'sat-cost');
+  cost.textContent = `Would collect ${t.files} file(s)`
+    + (t.bytes ? `, ${satSize(t.bytes)}` : '')
+    + (t.unsized ? ` (+${t.unsized} of unknown size)` : '');
+  host.appendChild(cost);
+  if (t.absent) {
+    host.appendChild(el('div', 'small warn',
+      `${t.absent} ticked companion(s) are declared but ABSENT from this `
+      + 'install. They cannot be copied; the entry will record that they were '
+      + 'on offer, so the gap stays visible.'));
+  }
+  if (t.unknown) {
+    host.appendChild(el('div', 'small warn',
+      `${t.unknown} ticked kind(s) were not measured.`));
+  }
+  // The two carries that survive every filter, exactly as `assetroot` keeps
+  // them. Without these a tidy list reads as an exhaustive one.
+  if (offer.unresolvedCount) {
+    host.appendChild(el('div', 'small warn',
+      `and ${offer.unresolvedCount} I could not resolve — named by this `
+      + 'install, resolving to no file here.'));
+  }
+  if ((offer.limits || []).length) {
+    const b = el('button', 'ghost tiny', `what was not enumerated (${offer.limits.length})`);
+    const d = el('ul', 'sat-limits hidden');
+    b.addEventListener('click', () => {
+      d.classList.toggle('hidden');
+      if (d.childElementCount) return;
+      for (const L of offer.limits) d.appendChild(el('li', 'small mut', L));
+    });
+    host.appendChild(b);
+    host.appendChild(d);
+  }
+  if (st.report) {
+    const held = el('div', 'sat-held small');
+    held.appendChild(el('b', null, 'Already collected: '));
+    held.appendChild(document.createTextNode(
+      st.report.filter(r => r.taken || r.state !== 'none')
+        .map(r => `${r.kind} ${r.taken} of `
+                + (r.available === 'unknown' ? '? (availability unknown)'
+                                             : r.available))
+        .join(' · ') || 'nothing yet'));
+    host.appendChild(held);
+  }
+}
+
+// ------------------------------------- the Builder's "what goes with this"
+//
+// Backlog section 6, step 4 -- the hard one, and it is hard for one reason:
+// **the Builder's subject is a COMPOSITION, not an asset.** So this panel is
+// per-slot, and three things follow that the Model Viewer's version does not
+// have to deal with:
+//
+//  * A slot whose art does not ship for the chosen body is GREYED WITH ITS
+//    REASON. That greying already exists (`slotCard`, `s.usable` / `s.reason`
+//    out of `/api/builder`), and this builds on it rather than forming a
+//    second opinion: the server carries the SAME `slot_info()` verdict into
+//    the response and the panel prints it verbatim.
+//  * A satellite can belong to two slots at once. In a composition two parts
+//    can reference the same texture, and a user who exports or edits it under
+//    `body` has also changed it under `weapon`. That is invisible in a
+//    per-asset view by construction, so the server computes it across the
+//    whole loadout and it is shown at the top, not in a footnote.
+//  * The honesty carries have to TOTAL. Six slots each saying "and 2 I could
+//    not resolve" still needs one number, or the summary reads as complete.
+
+let compFor = '';          // the loadout signature the panel was built for
+let compData = null;
+
+/** A stable signature of the current composition, so the panel is not rebuilt
+ *  on every stage event -- only when what is equipped actually changes. */
+function compSignature() {
+  return B.slots.map(s => {
+    const v = B.loadout[s.name];
+    return `${s.name}=${v ? (v.mesh || v.id) : ''}`;
+  }).join('|');
+}
+
+/** The card, created once and inserted into the right rail. Built here rather
+ *  than in builder.html so this feature is one file. */
+function compCard() {
+  let card = $('#card-companions');
+  if (card) return card;
+  const rail = $('#right');
+  if (!rail) return null;
+  card = el('section', 'card');
+  card.id = 'card-companions';
+  card.dataset.card = 'companions';
+  const h = el('h2');
+  const tog = el('button', 'cardtoggle', '▾');
+  tog.setAttribute('aria-expanded', 'true');
+  h.appendChild(tog);
+  h.appendChild(document.createTextNode('What goes with this'));
+  card.appendChild(h);
+  const bodyEl = el('div', 'cardbody');
+  bodyEl.id = 'companions-body';
+  card.appendChild(bodyEl);
+  const anchor = $('#card-look');
+  rail.insertBefore(card, anchor || rail.firstChild);
+  return card;
+}
+
+function compSlotBlock(rec) {
+  const wrap = el('div', 'comp-slot' + (rec.usable ? '' : ' disabled'));
+  const head = el('div', 'comp-head');
+  head.appendChild(el('b', null, rec.label || rec.slot));
+  wrap.appendChild(head);
+
+  if (!rec.usable) {
+    // The existing greying, carried through rather than restated. The reason
+    // is the one `/api/builder` already gives the slot card.
+    wrap.appendChild(el('div', 'small mut',
+      rec.reason || 'no art for this slot ships in this build'));
+    return wrap;
+  }
+  if (!rec.mesh) {
+    wrap.appendChild(el('div', 'small mut', rec.note || 'nothing equipped'));
+    return wrap;
+  }
+  head.appendChild(el('code', 'small mut', ' ' + rec.mesh));
+  const offer = rec.offer || {};
+  if (!offer.measured) {
+    wrap.appendChild(el('div', 'small warn',
+      'the companion set for this part could not be resolved — UNKNOWN, '
+      + 'not empty'));
+    return wrap;
+  }
+  const rows = el('div', 'comp-kinds');
+  for (const row of offer.kinds || []) {
+    // EVERY kind prints, the empty ones included. "No effects were found" and
+    // "effects were not looked for" are different answers, and a row that
+    // disappears when it is empty says neither.
+    const r = el('div', 'comp-kind');
+    r.appendChild(el('span', 'comp-k', row.label));
+    r.appendChild(el('span', row.absent ? 'comp-v warn'
+                                        : ('comp-v ' + satCountClass(row)),
+                     satCountText(row)));
+    if (row.bytes) r.appendChild(el('span', 'comp-v mut', satSize(row.bytes)));
+    if (!row.selectAll) {
+      // "opt-in", not "shared": the chip is about how SELECT ALL treats this
+      // group, and a chip reading "shared" beside a satellite list is read as
+      // "this file is shared between two slots", which is a different fact
+      // that this panel reports separately and must not be confused with.
+      const c = el('span', 'chip', 'opt-in');
+      c.title = row.whyNot;
+      r.appendChild(c);
+    }
+    rows.appendChild(r);
+    // The notes carry the reason a row is empty or unknown. Hiding them is
+    // how "Animations: none" gets printed about a body that plainly animates
+    // -- its motion is a SHARED set that MotionBinding classifies and does
+    // not enumerate. Measured live on CCO 2.0, 2026-09-07.
+    for (const note of row.notes || []) {
+      rows.appendChild(el('div', 'comp-absent small mut', note));
+    }
+    for (const it of (row.items || []).filter(i => !i.present)) {
+      // Declared and absent: shown, with the reason. Section 6's rule.
+      const a = el('div', 'comp-absent small mut');
+      a.appendChild(el('code', null, it.path || '(no file)'));
+      a.appendChild(document.createTextNode(
+        ' — ABSENT' + (it.note ? ': ' + it.note : '')));
+      rows.appendChild(a);
+    }
+  }
+  wrap.appendChild(rows);
+  if (offer.unresolvedCount) {
+    wrap.appendChild(el('div', 'small warn',
+      `and ${offer.unresolvedCount} I could not resolve`));
+  }
+  return wrap;
+}
+
+function renderCompanions(data) {
+  const host = $('#companions-body');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!data) {
+    host.appendChild(el('div', 'mut small', 'working it out…'));
+    return;
+  }
+  const equipped = (data.slots || []).filter(s => s.mesh).length;
+  host.appendChild(el('div', 'mut small',
+    `${equipped} part(s) equipped. Each one's companions are listed under it; `
+    + 'a part whose art does not ship for this body is greyed with the '
+    + 'reason, exactly as its slot card is.'));
+
+  // Shared satellites FIRST, because the whole hazard is that a user acts on
+  // one part without knowing they are acting on another.
+  if ((data.shared || []).length) {
+    const box = el('div', 'comp-shared warn');
+    box.appendChild(el('b', null,
+      `${data.shared.length} file(s) belong to more than one part`));
+    for (const s of data.shared) {
+      const r = el('div', 'small');
+      r.appendChild(el('code', null, s.path));
+      r.appendChild(document.createTextNode(' — ' + s.slots.join(', ')
+        + '. Editing or replacing it changes all of them.'));
+      box.appendChild(r);
+    }
+    host.appendChild(box);
+  }
+
+  for (const rec of data.slots || []) host.appendChild(compSlotBlock(rec));
+
+  if (data.unresolvedCount) {
+    host.appendChild(el('div', 'warn',
+      `and ${data.unresolvedCount} I could not resolve across this character `
+      + '— named by this install, resolving to no file here.'));
+  }
+  if ((data.limits || []).length) {
+    const b = el('button', 'ghost tiny',
+      `what was not enumerated (${data.limits.length})`);
+    const d = el('ul', 'sat-limits hidden');
+    b.addEventListener('click', () => {
+      d.classList.toggle('hidden');
+      if (d.childElementCount) return;
+      for (const L of data.limits) d.appendChild(el('li', 'small mut', L));
+    });
+    host.appendChild(b);
+    host.appendChild(d);
+  }
+}
+
+/** Ask the server for this composition's companion sets.
+ *
+ *  Every slot is sent, equipped or not, so the panel can show a greyed slot
+ *  with its reason rather than silently omitting it -- an omitted slot reads
+ *  as "nothing goes there", which is a different claim from "no art for this
+ *  slot ships in this build". */
+let compTimer = null;
+let compAbort = null;
+/** Ask for companions once the loadout has been still for COMP_SETTLE_MS. */
+const COMP_SETTLE_MS = 700;
+function scheduleCompanions() {
+  clearTimeout(compTimer);
+  compTimer = setTimeout(() => refreshCompanions(), COMP_SETTLE_MS);
+}
+
+async function refreshCompanions({ force = false } = {}) {
+  if (IS_MODELS) return;                    // the Model Viewer has its own
+  if (!compCard()) return;
+  const sig = compSignature();
+  if (!force && sig === compFor) return;
+  compFor = sig;
+  // A request for a loadout the user has already left is dropped, not left to
+  // finish: the page never renders it (`compFor !== sig` below), and closing
+  // it frees the browser's connection for the requests that matter now.
+  if (compAbort) compAbort.abort();
+  compAbort = new AbortController();
+  renderCompanions(null);
+  const items = B.slots.map(s => {
+    const v = B.loadout[s.name] || {};
+    return { slot: s.name, mesh: v.mesh || '', appearance: v.id || '' };
+  });
+  try {
+    const data = await api('/api/buildersatellites', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }), signal: compAbort.signal });
+    if (compFor !== sig) return;            // the loadout moved under us
+    compData = data;
+    renderCompanions(data);
+  } catch (e) {
+    if (compFor !== sig) return;
+    const host = $('#companions-body');
+    if (!host) return;
+    host.innerHTML = '';
+    // A failure is UNKNOWN, never "nothing goes with this".
+    host.appendChild(el('div', 'warn',
+      'The companion set could not be worked out: ' + e.message
+      + '. That is not the same as "nothing goes with this character".'));
+  }
+}
+
+/** Fetch the offer for one subject. Never throws into the caller: a failure
+ *  becomes an UNMEASURED offer, which the panel renders as "unknown" rather
+ *  than as an empty list. */
+async function satFetch(mesh, appearance) {
+  const p = new URLSearchParams({ path: mesh });
+  if (appearance) p.set('appearance', appearance);
+  // THE EQUIPPED COMPOSITION, so the Animations row can be ENUMERATED rather
+  // than only classified. Which motion set animates a body depends on what is
+  // in its hands, and this panel is per-SLOT -- so without these three the
+  // resolver can only answer "classified, not enumerated", which is what the
+  // owner read as "no animations" in this card AFTER the same bug was fixed
+  // in the Import/Export pop-out. One surface fixed and not the other leaves
+  // the identical sentence on screen somewhere else.
+  //
+  // `bodyAsset` is the subject string the body slot was sent as: the Builder
+  // sends MESH PATHS while the loadout names APPEARANCE ids, and appearance
+  // 002132300 resolves to mesh 002135000 -- two numbers that never match.
+  if (B.loadout && B.loadout.body && B.loadout.body.id) {
+    p.set('body', String(B.loadout.body.id));
+    const bm = B.loadout.body.mesh || String(B.loadout.body.id);
+    if (bm) p.set('bodyAsset', bm);
+    if (B.loadout.r_weapon && B.loadout.r_weapon.id) {
+      p.set('right', String(B.loadout.r_weapon.id));
+    }
+    if (B.loadout.l_weapon && B.loadout.l_weapon.id) {
+      p.set('left', String(B.loadout.l_weapon.id));
+    }
+  }
+  try {
+    return await api('/api/collectoffer?' + p.toString());
+  } catch (e) {
+    return { subject: mesh, measured: false, kinds: [], selectAllKinds: [],
+             notRecommended: [], unresolvedCount: 0,
+             limits: [`the offer could not be fetched: ${e.message}`] };
+  }
+}
+
 function currentCollectable() {
   if (B.adhoc && B.adhoc.mesh) {
     return { mesh: B.adhoc.mesh, tex: B.adhoc.resolvedTex || B.adhoc.tex || '',
@@ -2469,10 +3469,51 @@ function currentCollectable() {
   }
   const d = B.model.data;
   if (d && d.mesh) {
-    return { mesh: d.mesh, tex: d.texture || '', name: d.label || d.key || '' };
+    // `appearance` lets the offer consult WeaponEffect.ini / Action3DEffect.ini
+    // for this id. Without it those tables are not read at all, and the offer
+    // says so as a limit rather than reporting zero hit effects.
+    return { mesh: d.mesh, tex: d.texture || '', name: d.label || d.key || '',
+             appearance: d.ident || '' };
   }
   return null;
 }
+
+/* The satellite panels' own layout. Injected from here rather than added to
+ * style.css so this feature is one file; it sets structure only and takes
+ * every colour from the page's existing variables, so it cannot fight a theme
+ * change made in the stylesheet. */
+(function satStyles() {
+  if (document.getElementById('sat-style')) return;
+  const s = el('style');
+  s.id = 'sat-style';
+  s.textContent = `
+.sat-panel { margin-top: 8px; border-top: 1px solid var(--line, #333); padding-top: 6px; }
+.sat-bar { display: flex; gap: 4px; margin-bottom: 4px; }
+.sat-row { padding: 2px 0; }
+.sat-row .chk { display: block; }
+.sat-n { font-variant-numeric: tabular-nums; }
+.sat-why { margin: 0 0 3px 18px; }
+.sat-head { margin-top: 8px; font-weight: 700; letter-spacing: .04em; }
+.sat-notrec { border-left: 2px solid var(--warn, #e6b455); padding-left: 6px; }
+.sat-items { margin: 2px 0 4px 18px; max-height: 180px; overflow: auto; }
+.sat-item { padding: 1px 0; word-break: break-all; }
+.sat-item.absent { opacity: .6; text-decoration-line: line-through;
+                   text-decoration-color: var(--warn, #e6b455); }
+.sat-cost { margin-top: 6px; font-weight: 700; }
+.sat-limits { margin: 4px 0 0 14px; padding: 0; }
+.sat-held { margin-top: 6px; }
+.comp-slot { border-top: 1px solid var(--line, #333); padding: 5px 0; }
+.comp-slot.disabled { opacity: .55; }
+.comp-head { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.comp-kind { display: flex; gap: 6px; align-items: baseline; font-size: 11px; }
+.comp-k { flex: 1 1 auto; }
+.comp-v { font-variant-numeric: tabular-nums; }
+.comp-absent { margin-left: 10px; word-break: break-all; }
+.comp-shared { border: 1px solid var(--warn, #e6b455); padding: 5px; margin-bottom: 6px; }
+.hidden { display: none; }
+`;
+  document.head.appendChild(s);
+})();
 
 function guessCategory(p) {
   const k = (p || '').toLowerCase();
@@ -2492,6 +3533,20 @@ function guessCategory(p) {
 
 let collectFor = null;
 
+/** Which render of this card is the current one.
+ *
+ *  `renderCollect` awaits before it appends anything, and the "already drawn"
+ *  guard below cannot see a render that is still inside that await -- it looks
+ *  for an `<input>` that has not been created yet. So two calls arriving while
+ *  `/api/keep` is in flight both proceeded, and the card was drawn TWICE: two
+ *  category pickers, two Collect buttons, two satellite choosers each with
+ *  their own selection, and `satState` left holding whichever finished last.
+ *  Observed live on the model viewer, 2026-09-07.
+ *
+ *  A sequence number is the fix that does not depend on what has been
+ *  appended yet: every await re-checks it, and a superseded render stops. */
+let collectSeq = 0;
+
 async function renderCollect({ force = false } = {}) {
   const host = $('#collect-body');
   if (!host) return;
@@ -2501,12 +3556,22 @@ async function renderCollect({ force = false } = {}) {
   if (!force && collectFor === subj && host.querySelector('input')) {
     return;
   }
+  const seq = ++collectSeq;
   collectFor = subj;
-  host.innerHTML = '';
   if (!collectionMeta) {
     try { collectionMeta = await api('/api/keep'); }
-    catch (e) { host.appendChild(el('div', 'mut small', 'unavailable')); return; }
+    catch (e) {
+      if (seq !== collectSeq) return;
+      host.innerHTML = '';
+      host.appendChild(el('div', 'mut small', 'unavailable'));
+      return;
+    }
   }
+  // Cleared only once this render is committed to drawing, and only if it is
+  // still the current one. Clearing before the await left the card blank for
+  // the duration of a slow fetch and then filled it twice.
+  if (seq !== collectSeq) return;
+  host.innerHTML = '';
   if (!collectionMeta.library) {
     host.appendChild(el('div', 'mut small',
       'No COmmunity Library configured.'));
@@ -2546,11 +3611,19 @@ async function renderCollect({ force = false } = {}) {
   go.addEventListener('click', async () => {
     go.disabled = true;
     try {
+      const body = { path: cur.mesh, texture: cur.tex,
+                     category: catSel.value, name: nameIn.value.trim() };
+      // `kinds` is sent ONLY when the chooser is on screen. Its absence means
+      // "collect as this tool always did", so nothing about an older page or
+      // the CLI changes; its presence is the user's explicit selection.
+      if (satState && satState.subject === cur.mesh) {
+        body.kinds = (satState.offer.kinds || [])
+          .filter(r => satState.picked[r.name]).map(r => r.name);
+        if (cur.appearance) body.appearance = cur.appearance;
+      }
       const r = await api('/api/keep/add', { method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: cur.mesh, texture: cur.tex,
-                               category: catSel.value,
-                               name: nameIn.value.trim() }) });
+        body: JSON.stringify(body) });
       collectionMeta = null;
       const np = (r.entry.parts || []).length;
       toast(`collected ${r.entry.id}` + (np ? ` (+${np} motion/effect files)` : ''));
@@ -2562,6 +3635,31 @@ async function renderCollect({ force = false } = {}) {
   });
   host.appendChild(catSel);
   host.appendChild(nameIn);
+
+  // The chooser. Loaded after the buttons are on screen so a slow resolve on
+  // a cold install never delays the thing the user came here to click; until
+  // it lands the row says so, because a blank space would read as "there is
+  // nothing to choose".
+  const satHost = el('div', 'sat-panel');
+  satHost.appendChild(el('div', 'mut small', 'working out what goes with this…'));
+  host.appendChild(satHost);
+  (async () => {
+    const offer = await satFetch(cur.mesh, cur.appearance || '');
+    // Both checks: the stage may have moved, and a second render of the SAME
+    // subject may have superseded this one.
+    if (collectFor !== subj || seq !== collectSeq) return;
+    const st = { subject: cur.mesh, offer, picked: {},
+                 report: (offer.entry || {}).report || null };
+    // Nothing is ticked by default. A default selection is a decision made
+    // for the user, and the one thing it must never quietly include is in the
+    // NOT RECOMMENDED group; starting from the server's recommended set is
+    // both explicit and honours the ruling.
+    satSelectAll(st);
+    satState = st;
+    const redraw = () => satPanel(satHost, st, redraw);
+    redraw();
+  })();
+
   host.appendChild(go);
   const diag = el('button', 'ghost tiny', 'Test connection');
   diag.style.marginLeft = '6px';
@@ -2815,6 +3913,37 @@ async function openWeaponCollect(slot) {
       (cf.tables || []).join(' vs ') + ' — took ' + cf.path));
   }
   if (!plan.mesh) { go.disabled = true; }
+
+  // The satellite chooser, on the Builder's own Collect path.
+  //
+  // The weapon collector resolves its OWN motions and effects out of
+  // `weaponmotion.dbc`/`.ini` (core/weaponcollect.plan_files), and that stays
+  // the authority -- `c3/weapon/` has no per-action siblings at all, so
+  // anything the offer derived from the directory would be empty for every
+  // weapon on the install. So the checkboxes GATE that list rather than
+  // replacing it: a kind the user did not tick contributes nothing, and the
+  // ticked kinds still travel by the path that actually knows them.
+  //
+  // The one rule the page is NOT trusted with is the animations ruling. The
+  // server refuses an explicit motions list when animations is unticked,
+  // whatever this code does -- see post_collect.
+  let wcSat = null;
+  const wcHost = el('div', 'sat-panel');
+  if (plan.mesh) {
+    wcHost.appendChild(el('div', 'mut small',
+      'working out what goes with this\u2026'));
+    host.appendChild(wcHost);
+    (async () => {
+      const offer = await satFetch(plan.mesh, String(v.id || ''));
+      const st = { subject: plan.mesh, offer, picked: {},
+                   report: (offer.entry || {}).report || null };
+      satSelectAll(st);
+      wcSat = st;
+      const redraw = () => satPanel(wcHost, st, redraw);
+      redraw();
+    })();
+  }
+
   go.addEventListener('click', async () => {
     // `undetermined` confirms too, since 2026-08-27. It was suppressed
     // on ONE argument: with no displacement provider wired in, EVERY
@@ -2835,15 +3964,7 @@ async function openWeaponCollect(slot) {
     try {
       const r = await api('/api/keep/add', { method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path: plan.mesh, texture: plan.texture, category: 'Weapons',
-          name: v.name || String(v.id),
-          // Sent even when empty: `motions` present means "the tables were
-          // asked", and its absence would put the directory sweep back --
-          // which returns nothing for every weapon. See core/weaponcollect.py.
-          motions: plan.motions || [],
-          effects: (plan.effects || []).concat(plan.extraParts || []),
-        }) });
+        body: JSON.stringify(wcCollectBody(plan, v, wcSat)) });
       collectionMeta = null;
       const np = (r.entry.parts || []).length;
       toast('collected ' + r.entry.id + (np ? ' (+' + np + ' file(s))' : ''));
@@ -2858,6 +3979,40 @@ async function openWeaponCollect(slot) {
   back.style.marginLeft = '6px';
   back.addEventListener('click', () => renderCollect({ force: true }));
   host.appendChild(back);
+}
+
+/** What the weapon panel POSTs, with the chooser applied.
+ *
+ *  Split out so the gating rule is one readable thing rather than an inline
+ *  ternary inside a click handler.
+ *
+ *  `motions` is sent even when EMPTY and that is load-bearing: its presence
+ *  means "the tables were asked", and its absence would put the directory
+ *  sweep back -- which returns nothing for every weapon on the install and
+ *  would file a motionless entry while reporting success
+ *  (core/weaponcollect.py).
+ *
+ *  With no chooser (it is still loading, or the offer failed) the body is
+ *  exactly what this panel always sent. The chooser can only ever REMOVE from
+ *  that list, never add to it. */
+function wcCollectBody(plan, v, st) {
+  const body = {
+    path: plan.mesh, texture: plan.texture, category: 'Weapons',
+    name: v.name || String(v.id),
+    motions: plan.motions || [],
+    effects: (plan.effects || []).concat(plan.extraParts || []),
+  };
+  if (!st || st.subject !== plan.mesh) return body;
+  body.kinds = (st.offer.kinds || [])
+    .filter(r => st.picked[r.name]).map(r => r.name);
+  body.appearance = String(v.id || '');
+  // Which roles survive is read off the SERVER's kind table, so this stays
+  // free of any kind name of its own -- the same rule satSelectAll follows.
+  const roles = new Set((st.offer.kinds || [])
+    .filter(r => st.picked[r.name]).map(r => r.role));
+  if (!roles.has('motion')) body.motions = [];
+  if (!roles.has('effect') && !roles.has('sound')) body.effects = [];
+  return body;
 }
 
 /** The card when the thing on the stage IS a Collection entry's own copy.
@@ -3018,6 +4173,88 @@ function fillAdhocActions() {
  *  /api/mesh the browser itself uses, so anything visible there is visible
  *  here, with this stage's camera, zoom and lighting.
  */
+/** Call `done` once the mesh<->texture index finishes building.
+ *
+ *  Polls `/api/index/status`, which `sethealth.js` already reads -- the
+ *  endpoint existed and no 3D page asked it anything. Gives up after a bound
+ *  rather than polling forever, and says so in the stage message: a page that
+ *  waits silently and indefinitely is the symptom this whole change is about.
+ */
+let _indexWatch = null;
+function whenIndexReady(tk, done) {
+  if (_indexWatch) return;                 // one watcher, not one per mesh
+  const started = Date.now();
+  const LIMIT_MS = 5 * 60 * 1000;
+  const tick = async () => {
+    let st = null;
+    try { st = await api('/api/index/status'); } catch (e) { st = null; }
+    if (!stillCurrent(tk)) { _indexWatch = null; return; }
+    // THE STATE IS NESTED UNDER `index`, AND READING IT FLAT MEANT THIS
+    // WATCHER COULD NEVER FIRE.
+    //
+    // `api_index_status` answers `{index: unified_status(), run, root, offer}`,
+    // so `available`, `progress` and `state` live one level down. The first
+    // version of this function read `st.available` and `st.progress` at the
+    // top level: both are `undefined` for every response the server can send,
+    // so the watcher polled for its full five minutes and then printed "the
+    // index is still building" on a client whose index had landed thirty
+    // seconds in -- and the progress counts never rendered at all.
+    //
+    // WHAT MADE IT SURVIVE REVIEW is worth more than the fix: this PR verified
+    // the SERVER side (`texture_for_mesh_now` 0.0000 s steady-state,
+    // `unified_status` reporting state=building) and asserted that the page
+    // POLLS the endpoint. It does poll. A watcher that polls forever satisfies
+    // "the page polls /api/index/status" exactly as well as one that works.
+    // The outcome was never checked, only the mechanism.
+    //
+    // `sethealth.js` had it right from the start -- `const idx = rep.index ||
+    // {}` -- so the shape was documented by a working reader in the same tree.
+    // Caught by a peer session copying this function and hitting the same
+    // `state=None available=None` against a server that was `ready/true`.
+    const ix = (st && st.index) || null;
+    // STOP ON `settled`, NOT ON `available` -- the SECOND half of the defect
+    // described above, and it survived the first fix.
+    //
+    // Reading `available` at the right level made this watcher able to fire.
+    // It did not make it able to STOP: a build that FAILED publishes an empty
+    // index, so `available` is false and stays false while nothing further is
+    // coming, and this function would poll its whole five minutes and then
+    // report "still building" about a build that finished. Same reassuring
+    // wrong answer, one layer in.
+    //
+    // `settled` is `_unified_done`, set on both the success and the failure
+    // path -- the one signal the failure cannot leave undisturbed. `available`
+    // now only decides WHICH outcome to report.
+    if (ix && ix.settled) {
+      _indexWatch = null;
+      if (ix.available) {
+        done();
+      } else {
+        $('#gl-msg').textContent =
+          'the mesh/texture index finished without an answer' +
+          (ix.error ? ' (' + ix.error + ')' : '') +
+          '; the model is untextured';
+        $('#gl-msg').classList.remove('hidden');
+      }
+      return;
+    }
+    if (Date.now() - started > LIMIT_MS) {
+      _indexWatch = null;
+      $('#gl-msg').textContent =
+        'the mesh/texture index is still building; the model is untextured';
+      $('#gl-msg').classList.remove('hidden');
+      return;
+    }
+    const n = ix && ix.progress ? ix.progress : null;
+    $('#gl-msg').textContent = n && n.total
+      ? `building the mesh/texture index ${n.done}/${n.total} — geometry first, the skin follows`
+      : 'building the mesh/texture index — geometry first, the skin follows';
+    $('#gl-msg').classList.remove('hidden');
+    _indexWatch = setTimeout(tick, 2000);
+  };
+  _indexWatch = setTimeout(tick, 500);
+}
+
 async function rebuildAdhoc({ reframe = false } = {}) {
   const tk = tokenNow();
   const path = B.adhoc.mesh;
@@ -3039,6 +4276,14 @@ async function rebuildAdhoc({ reframe = false } = {}) {
     return;
   }
   const tex = B.adhoc.tex || d.guessedTexture || '';
+  /* THE SKIN CAN ARRIVE LATER THAN THE GEOMETRY. `/api/mesh` no longer waits
+   * on the mesh<->texture index -- that wait is ~52 s on an un-indexed
+   * client, for a satellite answer, while the geometry beside it is ready in
+   * milliseconds. When the server says `indexPending` it has told us the
+   * texture is NOT KNOWN YET, which is a different fact from "this mesh has
+   * no texture", so the model is drawn now and asked about again once the
+   * build lands. */
+  if (d.indexPending && !B.adhoc.tex) whenIndexReady(tk, () => rebuildAdhoc());
   const mat = zoomMatrix();
 
   // The clip is fetched first so its bounds can frame the camera in the same
@@ -3149,9 +4394,23 @@ function effectBounds(def) {
   return { min: lo, max: hi };
 }
 
+/** Frame the stage the way the EFFECT says to, falling back to the box fit.
+ *
+ *  `effectBounds` above is the fit, and it stays: it is what sets `center`
+ *  and `radius`, and `applyAuthoredCamera` pans relative to that centre. So
+ *  the order matters -- fit first, then override the orbit if the file has an
+ *  opinion. Returns the string the panel prints, so the page always says
+ *  WHICH of the two framings the user is looking at. */
+function frameEffect(def, eb) {
+  viewer.setMeshes([], { frameOn: eb, keepFraming: !eb });
+  const cam = def && def.camera;
+  if (!cam) return null;
+  return viewer.applyAuthoredCamera(cam) ? cam : null;
+}
+
 async function showEffectModel(info, tk) {
   const eb = effectBounds(info.effect);
-  viewer.setMeshes([], { frameOn: eb, keepFraming: !eb });
+  B.model.authoredCam = frameEffect(info.effect, eb);
   $('#anim-action').innerHTML = '';
   if (!info.effect) {
     $('#gl-msg').textContent = info.error || 'this effect has no playable geometry';
@@ -3179,7 +4438,14 @@ async function showEffectModel(info, tk) {
         ? 'no drawable layer — every layer of this effect failed to load'
         : 'this effect declares no layers';
   }
-  $('#gl-stats').textContent = `${info.ident || info.id} · ${n} layer(s)`;
+  // Which framing you are looking at is not cosmetic: an artist's camera and
+  // our box fit disagree, and someone tuning an effect against this view needs
+  // to know which one it is.
+  $('#gl-stats').textContent =
+    `${info.ident || info.id} · ${n} layer(s) · camera: ` +
+    (B.model.authoredCam
+      ? `CAME "${B.model.authoredCam.name || 'unnamed'}" (the artist's)`
+      : 'fitted to bounds (ours, not the artist\'s)');
   $('#fx-wrap').classList.toggle('hidden', !n);
   B.anim.seq = [];
   B.anim.data = null;
@@ -3607,6 +4873,9 @@ function bindCharacterControls() {
     if (slot) await unequip(slot);
   });
   $('#picker-search').addEventListener('input', debounce(loadPickerOptions, 220));
+  $('#picker-search').addEventListener('input', paintPickerClear);
+  if ($('#picker-clear-filters'))
+    $('#picker-clear-filters').addEventListener('click', clearPickerFilters);
   $('#picker').addEventListener('click', e => {
     if (e.target.id === 'picker') cancelPicker();
   });

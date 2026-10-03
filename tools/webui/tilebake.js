@@ -65,10 +65,13 @@ const TileGround = (() => {
   const VS = `
     attribute vec2 aPos;    // painted-image pixels
     attribute vec2 aUV;
+    attribute float aAlpha; // .pux layer mask, per VERTEX -- see _maskQuads
     uniform vec4 uRect;     // x0, y0, 1/w, 1/h of the target rect
     uniform float uFlipY;   // +1 into a texture, -1 straight onto a canvas
     varying vec2 vUV;
+    varying float vA;
     void main() {
+      vA = aAlpha;
       vec2 t = (aPos - uRect.xy) * uRect.zw;      // 0..1, y down like the image
       // Baking into a texture keeps the image's y-down convention, because
       // the UVs that later sample it are y-down too. Drawing straight to a
@@ -86,29 +89,77 @@ const TileGround = (() => {
   const WVS = `
     attribute vec2 aPos;
     attribute vec2 aUV;
+    attribute float aAlpha; // .pux layer mask, per VERTEX -- see _maskQuads
     uniform mat4 uMVP;
     uniform vec3 uAff;      // CELL/64, CELL/32, CELL*K
     uniform vec2 uShift;    // parallax shift, image px (planes only)
     varying vec2 vUV;
+    varying float vA;
     void main() {
+      vA = aAlpha;
       vec2 p = aPos + uShift;
       vec2 w = vec2(p.x * uAff.x + p.y * uAff.y,
                     p.x * uAff.x - p.y * uAff.y - uAff.z);
       gl_Position = uMVP * vec4(w, 0.0, 1.0);
       vUV = aUV;
     }`;
+  // `vA` is the .pux LAYER MASK, interpolated by the raster between the four
+  // corners of a sub-quad -- the same job the client's own `AlphaAt` vertex
+  // colours do (`docs/pux_f1_f2_attribution_2026-09-06.md` 2.4). It is 1.0 for
+  // every other draw path: the attribute ARRAY is disabled there and the
+  // generic vertex attribute is set to 1.0 explicitly, because WebGL's own
+  // default for a disabled attribute is (0,0,0,1) -- x = 0 -- which would make
+  // every plane, sprite and cover fully transparent.
+  // `uTint` is the `.OtherData` per-cover modulation: (r, g, b, a) in 0..1,
+  // NEUTRAL (1,1,1,1) for every draw path that does not set it. It multiplies
+  // the sampled texel, which is the same thing `otherdata.apply_tint` does on
+  // the PNG path -- ALPHA MULTIPLIES the sprite's own alpha rather than
+  // replacing it, so a cover's transparent margin stays transparent.
+  //
+  // A uniform rather than a vertex attribute because sprites are drawn one
+  // placement per call here (`_drawPlacements`), so there is nothing to batch
+  // across and an attribute would cost a buffer upload per sprite for a value
+  // that is constant over its four vertices.
   const FS = `
     precision mediump float;
     uniform sampler2D uTex;
+    uniform vec4 uTint;
     varying vec2 vUV;
-    void main() { gl_FragColor = texture2D(uTex, vUV); }`;
+    varying float vA;
+    void main() {
+      gl_FragColor = texture2D(uTex, vUV) * uTint;
+      gl_FragColor.a *= vA;
+    }`;
 
-  /** The manifest's slot grid: base64 of little-endian u16s. */
+  /** The manifest's slot grid: base64 of little-endian u32s.
+   *
+   *  **u32 since 2026-08-29** -- `tileset.SLOT_BYTES`. It was u16, which
+   *  matched the .pul on disk and stopped matching the manifest once
+   *  `puzzle.py` began minting synthetic ids at 1<<20 for a .pux tile's
+   *  layer stack; four maps in the corpus carry them and none of them could
+   *  be built at all. The single decoder serves both the ground grid and
+   *  every plane's, so the two cannot drift on width.
+   *
+   *  `>>> 0` because `<< 24` on a byte >= 0x80 is negative in JS's signed
+   *  32-bit bitwise ops, and Uint32Array would store the wrap silently --
+   *  a slot grid that mis-decodes renders a plausible-looking WRONG map,
+   *  which is the failure you cannot see. */
+  /** The `.pux` layer mask's geometry: 5x5 vertices bounding a 4x4 quad
+   *  subdivision of one tile, 25 bits, `row*5+col`. `core/dmap.py`'s
+   *  PUX_MASK_SIDE / PUX_MASK_QUADS / PUX_MASK_FULL, mirrored -- a mask this
+   *  file read with a different side length would draw a plausible-looking
+   *  WRONG blend, which is the failure you cannot see. */
+  const PUX_MASK_SIDE = 5;
+  const PUX_MASK_QUADS = PUX_MASK_SIDE - 1;
+  const PUX_MASK_FULL = (1 << (PUX_MASK_SIDE * PUX_MASK_SIDE)) - 1;
+
   function decodeSlots(b64) {
     const raw = atob(b64);
-    const out = new Uint16Array(raw.length / 2);
+    const out = new Uint32Array(raw.length / 4);
     for (let i = 0; i < out.length; i++)
-      out[i] = raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8);
+      out[i] = (raw.charCodeAt(i * 4) | (raw.charCodeAt(i * 4 + 1) << 8)
+             | (raw.charCodeAt(i * 4 + 2) << 16)
+             | (raw.charCodeAt(i * 4 + 3) << 24)) >>> 0;
     return out;
   }
 
@@ -153,14 +204,36 @@ const TileGround = (() => {
       gl.linkProgram(p);
       if (!gl.getProgramParameter(p, gl.LINK_STATUS))
         throw new Error('tilebake link: ' + gl.getProgramInfoLog(p));
+      // NEUTRALISE `uTint` AT LINK TIME. An unset WebGL uniform is (0,0,0,0),
+      // not (1,1,1,1), so `texture2D(...) * uTint` renders everything BLACK
+      // for any caller that does not set it. `_drawQuads` sets it per draw,
+      // but NOT every caller goes through `_drawQuads`:
+      // `tests/test_tilebake_render.py` drives this program with
+      // `gl.drawArrays` directly against a real WebGL context, and adding the
+      // uniform took 5 of its 11 arms red -- a full mask "left clear pixels",
+      // a partial mask "covered nothing", the two transposed masks drawing to
+      // the same place. All of it black.
+      //
+      // A uniform's value persists on the PROGRAM, so setting it once here
+      // makes NEUTRAL the program's own default and fixes every direct caller
+      // that exists and every one written later. The alternative -- making
+      // each caller set it -- is a requirement nobody can see from the call
+      // site, and the next direct caller would break exactly the same way.
+      const prev = gl.getParameter(gl.CURRENT_PROGRAM);
+      gl.useProgram(p);
+      const ut = gl.getUniformLocation(p, 'uTint');
+      if (ut) gl.uniform4f(ut, 1, 1, 1, 1);
+      gl.useProgram(prev);        // leave the caller's binding as we found it
       return { p,
                aPos: gl.getAttribLocation(p, 'aPos'),
                aUV: gl.getAttribLocation(p, 'aUV'),
+               aAlpha: gl.getAttribLocation(p, 'aAlpha'),
                uRect: gl.getUniformLocation(p, 'uRect'),
                uFlipY: gl.getUniformLocation(p, 'uFlipY'),
                uMVP: gl.getUniformLocation(p, 'uMVP'),
                uAff: gl.getUniformLocation(p, 'uAff'),
                uShift: gl.getUniformLocation(p, 'uShift'),
+               uTint: gl.getUniformLocation(p, 'uTint'),
                uTex: gl.getUniformLocation(p, 'uTex') };
     }
 
@@ -220,6 +293,13 @@ const TileGround = (() => {
       this.planeFrame = 0;
       this.scenes = manifest.scenes || [];
       this.covers = manifest.covers || [];
+      // The .DMap's SECOND record list. Absent from this bundle until
+      // 2026-09-15, so the GPU path could not draw a layer the PNG path drew.
+      this.interactive = manifest.interactive || [];
+      // `TerrainLayer0.Puzzle*` -- one tint for the whole main ground. The
+      // per-plane ones live on each `planes[]` record as `tint`, because they
+      // come from a DIFFERENT section (`SceneLayerN`) and a different surface.
+      this.groundTint = manifest.groundTint || null;
       this.stats.tiles = this.tiles.size;
       this.stats.sprites = this.sprites.length;
       this.stats.bytes = manifest.bytes;
@@ -308,6 +388,8 @@ const TileGround = (() => {
       this.planeFrame = 0;
       this.scenes = [];
       this.covers = [];
+      this.interactive = [];
+      this.groundTint = null;
       this.manifest = null;
       this.slots = null;
       for (const b of ['groundBuf', 'planeBuf', 'sceneBuf', 'coverBuf'])
@@ -329,9 +411,38 @@ const TileGround = (() => {
     // `pr` defaults to the window-bake program; the world pass has its own
     // and must pass it in, or the attribute locations come from the wrong
     // program (or from null, when only the world path has ever run).
-    _drawQuads(verts, tex, prog) {
+    /** `alphas` is the OPTIONAL per-vertex `.pux` layer mask, one float per
+     *  vertex, in the same order as `verts`. Ground runs pass it; every other
+     *  caller omits it and gets a constant 1.0.
+     *
+     *  **The constant is not optional and must not be left to WebGL.** A
+     *  disabled attribute defaults to `(0, 0, 0, 1)`, so `aAlpha` would read
+     *  ZERO and the run would draw fully transparent -- the same trap
+     *  `_drawRuns` documents. `_bindAlpha(pr, null)` sets it explicitly. */
+    _drawQuads(verts, tex, prog, alphas, tint) {
       const gl = this.gl, pr = prog || this.prog;
       gl.bindTexture(gl.TEXTURE_2D, tex);
+      // SET EVERY TIME, never only when tinted: a uniform persists on the
+      // program, so one tinted sprite would colour every sprite drawn after
+      // it. That failure looks like a rendering bug anywhere except where it
+      // was caused, which is the expensive kind.
+      if (pr.uTint) {
+        if (tint) gl.uniform4f(pr.uTint, tint[0] / 255, tint[1] / 255,
+                                         tint[2] / 255, tint[3] / 255);
+        else gl.uniform4f(pr.uTint, 1, 1, 1, 1);
+      }
+      if (alphas && alphas.length === verts.length / 4) {
+        if (!this._aBuf) this._aBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this._aBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, alphas, gl.STREAM_DRAW);
+        this._bindAlpha(pr, this._aBuf);
+      } else {
+        // Includes the length-mismatch case ON PURPOSE: a mask array that
+        // does not match the geometry would blend by the wrong vertices,
+        // which looks plausible and is wrong. Falling back to opaque is the
+        // visible failure rather than the convincing one.
+        this._bindAlpha(pr, null);
+      }
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
       gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
       gl.vertexAttribPointer(pr.aPos, 2, gl.FLOAT, false, 16, 0);
@@ -356,6 +467,70 @@ const TileGround = (() => {
     static _quad(x0, y0, x1, y1, u0, v0, u1, v1) {
       return [x0, y0, u0, v0,  x1, y0, u1, v0,  x1, y1, u1, v1,
               x0, y0, u0, v0,  x1, y1, u1, v1,  x0, y1, u0, v1];
+    }
+
+    /** One `.pux` layer's quads over a tile rect, carrying its VERTEX MASK.
+     *
+     *  A layer entry is a terrain row plus a 25-bit mask over the 5x5 grid of
+     *  vertices bounding a 4x4 subdivision of the tile -- the client's own
+     *  `AlphaAt` at `Clients/7878/Env_DX9/Conquer.exe` RVA 0x872A68 turns bit
+     *  `row*5+col` into an alpha of 255 or 0 and hands it to the raster as a
+     *  vertex colour (`docs/pux_f1_f2_attribution_2026-09-06.md`). So the tile
+     *  is emitted as up to 16 sub-quads whose corner alphas the raster
+     *  interpolates, which is what makes one terrain blend into another
+     *  instead of the topmost opaque layer covering everything under it.
+     *
+     *  Returns `{ v, a }` -- vertices in `_quad`'s layout and ONE alpha per
+     *  vertex, `a.length === v.length / 4`.
+     *
+     *  TWO SHORT CIRCUITS, and both are the common case rather than
+     *  micro-optimisation: a FULL mask (0x1FFFFFF, the single most common
+     *  value in the corpus, and what every layer of every map with no mask at
+     *  all is given) emits the one quad this function's caller emitted before
+     *  any of this existed, byte for byte; and a sub-quad whose four corners
+     *  are all clear is dropped, because it would draw nothing.
+     *
+     *  Mirrors `core/dmap.pux_mask_field` -- same 5x5 vertices, same
+     *  `row*5+col`. The FILL differs and it is not hidden: this emits two
+     *  triangles per sub-quad and the raster interpolates them linearly
+     *  (Gouraud), while `pux_mask_field` fills the same square bilinearly. The
+     *  two agree at the vertices and along every sub-quad edge and differ in
+     *  the interiors. The client's own fill is now traced: it is Gouraud on the
+     *  **anti-diagonal** (`docs/pux_interp_diagonal_2026-09-10.md`), which is
+     *  the split this function emits; `pux_mask_field`'s bilinear is the smooth
+     *  approximation. `tests/test_tilebake_exec.py` compares the two where they
+     *  must agree (vertices and edges), not in the interiors. */
+    static _maskQuads(x0, y0, x1, y1, mask) {
+      if ((mask & PUX_MASK_FULL) === PUX_MASK_FULL || !(mask & PUX_MASK_FULL))
+        return { v: Baker._quad(x0, y0, x1, y1, 0, 0, 1, 1),
+                 a: (mask & PUX_MASK_FULL) ? [1, 1, 1, 1, 1, 1]
+                                           : [0, 0, 0, 0, 0, 0] };
+      const v = [], a = [];
+      const w = (x1 - x0) / PUX_MASK_QUADS, h = (y1 - y0) / PUX_MASK_QUADS;
+      const bit = (c, r) => (mask >>> (r * PUX_MASK_SIDE + c)) & 1;
+      for (let r = 0; r < PUX_MASK_QUADS; r++)
+        for (let c = 0; c < PUX_MASK_QUADS; c++) {
+          const a00 = bit(c, r), a10 = bit(c + 1, r),
+                a01 = bit(c, r + 1), a11 = bit(c + 1, r + 1);
+          if (!(a00 || a10 || a01 || a11)) continue;
+          const qx0 = x0 + c * w, qy0 = y0 + r * h;
+          const qx1 = qx0 + w, qy1 = qy0 + h;
+          const u0 = c / PUX_MASK_QUADS, u1 = (c + 1) / PUX_MASK_QUADS;
+          const t0 = r / PUX_MASK_QUADS, t1 = (r + 1) / PUX_MASK_QUADS;
+          // THE ANTI-DIAGONAL split, NOT `_quad`'s main diagonal. The client
+          // (Clients/7878/Env_DX9/Conquer.exe, caller at 0x87B26A) emits each
+          // sub-quad as two triangles (v,u)(v,u+1)(v+1,u) and
+          // (v,u+1)(v+1,u+1)(v+1,u) -- both carry (v,u+1) and (v+1,u), so the
+          // shared edge is TR--BL, the anti-diagonal. `_quad` shares TL--BR and
+          // would split every subdivided sub-quad the wrong way, a wrong
+          // interior on the ~55% of drawn sub-quads whose corners are not
+          // co-planar. `docs/pux_interp_diagonal_2026-09-10.md`. The per-vertex
+          // alpha array below MUST follow the same six-vertex order.
+          v.push(qx0, qy0, u0, t0,  qx1, qy0, u1, t0,  qx0, qy1, u0, t1,   // TL TR BL
+                 qx1, qy0, u1, t0,  qx1, qy1, u1, t1,  qx0, qy1, u0, t1);  // TR BR BL
+          a.push(a00, a10, a01,  a10, a11, a01);
+        }
+      return { v, a };
     }
 
     /** The piece of this plane behind a ground rect, parallax-shifted.
@@ -424,6 +599,8 @@ const TileGround = (() => {
       const [sx0, sy0, sx1, sy1] = Baker._sampleRect(rect, p.parallax);
       const pw = Math.max(1, p.pixels[0]), ph = Math.max(1, p.pixels[1]);
       const G = p.grid, [tw, th] = p.pul;
+      //: The MAP's painted-image extent, which the plane is clipped to below.
+      const MW = this.manifest.pixels[0], MH = this.manifest.pixels[1];
       const groups = new Map();
       for (let oy = Baker._tileOrigin(sy0, ph); oy < sy1; oy += ph)
         for (let ox = Baker._tileOrigin(sx0, pw); ox < sx1; ox += pw)
@@ -445,12 +622,36 @@ const TileGround = (() => {
               if (tx0 + G <= sx0 || tx0 >= sx1 || ty0 + G <= sy0 || ty0 >= sy1)
                 continue;
               const wx0 = x0 + (tx0 - sx0), wy0 = y0 + (ty0 - sy0);
+              // CLIP TO THE MAP'S OWN EXTENT. A backdrop is a backdrop FOR A
+              // MAP: it repeats across whatever rect it is asked for, and the
+              // rect at fit zoom is bigger than the map, so unclipped tiles
+              // painted into the void OUTSIDE the art -- fragments of wall and
+              // railing floating beside the map, which is content that can
+              // never appear in game.
+              //
+              // Measured on 2024thx_new over art x -4096..-1024 (entirely off
+              // the map): 954,220 non-void pixels drawn with planes, 0 with
+              // `planes = []`. 2024xmas_new was clean only because it ships no
+              // plane at all.
+              //
+              // The UVs are clipped with the rect rather than the quad being
+              // dropped, so a tile straddling the edge keeps its remaining
+              // part in register instead of shifting.
+              const cx0 = Math.max(wx0, 0), cy0 = Math.max(wy0, 0);
+              const cx1 = Math.min(wx0 + G, MW), cy1 = Math.min(wy0 + G, MH);
+              if (cx1 <= cx0 || cy1 <= cy0) continue;
               let g = groups.get(ent);
               if (!g) groups.set(ent, g = []);
-              g.push(...Baker._quad(wx0, wy0, wx0 + G, wy0 + G, 0, 0, 1, 1));
+              g.push(...Baker._quad(cx0, cy0, cx1, cy1,
+                                    (cx0 - wx0) / G, (cy0 - wy0) / G,
+                                    (cx1 - wx0) / G, (cy1 - wy0) / G));
             }
+      // `SceneLayerN.Puzzle*` tints backdrop plane N. The value rides on the
+      // plane's own manifest record, so selecting one plane cannot pick up a
+      // neighbour's colour -- `sdragon01_new` carries four different ones.
       for (const [ent, verts] of groups)
-        this._drawQuads(new Float32Array(verts), this.sprites[ent]);
+        this._drawQuads(new Float32Array(verts), this.sprites[ent],
+                        null, null, p.tint);
     }
 
     /** Sprite placements (scenes or covers) over `rect`, in stored painter
@@ -475,7 +676,7 @@ const TileGround = (() => {
         let v = c._verts[ent];
         if (!v) v = c._verts[ent] = new Float32Array(
           Baker._quad(c.x, c.y, c.x + meta.w, c.y + meta.h, 0, 0, 1, 1));
-        this._drawQuads(v, tex);
+        this._drawQuads(v, tex, null, null, c.tint);
       }
     }
 
@@ -604,6 +805,7 @@ const TileGround = (() => {
       gl.activeTexture(gl.TEXTURE0);
       gl.enableVertexAttribArray(pr.aPos);
       gl.enableVertexAttribArray(pr.aUV);
+      this._bindAlpha(pr, null);
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA,
                            gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
@@ -638,6 +840,43 @@ const TileGround = (() => {
     // load, drawn every frame straight into the scene's MVP. Zooming out to
     // the whole map is just a bigger orthographic box over the same buffers.
 
+    /** The drawable layers of a slot, bottom first, as [depth, tileIndex].
+     *
+     * A `.pux` slot may be a STACK: `tileset.py` gives it a synthetic index,
+     * ships the terrain ROWS it is built from, and lists them here bottom
+     * first. A single-layer slot is its own only layer at depth 0, so both
+     * kinds go through one path and the caller never branches on which it has.
+     *
+     * **The per-layer mask IS consulted since 2026-09-06.** A manifest entry
+     * is `[terrainRow, mask]`, the mask being the 25-bit per-vertex alpha the
+     * client reads (`docs/pux_f1_f2_attribution_2026-09-06.md`); `_maskQuads`
+     * turns it into geometry. Before this, layers were stacked full-tile and
+     * the topmost opaque one covered everything beneath it.
+     *
+     * A bare number is still accepted in that slot and read as a FULL mask, so
+     * a manifest cached by a page from before the change renders exactly as it
+     * did rather than going blank.
+     *
+     * Returns [] for a slot whose art did not ship, which is what `empty` and
+     * an unresolved tile have always done.
+     */
+    _layersOf(idx) {
+      const m = this.manifest;
+      if (idx === m.empty) return [];
+      const st = m.stacks && m.stacks[idx];
+      if (st) {
+        const out = [];
+        for (let d = 0; d < st.length; d++) {
+          const e = st[d];
+          const tile = (typeof e === 'number') ? e : e[0];
+          const mask = (typeof e === 'number') ? PUX_MASK_FULL : (e[1] >>> 0);
+          if (this.tiles.has(tile)) out.push([d, tile, mask]);
+        }
+        return out;
+      }
+      return this.tiles.has(idx) ? [[0, idx, PUX_MASK_FULL]] : [];
+    }
+
     /** Build the static geometry for the whole map. `cell` is the world
      *  units per map cell (play.js's CELL). Call after load(). */
     buildWorld(cell) {
@@ -647,32 +886,57 @@ const TileGround = (() => {
       this.k = m.pixels[0] / 64;
       const t0 = performance.now();
 
-      // Ground: every painted slot, grouped by tile, one static VBO of
-      // (pos.px, uv) quads with per-group [first, count) draw ranges.
+
+
+      // Ground: every painted slot, grouped by (depth, tile). A STACKED slot
+      // contributes one quad per layer, and grouping by DEPTH FIRST is what
+      // makes the draw order correct globally -- every slot's layer 0 is drawn
+      // before any slot's layer 1, so a deep stack never paints under a
+      // shallow one. Max depth measured on 2025tsf_new is 13.
       const groups = new Map();
       const G = m.grid, [tw, th] = m.pul;
       for (let j = 0; j < th; j++)
         for (let i = 0; i < tw; i++) {
           const idx = this.slots[j * tw + i];
-          if (idx === m.empty || !this.tiles.has(idx)) continue;
-          let g = groups.get(idx);
-          if (!g) groups.set(idx, g = []);
-          g.push(...Baker._quad(i * G, j * G, (i + 1) * G, (j + 1) * G,
-                                0, 0, 1, 1));
+          for (const [d, tile, mask] of this._layersOf(idx)) {
+            const key = d * 4294967296 + tile;
+            let g = groups.get(key);
+            if (!g) groups.set(key, g = { d, tile, v: [], a: [] });
+            // A partially-masked layer becomes up to 16 sub-quads with
+            // per-vertex alpha; a full mask stays the single quad this loop
+            // has always emitted. Grouping is unchanged -- the sub-quads of
+            // one tile go into the same (depth, tile) run as the whole quad
+            // did, so run order, run count and the depth-first painter order
+            // below are all exactly as before.
+            const q = Baker._maskQuads(i * G, j * G, (i + 1) * G, (j + 1) * G,
+                                       mask);
+            g.v.push(...q.v);
+            g.a.push(...q.a);
+          }
         }
       const runs = [];
       const parts = [];
+      const aparts = [];
       let total = 0;
-      for (const [idx, verts] of groups) {
-        runs.push({ tex: this.tiles.get(idx), first: total / 4,
-                    count: verts.length / 4 });
-        parts.push(verts);
-        total += verts.length;
+      for (const g of [...groups.values()].sort((a, b) => a.d - b.d)) {
+        runs.push({ tex: this.tiles.get(g.tile), first: total / 4,
+                    count: g.v.length / 4 });
+        parts.push(g.v);
+        aparts.push(g.a);
+        total += g.v.length;
       }
       this.groundRuns = runs;
       this.groundBuf = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.groundBuf);
       gl.bufferData(gl.ARRAY_BUFFER, Baker._pack(parts, total), gl.STATIC_DRAW);
+      // ONE FLOAT PER VERTEX, in its own buffer rather than a fifth component
+      // of the shared 16-byte vertex: `aPos`/`aUV` at stride 16 is the format
+      // FIVE draw paths bind (ground, planes, scenery, covers, the window
+      // bake), and widening it would have touched all five to serve one.
+      this.groundAlphaBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.groundAlphaBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, Baker._pack(aparts, total / 4),
+                    gl.STATIC_DRAW);
       this.groundVertBytes = total * 4;
 
       // Backdrop planes: wrap copies over the map's full-diamond bounding
@@ -807,6 +1071,22 @@ const TileGround = (() => {
       this.coverVertBytes = ctotal * 4;
     }
 
+    /** `aAlpha` from `buf`, or a constant 1.0 when there is no buffer.
+     *  One place, so "disabled means 1.0, never the WebGL default" is stated
+     *  once rather than at each of the binding sites. */
+    _bindAlpha(pr, buf) {
+      const gl = this.gl;
+      if (pr.aAlpha === undefined || pr.aAlpha < 0) return;
+      if (buf) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.enableVertexAttribArray(pr.aAlpha);
+        gl.vertexAttribPointer(pr.aAlpha, 1, gl.FLOAT, false, 0, 0);
+      } else {
+        gl.disableVertexAttribArray(pr.aAlpha);
+        gl.vertexAttrib1f(pr.aAlpha, 1.0);
+      }
+    }
+
     _beginWorld(mvp) {
       const gl = this.gl;
       const pr = this._worldProgram();
@@ -818,6 +1098,7 @@ const TileGround = (() => {
       gl.activeTexture(gl.TEXTURE0);
       gl.enableVertexAttribArray(pr.aPos);
       gl.enableVertexAttribArray(pr.aUV);
+      this._bindAlpha(pr, null);
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);
       return pr;
@@ -827,14 +1108,23 @@ const TileGround = (() => {
       const gl = this.gl;
       gl.disableVertexAttribArray(pr.aPos);
       gl.disableVertexAttribArray(pr.aUV);
+      // The ground run may have left the mask array enabled. Leaving an array
+      // enabled that points into a freed buffer is how a later unrelated draw
+      // reads garbage, and gl.js shares this context.
+      this._bindAlpha(pr, null);
       gl.enable(gl.DEPTH_TEST);
     }
 
-    _drawRuns(pr, buf, runs) {
+    _drawRuns(pr, buf, runs, alphaBuf) {
       const gl = this.gl;
       gl.bindBuffer(gl.ARRAY_BUFFER, buf);
       gl.vertexAttribPointer(pr.aPos, 2, gl.FLOAT, false, 16, 0);
       gl.vertexAttribPointer(pr.aUV, 2, gl.FLOAT, false, 16, 8);
+      // The per-vertex `.pux` layer mask, GROUND ONLY. Every other run has to
+      // put the attribute back to a constant 1.0, and MUST NOT rely on WebGL's
+      // own default for a disabled attribute -- that is (0,0,0,1), so x is
+      // ZERO and the run would draw fully transparent.
+      this._bindAlpha(pr, alphaBuf);
       for (const r of runs) {
         gl.bindTexture(gl.TEXTURE_2D, r.tex);
         gl.drawArrays(gl.TRIANGLES, r.first, r.count);
@@ -954,7 +1244,8 @@ const TileGround = (() => {
       gl.enable(gl.BLEND);
       gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA,
                            gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-      this._drawRuns(pr, this.groundBuf, this.groundRuns);
+      this._drawRuns(pr, this.groundBuf, this.groundRuns,
+                     this.groundAlphaBuf);
       this._drawRuns(pr, this.sceneBuf, this.sceneRuns);
       this._endWorld(pr);
     }
@@ -1024,22 +1315,47 @@ const TileGround = (() => {
       const i0 = Math.max(0, Math.floor(x0 / G)), i1 = Math.min(m.pul[0], Math.ceil(x1 / G));
       const j0 = Math.max(0, Math.floor(y0 / G)), j1 = Math.min(m.pul[1], Math.ceil(y1 / G));
       const sig = i0 + ',' + i1 + ',' + j0 + ',' + j1;
+      // THIS PATH DISCARDED THE `.pux` MASK UNTIL 2026-09-14, and the comment
+      // on `buildWorld` -- "the per-layer mask IS consulted since 2026-09-06"
+      // -- was true of the WORLD path only. `_layersOf` has returned
+      // `[d, tile, mask]` since that change; this loop destructured
+      // `[d, tile]` and called `_quad`, so every ground layer drew as one
+      // fully opaque tile-sized quad and the topmost covered everything under
+      // it. `drawInto` is what `mapedit.js:199` calls, so the Map Editor drew
+      // HARD SEAMS wherever the art specifies a blend -- 72.1% of 2024xmas's
+      // 4,101 layers carry a PARTIAL mask.
+      //
+      // Measured before the fix, tile (20,0) of 2024xmas_new, whose layer 538
+      // specifies a clean left(255) -> right(0) ramp:
+      //
+      //     forcing every mask to FULL      0 of 65,536 pixels changed
+      //     CONTROL, swapping the tile  65,536 of 65,536 pixels changed
+      //
+      // The control is why the 0 is evidence and not a broken probe.
       if (!this._runs || this._runSig !== sig) {
-        const groups = new Map();                      // tile idx -> vert list
+        const groups = new Map();      // depth<<32|tile -> {d,tile,v,a}
         for (let j = j0; j < j1; j++)
           for (let i = i0; i < i1; i++) {
             const idx = this.slots[j * m.pul[0] + i];
-            if (idx === m.empty || !this.tiles.has(idx)) continue;
-            let g = groups.get(idx);
-            if (!g) groups.set(idx, g = []);
-            g.push(...Baker._quad(i * G, j * G, (i + 1) * G, (j + 1) * G,
-                                  0, 0, 1, 1));
+            for (const [d, tile, mask] of this._layersOf(idx)) {
+              const key = d * 4294967296 + tile;
+              let g = groups.get(key);
+              if (!g) groups.set(key, g = { d, tile, v: [], a: [] });
+              const q = Baker._maskQuads(i * G, j * G,
+                                         (i + 1) * G, (j + 1) * G, mask);
+              g.v.push(...q.v);
+              g.a.push(...q.a);
+            }
           }
-        this._runs = [...groups].map(([idx, v]) =>
-          [this.tiles.get(idx), new Float32Array(v)]);
+        this._runs = [...groups.values()].sort((a, b) => a.d - b.d).map(g =>
+          [this.tiles.get(g.tile), new Float32Array(g.v),
+           new Float32Array(g.a)]);
         this._runSig = sig;
       }
-      for (const [tex, verts] of this._runs) this._drawQuads(verts, tex);
+      // `TerrainLayer0.Puzzle*` -- ONE tint for the whole main ground, from a
+      // different section and a different surface than the per-plane ones.
+      for (const [tex, verts, alphas] of this._runs)
+        this._drawQuads(verts, tex, null, alphas, this.groundTint);
       return this._runs.length;
     }
 
@@ -1050,10 +1366,26 @@ const TileGround = (() => {
      *  pass. This is what the asset viewer's MapEditor uses in place of the
      *  server's per-tile PNG pyramid.
      *
-     *  `opts.layers` selects which of background / ground / terrain / cover
-     *  to include, in the game's painter order (docs/map_scenery.md 7) --
-     *  the editor's per-layer toggles become four booleans rather than four
-     *  sets of HTTP requests. `opts.timeMs` picks the animation frame.
+     *  `opts.layers` selects which layers to include, keyed by LAYER ID, and
+     *  `opts.order` is the order to draw them in, furthest first. An id is
+     *  `background:N` for one backdrop plane or a bare `ground` / `terrain` /
+     *  `cover`; bare `background` still means every plane, which is what the
+     *  pre-2026-09-14 callers passed and what `bake()` does.
+     *
+     *  WHY AN ORDER AND NOT FOUR BOOLEANS. The composite order here was
+     *  hard-coded to planes -> tiles -> scenes -> covers, so the Map Editor
+     *  could show you a map but not ask a question about it. The owner's
+     *  question is exactly which order the client really uses, and the only
+     *  instrument for that is a human eye plus the ability to try one --
+     *  `docs/map_scenery.md` 7 is a reading of the composite, not a
+     *  measurement of it. Passing the order in means the panel's order IS the
+     *  draw order, with no second copy of the rule in this file.
+     *
+     *  With no `order`, the default is the old fixed sequence, so every
+     *  existing caller (`bake()`, the tests, an older page against a newer
+     *  file) draws byte for byte what it drew before.
+     *
+     *  `opts.timeMs` picks the animation frame.
      *
      *  Returns false when it cannot draw and the caller must fall back. */
     drawInto(rect, opts) {
@@ -1071,14 +1403,47 @@ const TileGround = (() => {
       this._beginQuads(rect, -1);
 
       let groups = 0;
-      if (want('background')) {
-        gl.disable(gl.BLEND);          // planes are the floor, always opaque
-        for (const p of this.planes) this._drawPlane(p, rect);
-      }
+      const order = (o.order && o.order.length) ? o.order : Baker.DEFAULT_ORDER;
       gl.enable(gl.BLEND);
-      if (want('ground')) groups = this._drawTiles(rect);
-      if (want('terrain')) this._drawPlacements(this.scenes, rect, o.timeMs || 0);
-      if (want('cover')) this._drawPlacements(this.covers, rect, o.timeMs || 0);
+      for (const id of order) {
+        if (!want(id)) continue;
+        const cut = id.indexOf(':');
+        const kind = cut < 0 ? id : id.slice(0, cut);
+        if (kind === 'background') {
+          // **PLANES ARE NOT ALL OPAQUE, AND THIS USED TO ASSUME THEY WERE.**
+          // The old comment here read "Planes are the FLOOR: opaque, blend
+          // off", and disabled blending for the whole pass. That is true of a
+          // bottom sky plane and false of the ones above it. MEASURED on
+          // `zsjx03_new`, which is where the owner reported it:
+          //
+          //     plane 0  zsjx03-bg02.pul  320 tiles, 0 with partial alpha
+          //     plane 1  zsjx03-bg01.pul  122 tiles, 36 with >2% PARTIAL,
+          //                               worst tile 83.1% partial
+          //
+          // With BLEND off, a half-transparent cloud texel overwrites the sky
+          // at full strength, so a feathered tile lands as a SOLID RECTANGLE
+          // -- the owner's "transparency blocks that aren't transparent".
+          //
+          // Enabling blending does NOT cost the drag-on-top behaviour the old
+          // comment was protecting: an alpha-255 texel still replaces the
+          // destination completely under SRC_ALPHA/ONE_MINUS_SRC_ALPHA. The
+          // only pixels whose result changes are the ones that were WRONG.
+          const n = cut < 0 ? -1 : parseInt(id.slice(cut + 1), 10);
+          const ps = cut < 0 ? this.planes
+                   : (this.planes[n] ? [this.planes[n]] : []);
+          for (const p of ps) this._drawPlane(p, rect);
+        } else if (kind === 'ground') {
+          groups = this._drawTiles(rect);
+        } else if (kind === 'terrain') {
+          this._drawPlacements(this.scenes, rect, o.timeMs || 0);
+        } else if (kind === 'cover') {
+          this._drawPlacements(this.covers, rect, o.timeMs || 0);
+        } else if (kind === 'interactive') {
+          this._drawPlacements(this.interactive, rect, o.timeMs || 0);
+        }
+        // `passability` is deliberately not here: it is drawn from the cell
+        // grid on the 2D canvas and has no texture anywhere in it.
+      }
 
       this._endQuads();
       if (hadDepth) gl.enable(gl.DEPTH_TEST);
@@ -1088,6 +1453,14 @@ const TileGround = (() => {
       return true;
     }
   }
+
+  /** `drawInto`'s order when a caller passes none: the composite order
+   *  `terrain.art_texture()` uses, with `background` meaning every plane.
+   *  Named rather than inlined so a test can assert the default IS the old
+   *  sequence -- "reordering is possible" must not mean "the default moved".
+   */
+  Baker.DEFAULT_ORDER = ['background', 'ground', 'terrain', 'cover',
+                         'interactive'];
 
   return { Baker, decodeSlots };
 })();

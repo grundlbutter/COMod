@@ -549,6 +549,16 @@ class Recovery:
         n = len(self.found)
         tot = len(self.want)
         fp = self.tested * tot / 2 ** 32
+        if not tot:
+            # NOTHING WANTED IS NOT 0/0. An install with no c3.wdf/data.wdf
+            # (7878 is one) leaves `want` empty, and this line divided by it:
+            # the owner's fresh bootstrap ran 45 minutes of scanning and then
+            # died with ZeroDivisionError, 2026-09-18. `health.bootstrap` now
+            # skips this builder for such an install, and this stays as the
+            # second line of defence, because the tool is also run directly.
+            print(f"  {label:<34} {n:6}/0 (nothing to recover)  "
+                  f"tested={self.tested:,}  {time.time()-t0:.0f}s", flush=True)
+            return
         print(f"  {label:<34} {n:6}/{tot} ({100.0*n/tot:5.1f}%)  "
               f"tested={self.tested:,} exp_fp~{fp:.1f}  {time.time()-t0:.0f}s",
               flush=True)

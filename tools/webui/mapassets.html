@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CO Asset Viewer — map assets</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/mapassets.css">
+</head>
+<body data-co-page="mapassets">
+
+<!-- THE HOST, AND IT WAS MISSING. This page already declared its tab and
+     already loaded `nav.js` -- from the bottom of the document -- and drew no
+     bar at all, because `render()` opens with `if (!host) return null`. So a
+     page listed in `TABS` as a destination was a one-way trip, and nothing
+     said so: no console error, no missing file, valid markup. Half the
+     contract signed reads exactly like all of it. -->
+<div id="co-nav"></div>
+<script src="/ui/nav.js"></script>
+
+<header>
+  <h1>Map Assets</h1>
+  <div class="mut" id="sub">find a map satellite, and see where it can go</div>
+</header>
+
+<main class="ma-main">
+
+<!-- THE NOTE IS NOT A FOOTNOTE AND IT IS NOT CONDITIONAL. A catalogue that
+     listed what exists and left "can I use it here" to the reader would be
+     inviting exactly the edit that produces a valid file the client draws
+     nothing from. -->
+<p class="ma-note">
+  <b>Where a cover can go is not where it is used.</b> A cover's
+  <code>key</code> is resolved through an <b>index</b> the map loads
+  (<code>ani/mapscene-new.json</code> and friends). Placed on a map that does
+  not load a resolving index, the record is valid, the file re-parses, this
+  page draws it — <b>and the client shows nothing</b>. <span id="spread"></span>
+</p>
+
+<nav class="ma-tabs">
+  <button class="ma-tab on" data-kind="covers">Covers</button>
+  <button class="ma-tab" data-kind="shared">Shared art</button>
+  <input id="q" type="search" placeholder="filter by key or path…"
+         spellcheck="false" autocomplete="off">
+  <span class="mut" id="count"></span>
+</nav>
+
+<div id="unavailable" class="ma-refuse" hidden>
+  <b>No install loaded.</b>
+  <span id="why"></span>
+</div>
+
+<div class="ma-wrap">
+  <table class="ma" id="rows">
+    <thead><tr id="head"></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<p class="ma-foot mut" id="foot"></p>
+
+</main>
+
+<script src="/ui/mapassets.js"></script>
+</body>
+</html>

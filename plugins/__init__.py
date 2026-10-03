@@ -59,6 +59,7 @@ Usage::
 """
 from __future__ import annotations
 
+import dataclasses as _dc
 import importlib
 import pkgutil
 from pathlib import Path
@@ -380,6 +381,10 @@ class Plugin:
         return None
 
     # -- library import ----------------------------------------------------
+    #: DatPkg index files an official client ships, base pair then overlays
+    #: (7867+ adds `c31`/`data1`). Order is the order they are imported.
+    DATPKG_ARCHIVES = ("c3.tpi", "data.tpi", "c31.tpi", "data1.tpi")
+
     def import_plan(self, root: Path, exists: Callable[[str], bool]) -> dict:
         """What importing this client involves, for the add-a-library flow.
 
@@ -395,7 +400,19 @@ class Plugin:
         overlay. A DatPkg client overrides `archives`; a client with no
         archives at all sets it empty.
         """
-        return {"archives": ["c3.wdf", "data.wdf"], "loose": True,
+        archives = ["c3.wdf", "data.wdf"]
+        # A DatPkg install: `.tpi` pairs present and no `.wdf` pair. Found
+        # 2026-09-19 by the patch7280 plugin agent: every plugin without an
+        # override (patch7878 included, through PlaintextFamily) named the
+        # WDF pair here, and `assetdiff.catalog_baseline` skipped a missing
+        # archive without a word -- so importing 7878 indexed NO archive and
+        # reported success. The WDF pair stays the default whenever it or
+        # nothing is found, which is the literal behaviour the official
+        # clients and the tests pin.
+        tpi = [n for n in self.DATPKG_ARCHIVES if exists(n)]
+        if tpi and not any(exists(n) for n in archives):
+            archives = tpi
+        return {"archives": archives, "loose": True,
                 "tables": ["ini/"], "skip": ["log/", "debug/", "AutoPatch"],
                 "note": f"importing as {self.label}"}
 
@@ -424,6 +441,64 @@ class Plugin:
     #: cells before it was.
     ROW_LABEL_KEY: dict = {}
     ROW_LABEL_DEFAULT = "Name"
+
+    #: `{subject: {"id": i, "name": j}}` -- the POSITIONAL twin of
+    #: `ROW_LABEL_KEY`, MEASURED per build.
+    #:
+    #: `TableSpec.columns` is the right home for a hand-written spec, and it
+    #: still wins here. It has no reach at all over the CENSUSED specs: those
+    #: are generated tuples in `plugins/catalog/censused.py` with no `columns`
+    #: field, so every one of the ~170 positional `.ini` tables fell back to
+    #: `ITEM_COLUMNS` -- an `itemtype.dat` fact ("the name is column 1")
+    #: applied to tables that are not `itemtype.dat`. `browse region` listed
+    #: `1002 -> 4` on ten builds, where column 6 holds `TwinCity`.
+    #:
+    #: Empty here, and that is the point: a build declares its own after
+    #: measuring its own file. `PositionalLabelsAreMeasuredPerBuild` re-derives
+    #: every entry from the bytes on the install it names, so an entry
+    #: inherited from a superclass is CHECKED on the subclass rather than
+    #: assumed to carry over.
+    ROW_COLUMNS: dict = {}
+
+    #: `{filename_lower: encoding}` -- PER-TABLE overrides of `TEXT_ENCODING`,
+    #: MEASURED per build. Applied onto every spec (hand-written or censused)
+    #: whose own `TableSpec.encoding` is unset, by `apply_table_encoding`.
+    #: Empty here, so a plugin that does not set it behaves exactly as before.
+    #: For a GBK build whose table is not GBK: `{"chatfilter.ini": "latin1"}`.
+    TABLE_ENCODING: dict = {}
+
+    def spec_encoding(self, spec) -> str:
+        """The codec that decodes `spec`'s text: its own, else the build's."""
+        return getattr(spec, "encoding", None) or self.TEXT_ENCODING
+
+    def apply_table_encoding(self, specs) -> tuple:
+        """`specs` with `TABLE_ENCODING` applied where a spec says nothing."""
+        if not self.TABLE_ENCODING:
+            return tuple(specs)
+        return tuple(
+            _dc.replace(s, encoding=self.TABLE_ENCODING[s.filename.lower()])
+            if s.encoding is None and s.filename.lower() in self.TABLE_ENCODING
+            else s for s in specs)
+
+    def measured_specs(self, root: Path) -> tuple:
+        """`table_specs` with this build's measured positional columns on.
+
+        The one place `ROW_COLUMNS` is applied, so `catalogs`, `browse` and
+        `open_row` cannot disagree about which column a row's label is in --
+        which is the shape of the defect this exists to fix, one level up:
+        `catalogs` counted a table that `browse` then labelled from a
+        different column than the control probe had checked.
+
+        A spec that carries its own `columns` is left alone: it was measured
+        against that one table by someone who knew what the table means.
+        """
+        specs = self.apply_table_encoding(self.table_specs(root))
+        if not self.ROW_COLUMNS:
+            return specs
+        return tuple(
+            _dc.replace(s, columns=self.ROW_COLUMNS[s.subject])
+            if s.columns is None and s.subject in self.ROW_COLUMNS else s
+            for s in specs)
 
     def table_specs(self, root: Path) -> tuple:
         """The `TableSpec`s this build declares, censused from its own `ini/`.
@@ -474,7 +549,7 @@ class Plugin:
             text = raw
             if text.startswith(b"\xef\xbb\xbf"):
                 text = text[3:]
-            return (text.decode(self.TEXT_ENCODING, "replace"), raw,
+            return (text.decode(self.spec_encoding(spec), "replace"), raw,
                     _cat.CONTROL_RAW, None)
         if spec.codec == "tq-stream":
             # A tq decrypt of `itemtype.dat` costs 736 ms and 6609's whole
@@ -499,7 +574,7 @@ class Plugin:
                 # same bytes back as the "independent re-decode" would make
                 # the witness the parse's own output -- an identical-looking
                 # count with the evidence removed. Reported as its own kind.
-                return (cached.decode(self.TEXT_ENCODING, "replace"),
+                return (cached.decode(self.spec_encoding(spec), "replace"),
                         cached, _cat.CONTROL_CACHED, None)
             # Decoded twice, from disk both times. The second decode is the
             # witness: it makes the PARSE checkable without making the CIPHER
@@ -510,8 +585,83 @@ class Plugin:
             # first run of a table always earns a real re-decode control and a
             # cache can never manufacture one.
             dcache.put(path, "tq-stream", decoded, root)
-            return (decoded.decode(self.TEXT_ENCODING, "replace"),
+            return (decoded.decode(self.spec_encoding(spec), "replace"),
                     witness, _cat.CONTROL_REDECODE, None)
+        if spec.codec == "block96":
+            # The 6907..7878 ECB block cipher, read through the dictionary in
+            # `core/block96.py`. Added 2026-08-30 for `patch7205`; every build
+            # in that range needs it, so it lives here rather than in one
+            # plugin's override.
+            #
+            # THREE THINGS THIS BRANCH GETS RIGHT AND A NAIVE ONE DOES NOT:
+            #
+            # 1. **The dictionary's absence is not the table's.** A box without
+            #    `derived/7878-dat-decrypted/` refuses BY NAME, so "we cannot
+            #    read this here" never renders as "this client has no items".
+            #
+            #    **AND THE LOOKUP IS ROOTED AT THE INSTALL, which it was not.**
+            #    `block96.dictionary_path(None)` answers None unless
+            #    `$CO_BLOCK96_DICT` is set -- the un-rooted call has no way to
+            #    find `<ConquerAssets>/derived/`, because the relationship it
+            #    resolves is `Clients/<build>` -> `../../derived`. So this
+            #    branch refused BY NAME on a box that has the dictionary:
+            #    MEASURED 2026-09-07, `patch7205.catalogs()` returned 16
+            #    refusals all reading "the block96 dictionary is not on this
+            #    box" against a `block_dict.pkl` sitting right there, and
+            #    `patch6907`, whose override passes `root`, read the same
+            #    cipher on ten sibling installs in the same sweep.
+            #
+            #    **The test that exists for this could not fire**:
+            #    `tests/test_patch7205.py`'s `have_dict()` asked the same
+            #    un-rooted question, so `test_with_the_dictionary_the_same_
+            #    call_returns_rows` -- whose whole job is to be the control
+            #    for the refusal above -- SKIPPED, and took nine other tests
+            #    with it. A guard that shares the defect it guards against
+            #    reports health exactly when the thing is broken.
+            # 2. **Damaged records are dropped whole, and sections differently
+            #    from rows.** `clean_sections` discards a section whose header
+            #    or any key is holed; dropping the holed LINE would donate its
+            #    remaining keys to the section above. See `core/block96.py`.
+            # 3. **The control is `CONTROL_REDECODE`, never `CONTROL_RAW`.**
+            #    The witness is a second decode from disk, so it witnesses the
+            #    PARSE and not the CIPHER -- searching the witness for a served
+            #    row asks the same dictionary twice. That is exactly the
+            #    strength `tq-stream` claims above, for exactly the same
+            #    reason, and calling it `raw` would overstate it.
+            try:
+                from core import block96                # noqa: PLC0415
+            except ImportError:                         # pragma: no cover
+                import block96                          # noqa: PLC0415
+            table = block96.load_dictionary(root)
+            if table is None:
+                return None, b"", None, (
+                    f"{spec.display}: {block96.why_no_dictionary(root)}")
+            pt, total, unk = block96.decode(raw, table)
+            if unk == total and total:
+                return None, b"", None, (
+                    f"{spec.display}: the dictionary carries none of this "
+                    f"file's {total} blocks, so there is nothing to serve. "
+                    f"Cross-table block reuse is small; a table 7878 never "
+                    f"shipped is the expected case, not a defect.")
+            if spec.kind == _cat.KIND_SECTIONS:
+                text, kept, dropped = block96.clean_sections(pt)
+            else:
+                text, kept, dropped = block96.clean_rows(pt)
+            if not kept:
+                return None, b"", None, (
+                    f"{spec.display}: {100.0 * (total - unk) / max(1, total):.1f}% "
+                    f"of blocks are known but not one record came out whole "
+                    f"({dropped} damaged). Block coverage is not record "
+                    f"coverage -- see core/block96.py.")
+            # The witness is an INDEPENDENT re-decode, read from disk again,
+            # exactly as the tq-stream branch does. Same cleaning, or the
+            # control would search a witness the served text is not in.
+            wit_pt, _t, _u = block96.decode(path.read_bytes(), table)
+            witness = (block96.clean_sections(wit_pt)[0]
+                       if spec.kind == _cat.KIND_SECTIONS
+                       else block96.clean_rows(wit_pt)[0])
+            return (text.decode(self.spec_encoding(spec), "replace"), witness,
+                    _cat.CONTROL_REDECODE, None)
         if spec.codec == "json":
             # JSON is plaintext, so the strong control applies: the witness is
             # the file itself and `control_json_row` searches the undecoded
@@ -523,7 +673,12 @@ class Plugin:
             # established -- and on all seven builds at once, which is why it
             # reads here rather than in a per-build override. Everything else
             # binary is still named and refused.
-            if spec.kind == _cat.KIND_GAMEMAP:
+            #
+            # **`MagicType.dat` on 5017/5065 joined it 2026-09-07**
+            # (`KIND_MAGIC_RECORDS`), which is why this is a set and not a
+            # comparison: the next binary grammar that gets measured is a
+            # one-line change here, and the refusal below stays the default.
+            if spec.kind in (_cat.KIND_GAMEMAP, _cat.KIND_MAGIC_RECORDS):
                 return None, raw, _cat.CONTROL_RAW, None
             return None, b"", None, (
                 "binary record layout, not sections or rows -- readable bytes "
@@ -561,7 +716,7 @@ class Plugin:
         """
         from . import catalog as _cat
         root = Path(root)
-        specs = self.table_specs(root)
+        specs = self.measured_specs(root)
         if not specs:
             return _cat.no_tables_declared(self.name, self.why_no_tables())
         return _cat.build_catalogs(
@@ -599,7 +754,7 @@ class Plugin:
         # `monster`, `mount`, `item` and `garment` come from its bespoke
         # `catalogs()` and are not spec-driven -- so behaviour is unchanged
         # for them; they are a handful, not a hundred.
-        spec = next((s for s in self.table_specs(root)
+        spec = next((s for s in self.measured_specs(root)
                      if s.subject == subject), None)
         if spec is None:
             cat = self.catalogs(root).get(subject)
@@ -634,6 +789,24 @@ class Plugin:
                 pairs, _note = _cat.gamemap_records(witness)
             except ValueError as e:
                 return [], 0, f"{subject}: {e}"
+        elif spec.kind == _cat.KIND_MAGIC_RECORDS:
+            # Binary records again, so the witness rather than text. The label
+            # is the skill NAME out of the record's `char[16]`, which is the
+            # half of the row this project has established; the level is
+            # `id % 10` and is left in the id rather than split out.
+            #
+            # **Deduplicated FIRST-WINS, through the same helper `catalogs()`
+            # uses.** The index array repeats ids -- 648 records over 642
+            # distinct on 5017 -- and listing all 648 here while the catalog
+            # reported 642 is a surface that tells the user one number and
+            # shows them another. `test_subject_source_agreement` caught
+            # exactly that on 5065 (651 vs 657); the repeats are not lost,
+            # they are on `Catalog.duplicated`.
+            try:
+                pairs, _note = _cat.magic_records(witness)
+            except ValueError as e:
+                return [], 0, f"{subject}: {e}"
+            pairs, _dupes = _cat.magic_unique(pairs)
         elif text is None:
             return [], 0, f"{subject}: unreadable on a second pass"
         elif spec.kind == _cat.KIND_SECTIONS:
@@ -676,11 +849,51 @@ class Plugin:
             # symptom as "nothing to check".
             delim = _cat.ROW_KINDS.get(spec.kind, "@@")
             rows = _cat.rows_from_text(text, delim)
-            i_id = self.ITEM_COLUMNS.get("id", 0)
-            i_nm = self.ITEM_COLUMNS.get("name", 1)
-            for r in rows:
-                if len(r) > max(i_id, i_nm):
-                    pairs.append((r[i_id], r[i_nm]))
+            # **THE SPEC'S OWN COLUMNS FIRST.** `ITEM_COLUMNS` is a fact
+            # about `itemtype.dat` -- name in column 1 -- applied here to
+            # every positional table on the build. `Achievement.dat` carries
+            # a message id in column 1 and the name in column 2, so under the
+            # plugin-wide map this listed a column of numbers where the names
+            # are. A spec that has MEASURED its own columns says so.
+            cols = spec.columns or self.ITEM_COLUMNS
+            i_id = cols.get("id", 0)
+            i_nm = cols.get("name", 1)
+            if i_nm is None:
+                # **MEASURED: no column of this table is text.** The 6907
+                # era's `.dat` config tables are numbers all the way across --
+                # 24 of the 25 censused there -- and `ITEM_COLUMNS["name"] = 1`
+                # would label every row with a number, which is the `magic`
+                # defect one table at a time. An empty label is what "the id
+                # stands alone" looks like, and the spec says so with
+                # `label_key=None` so the blank-label guard permits it.
+                pairs = [(r[i_id], "") for r in rows if len(r) > i_id]
+            else:
+                # **A ROW TOO SHORT TO REACH THE NAME COLUMN KEEPS ITS PLACE
+                # AND LOSES ITS LABEL. It used to lose its existence.**
+                #
+                # `block96.recover_rows` serves a damaged row TRUNCATED at the
+                # damage, so a table whose name is column 3 comes back as a
+                # mixture of full rows and rows of 2 and 3 fields. Dropping
+                # the short ones made `browse` return fewer rows than
+                # `catalogs` counted, with no refusal -- the difference in
+                # EXISTENCE that `test_a_counted_table_never_browses_EMPTY_
+                # without_saying_why` forbids, one notch below total.
+                #
+                # MEASURED before the change, over every positional table on
+                # all nineteen installs on this box: ZERO subjects lost a row
+                # to it, because nothing yet declared a name column past its
+                # shortest row. `patch6907.hairface_storage_type` is the first
+                # -- 35 of 186 rows on 7009 and 14 of 195 on 7135 -- and the
+                # comment that held that declaration back named this line as
+                # the alternative to fixing the recovery.
+                #
+                # The id is still required: a row with no `i_id` field has no
+                # identity to list, which is a different thing from having no
+                # name.
+                for r in rows:
+                    if len(r) > i_id:
+                        pairs.append((r[i_id],
+                                      r[i_nm] if len(r) > i_nm else ""))
 
         if query:
             q = query.lower()
@@ -713,7 +926,7 @@ class Plugin:
         """One row by id, as a dict, or None when the subject cannot be read."""
         from . import catalog as _cat
         root = Path(root)
-        spec = next((s for s in self.table_specs(root)
+        spec = next((s for s in self.measured_specs(root)
                      if s.subject == subject), None)
         if spec is None:
             return None
@@ -735,8 +948,15 @@ class Plugin:
             secs, _ = _cat.sections_from_text(text)
             body = secs.get(ident)
             return dict(body) if body is not None else None
-        i_id = self.ITEM_COLUMNS.get("id", 0)
-        for r in _cat.at_rows_from_text(text):
+        # **THE TABLE'S OWN DELIMITER AND ITS OWN COLUMNS**, the same two
+        # corrections `browse` above carries. `at_rows_from_text` splits on
+        # `@@` whatever the kind says, so a `csv-rows` or `space-rows` table
+        # produced one field per line here and `open_row` returned None for
+        # every id -- indistinguishable from "no such row".
+        cols = spec.columns or self.ITEM_COLUMNS
+        i_id = cols.get("id", 0)
+        delim = _cat.ROW_KINDS.get(spec.kind, "@@")
+        for r in _cat.rows_from_text(text, delim):
             if len(r) > i_id and r[i_id] == ident:
                 return {str(i): v for i, v in enumerate(r)}
         return None
@@ -846,6 +1066,83 @@ FIRST_PARTY: dict = {
     "patch5517": "patch5517",
     "patch6090": "patch6090",
     "patch6609": "patch6609",
+    "patch6907": "patch6907",
+    "patch7205": "patch7205",
+    # -- RESERVED PLUGIN SLOTS, the 7205..7632 official patches (owner,
+    #    2026-09-19; plan: scratchpad/PLAN-official-patch-notes.md). Each
+    #    plugin PR replaces ONLY its own `slot` line. The bare `#` lines
+    #    between slots are never edited: git conflicts on ADJACENT line
+    #    edits, so one untouched line between slots is what lets twelve
+    #    parallel plugin PRs merge without a conflict push.
+    "patch7217": "patch7217",
+    #
+    "patch7250": "patch7250",
+    #
+    "patch7275": "patch7275",
+    #
+    "patch7280": "patch7280",
+    #
+    "patch7320": "patch7320",
+    #
+    "patch7336": "patch7336",
+    #
+    "patch7373": "patch7373",
+    #
+    "patch7387": "patch7387",
+    #
+    "patch7506": "patch7506",
+    #
+    "patch7535": "patch7535",
+    #
+    "patch7562": "patch7562",
+    #
+    "patch7589": "patch7589",
+    # -- end of reserved plugin slots
+    # -- RESERVED PLUGIN SLOTS (2), the 20 official patches still without a plugin
+    #    (owner, 2026-09-19 ~15:50Z: "a parser plugin and a patch notes for every
+    #    patch that now exists in our corpus"). Same rule as the block above: each
+    #    plugin PR replaces ONLY its own `slot` line and never edits the bare `#`
+    #    lines.
+    "patch4274": "patch4274",
+    #
+    "patch6256": "patch6256",
+    #
+    "patch6271": "patch6271",
+    #
+    "patch6652": "patch6652",
+    #
+    "patch6680": "patch6680",
+    #
+    "patch6707": "patch6707",
+    #
+    "patch6772": "patch6772",
+    #
+    "patch6805": "patch6805",
+    #
+    "patch6868": "patch6868",
+    #
+    "patch6968": "patch6968",
+    #
+    "patch7009": "patch7009",
+    #
+    "patch7065": "patch7065",
+    #
+    "patch7083": "patch7083",
+    #
+    "patch7110": "patch7110",
+    #
+    "patch7135": "patch7135",
+    #
+    "patch7170": "patch7170",
+    #
+    "patch7182": "patch7182",
+    #
+    "patch7189": "patch7189",
+    #
+    "patch7622": "patch7622",
+    #
+    "patch7867": "patch7867",
+    # -- end of reserved plugin slots (2)
     "patch7878": "patch7878",
     "plaintext": "plaintext",
     "zephyr1057": "zephyr1057",
@@ -943,6 +1240,52 @@ def for_kind(kind: str):
         if k in names:
             return p
     return None
+
+
+#: Below this a detection is a GUESS, not an identification.
+#:
+#: THE THRESHOLDS LIVE HERE because `rank`'s own docstring already says the
+#: threshold is the codebase's and not any one caller's -- and they were
+#: written twice, in `tools/comod.py` and `tools/coviewer.py`, which is how a
+#: literal drifts.
+CONFIDENT = 0.9
+
+#: Two candidates within this of each other are a TIE. A tie is not an answer.
+#:
+#: **THE BOUNDARY IS `<=`, AND IT WAS TWO DIFFERENT RULES.** `comod` tested
+#: `(score - second) < TIE` and the viewer `(top - second) <= DETECT_TIE`, so
+#: a gap of exactly 0.05 was a tie on the picker and a clean identification
+#: at `comod clients add` -- the two surfaces telling the same user opposite
+#: things about the same folder. `<=` is what the viewer ships and what the
+#: owner has been seeing, so `<=` is what this keeps.
+TIE = 0.05
+
+
+def verdict(ranked: list) -> dict:
+    """`{verdict, suggested, confidence, gap, ask}` for a `rank()` result.
+
+    One implementation of "is this an identification, a tie, a weak guess or
+    nothing", because the two callers had it twice with different boundaries.
+    Pure: it takes the ranking and returns a judgement, so it can be tested
+    without an install.
+    """
+    out = {"verdict": "none", "suggested": None, "confidence": None,
+           "gap": None, "ask": True}
+    if not ranked:
+        return out
+    top = float(ranked[0][1])
+    second = float(ranked[1][1]) if len(ranked) > 1 else None
+    out["confidence"] = round(top, 4)
+    out["gap"] = None if second is None else round(top - second, 4)
+    out["suggested"] = ranked[0][0].name
+    if second is not None and (top - second) <= TIE:
+        out["verdict"] = "tie"
+    elif top < CONFIDENT:
+        out["verdict"] = "weak"
+    else:
+        out["verdict"] = "confident"
+        out["ask"] = False
+    return out
 
 
 def rank(root: Path, exists: Optional[Callable[[str], bool]] = None) -> list:

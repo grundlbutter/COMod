@@ -30,15 +30,14 @@
     if (txt != null) n.textContent = txt;
     return n;
   };
-  // The server answers errors as {"error": "..."}; api() rethrows the raw
-  // body, so printing e.message put JSON punctuation in front of the reader at
-  // the moment something had already gone wrong. Unwrap it to the sentence.
+  // `api()` unwraps the server's {"error": "..."} envelope where the Error is
+  // constructed, so `e.message` IS the sentence and this is now a plain
+  // read. It stays a function because the six call sites that had it right
+  // read better with a name, and because an Error thrown by something other
+  // than `api()` -- a TypeError from the network layer, say -- still arrives
+  // here.
   function say(e) {
-    const raw = (e && e.message) || String(e);
-    try {
-      const d = JSON.parse(raw);
-      return d.error || d.detail || d.headline || raw;
-    } catch (_) { return raw; }
+    return (e && e.message) || String(e);
   }
 
   async function api(url, opts) {
@@ -47,7 +46,20 @@
     // or, worse, reaches a same-named read route. csrf.js attaches the token
     // to same-origin POSTs on its own.
     const r = await fetch(url, opts || undefined);
-    if (!r.ok) throw new Error((await r.text()) || r.statusText);
+    if (!r.ok) {
+      // THE UNWRAP LIVES HERE NOW, not in a helper the caller has to
+      // remember. `say()` did this correctly and SIX sites used it while
+      // FOUR printed `e.message` raw -- the rule existed in the file and a
+      // third of the call sites did not have it. Doing it where the Error is
+      // MADE means no caller can miss it.
+      const body = await r.text().catch(() => '');
+      let msg = body || r.statusText;
+      try {
+        const d = JSON.parse(body);
+        msg = d.error || d.detail || d.headline || msg;
+      } catch (_) { /* not JSON -- the body is the best sentence available */ }
+      throw new Error(msg);
+    }
     return r.json();
   }
 
@@ -55,10 +67,16 @@
     donor: { viewer: null, rows: [], sel: null },
     target: { viewer: null, rows: [], sel: null },
   };
+  // Dropped by the selective rescue a7451a54, which took drawMid()'s READS of
+  // SIDES but not this declaration. Reading an undeclared identifier throws a
+  // ReferenceError -- and drawMid() runs unconditionally from boot(), so the
+  // whole page died before wireDrawer(), wireFilters() and refreshWritable()
+  // ever ran. Left null when /api/swap/sides is unavailable, which drawMid
+  // already guards for.
+  let SIDES = null;      // /api/swap/sides
   let LIB = null;        // /api/swap/library
   let TARGETS = null;    // /api/swap/targets
   let NPCSET = null;     // /api/swap/npcset
-  let scope = 'one';     // 'one' = split this NPC only; 'all' = the whole set
 
   function makeViewer(side) {
     try {
@@ -199,7 +217,7 @@
   function drawLibrary() {
     const host = $('#donor-list');
     host.textContent = '';
-    const kinds = $('#donor-kinds');
+    const kinds = $('#library-cats');
     kinds.textContent = '';
 
     if (!LIB) { host.appendChild(el('div', 'sw-note', 'loading…')); return; }
@@ -297,17 +315,54 @@
   let targetKind = 'npc';
   let WRITABLE = null;   // /api/swap/writable -- probed, not guessed
   let LASTSTAGE = null;  // what the last stage call reported
+  let RECORD = null;     // /api/swap/record entries -- what a full revert undoes
+  let STAGEDIR = '';     // /api/stage's stageDir -- comod.STAGE, in its words
   let MODIFIED = null;   // /api/swap/modified -- comod's OWN install record
   let repaintTarget = null;  // set by drawNpcSet so the filter bar can repaint
 
-  const TARGET_KINDS = [
-    { key: 'npc', label: 'NPCs',
-      note: 'table-keyed; motion ids are shared, so a swap can need a split' },
-    { key: 'monster', label: 'Monsters',
-      note: 'one look per monster -- 374 rows, 374 distinct types, no sharing' },
-    { key: 'weapon', label: 'Weapons',
-      note: 'flat equipment files, not table rows' }
-  ];
+  // The prose per kind. The LIST itself is NOT here -- it is derived from
+  // /api/swap/kinds, which serves swapplan.KINDS. This used to be a hardcoded
+  // array of three (npc, monster, weapon) while the planner has always had six,
+  // so Body, Head and Mount were reachable as DONORS and unreachable as
+  // TARGETS, and nothing anywhere said why. The owner asked for garment/armor
+  // swaps; the planner could already do them and only this list could not.
+  //
+  // Derived rather than lengthened on purpose: a hardcoded copy of another
+  // module's registry drifts silently, and it already had.
+  const TARGET_NOTES = {
+    npc: 'table-keyed; motion ids are shared, so a swap can need a split',
+    monster: 'one look per monster -- 374 rows, 374 distinct types, no sharing',
+    mount: 'a model directory per look, like NPCs and Monsters',
+    body: 'garment / armor -- flat equipment files, not table rows',
+    head: 'armet / headgear -- flat equipment files, not table rows',
+    weapon: 'flat equipment files, not table rows'
+  };
+  let TARGET_KINDS = [];
+
+  /** Fill TARGET_KINDS from the server's registry. An UNUSABLE kind is kept
+   *  and marked, not dropped: a kind missing from the pane and a kind whose
+   *  install has no art for it look identical to a user, and only one of them
+   *  is worth reporting. */
+  async function loadTargetKinds() {
+    try {
+      const d = await api('/api/swap/kinds');
+      TARGET_KINDS = (d.kinds || []).map(k => ({
+        key: k.key,
+        label: k.label + (k.usable === false ? ' (none)' : ''),
+        usable: k.usable !== false,
+        note: (TARGET_NOTES[k.key] || '') +
+              (k.usable === false && k.reason ? ' -- ' + k.reason : '')
+      }));
+    } catch (e) {
+      // Fall back to the three that were hardcoded before, so a failed fetch
+      // degrades to the old behaviour rather than an empty picker.
+      TARGET_KINDS = ['npc', 'monster', 'weapon'].map(
+        k => ({ key: k, label: k, usable: true, note: TARGET_NOTES[k] || '' }));
+    }
+    if (!TARGET_KINDS.some(k => k.key === targetKind) && TARGET_KINDS.length) {
+      targetKind = TARGET_KINDS[0].key;
+    }
+  }
 
   function drawTargets() {
     const kinds = $('#target-kinds');
@@ -839,6 +894,23 @@
 
   /* -------------------------------------------------------------- the mid */
 
+  /** A titled box stating one side's state, rather than blank space.
+   *
+   *  Also dropped by a7451a54: drawMid() calls this twice and nothing on master
+   *  defined it. The shape is the branch's -- a headline, an optional detail
+   *  line, and the files the verdict was reached over -- because a state that
+   *  names no files reads as an opinion rather than a measurement.
+   */
+  function stateBox(state, headline, detail, files) {
+    const n = el('div', 'sw-state sw-' + state);
+    n.appendChild(el('b', null, headline));
+    if (detail) n.appendChild(el('div', 'sw-detail', detail));
+    if (files && files.length) {
+      n.appendChild(el('div', 'sw-files', files.join('\n')));
+    }
+    return n;
+  }
+
   function drawMid() {
     const host = $('#mid-body');
     host.textContent = '';
@@ -852,7 +924,6 @@
       host.appendChild(stateBox('served',
         'No swap can be described against this install.',
         SIDES.right.note, [SIDES.right.install]));
-      plan = null;
       return;
     }
 
@@ -871,7 +942,6 @@
         + 'addresses donors by their path inside the install and a collected '
         + 'entry lives in the library. This is the next step, not a failure. '
         + 'Owner: COMod Explorer.', []));
-      plan = null;
       return;
     }
 
@@ -889,9 +959,9 @@
     host.appendChild(el('div', null, (D.name || D.id) + ' → ' +
       (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group)));
 
-    // The scope choice, and SPLIT is the default because sharing is the
-    // common case: most standby groups on CCO are used by more than one NPC,
-    // so the destructive option is the one you would hit by accident.
+    // What a swap here DOES, and it is always a SPLIT: sharing is the common
+    // case -- most standby groups on CCO are used by more than one NPC -- so
+    // the one NPC on screen gets private art and the rest keep theirs.
     const standbyResolves = T.resolves && T.resolves.standby_motion === true;
     if (T.art && T.art !== 'ok' && !standbyResolves) {
       // npcsplit refuses this case too ("the current motion path did not
@@ -952,18 +1022,18 @@
           '... ' + (T.count - T.members.length) + ' more not listed here'));
       }
       host.appendChild(box);
-      const mk = (val, label, sub) => {
-        const b = el('div', 'sw-item' + (scope === val ? ' on' : ''));
-        b.appendChild(el('span', null, label));
-        b.appendChild(el('span', 'sw-id', sub));
-        b.onclick = () => { scope = val; drawMid(); };
-        return b;
-      };
-      host.appendChild(mk('one', 'Replace ' + (picked || 'this NPC') + ' only',
-                          'gives it private art; the other ' + (T.count - 1) +
-                          ' keep theirs'));
-      host.appendChild(mk('all', 'Replace all ' + T.count,
-                          'every NPC on group ' + T.group + ' changes'));
+      // STATED, NOT OFFERED. This used to be a pick -- "Replace <name> only"
+      // or "Replace all N" -- and stageSplit() never sent it. /api/swap/stage
+      // runs tools/npcstage.py, which only splits, so "Replace all" staged a
+      // split of ONE NPC and printed "the other N NPC(s) on its old group are
+      // untouched" beneath a choice that said every one of them would change.
+      // Replacing the shared art in place is not a mode of the stager; when
+      // it becomes one, the choice comes back WITH the parameter that carries
+      // it to the server (tests/test_swap_scope.py holds that join).
+      host.appendChild(el('div', 'sw-note',
+        'Staging gives ' + (picked || 'this NPC') + ' private art; the other '
+        + (T.count - 1) + ' keep theirs. Replacing the art of all ' + T.count
+        + ' at once is not something staging does.'));
     } else {
       host.appendChild(el('div', 'sw-note',
         'Only one NPC uses this art, so there is nothing to split from.'));
@@ -978,12 +1048,20 @@
     row.appendChild(go);
     host.appendChild(row);
     host.appendChild(el('div', 'sw-note',
-      'Staging writes into mods/stage only. Nothing reaches the game install '
-      + 'until you press Install in Mod staging, which backs up every file it '
-      + 'displaces and can be reverted.'));
+      'Staging writes into ' + stageDir() + ' only. Nothing reaches the game '
+      + 'install until you press Install in Mod staging, which backs up every '
+      + 'file it displaces and can be reverted.'));
   }
 
   /* ------------------------------------------------------------ staging */
+
+  // Where staged files live: the server's own answer once /api/stage has been
+  // read -- it reports comod.STAGE, the one definition -- and comod's layout
+  // until then. Five strings on this page said `mods/stage` for weeks after
+  // the tree moved to Installed/stage, because each re-typed the path.
+  function stageDir() {
+    return STAGEDIR || 'Installed/stage';
+  }
 
   function whichRow(T) {
     // A row is identified by `type`, never by name: names repeat in npc.json
@@ -1018,7 +1096,7 @@
       const b = el('div', 'sw-note');
       b.appendChild(el('strong', null, dry ? 'Could not work out the change.'
                                            : 'Could not stage.'));
-      b.appendChild(el('div', null, e.message));
+      b.appendChild(el('div', null, say(e)));
       host.appendChild(b);
       return;
     }
@@ -1074,7 +1152,7 @@
       host.textContent = '';
       const b = el('div', 'sw-note');
       b.appendChild(el('strong', null, 'Could not stage.'));
-      b.appendChild(el('div', null, e.message));
+      b.appendChild(el('div', null, say(e)));
       host.appendChild(b);
       return;
     }
@@ -1094,9 +1172,9 @@
       if ((res.text || '').indexOf('was written against') >= 0) {
         b.appendChild(el('div', null,
           'The stage tree still holds an earlier split of this NPC. An '
-          + 'uninstall reverts the install but leaves mods/stage as it was, '
-          + 'so the two disagree. Open Mod staging and use "Clear staging", '
-          + 'then plan this split again.'));
+          + 'uninstall reverts the install but leaves ' + stageDir() + ' as '
+          + 'it was, so the two disagree. Open Mod staging and use "Clear '
+          + 'staging", then plan this split again.'));
       }
       host.appendChild(b);
     } else {
@@ -1151,14 +1229,15 @@
       return;
     }
     const rows = d.files || d.rows || [];
+    if (d.stageDir) STAGEDIR = d.stageDir;
     const dir = $('#stage-dir');
     if (dir && d.stageDir) dir.textContent = d.stageDir;
     if (!rows.length) {
       // Empty is a state, not a failure, and it is the state this page is in
       // before you stage anything.
       host.appendChild(el('div', 'sw-note',
-        'Nothing is staged. Pick a library entry and an NPC, then '
-        + '"Stage this split".'));
+        'Nothing is staged. Pick a library entry and what it replaces, then '
+        + '"Stage this swap" (or "Stage this replacement").'));
       return;
     }
     for (const r of rows) {
@@ -1175,6 +1254,7 @@
     if (!host) return;
     host.textContent = '';
     let d;
+    RECORD = null;
     try {
       d = await api('/api/swap/record?root=' +
                     encodeURIComponent(targetPath || ''));
@@ -1183,6 +1263,7 @@
                           + say(e)));
       return;
     }
+    RECORD = d.entries || [];
     if (!d.entries || !d.entries.length) {
       // Nothing installed is a state, and the ordinary one before you start.
       const b = el('div', 'sw-note');
@@ -1231,6 +1312,10 @@
     await refreshWritable();
     renderWritable(warn, WRITABLE);
     await loadStageList();
+    // The record too, on OPEN. It used to load only after an action ran, so
+    // "Installed, by date" -- and the per-entry reverts in it -- stayed blank
+    // until you had already pressed something.
+    await loadRecord();
   }
 
   async function clearStaging() {
@@ -1248,8 +1333,9 @@
       return;
     }
     if (!confirm('Remove all ' + rows.length + ' staged file(s)?\n\n'
-                 + 'This only empties mods/stage. Anything already installed '
-                 + 'stays installed -- use "Uninstall / revert" for that.')) return;
+                 + 'This only empties ' + stageDir() + '. Anything already '
+                 + 'installed stays installed -- use "Uninstall / revert" for '
+                 + 'that.')) return;
     const out = $('#mod-output');
     out.textContent = 'clearing ' + rows.length + ' file(s)...';
     let gone = 0; const failed = [];
@@ -1285,12 +1371,16 @@
       if (r.returncode !== undefined && r.returncode !== 0) {
         out.textContent = 'exit ' + r.returncode + '\n\n' + out.textContent;
       }
-      // comod keeps ONE install record, because the manifest is what lets
-      // uninstall put every displaced file back exactly. A second install
-      // layered on it would leave backups describing a state that no longer
-      // exists. The stage tree, meanwhile, ACCUMULATES: each swap edits the
-      // staged tables, so everything staged goes on together in one install.
-      // That makes this refusal a two-step, not a dead end -- say so.
+      // A plain install refuses while ANYTHING is on record, because the
+      // manifest is what lets uninstall put every displaced file back
+      // exactly, and a second install layered on it without its own dated
+      // entry would leave backups describing a state that no longer exists.
+      // The stage tree, meanwhile, ACCUMULATES: each swap edits the staged
+      // tables, so everything staged goes on together. That makes this
+      // refusal a two-step, not a dead end -- and the two-step depends on
+      // "Uninstall / revert" clearing the WHOLE record, which is why that
+      // button sends no `last=1`. "Add to install (amend)" is the other way
+      // through: a new dated entry with its own backups.
       if ((body || '').indexOf('already has an install recorded') >= 0) {
         const b = el('div', 'sw-warn');
         b.appendChild(el('strong', null,
@@ -1301,12 +1391,15 @@
           + '"Install for real": the whole stage tree goes on in one install, '
           + 'with one manifest that can revert all of it.'));
         b.appendChild(el('div', null,
-          'The single record is what made your earlier revert exact. Layering '
-          + 'a second install on it is what would take that away.'));
+          'Or press "Add to install (amend)" to put it on as a new dated '
+          + 'entry, with its own backups, on top of what is installed.'));
+        b.appendChild(el('div', null,
+          'The record is what makes a revert exact. Layering a second install '
+          + 'on it without its own entry is what would take that away.'));
         out.parentNode.insertBefore(b, out);
       }
     } catch (e) {
-      out.textContent = label + ' failed: ' + e.message;
+      out.textContent = label + ' failed: ' + say(e);
     }
     await loadStageList();
     await loadRecord();
@@ -1326,8 +1419,8 @@
       if (WRITABLE && !WRITABLE.writable &&
           !confirm('COMod could not write to this install when it checked. '
                    + 'Install will probably fail. Try anyway?')) return;
-      if (!confirm('This copies mods/stage into the game install at\n\n'
-                   + (targetPath || '(the open install)')
+      if (!confirm('This copies ' + stageDir() + ' into the game install at'
+                   + '\n\n' + (targetPath || '(the open install)')
                    + '\n\nEvery file it replaces is backed up first, and '
                    + '"Uninstall / revert" puts them back. Continue?')) return;
       runMod('/api/install?dry=0&root=' + encodeURIComponent(targetPath || ''),
@@ -1344,10 +1437,33 @@
       runMod('/api/install?dry=0&amend=1&root='
              + encodeURIComponent(targetPath || ''), 'amend');
     };
+    // "Uninstall / revert" reverts EVERY entry on record -- it sends no
+    // `last=1`, `entry=` or `since=`, so comod's `uninstall` takes the whole
+    // record (`select_entries` with no selector). That is the button's job:
+    // the "one install at a time" hint in runMod sends people here to clear
+    // the record before "Install for real", and a plain install refuses while
+    // even one entry is left. Reverting only the newest is "Revert this" on
+    // its row in "Installed, by date". The confirm used to say "the last
+    // install", written the day before amendments existed, when the record
+    // held one install and "last" and "all" were the same thing.
+    //
+    // The dry run sends the SAME selector with dry=1, so what it lists is
+    // exactly what the real press reverts.
+    const undry = $('#btn-uninstall-dry');
+    if (undry) undry.onclick = () => runMod(
+      '/api/uninstall?dry=1&root=' + encodeURIComponent(targetPath || ''),
+      'uninstall (dry run)');
     const un = $('#btn-uninstall');
     if (un) un.onclick = () => {
-      if (!confirm('This reverts the last install: restores every backed-up '
-                   + 'file and removes the ones that were added. Continue?')) return;
+      const n = RECORD ? RECORD.length : 0;
+      const what = n ? ('all ' + n + ' entr' + (n === 1 ? 'y' : 'ies')
+                        + ' on record')
+                     : 'every entry on record';
+      if (!confirm('This reverts EVERYTHING installed here: ' + what
+                   + ', newest first, including every amendment. Each entry '
+                   + 'restores the files it backed up and removes the ones it '
+                   + 'added.\n\nTo revert only the newest entry, use "Revert '
+                   + 'this" under Installed, by date. Continue?')) return;
       runMod('/api/uninstall?dry=0&root=' + encodeURIComponent(targetPath || ''),
              'uninstall');
     };
@@ -1377,7 +1493,7 @@
       host.textContent = '';
       const b = el('div', 'sw-note');
       b.appendChild(el('strong', null, 'Could not work out the change.'));
-      b.appendChild(el('div', null, e.message));
+      b.appendChild(el('div', null, say(e)));
       // A failure to PLAN is not "nothing to do" and must not render as an
       // empty step list.
       host.appendChild(b);
@@ -1391,7 +1507,7 @@
     const picked = (T.members && T.members[0] && T.members[0].name) || '';
     host.appendChild(el('div', null, (D.name || D.id) + ' \u2192 ' +
       (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group) +
-      (scope === 'one' ? '  (this NPC only)' : '  (all ' + T.count + ')')));
+      '  (this NPC only)'));
 
     if (plan.headline) {
       const b = el('div', 'sw-note');
@@ -1411,17 +1527,6 @@
         'That is a fault, not an empty change.'));
       host.appendChild(b);
       return;
-    }
-
-    if (scope === 'all') {
-      const b = el('div', 'sw-note');
-      b.appendChild(el('strong', null,
-        'You chose to replace all ' + T.count + ' NPCs on this group.'));
-      b.appendChild(el('div', null,
-        'Overwrite the group art in place -- no new id, no table edit. Every ' +
-        'NPC on group ' + T.group + ' changes. The steps below describe the ' +
-        'SPLIT instead; use them if you meant only one.'));
-      host.appendChild(b);
     }
 
     const pre = el('pre', 'sw-plan', plan.text);
@@ -1452,11 +1557,23 @@
     $('#msg-donor').textContent = 'pick from your library';
     $('#msg-target').textContent = 'pick an NPC to replace';
 
+    // Populate SIDES before drawMid() reads it. Its own guard treats null as
+    // "no verdict", so a failed fetch degrades to the previous behaviour rather
+    // than throwing -- and the endpoint was 404ing until the route above was
+    // restored, which is exactly the case this must survive.
+    try { SIDES = await api('/api/swap/sides'); }
+    catch (e) { SIDES = null; }
+
     try { LIB = await api('/api/swap/library'); }
     catch (e) { LIB = { configured: true, error: true, entries: [],
                         headline: 'The library would not read.', detail: e.message }; }
     drawLibrary();
 
+    // The kind picker is derived from the planner's registry, so it must be
+    // filled BEFORE the pane draws. Awaited rather than fired-and-forgotten:
+    // drawTargets() over an empty TARGET_KINDS renders a pane with no chips,
+    // which is indistinguishable from an install that supports nothing.
+    await loadTargetKinds();
     try { TARGETS = await api('/api/swap/targets'); }
     catch (e) { TARGETS = { targets: [], headline: 'Could not read targets.',
                             detail: e.message }; }

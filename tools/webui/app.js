@@ -18,6 +18,17 @@ const el = (tag, cls, txt) => {
   return e;
 };
 
+/* The sentinel for "has no tags", kept out of the tag namespace by a leading
+ * NUL -- no real tag can contain one, so it cannot collide.
+ *
+ * WRITTEN AS AN ESCAPE, NOT AS A RAW BYTE. Three literal NULs used to sit in
+ * this file's source, and `grep` therefore reported app.js as a BINARY FILE:
+ * `grep -n 'function toast' tools/webui/app.js` printed
+ * "Binary file ... matches" with no line number. Every text audit of the two
+ * files that define the most shared helpers silently skipped them unless the
+ * operator remembered `-a`. Identical string at runtime, text-safe source. */
+const UNTAGGED = '\u0000untagged';
+
 const AXIS_LABEL = { class: 'Class', gender: 'Gender', size: 'Body size', kind: 'Kind' };
 const VALUE_LABEL = {
   any: 'Any class', unknown: 'Unclassified', 'n/a': 'n/a',
@@ -393,12 +404,32 @@ function cmdBlock(text) {
 }
 
 function kv(pairs) {
+  /* NULL IS A VALUE THE SERVER SENT; '' IS THE CALLER CHOOSING TO HIDE.
+   *
+   * This used to skip null, undefined and '' alike, so a row the server
+   * answered as null simply VANISHED -- and "the server said null" was then
+   * indistinguishable from "this panel does not show that field". Three
+   * defects in one night were fields the API returned that no panel
+   * rendered; a helper that drops nulls is that failure built in.
+   *
+   * null/undefined now render an em dash carrying the reason on hover.
+   * '' still omits the row, because that is the caller's own choice and all
+   * 13 call sites pass an explicit key list. The em-dash convention is
+   * borrowed from ui.js field(), not invented here. */
   const d = el('dl', 'kv');
   for (const [k, v] of pairs) {
-    if (v === null || v === undefined || v === '') continue;
+    if (v === '') continue;
     d.appendChild(el('dt', null, k));
     const dd = el('dd');
-    if (v instanceof Node) dd.appendChild(v); else dd.textContent = String(v);
+    if (v === null || v === undefined) {
+      dd.className = 'null';
+      dd.textContent = '—';
+      dd.title = 'returned as ' + (v === null ? 'null' : 'undefined');
+    } else if (v instanceof Node) {
+      dd.appendChild(v);
+    } else {
+      dd.textContent = String(v);
+    }
     d.appendChild(dd);
   }
   return d;
@@ -598,7 +629,7 @@ async function renderCollect({ force = false } = {}) {
     const panel = el('div', 'swap-panel');
     panel.style.marginTop = '8px';
     const stage = el('button', 'ghost tiny', 'Replace an asset with this…');
-    stage.title = 'Write this entry into mods/stage/ over the asset it '
+    stage.title = 'Write this entry into Installed/stage/ over the asset it '
                 + 'replaces, choosing what travels with it. Nothing touches '
                 + 'the game until you install.';
     stage.addEventListener('click', () => {
@@ -646,7 +677,7 @@ function renderCollectedCopy(host, entry) {
   const panel = el('div', 'swap-panel');
   panel.style.marginTop = '8px';
   const stage = el('button', 'ghost tiny', 'Replace an asset with this…');
-  stage.title = 'Write this entry into mods/stage/ over the asset it '
+  stage.title = 'Write this entry into Installed/stage/ over the asset it '
               + 'replaces, choosing what travels with it. Nothing touches '
               + 'the game until you install.';
   stage.addEventListener('click', () => {
@@ -864,7 +895,7 @@ function selectDir(path) {
     r.classList.remove('on');
   }
   renderDirTree(state.dirTree);
-  loadFiles();
+  loadFilesFirstPage();
 }
 
 async function fillDirs(ext, prefer) {
@@ -916,6 +947,7 @@ function bindControls() {
     if (!fx.playing) fxPlay();
   });
 
+  initCatSince();
   const hideBox = $('#chk-hide-motion');
   if (hideBox) {
     hideBox.checked = state.hideMotion;
@@ -923,7 +955,9 @@ function bindControls() {
   }
   showMotionNote();
 
-  $('#cat-search').addEventListener('input', debounce(loadCategoryFiles, 240));
+  $('#cat-search').addEventListener('input', debounce(loadCategoryFirstPage, 240));
+  if ($('#cat-clear-filters'))
+    $('#cat-clear-filters').addEventListener('click', clearCatFilters);
   $('#map-search').addEventListener('input', debounce(renderMapList, 200));
 
   $('#table-select').addEventListener('change', e => {
@@ -942,7 +976,7 @@ function bindControls() {
                         'Cancel for raw JSON (re-importable).') ? 'csv' : 'json';
     window.open('/api/tags/export?format=' + fmt, '_blank');
   });
-  $('#source-select').addEventListener('change', loadFiles);
+  $('#source-select').addEventListener('change', loadFilesFirstPage);
   $('#dir-expand').addEventListener('click', () => {
     dirClosed.clear();
     saveDirClosed();
@@ -962,9 +996,9 @@ function bindControls() {
   $('#ext-select').addEventListener('change', async () => {
     const ext = $('#ext-select').value;
     await fillDirs(ext, ext === '.c3' ? 'c3/mesh' : 'c3/texture');
-    loadFiles();
+    loadFilesFirstPage();
   });
-  $('#file-search').addEventListener('input', debounce(loadFiles, 260));
+  $('#file-search').addEventListener('input', debounce(loadFilesFirstPage, 260));
 
   const rerender = () => { if (viewer) viewer.draw(); };
   $('#cull-mode').addEventListener('change', e => { viewer.opts.cull = e.target.value; rerender(); });
@@ -1033,8 +1067,8 @@ function facetQuery() {
   for (const [axis, set] of Object.entries(state.sel)) {
     if (set.size) p.set(axis, [...set].join(','));
   }
-  if (state.selTags.has(' untagged')) p.set('untagged', '1');
-  const tags = [...state.selTags].filter(t => t !== ' untagged');
+  if (state.selTags.has(UNTAGGED)) p.set('untagged', '1');
+  const tags = [...state.selTags].filter(t => t !== UNTAGGED);
   if (tags.length) p.set('tag', tags.join(','));
   if (state.group) p.set('group', 'mesh');
   return p;
@@ -1275,6 +1309,10 @@ async function loadCategories() {
     host.appendChild(row);
   }
   $('#cat-more') && ($('#cat-more').textContent = '');
+  // The pager belongs to the category that is open; leaving it on screen
+  // after that category closes offers navigation through a list that is no
+  // longer there.
+  if ($('#cat-pager')) { $('#cat-pager').innerHTML = ''; $('#cat-pager').hidden = true; }
 }
 
 function openCategory(id, sub) {
@@ -1286,7 +1324,7 @@ function openCategory(id, sub) {
   $('#cat-tree').classList.add('hidden');
   $('#cat-controls').classList.remove('hidden');
   $('#cat-search').value = '';
-  loadCategoryFiles();
+  loadCategoryFirstPage();
 }
 
 function closeCategory() {
@@ -1298,19 +1336,81 @@ function closeCategory() {
   navSet('category', []);
 }
 
+/** Rows per page of the category list. Matches what this list already
+ *  requested, so the pane looks unchanged until you reach the bottom of it. */
+const CAT_PAGE = 300;
+
+/** Prev / Next under the category list.
+ *
+ *  `data.total` here is the count AFTER the filters and AFTER folding
+ *  (`foldedAway` counts skins merged into their mesh), which is what makes it
+ *  the right divisor: the pager must count the rows this list will actually
+ *  render, not the catalogue-wide figure the banner carries. Getting that
+ *  wrong would produce a last page that is empty and a total that never
+ *  matches what you can see.
+ */
+function drawCatPager(pages) {
+  const host = $('#cat-pager');
+  if (!host) return;
+  host.innerHTML = '';
+  if (pages <= 1) { host.hidden = true; return; }
+  host.hidden = false;
+  const mk = (text, to, enabled) => {
+    const b = el('button', 'fx-pagebtn', text);
+    b.type = 'button';
+    b.disabled = !enabled;
+    if (enabled) {
+      b.addEventListener('click', () => {
+        state.catPage = to;
+        loadCategoryFiles();
+      });
+    }
+    return b;
+  };
+  const cur = state.catPage || 0;
+  host.appendChild(mk('\u2039 prev', cur - 1, cur > 0));
+  host.appendChild(el('span', 'mut small', ` ${cur + 1} / ${pages} `));
+  host.appendChild(mk('next \u203a', cur + 1, cur < pages - 1));
+}
+
+/** Load page ONE of whatever the category filters now select.
+ *
+ *  Opening a category, a sub, a role chip, a group chip and the search box all
+ *  change WHICH rows exist, so all of them come through here. Only the pager
+ *  itself sets `state.catPage` directly -- staying on page 40 of Maps while
+ *  switching to Mounts (4 rows) would render an empty pane, and an empty pane
+ *  reads as "this category is empty".
+ */
+function loadCategoryFirstPage() {
+  state.catPage = 0;
+  return loadCategoryFiles();
+}
+
 async function loadCategoryFiles() {
   const list = $('#cat-list');
   list.innerHTML = '<div class="mut small" style="padding:10px">loading…</div>';
   const p = motionParam(
-    new URLSearchParams({ category: state.cat.id, limit: '300' }));
+    new URLSearchParams({ category: state.cat.id, limit: String(CAT_PAGE) }));
+  // PAGED SERVER-SIDE, for the same reason the file list is: Maps holds
+  // 55,849 rows after folding, so pulling the category into the browser to
+  // page it there would trade one bad answer for a slow one. `offset` was
+  // always accepted here and never sent -- verified before relying on it:
+  // offset=55800 returns exactly 49 rows of 55,849.
+  p.set('offset', String((state.catPage || 0) * CAT_PAGE));
   if (state.cat.sub) p.set('sub', state.cat.sub);
   if (state.cat.role) p.set('role', state.cat.role);
   if (state.cat.group) p.set('group', state.cat.group);
   const q = $('#cat-search').value.trim();
   if (q) p.set('q', q);
+  const since = ($('#cat-since-base') || {}).value;
+  if (since) {
+    p.set('newSince', since);
+    p.set('sinceMode', ($('#cat-since-mode') || {}).value || 'new');
+  }
   let data;
   try { data = await api('/api/catfiles?' + p.toString()); }
   catch (e) { list.innerHTML = ''; list.appendChild(el('div', 'err', e.message)); return; }
+  paintCatClear();
 
   // breadcrumbs
   const cb = $('#cat-crumbs');
@@ -1342,13 +1442,88 @@ async function loadCategoryFiles() {
   // true either way; the hidden entries are named separately rather than
   // quietly subtracted and never mentioned. This figure is the one for THIS
   // category; the banner carries the catalogue-wide one.
+  const cFrom = (state.catPage || 0) * CAT_PAGE;
+  const cPages = Math.max(1, Math.ceil((data.total || 0) / CAT_PAGE));
   $('#cat-more').textContent =
     `${data.rows.length} shown of ${data.total.toLocaleString()}` +
-    (data.total > data.rows.length ? ' — narrow with the filters' : '') +
+    (cPages > 1
+      ? ` — ${data.rows.length ? cFrom + 1 : 0}\u2013${cFrom + data.rows.length},`
+        + ` page ${(state.catPage || 0) + 1} of ${cPages}`
+      : '') +
     (data.foldedAway ? ` · ${data.foldedAway.toLocaleString()} skins merged into their mesh` : '') +
     (data.motionFilter
       ? ` · ${(data.motionHidden || 0).toLocaleString()} animation entries in this category hidden by the filter`
-      : '');
+      : '') + sinceText(data.newSince);
+  drawCatPager(cPages);
+  if (data.newSince && data.newSince.state === 'computing') {
+    const at = state.cat.id;
+    clearTimeout(loadCategoryFiles.sinceT);
+    loadCategoryFiles.sinceT = setTimeout(() => {
+      if (state.cat.id === at) loadCategoryFiles();
+    }, 1500);
+  }
+}
+
+/** How many filters narrow the file list: kind, group, the path filter and
+ *  "Since". ("hide animation assets" is a separate, announced toggle.) */
+function catFilterCount() {
+  let n = 0;
+  if (state.cat.role) n++;
+  if (state.cat.group) n++;
+  if ($('#cat-search') && $('#cat-search').value.trim()) n++;
+  if ($('#cat-since-base') && $('#cat-since-base').value) n++;
+  return n;
+}
+
+function paintCatClear() {
+  const b = $('#cat-clear-filters');
+  if (!b) return;
+  const n = catFilterCount();
+  b.disabled = n === 0;
+  b.textContent = n ? `Clear filters (${n})` : 'No filters';
+}
+
+function clearCatFilters() {
+  state.cat.role = null;
+  state.cat.group = null;
+  if ($('#cat-search')) $('#cat-search').value = '';
+  if ($('#cat-since-base')) $('#cat-since-base').value = '';
+  loadCategoryFirstPage();
+}
+
+/** "Since <install>": what the file filter did, in the count line -- or that
+ *  it is still comparing (list NOT filtered yet), or why it refused. */
+function sinceText(ns) {
+  if (!ns) return '';
+  const what = { new: 'new', changed: 'changed', both: 'new or changed' }[ns.mode] || 'new';
+  if (!ns.comparable) return ` · since-filter off: ${ns.why}`;
+  if (ns.state === 'computing')
+    return ` · comparing with ${ns.label}… ${ns.done} of ${ns.total} (not filtered yet)`;
+  if (ns.state === 'failed') return ` · comparison failed: ${ns.error}`;
+  const unk = ns.unknown ? `, ${ns.unknown} unreadable not counted` : '';
+  return ` · ${ns.shown.toLocaleString()} of ${ns.ofTotal.toLocaleString()} ${what} since ${ns.label}${unk}`;
+}
+
+/** Fill the "Since" list from the declared installs, leaving out the one being
+ *  browsed (by ROOT), and reload the list when either control changes. */
+async function initCatSince() {
+  const sel = $('#cat-since-base'), mode = $('#cat-since-mode');
+  if (!sel || initCatSince.done) return;
+  initCatSince.done = true;
+  let d, st;
+  try { d = await api('/api/bases'); st = await api('/api/status'); } catch (e) { return; }
+  const norm = x => String(x || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  const here = norm(st && st.root);
+  for (const b of (d && d.paths) || []) {
+    if (b.kind !== 'install' || (here && norm(b.detail) === here)) continue;
+    const o = document.createElement('option');
+    o.value = b.id;
+    o.textContent = b.label || b.id;
+    sel.appendChild(o);
+  }
+  const reload = () => { if (state.cat.id) loadCategoryFirstPage(); };
+  sel.addEventListener('change', reload);
+  mode.addEventListener('change', () => { if (sel.value) reload(); });
 }
 
 /** Above this many groups the chip list starts collapsed.
@@ -1380,20 +1555,26 @@ function renderCatFacets() {
   if (!data) return;
 
   const roles = Object.entries(data.roles || {}).sort((a, b) => b[1] - a[1]);
-  if (roles.length > 1) {
+  // AN ACTIVE FILTER IS ALWAYS DRAWN (the owner: "filters will get stuck or
+  // disappear"). Selecting a kind narrows the rows to that kind, so the counts
+  // come back with ONE role -- and `roles.length > 1` then hid the very chip
+  // that would untick it. Same for the group axis below.
+  if (state.cat.role && !roles.some(([r]) => r === state.cat.role))
+    roles.push([state.cat.role, 0]);
+  if (roles.length > 1 || state.cat.role) {
     const box = el('div', 'facet-axis');
     box.appendChild(el('div', 'axis-name', 'Kind of file'));
     for (const [r, n] of roles) {
       box.appendChild(chip(r, n, state.cat.role === r, () => {
         state.cat.role = state.cat.role === r ? null : r;
-        loadCategoryFiles();
+        loadCategoryFirstPage();
       }));
     }
     fh.appendChild(box);
   }
 
   const groups = data.groups || [];
-  if (groups.length <= 1) return;
+  if (groups.length <= 1 && !state.cat.group) return;
 
   // `groups` is the server's top 400; `groupTotal` is how many exist. Fall
   // back to the list length only for a server too old to send the figure --
@@ -1410,7 +1591,7 @@ function renderCatFacets() {
 
   const mkChip = g => chip(g.id, g.count, state.cat.group === g.id, () => {
     state.cat.group = state.cat.group === g.id ? null : g.id;
-    loadCategoryFiles();
+    loadCategoryFirstPage();
   });
 
   const box = el('div', 'facet-axis');
@@ -2045,6 +2226,12 @@ function fxStop() {
 function fxSeek(ms, fromRaf) {
   if (!viewer) return;
   const alive = viewer.setEffectTime(ms, fxParentFor);
+  // `setEffectTime` ticks and no longer draws, so the one draw the scrub
+  // needs happens HERE -- once, at the target. The replay loop above it
+  // (`#fx-slider` input) advances from zero to rebuild path-dependent
+  // ribbons and used to pay a full scene draw on every 16.7 ms step:
+  // ~180 draws for a 3 s scrub, on an input event.
+  viewer.draw();
   if (!fromRaf) fx.pausedAt = ms;
   $('#fx-slider').value = String(Math.round(ms));
   const names = fx.loaded.filter(r => r.effect).map(r => r.name).join(' + ');
@@ -2283,8 +2470,17 @@ function renderLoadout() {
   saveLoadout();
 }
 
+/** Per install, exactly as the builder keys it (see builder.js
+ *  `loadoutKey`): a character saved on one install must not come back on
+ *  another, whose ids it does not name. */
+function loadoutKey() {
+  const norm = x => String(x || '').replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+  const root = state.status && state.status.root;
+  return root ? `coviewer.loadout@${norm(root)}` : 'coviewer.loadout';
+}
+
 function saveLoadout() {
-  try { localStorage.setItem('coviewer.loadout', JSON.stringify(state.loadout)); }
+  try { localStorage.setItem(loadoutKey(), JSON.stringify(state.loadout)); }
   catch (e) { /* ignore */ }
 }
 
@@ -2296,8 +2492,11 @@ function restoreLoadout() {
     state.loadout = out;
     return true;
   }
+  // This install's own save only. The pre-fix shared save may be another
+  // install's character; the builder reads it once and CHECKS it, this page
+  // does not, so it is not trusted here.
   try {
-    const s = JSON.parse(localStorage.getItem('coviewer.loadout') || 'null');
+    const s = JSON.parse(localStorage.getItem(loadoutKey()) || 'null');
     if (s && typeof s === 'object') { state.loadout = s; return !!s.body; }
   } catch (e) { /* ignore */ }
   return false;
@@ -2682,6 +2881,9 @@ function renderFacets(data) {
     const counts = data.facets[axis] || {};
     const order = (data.facetOrder[axis] || []).filter(v => v in counts || state.sel[axis].has(v));
     const rest = Object.keys(counts).filter(v => !order.includes(v)).sort();
+    // A ticked value the counts no longer name stays drawn (at 0), so it can
+    // be unticked -- the same stuck-filter defect as the picker's.
+    for (const v of state.sel[axis]) if (!order.includes(v) && !rest.includes(v)) rest.push(v);
     const box = el('div', 'facet-axis');
     box.appendChild(el('div', 'axis-name', AXIS_LABEL[axis]));
     for (const v of [...order, ...rest]) {
@@ -2729,7 +2931,7 @@ function renderFacets(data) {
 function renderTagFacet(host, data) {
   const counts = data.tagCounts || {};
   const known = { ...state.vocabulary, ...counts };
-  const U = ' untagged';
+  const U = UNTAGGED;
   const names = Object.keys(known).sort((a, b) => (counts[b] || 0) - (counts[a] || 0) ||
                                                   a.localeCompare(b));
   //: every selectable name, with the value each one puts in `state.selTags`.
@@ -2858,6 +3060,53 @@ async function bulkTag() {
   }
 }
 
+/** Rows per page of the file list. The server caps `limit` at 2000; 300 is
+ *  what this list already asked for, kept so the pane looks unchanged until
+ *  you reach the bottom of it -- what changes is that there is now a bottom
+ *  to reach. */
+const FILE_PAGE = 300;
+
+/** Prev / Next under the file list.
+ *
+ *  Only rendered when the folder has more than one page. A disabled pager on
+ *  a four-file folder is furniture, and furniture teaches the eye to skip the
+ *  control exactly where it will later matter.
+ */
+function drawFilePager(pages) {
+  const host = $('#file-pager');
+  if (!host) return;
+  host.innerHTML = '';
+  if (pages <= 1) { host.hidden = true; return; }
+  host.hidden = false;
+  const mk = (text, to, enabled) => {
+    const b = el('button', 'fx-pagebtn', text);
+    b.type = 'button';
+    b.disabled = !enabled;
+    if (enabled) {
+      b.addEventListener('click', () => { state.filePage = to; loadFiles(); });
+    }
+    return b;
+  };
+  const cur = state.filePage || 0;
+  host.appendChild(mk('\u2039 prev', cur - 1, cur > 0));
+  host.appendChild(el('span', 'mut small', ` ${cur + 1} / ${pages} `));
+  host.appendChild(mk('next \u203a', cur + 1, cur < pages - 1));
+}
+
+/** Load page ONE of whatever is being listed now.
+ *
+ *  Everything that changes WHICH files are listed -- a folder click, the
+ *  extension dropdown, the search box, the source picker -- goes through here.
+ *  Staying on page 7 while switching to a folder with 12 files renders an
+ *  empty pane, and an empty pane reads as "this folder is empty": a false
+ *  negative manufactured by the pager, which would be a poor trade for the
+ *  one it was added to fix.
+ */
+function loadFilesFirstPage() {
+  state.filePage = 0;
+  return loadFiles();
+}
+
 /** Monotonic guard: clicking through folders issues overlapping requests,
  *  and without this the slower one lands last and shows the wrong folder's
  *  files under the right folder's highlight. */
@@ -2872,7 +3121,16 @@ async function loadFiles() {
     dir,
     ext: $('#ext-select').value || '',
     q: $('#file-search').value.trim(),
-    limit: '300',
+    limit: String(FILE_PAGE),
+    // PAGED, SERVER-SIDE, and server-side is the right half of the choice:
+    // the install root holds 71,453 entries, so fetching them all to page in
+    // the browser would trade one bad answer for a slow one. `/api/files` has
+    // always accepted `offset` (`rows[offset:offset+limit]`); no client ever
+    // sent it, so every folder showed its first 300 rows and offered
+    // "narrow with the filter" as the only way forward. That is not
+    // navigation -- it asks you to already know the name of the thing you are
+    // looking for, which is the state the owner reported.
+    offset: String((state.filePage || 0) * FILE_PAGE),
   });
   const origin = $('#source-select').value;
   if (origin) p.set('source', origin);
@@ -2887,10 +3145,16 @@ async function loadFiles() {
     items.push({ path: r.path, el: list.lastChild });
   }
   navSet('files', items);
+  const fFrom = (state.filePage || 0) * FILE_PAGE;
+  const fPages = Math.max(1, Math.ceil((data.total || 0) / FILE_PAGE));
   $('#file-more').textContent =
     `${data.rows.length} shown of ${data.total}` +
-    (data.total > data.rows.length ? ' — narrow with the filter' : '') +
+    (fPages > 1
+      ? ` — ${data.rows.length ? fFrom + 1 : 0}\u2013${fFrom + data.rows.length},`
+        + ` page ${(state.filePage || 0) + 1} of ${fPages}`
+      : '') +
     (data.unified ? ' · mesh + skins merged into one entry' : '');
+  drawFilePager(fPages);
   $('#file-more').title = data.unifiedNote || '';
 }
 
@@ -2959,6 +3223,7 @@ async function selectFile(path) {
   state.selection = { kind: 'file', path };
   showTagPanel('file:' + path);
   showRelated({ path });
+  usedByShow(path);
   $('#card-effects').classList.add('hidden');
   fxStop();
   $('#card-mappieces').classList.add('hidden');
@@ -3463,3 +3728,139 @@ boot().catch(e => {
   document.getElementById('statusline').textContent = 'startup failed: ' + e.message;
   console.error(e);
 });
+
+// --------------------------------------------- which effect uses this file
+//
+// THE ROUTE BACK, and it did not exist. The Files tab could show you
+// `c3/effect/tj/2.c3` in full -- archive, offset, byte size, motion binding --
+// and never once say the word `tj`, which is the name of the only effect that
+// plays it. The Effects Viewer indexes by effect NAME, so a file you found by
+// browsing was a dead end: you could see the thing and not name it.
+//
+// NONE OF THIS IS NEW MACHINERY. `depclose.DepGraph.impact()` has carried
+// `effect_refs` -- a path-keyed reverse index -- the whole time, `assetroot`
+// groups it into `Satellites.effects`, and `/api/assetroot` already returns it
+// as JSON. MEASURED on Classic Conquer 2.0: `c3/effect/tj/2.c3` ->
+// `EffectRef(effect='tj', layer=1, role='mesh', asset_id='2084')`, graph built
+// in 0.8 s. No JS called that route. This is the wire, not the resolver.
+//
+// THREE THINGS IT MUST NOT DO, all of them ways to look helpful and lie:
+//
+//  1. AN EMPTY LIST IS NOT "NO EFFECT USES THIS". `impact()` indexes `.c3` and
+//     `.dds` and NOTHING else -- it returns `kind: "other"` and says so in its
+//     own limits. For a `.ani`, a sound, a `.wdb`, the honest answer is NOT
+//     INDEXED, and it is rendered differently from an indexed asset that
+//     genuinely has no users. Those two look identical in a bare list and only
+//     one of them is a fact about the client.
+//  2. IT MUST NOT PAY THE COLD WALK WITHOUT SAYING SO. The forward index is a
+//     7-34 s build on a cold install (the same walk `/api/fx/list` and the
+//     compare panel warn about). So the first lookup on a page is a BUTTON
+//     with the cost stated, exactly as `fx-cmp` does it; once the graph is
+//     warm the answer is a dict lookup and later files resolve on selection
+//     without asking. `usedBy.warm` is that latch and nothing else sets it.
+//  3. A FAILED LOOKUP IS NOT AN EMPTY ONE. Any error prints what failed.
+
+const usedBy = { warm: false, token: 0 };
+
+/** `/effects#kind=3d&name=<effect>` -- the deep link effects.js already reads
+ *  (it writes the same shape on selection). Built here rather than by
+ *  string-appending a name a caller may not have encoded. */
+function effectHref(name) {
+  return '/effects#kind=3d&name=' + encodeURIComponent(name);
+}
+
+/** Render one `Satellites.effects` row as a link back to the Effects Viewer. */
+function usedByRow(it) {
+  // The server's label is prose for a person ("tj layer 1 (mesh)"); the NAME
+  // is what the link needs, and parsing it back out of the label would make
+  // every future rewording a silent dead link. `effect` is carried separately
+  // for exactly this reason -- see fxview.js rule 1 on navigation by structure.
+  const r = it.rule || {};
+  const name = r.effect || '';
+  const li = el('li', 'usedby-row');
+  if (name) {
+    const a = el('a', 'navlink-inline', name);
+    a.href = effectHref(name);
+    li.appendChild(a);
+  } else {
+    li.appendChild(el('b', null, it.label || '(unnamed effect)'));
+  }
+  const bits = [];
+  if (r.layer !== undefined && r.layer !== null) bits.push('layer ' + r.layer);
+  if (r.role) bits.push(r.role);
+  if (it.asset_id) bits.push('id ' + it.asset_id);
+  if (bits.length) li.appendChild(el('span', 'mut small', ' — ' + bits.join(' · ')));
+  if (it.source) li.appendChild(el('div', 'mut fx-src', '[' + it.source + ']'));
+  if (it.form) li.appendChild(el('div', 'note', it.form));
+  return li;
+}
+
+/** The card. `path` is a logical asset path; anything else is refused loudly. */
+async function usedByShow(path) {
+  const card = $('#card-usedby');
+  const b = $('#usedby-body');
+  if (!path) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  b.innerHTML = '';
+
+  // Rule 2: on a cold page the walk is the user's to authorise.
+  if (!usedBy.warm) {
+    b.appendChild(el('div', 'mut small',
+      'Finding which effects name this file needs the install-wide dependency ' +
+      'index. Building it is a 7–34 s walk on a cold install; after the first ' +
+      'build every later file answers immediately.'));
+    const btn = el('button', null, 'Find the effects that use this');
+    btn.type = 'button';
+    btn.addEventListener('click', () => { usedBy.warm = true; usedByShow(path); });
+    b.appendChild(btn);
+    return;
+  }
+
+  const tk = ++usedBy.token;
+  b.textContent = 'looking…';
+  let d;
+  try {
+    d = await api('/api/assetroot?asset=' + encodeURIComponent(path));
+  } catch (e) {
+    // Rule 3.
+    b.innerHTML = '';
+    b.appendChild(el('div', 'bad',
+      'the lookup failed, so this says NOTHING about which effects use the ' +
+      'file: ' + e.message));
+    return;
+  }
+  if (tk !== usedBy.token) return;          // a later selection won
+  b.innerHTML = '';
+
+  if (d.error) {
+    b.appendChild(el('div', 'bad', 'the resolver refused this asset: ' + d.error));
+    return;
+  }
+
+  // Rule 1: not-indexed and no-users are different answers.
+  if (d.kind === 'other' || d.measured === false) {
+    b.appendChild(el('div', 'note',
+      'NOT INDEXED. The reverse index covers .c3 meshes and .dds textures ' +
+      'only, so for this file the question was not asked — this is not the ' +
+      'same as "no effect uses it".'));
+    for (const l of (d.limits || [])) b.appendChild(el('div', 'mut small', l));
+    return;
+  }
+
+  const rows = d.effects || [];
+  if (!rows.length) {
+    b.appendChild(el('div', 'mut small',
+      'No effect layer names this file. The index WAS built and this asset ' +
+      'is in it, so this is a measured "none" rather than a gap.'));
+  } else {
+    const ul = el('ul', 'components');
+    for (const it of rows) ul.appendChild(usedByRow(it));
+    b.appendChild(ul);
+    b.appendChild(el('div', 'mut small',
+      rows.length === 1 ? '1 effect layer names this file.'
+                        : rows.length + ' effect layers name this file.'));
+  }
+  // The subject's own blind spots travel with the answer -- fxview.js rule 4,
+  // a link may not launder a caveat.
+  for (const l of (d.limits || [])) b.appendChild(el('div', 'mut small', l));
+}

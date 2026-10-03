@@ -312,9 +312,16 @@ def catalog_baseline(root: Path, names: dict[int, str] | None = None,
     loose: dict[str, str] = {}                # lowercased rel path -> hash
     locator: dict[str, list] = {}             # content hash -> ["b",...]/["w",...]
     t0 = time.time()
+    missing = []
     for arc_name in plan.get("archives", ("c3.wdf", "data.wdf")):
         p = root / arc_name
         if not p.is_file():
+            # SAID, not skipped: a plan naming an archive the install does
+            # not have catalogued nothing from it, and the old silent
+            # `continue` let that read as a complete import (patch7878).
+            missing.append(arc_name)
+            print(f"baseline {arc_name}: NOT FOUND in {root} -- nothing from "
+                  f"this archive is catalogued", flush=True)
             continue
         rows = list(_iter_archive(p, names))
         n = len(rows)
@@ -334,7 +341,7 @@ def catalog_baseline(root: Path, names: dict[int, str] | None = None,
         print("baseline loose layer: skipped, the plugin declares none",
               flush=True)
         return {"content": content, "nameHashes": name_hashes, "loose": loose,
-                "locator": locator}
+                "locator": locator, "missingArchives": missing}
     files = _walk_loose(root, plan.get("skip"))
     print(f"baseline loose files: {len(files)}", flush=True)
     for i, p in enumerate(files, 1):
@@ -352,7 +359,7 @@ def catalog_baseline(root: Path, names: dict[int, str] | None = None,
             locator.setdefault(h, ["b", rel])
         _progress("loose", i, len(files), t0)
     return {"content": content, "nameHashes": name_hashes, "loose": loose,
-            "locator": locator}
+            "locator": locator, "missingArchives": missing}
 
 
 # ---------------------------------------------------------------------------

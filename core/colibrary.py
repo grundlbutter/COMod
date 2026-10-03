@@ -284,7 +284,12 @@ class ServerView(AssetRoot):
                 return None
             # keep the *requested* path as the identity; the baseline path is
             # a storage detail.
-            return Located(key, loc.source, loc.real_path, loc.size)
+            # `origin_root` is carried through: `super().locate` cannot
+            # return a foreign hit today (only `resolve_garment`'s opt-in
+            # fallback makes one), but dropping the field here is how that
+            # would stop being true silently.
+            return Located(key, loc.source, loc.real_path, loc.size,
+                           origin_root=loc.origin_root)
         if kind == "w":
             arc = self._archives.get(ref[1])
             if arc is None:
@@ -586,11 +591,23 @@ class ServerView(AssetRoot):
             seven = cand
             break
         for logical in self.filemap:
-            # map data plus the ani/ placement scripts (MapScene.ani and kin)
-            # that scene rendering parses from disk.
-            if not (logical.startswith("map/")
-                    or (logical.startswith("ani/")
-                        and logical.endswith(".ani"))):
+            # map data, the ani/ placement scripts (MapScene.ani and kin) that
+            # scene rendering parses from disk, and THE MAP REGISTRY.
+            #
+            # The registry is the one that was missing and it cost the whole
+            # feature: `MapEditor.rows()` lists `ini/GameMap.json` (or the
+            # binary `.dat`), not the directory, so a materialised root with
+            # every map file and no registry offers ZERO maps. Selecting the
+            # Collection in the Map Editor showed an empty picker with a
+            # complete map tree sitting beside it.
+            #
+            # Named exactly, not `ini/`: a server view's `ini/` is the whole
+            # of the client's tables and copying it here would put a second,
+            # divergent copy of every one of them on disk under `out/`.
+            low = logical.lower()
+            if not (low.startswith("map/")
+                    or (low.startswith("ani/") and low.endswith(".ani"))
+                    or low in ("ini/gamemap.json", "ini/gamemap.dat")):
                 continue
             # The key comes from a third-party COmmunity Library's
             # filemap.json (see the module docstring) -- untrusted. The old

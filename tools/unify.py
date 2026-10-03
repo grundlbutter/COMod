@@ -136,7 +136,8 @@ class UnifiedIndex:
                  coverage: Optional[Path] = None,
                  thumb_dir: Optional[Path] = None,
                  build: bool = True,
-                 progress: Optional[Callable[[int, int], None]] = None):
+                 progress: Optional[Callable[[int, int], None]] = None,
+                 persist: bool = False):
         self.root = Path(root)
         #: where thumbnail manifests live; a server view passes its own
         #: out/thumbs/servers/<name>/ so the base install's renders (same
@@ -148,7 +149,7 @@ class UnifiedIndex:
         #: different bytes" is as true between 6090 and 5517 as it is for a
         #: library server.
         self._thumb_dir = (Path(thumb_dir) if thumb_dir
-                           else coroot.derived_path("out/thumbs", self.root))
+                           else coroot.thumbs_dir(self.root))
         self._exists = exists or (lambda p: True)
         self.mesh_matches: dict[str, list[dict]] = {}
         self.source = ""
@@ -181,7 +182,7 @@ class UnifiedIndex:
             self._load(coverage
                        or coroot.find_derived("out/meshtex/coverage.json",
                                               self.root),
-                       progress=progress)
+                       progress=progress, persist=persist)
         else:
             self.source = f"not built yet for {self._base()}"
 
@@ -220,7 +221,8 @@ class UnifiedIndex:
             return "unkeyed"
 
     def _load(self, coverage: Path | None,
-              progress: Optional[Callable[[int, int], None]] = None) -> None:
+              progress: Optional[Callable[[int, int], None]] = None,
+              persist: bool = False) -> None:
         """Load this base's coverage index, or build one for this base.
 
         ``None`` means no per-base index exists yet. That is a legitimate
@@ -243,18 +245,47 @@ class UnifiedIndex:
         try:
             import meshtex                                # imported, never edited
             idx = meshtex.MeshTextureIndex(self.root)
-            # `progress(done, total)` exists because this loop is 30-60 s on a
-            # large client and the only honest thing to show someone waiting
-            # is the renderer's OWN count, not an animation. Ticked every 250
-            # meshes: often enough for a moving bar, rarely enough that the
-            # callback is not measurable against the work.
-            meshes = list(idx.all_meshes())
-            total = len(meshes)
-            for i, mesh in enumerate(meshes):
-                self.mesh_matches[mesh] = [m.as_dict() for m in idx.matches(mesh)]
-                if progress is not None and (i % 250 == 0 or i + 1 == total):
-                    progress(i + 1, total)
+            # ONE WRITER. The live build goes through the SAME
+            # `build_coverage` the CLI writes coverage.json with, so the
+            # answer built here and the answer later loaded from the file
+            # are the same data -- including its per-mesh cap
+            # (`meshtex.COVERAGE_MATCHES`). Before this the live branch kept
+            # every match and the file kept 12, and the two states of one
+            # viewer disagreed about which mesh owns a texture.
+            #
+            # `progress(done, total)` exists because this loop is 30-60 s on
+            # a large client and the only honest thing to show someone
+            # waiting is the renderer's OWN count, not an animation.
+            rep = meshtex.build_coverage(idx, progress=progress)
+            self.mesh_matches = {k: v.get("matches", [])
+                                 for k, v in rep["meshes"].items()}
             self.source = f"tools/meshtex.py, built live for {self._base()}"
+            if persist:
+                # Keep what was just paid for. A server patch changes the
+                # base id, the old file stops matching, and without this
+                # every launch after a patch rebuilt live (30-60 s) forever.
+                # A failed write costs the NEXT launch its fast path, not
+                # this one its answer -- so it is reported, not raised.
+                #
+                # THERE IS DELIBERATELY NO SWITCH TO TURN THIS OFF FOR TESTS
+                # (SD ruling, 2026-09-18). A gate run that leaves the
+                # checkout's out/ warm is product behaviour, not
+                # contamination. A gate-only opt-out would make the suite
+                # exercise a path no user runs -- the family that hid both
+                # coverage bugs found that day, because tests took ONE path
+                # by ambient box state and nobody knew which. The cure for
+                # order-dependence is that no test DEPENDS on the state: a
+                # test whose answer differs fast vs live SETS the state it
+                # needs (a temp checkout with the fallback off, or an explicit
+                # build) and ASSERTS which path it took (the `unified` field
+                # test_viewer's motion-toggle test checks); everything else
+                # passes in both states, which the one writer above makes true.
+                try:
+                    dest = meshtex.write_coverage(
+                        rep, self.root, tool="unify.py live build")
+                    self.source += f", persisted to {_describe(dest)}"
+                except Exception as e:                    # pragma: no cover
+                    self.error = f"coverage not persisted: {e}"
         except Exception as e:                            # pragma: no cover
             self.error = (self.error + "; " if self.error else "") + \
                 f"meshtex unavailable: {e}"
@@ -481,7 +512,13 @@ class UnifiedIndex:
                 # module constant this comparison was false for every base but
                 # whichever was configured when the module loaded, so the
                 # inheritance below silently never ran for the others. C55.
-                if self._thumb_dir == coroot.derived_path("out/thumbs", self.root):
+                # Also the READ-ONLY bridge from the old layout: a folder from
+                # `coroot.thumbs_dir` that has no manifest yet still shows a
+                # cache already rendered into this (or the primary)
+                # checkout's `out/thumbs`, rather than going blank until a
+                # full re-render. Images resolve against that manifest's own
+                # folder. A generation run still writes to the new folder.
+                if self._thumb_dir == coroot.thumbs_dir(self.root):
                     for name in THUMB_MANIFEST_NAMES:
                         p = coroot.find_derived("out/thumbs/" + name, self.root)
                         if p is not None and p.is_file():
@@ -499,7 +536,8 @@ class UnifiedIndex:
             # texture manifest for both -- the same shape as C21, in the same
             # file, one attribute over. C55.
             p = self._thumb_dir / "manifest.json"
-            if not p.is_file():
+            if (not p.is_file()
+                    and self._thumb_dir == coroot.thumbs_dir(self.root)):
                 p = coroot.find_derived("out/thumbs/manifest.json",
                                         self.root) or p
             self._tex_thumbs = self._read_manifest(p) if p.is_file() else {}

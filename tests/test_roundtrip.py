@@ -11,9 +11,15 @@ the bytes to be identical.  Anything short of 100% means an unmodelled field.
 Sources, in the same order validate_phy.py uses them:
   * loose  $ROOT/c3/**.c3 and $ROOT/data/**.c3
   * out/wdf/sample/**
-  * c3.wdf and data.wdf, every MAXFILE payload
+  * every archive `AssetRoot._discover_archives` finds -- `.wdf` AND `.tpi`
+    pairs -- every MAXFILE payload
 
 $ROOT is READ-ONLY.  This test only reads.
+
+WIDENED 2026-09-05.  The third source used to be `c3.wdf` and `data.wdf` by
+name, so on the five installs that ship a `.tpi` pair and no `.wdf` at all
+(7632, 7682, 7867, 7878, Zephyr) it yielded nothing and this gate ran on the
+loose tree while printing a PASS.  It now prints which archives it opened.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ def sources(use_wdf=True):
     yield from validate_phy.loose_sources()
     yield from validate_phy.sample_sources()
     if use_wdf:
-        yield from validate_phy.wdf_sources()
+        yield from validate_phy.archive_sources()
 
 
 def main(argv=()):
@@ -44,6 +50,7 @@ def main(argv=()):
     if "--limit" in argv:
         limit = int(argv[argv.index("--limit") + 1])
     use_wdf = "--no-wdf" not in argv
+    validate_phy.reset_manifest_state()
     verbose = "-v" in argv or "--verbose" in argv
 
     per_tag = Counter()
@@ -60,6 +67,11 @@ def main(argv=()):
         try:
             chunks = list(iter_chunks(blob))
         except Exception as e:                              # noqa: BLE001
+            # A container in the known-bad manifest is recorded, not failed --
+            # but ONLY on an exact (install, label) + md5 + error match. Every
+            # other refusal, including a near miss, still fails.
+            if validate_phy.classify_container_failure(label, blob, repr(e)):
+                continue
             fails.append((label, "container", repr(e)))
             continue
 
@@ -103,6 +115,10 @@ def main(argv=()):
 
     print(f"containers scanned : {containers}")
     print(f"PHY chunks         : {total}")
+    if use_wdf:
+        # WHICH archives, not just how many containers. An archive that
+        # contributes nothing is a printed row here rather than an absence.
+        print(validate_phy.format_archive_report())
     print()
     print(f"{'tag':6s} {'seen':>8s} {'byte-exact':>11s} {'rate':>8s}")
     for tag in sorted(per_tag):
@@ -113,19 +129,39 @@ def main(argv=()):
     print(f"\nwhole .c3 containers byte-exact: "
           f"{container_exact}/{container_total}")
 
-    if fails:
-        print(f"\n=== {len(fails)} FAILURES (showing "
+    # TWO FAILURE KINDS, COUNTED SEPARATELY. A chunk that did not round-trip
+    # is a WRITER defect; a container `iter_chunks` refused never reached the
+    # writer at all. Reporting one number for both says "the writer failed 3
+    # times" about an install where every chunk that parsed was byte-exact.
+    # Neither is downgraded -- both still FAIL -- they are just named.
+    unreadable = [f for f in fails if f[1] == "container"]
+    chunkfails = [f for f in fails if f[1] != "container"]
+    if chunkfails:
+        print(f"\n=== {len(chunkfails)} CHUNK FAILURES (showing "
               f"{'all' if verbose else 'first 30'}) ===")
-        for f in (fails if verbose else fails[:30]):
+        for f in (chunkfails if verbose else chunkfails[:30]):
             print(f"  {f[0]}  [{f[1]}]  {f[2]}")
-    else:
+    print()
+    print(validate_phy.format_manifest_report(len(unreadable)))
+    if unreadable:
+        print(f"\n=== {len(unreadable)} CONTAINER(S) THE CHUNK WALKER REFUSED ===")
+        print("  These never reached the writer. A container whose declared "
+              "chunk length runs")
+        print("  past its own end is malformed input, not a writer defect -- "
+              "but it is still")
+        print("  a corpus this gate cannot vouch for, so it FAILS.")
+        for f in (unreadable if verbose else unreadable[:30]):
+            print(f"  {f[0]}  {f[2]}")
+    if not fails:
         print("\nPASS - every PHY chunk re-serializes byte-exactly.")
     # A `RESULT:` line with its counts on it, in the same shape as the other
     # script gates. Before this the only verdict was the prose "PASS - ..."
     # above, printed on success only -- so nothing could be grepped for a
     # verdict, and nothing could check the verdict against the work done.
     print(f"\nRESULT: {'FAIL' if fails else 'PASS'} -- {containers} container(s) "
-          f"scanned, {total} PHY chunk(s), {good} byte-exact, {len(fails)} failure(s)")
+          f"scanned, {total} PHY chunk(s), {good} byte-exact, "
+          f"{len(chunkfails)} chunk failure(s), "
+          f"{len(unreadable)} unreadable container(s)")
     return 0 if not fails else 1
 
 

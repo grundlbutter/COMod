@@ -143,6 +143,117 @@ const FX = {
     return { visible, alpha, cell, uv: [wrap11(uv[0]), wrap11(uv[1])] };
   },
 
+  /** Is this part posed by more than one bone?
+   *
+   *  A one-matrix draw is correct for a one-bone part and WRONG for a cloth
+   *  rig: `lhd_lw3` is a nine-bone REED -- a grass frond, not a
+   *  banner, whatever this file called it for a day -- whose tip bone
+   *  travels 23 units over
+   *  its 61-frame track while bone 0 travels 5, so posing every vertex by bone
+   *  0 renders a swaying frond as a rigid one that drifts. 532 of the corpus's
+   *  10,172 map-effect placements reference a multi-bone mesh -- the reeds,
+   *  the balloons, the ribbons, the music trees and four monsters.
+   *
+   *  The skin ships only when there is one (see `mesh_to_json`), so its mere
+   *  presence is the test and a part without it takes the cheap path.
+   */
+  isSkinned(part) {
+    const g = (part && part.geometry) || {};
+    return !!(g.skinBones && g.skinBones.length &&
+              g.skinWeights && g.skinWeights.length === g.skinBones.length &&
+              part.motion && part.motion.keys && part.motion.keys.length);
+  },
+
+  /** Every bone's matrix at `frame`, indexed by BONE ID, not by palette slot.
+   *
+   *  The payload's `boneIndex` maps id -> slot inside each key's flat `m`;
+   *  this returns a plain array long enough to index by id directly, because
+   *  the per-vertex `skinBones` are ids. Missing ids get the identity, which
+   *  is what `Motion_GetMatrix` returns for a bone the track does not carry.
+   */
+  skinMatrices(motion, frame) {
+    const bones = (motion && motion.bones) || [];
+    const out = [];
+    let hi = 0;
+    for (const b of bones) hi = Math.max(hi, b);
+    for (let i = 0; i <= hi; i++) out.push(null);
+    for (const b of bones) out[b] = FX.motionMatrix(motion, b, frame);
+    return out;
+  },
+
+  /** The part's positions posed at `frame`, as a new Float32Array.
+   *
+   *  `p' = w0 * (p x M[bone0]) + w1 * (p x M[bone1])` -- the same blend
+   *  `attach.transform_vertex` does on the server and the same one `Phy_Load`
+   *  hands the GPU as BLENDINDICES/BLENDWEIGHT. The matrices are already in
+   *  render space and the positions are already z-negated; that pairing is
+   *  exact, not approximate (the conjugation collapses to a sign flip on six
+   *  entries, so skinning in render space and skinning in C3 space then
+   *  negating agree to 0.0 over every bone of every key of `lhd_lw3`).
+   *
+   *  Returns null when the part is not skinned -- the caller then keeps the
+   *  one-matrix path, which stays correct for the other 2,865 parts.
+   */
+  skinPositions(part, frame) {
+    if (!FX.isSkinned(part)) return null;
+    const g = part.geometry;
+    const src = g.positions, bi = g.skinBones, bw = g.skinWeights;
+    const n = (src.length / 3) | 0;
+    const M = FX.skinMatrices(part.motion, frame);
+    const out = new Float32Array(n * 3);
+    for (let v = 0; v < n; v++) {
+      const x = src[v * 3], y = src[v * 3 + 1], z = src[v * 3 + 2];
+      let ox = 0, oy = 0, oz = 0;
+      for (let k = 0; k < 2; k++) {
+        const w = bw[v * 2 + k];
+        if (!w) continue;
+        const m = M[bi[v * 2 + k]];
+        if (!m) { ox += x * w; oy += y * w; oz += z * w; continue; }
+        ox += w * (m[0] * x + m[4] * y + m[8] * z + m[12]);
+        oy += w * (m[1] * x + m[5] * y + m[9] * z + m[13]);
+        oz += w * (m[2] * x + m[6] * y + m[10] * z + m[14]);
+      }
+      out[v * 3] = ox; out[v * 3 + 1] = oy; out[v * 3 + 2] = oz;
+    }
+    return out;
+  },
+
+  /** The part's NORMALS posed at `frame`, renormalised.
+   *
+   *  The same blend as `skinPositions` with the translation dropped -- a
+   *  normal is a direction. Not the inverse-transpose: these matrices are
+   *  rigid (the tracks are rotation + translation, and ZKEY is literally a
+   *  quaternion), and for a rigid transform the inverse-transpose of the 3x3
+   *  IS the 3x3. Renormalising covers the blend between two bones, which is
+   *  not rigid even when both inputs are.
+   */
+  skinNormals(part, frame) {
+    if (!FX.isSkinned(part)) return null;
+    const g = part.geometry;
+    const src = g.normals;
+    if (!src || !src.length) return null;
+    const bi = g.skinBones, bw = g.skinWeights;
+    const n = (src.length / 3) | 0;
+    const M = FX.skinMatrices(part.motion, frame);
+    const out = new Float32Array(n * 3);
+    for (let v = 0; v < n; v++) {
+      const x = src[v * 3], y = src[v * 3 + 1], z = src[v * 3 + 2];
+      let ox = 0, oy = 0, oz = 0;
+      for (let k = 0; k < 2; k++) {
+        const w = bw[v * 2 + k];
+        if (!w) continue;
+        const m = M[bi[v * 2 + k]];
+        if (!m) { ox += x * w; oy += y * w; oz += z * w; continue; }
+        ox += w * (m[0] * x + m[4] * y + m[8] * z);
+        oy += w * (m[1] * x + m[5] * y + m[9] * z);
+        oz += w * (m[2] * x + m[6] * y + m[10] * z);
+      }
+      const L = Math.sqrt(ox * ox + oy * oy + oz * oz) || 1;
+      out[v * 3] = ox / L; out[v * 3 + 1] = oy / L; out[v * 3 + 2] = oz / L;
+    }
+    return out;
+  },
+
   /** Motion_GetMatrix (RVA 0x551A0): clamp at both ends, else element-wise
    *  lerp all 16 elements. Element-wise, not slerp -- ZKEY quaternions were
    *  already baked to matrices at load time. */
@@ -210,8 +321,21 @@ const FX = {
     if (!f) return out;
     const m = FX.mul(Array.from(world), f.m || FX.IDENT);
     const scale = FX.particleScale(m);
+    // ROWS and COLUMNS. They are only equal when the part carries no CCFL
+    // kind 3, and 75 files on 7878 do -- see `effects.Particle.cell`. `u`
+    // steps by 1/K and `v` by 1/N; one number for both axes is the defect.
     const N = Math.max(1, part.atlas || 1);
-    const cell = 1 / N, last = N * N - 1;
+    const K = Math.max(1, (part.atlasCols | 0) || N);
+    // CCFL kind 10 is a HYBRID: the offset pair is ADDED to the cell UV and
+    // the extent pair is MULTIPLIED into the cell SIZE. Traced by RE in
+    // graphic.dll (offset 0x14DCA9 fadd, extent 0x14F554 fmul), both loading
+    // the annotation from PTC3+0x6C. Absent uvRect = the engine's clear flag,
+    // which draws the UNMODIFIED cell rect -- still drawn, not dormant.
+    const rect = (part.uvRect && part.uvRect.length === 4) ? part.uvRect : null;
+    const offU = rect ? rect[0] : 0, offV = rect ? rect[1] : 0;
+    let cellU = 1 / K, cellV = 1 / N;
+    if (rect) { cellU *= rect[2]; cellV *= rect[3]; }
+    const last = K * N - 1;
     const sa = part.systemAlpha;
     if (sa && sa.length) out.alpha = sa[Math.min(frame | 0, sa.length - 1)];
 
@@ -221,16 +345,17 @@ const FX = {
     for (let i = 0; i < n; i++) {
       const p = FX.xform(m, [f.p[i*3], f.p[i*3+1], f.p[i*3+2]]);
       const s = f.s[i] * scale;
-      const c = Math.min(Math.trunc(f.c[i] * N * N), last);
-      const u0 = (c % N) * cell, v0 = Math.floor(c / N) * cell;
+      const c = Math.min(Math.trunc(f.c[i] * K * N), last);
+      // Origin on the UNSCALED pitch; only the size carries the extent.
+      const u0 = (c % K) / K + offU, v0 = Math.floor(c / K) / N + offV;
       for (let q = 0; q < 6; q++) {
         const [dr, du, cu, cv] = FX.QUAD[q];
         const o = (i * 6 + q) * 3, t = (i * 6 + q) * 2;
         pos[o]     = p[0] + right[0]*dr*s + up[0]*du*s;
         pos[o + 1] = p[1] + right[1]*dr*s + up[1]*du*s;
         pos[o + 2] = p[2] + right[2]*dr*s + up[2]*du*s;
-        uv[t]     = u0 + cu * cell;
-        uv[t + 1] = v0 + cv * cell;
+        uv[t]     = u0 + cu * cellU;
+        uv[t + 1] = v0 + cv * cellV;
       }
     }
     out.n = n; out.pos = pos; out.uv = uv;
@@ -259,7 +384,23 @@ const FX = {
   },
 };
 
-function wrap11(v) {                 // graphic.dll wraps into [-1.1, 1.1]
+/** graphic.dll's UV fold, into [-1.1, 1.1]. A MIRROR of `effectplay._wrap11`.
+ *
+ *  **EXPORTED ON `FX` SO IT CAN BE GATED.** It is a hand copy, like `frameAt`
+ *  in effects.js, and until 2026-09-16 it had no parity arm anywhere -- while
+ *  the kind-13 scroll counter that FEEDS it did. An odd place for coverage to
+ *  stop. `tests/test_effect_skin` now drives it against the Python over a
+ *  table straddling both fold boundaries.
+ *
+ *  **THE RANGE IS NOT [0,1) AND THAT IS NOT A BUG.** Every step subtracts an
+ *  INTEGER, so this and a `frac()` fold differ by an integer and sample the
+ *  same texel UNDER A REPEAT SAMPLER. Measured over 20,014 values including
+ *  +/-1.3e6: never a non-integer difference. **Under CLAMP they are NOT
+ *  equivalent** -- a negative output and a [0,1) output sample different
+ *  texels -- which is why `mapfx.js` uploading effect textures with
+ *  CLAMP_TO_EDGE was a real bug (`tests/test_mapfx_texture_wrap.py`), and why
+ *  the parity arm asserts an INTEGER DIFFERENCE rather than equality. */
+function wrap11(v) {
   while (v > 1.1) v -= Math.ceil(v);
   while (v < -1.1) v -= Math.floor(v);
   return v;
@@ -335,14 +476,44 @@ class EffectInstance {
     this._build();
   }
 
+  /** Build the GL resources, and RECORD WHAT WAS DROPPED DOING IT.
+   *
+   *  `this.build` is one entry per DECLARED layer, in declaration order:
+   *
+   *      { index, declared, kept, drops: [{ kind, why }] }
+   *
+   *  **It is written HERE, by the builder, and that is the whole point.**
+   *  Backlog item 24 names the trap explicitly: a "drawn" count re-derived
+   *  in the page from `def.layers` counts DECLARED layers, which is the
+   *  number the panel already prints, so the two columns would agree by
+   *  construction and the check could never fire. The only place that knows
+   *  what the GL build KEPT is the loop below.
+   *
+   *  Three parts are skipped and continue -- a `phy` with no geometry or no
+   *  indices, a `shape` whose line is not exactly two points, and a
+   *  `particle` that did not decode. Each still leaves its layer in
+   *  `this.layers` as `{src, parts: []}`, so a layer can be present and draw
+   *  nothing. Before this, the ONLY signal was all-or-nothing: `play3d`
+   *  prints "no drawable layer" when zero instances build. **Partial loss
+   *  produced no message at all**, which is `fxview.js` rule 2 -- nothing
+   *  unresolved is dropped for being untidy -- held on the panel side and
+   *  broken on the stage side. */
   _build() {
     const gl = this.gl;
+    this.build = [];
+    let li = -1;
     for (const lay of this.def.layers || []) {
+      li += 1;
       const parts = [];
+      const drops = [];
       for (const p of lay.parts || []) {
         if (p.kind === 'phy') {
           const g = p.geometry;
-          if (!g || !g.indices.length) continue;
+          if (!g) { drops.push({ kind: 'phy', why: 'no geometry' }); continue; }
+          if (!g.indices.length) {
+            drops.push({ kind: 'phy', why: 'geometry has no indices' });
+            continue;
+          }
           parts.push({
             kind: 'phy', src: p, meta: g,
             vbo: buf(gl, g.positions, Float32Array),
@@ -351,7 +522,11 @@ class EffectInstance {
             ibo: buf(gl, g.indices, Uint16Array, gl.ELEMENT_ARRAY_BUFFER),
             count: g.indices.length,
           });
-        } else if (p.kind === 'shape' && p.line && p.line.length === 2) {
+        } else if (p.kind === 'shape' && !(p.line && p.line.length === 2)) {
+          drops.push({ kind: 'shape',
+                       why: 'line is ' + ((p.line || []).length) +
+                            ' point(s), a ribbon needs exactly 2' });
+        } else if (p.kind === 'shape') {
           // Two dynamic buffers: the ribbon is rebuilt every frame from the
           // rolling pair history.
           parts.push({
@@ -359,8 +534,13 @@ class EffectInstance {
             vbo: gl.createBuffer(), tbo: gl.createBuffer(),
             count: 0, capacity: 0,
           });
-        } else if (p.kind === 'particle' && p.decoded && p.frames &&
-                   p.frames.length) {
+        } else if (p.kind === 'particle' && !(p.decoded && p.frames &&
+                                             p.frames.length)) {
+          drops.push({ kind: 'particle',
+                       why: p.decoded === false
+                         ? 'the particle chunk did not decode'
+                         : 'the particle system has no frames' });
+        } else if (p.kind === 'particle') {
           // Two dynamic buffers, like a ribbon: the quads are rebuilt every
           // frame because they face the camera, so they change when the
           // camera moves and not only when the clock does. Sized once for the
@@ -377,18 +557,92 @@ class EffectInstance {
           gl.bufferData(gl.ARRAY_BUFFER, cap * 12 * 4, gl.DYNAMIC_DRAW);
         }
         // A particle chunk that did not decode still arrives in the payload
-        // with `decoded: false`; it is skipped rather than faked.
+        // with `decoded: false`; it is skipped rather than faked -- and now
+        // it is skipped and SAID, which is the difference item 24 is about.
+        else { drops.push({ kind: String(p.kind || 'unknown'),
+                            why: 'no builder for this part kind' }); }
       }
-      this.layers.push({ src: lay, parts });
+      // `visible` is VIEW STATE and nothing else (backlog item 24 rule 3).
+      // It is set here, defaulted true, and read by the draw loop. It never
+      // reaches the definition, is never sent anywhere, and is rebuilt from
+      // scratch every time `_build` runs -- which is every subject change,
+      // so it resets by construction rather than by anyone remembering to
+      // reset it. A toggle that persisted across subjects would hide a layer
+      // of an effect the user never hid.
+      this.layers.push({ src: lay, parts, visible: true });
+      this.build.push({
+        index: (lay.index != null ? lay.index : li),
+        declared: (lay.parts || []).length,
+        kept: parts.length,
+        drops,
+      });
     }
   }
 
   dispose() {
     const gl = this.gl;
     for (const l of this.layers) for (const p of l.parts) {
-      for (const k of ['vbo', 'nbo', 'tbo', 'ibo']) if (p[k]) gl.deleteBuffer(p[k]);
+      for (const k of ['vbo', 'nbo', 'tbo', 'ibo', 'sbo', 'snbo'])
+        if (p[k]) gl.deleteBuffer(p[k]);
     }
     this.layers = [];
+  }
+
+  /** Pose one multi-bone PHY part at `frame`, returning the buffers to draw
+   *  it with -- or null when the part is not skinned and the caller should
+   *  keep the cheap one-matrix path.
+   *
+   *  WHY THIS EXISTS. `motion.bones[0]` poses a whole mesh by its first bone.
+   *  That is exact for a one-bone part, which is what almost every effect is,
+   *  and it silently discards the entire motion of a cloth rig: on `lhd_lw3`,
+   *  a nine-bone REED (a grass frond), bone 0 travels 5 units over the track and
+   *  bone 8 travels 23 -- the wave IS the spread between them, so posing by
+   *  bone 0 renders a swaying frond as a rigid one that drifts. 532 of the
+   *  10,172 map-effect placements reference a multi-bone mesh.
+   *
+   *  The returned positions have the motion BAKED IN, so the caller's model
+   *  matrix must then be the placement alone. Applying a bone matrix on top
+   *  poses it twice.
+   *
+   *  NORMALS are skinned too, by the same matrices' upper 3x3 and
+   *  renormalised. The map-effect pass does not light anything and does not
+   *  care; the Model Viewer does, and unskinned normals on a moving surface
+   *  read as the lighting sliding off the geometry.
+   *
+   *  CACHING is at two levels because the two things live at different
+   *  levels: the blended arrays hang off `part.src`, which is the SHARED
+   *  scene definition -- one fetch per effect name, handed to every placement
+   *  of it -- while the GL buffers are per part, because parts belong to a
+   *  single instance. One entry is enough: `tick` runs every placement off
+   *  one clock with no phase offsets, so all sixteen `lhd_lw1`s on
+   *  `2024tsf_new` are on the same frame at the same moment.
+   */
+  poseSkin(part, frame) {
+    const src = part.src;
+    if (!FX.isSkinned(src)) return null;
+    const gl = this.gl;
+    if (src._skinFrame !== frame || !src._skinPos) {
+      src._skinPos = FX.skinPositions(src, frame);
+      src._skinNrm = FX.skinNormals(src, frame);
+      src._skinFrame = frame;
+    }
+    if (!src._skinPos) return null;
+    if (!part.sbo) {
+      part.sbo = buf(gl, src._skinPos, Float32Array);
+      part.snbo = src._skinNrm ? buf(gl, src._skinNrm, Float32Array) : part.nbo;
+      part.skinAt = frame;
+      return { vbo: part.sbo, nbo: part.snbo };
+    }
+    if (part.skinAt !== frame) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, part.sbo);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, src._skinPos);
+      if (src._skinNrm && part.snbo !== part.nbo) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, part.snbo);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, src._skinNrm);
+      }
+      part.skinAt = frame;
+    }
+    return { vbo: part.sbo, nbo: part.snbo };
   }
 
   /** Advance to `elapsed` ms since spawn. Returns the frame state. */
@@ -495,5 +749,8 @@ function buf(gl, data, Type, target) {
   return b;
 }
 
+// `wrap11` is published for the PARITY GATE, not for callers: inside this
+// file every consumer already reaches it through `samplePart`.
+FX.wrap11 = wrap11;
 window.FX = FX;
 window.EffectInstance = EffectInstance;

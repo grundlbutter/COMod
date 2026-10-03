@@ -86,7 +86,7 @@ body appearance 002135000            equipped weapon 410009
    ini/3dmotion.ini["2" + "410" + "401"]  =  c3/0002/410/401.c3
                         |
                         v
-   a motion-only .c3: N MOTI chunks, no PHY
+   the action motion .c3: N MOTI chunks (+ N PHY on CCO, §8 step 2)
                         |
         C3Mesh::SetMotion  (graphic.dll 0x277C0)  -- BY ORDINAL
                         v
@@ -174,8 +174,31 @@ keys with this decomposition.
 
 Both families exist. `1`–`4` are the four player bodies (`c3/0001` …
 `c3/0004`) and carry ~22,400 rows each; `1001`–`1004` are a parallel set with
-~22,750 rows each under `c3/1001` … `c3/1004`. `0001`–`0004` also appear, with
-only ~1,420 rows each and only under the `800`–`804` weaponsets.
+~22,750 rows each under `c3/1001` … `c3/1004`. `0001`–`0004` also appear, as a
+ten-wide spelling of the same four bodies.
+
+**That ten-wide family is wider than this section used to say.** It read "only
+~1,420 rows each and only under the `800`–`804` weaponsets". MEASURED
+2026-09-25 on the live CCO install (`C:\Program Files\Classic Conquer 2.0`, the
+default root): **5,240 rows over nine weaponsets**, ~1,310 per shape
+(`0001` 1,307, the other three 1,311 each) —
+
+| weaponsets | rows |
+|---|---:|
+| `350`, `360`, `370`, `380` | **3,436** (976 / 932 / 736 / 792) |
+| `800`–`804` | **1,804** (344 / 352 / 352 / 352 / 404) |
+
+The `350`–`380` half was missed entirely, and it is the larger half. The same
+counts hold on `CCO-snapshot-2026-08-24`, which is the install §2's own row
+totals were measured on, so **this was never a stale figure — it was wrong when
+written**. (The live install carries 229,493 rows / 228,997 distinct keys to the
+snapshot's 229,481 / 228,985; §2's table is the snapshot's.)
+
+Those 5,240 rows name **1,091 distinct files, 1,043 of which a seven-wide key
+also names — so 48 files are reachable only through a ten-wide key.** A reader
+that indexes one spelling and not the other loses those 48 and nothing
+complains; `MotionIndex` indexes both, and `SRC_INI_PATH` marks which spelling
+came from a row's own path.
 
 The shape for a player is **the first three digits of the `armor.ini`
 appearance with leading zeros stripped** — `002135000` → `2` (VERIFIED, this
@@ -620,8 +643,36 @@ most likely to be got wrong.
    chunks into another, **separately**, and pair them by index. 447 of 2,002
    loose `.c3` files store all `PHY`s then all `MOTI`s; adjacency pairing
    produces nothing on those. `attach.PartMesh.parse` does this.
-2. Load the action motion `.c3`. It is **motion-only** — `MOTI` chunks and no
-   `PHY`.
+2. Load the action motion `.c3`. **Whether it is "motion-only" is a property of
+   the install, not of the format** — MEASURED 2026-09-25 on the live CCO
+   install (`C:\Program Files\Classic Conquer 2.0`, the default root) against
+   client 5517, on the same logical path `c3/0002/000/100.c3`, both served out
+   of `c3.wdf`:
+
+   | | 5517 | CCO (default root) |
+   |---|---:|---:|
+   | size | 39,232 B | 140,252 B |
+   | `PHY` chunks | 0 | 4 |
+   | `MOTI` chunks | 4 (ZKEY) | 4 (RAW) |
+   | `CAME` chunks | 0 | 1 |
+
+   On CCO that file carries a full reference body — `v_body` at 562 vertices /
+   720 faces plus the three sockets `v_armet`, `v_l_weapon`, `v_r_weapon` (24 /
+   6 / 6 vertices) — and its four `MOTI`s are one 84-bone track and three
+   1-bone socket tracks, 16 keys each. **So "`MOTI` chunks and no `PHY`" is
+   true on 5517 and false on CCO**, and reading step 1's body chunks out of an
+   action file would silently succeed there.
+
+   Corpus-wide, over the 1,664 distinct files named by the seven-wide
+   (shape `1`–`4`) `3dmotion.ini` keys, **1,120 are present on CCO and 1,043 of
+   those carry at least one `PHY`** — 1,041 with exactly 4 and 2 with 5; only
+   77 are motion-only. Bind by ordinal regardless (step 3): the extra `PHY`s
+   are a reference copy of the body, not the body you are posing.
+
+   > `docs/attachment.md` §3's "343 motion-only" is **not** in conflict: it
+   > counts the 2,002 **loose** `.c3` files, and these motion sets are served
+   > from the WDF archives. Resolve through `AssetRoot`, not `os.walk`, or the
+   > population is a different one.
 3. Bind by ordinal: `bodyMesh.phy[i].motion = motionSet.Get(i)`
    (`C3Mesh::SetMotion`, `graphic.dll 0x277C0`, loop at `0x27818`). There is no
    name matching. The engine rejects a motion set with fewer entries than the

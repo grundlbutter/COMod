@@ -32,18 +32,46 @@
  * (`coroot.declare_kind`) plus any library servers. Nothing here enumerates
  * clients; declare another install on the setup page and it appears.
  *
- * Depends only on the page's own `api()` and `toast()`, so it loads last and
- * does nothing if the page has neither.
+ * WHERE IT RUNS. Any page that puts `#path-label` / `#path-select` in its
+ * header and loads this file. It uses the page's own `api()` and `toast()`
+ * when they exist and falls back to plain `fetch` when they do not, so a page
+ * needs no helpers of its own to get the control -- which is how the Map
+ * Editor and the Effects Viewer got it without either growing a network
+ * layer. The Effects Viewer has no `api()` at all.
  */
 'use strict';
+
+/** The page's `api()` if it has one, else a minimal equivalent.
+ *
+ * Every page that wants this control should not have to grow a network
+ * helper for it. The fallback matches what the pages that DO have one do:
+ * throw on a non-2xx with the body as the message, and parse JSON.
+ */
+function bpApi(url, opts) {
+  if (typeof api === 'function') return api(url, opts);
+  return fetch(url, opts).then(async r => {
+    if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+    return r.json();
+  });
+}
+
+function bpToast(msg, ms) {
+  if (typeof toast === 'function') { toast(msg, ms); return; }
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(bpToast._t);
+  bpToast._t = setTimeout(() => t.classList.add('hidden'), ms || 2200);
+}
 
 async function initBasePicker() {
   const sel = document.getElementById('path-select');
   const label = document.getElementById('path-label');
-  if (!sel || !label || typeof api !== 'function') return;
+  if (!sel || !label) return;
 
   let doc;
-  try { doc = await api('/api/bases'); } catch (e) { return; }
+  try { doc = await bpApi('/api/bases'); } catch (e) { return; }
   const paths = (doc && doc.paths) || [];
   // One path is not a choice. Stay out of the header rather than offer a
   // control whose only option is the state you are already in.
@@ -95,11 +123,9 @@ async function initBasePicker() {
     const id = sel.value;
     const prev = doc.current || '';
     sel.disabled = true;
-    if (typeof toast === 'function') {
-      toast('switching… your loadout and action are kept', 8000);
-    }
+    bpToast('switching… the page reloads from the new path', 8000);
     try {
-      await api('/api/base', {
+      await bpApi('/api/base', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: id }),
@@ -112,7 +138,7 @@ async function initBasePicker() {
     } catch (e) {
       sel.disabled = false;
       sel.value = prev;
-      if (typeof toast === 'function') toast('switch failed: ' + e.message, 6000);
+      bpToast('switch failed: ' + e.message, 6000);
     }
   });
 }

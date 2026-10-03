@@ -52,7 +52,20 @@ const CoNav = (() => {
     { id: 'viewer',   href: '/index.html', label: 'Asset Viewer' },
     { id: 'builder',  href: '/builder',  label: 'Character Builder' },
     { id: 'models',   href: '/models',   label: 'Model Viewer' },
+    // ONE tab, and it was two until 2026-09-08. `/effects` (Effect Preview)
+    // and `/fxview` (Effects Viewer) were the same subject seen twice: one
+    // played an effect and the other catalogued it. The owner asked for one
+    // page called "Effects Viewer", so the Effect Preview's three-column
+    // shell survived and the library's panels moved into it. `/fxview` still
+    // resolves -- old links do not break -- and forwards here, which is why
+    // there is no `fxview` entry in `UNDER` either: it is not a page any
+    // more, it is a redirect.
+    { id: 'effects',  href: '/effects',  label: 'Effects Viewer' },
     { id: 'mapedit',  href: '/mapedit',  label: 'Map Editor' },
+    // A PEER OF THE MAP EDITOR, not a panel on it: its subject is the
+    // SATELLITE asked across every map at once, where the Editor's
+    // subject is one map.
+    { id: 'mapassets', href: '/mapassets', label: 'Map Assets' },
     { id: 'swap',     href: '/swap',     label: 'Swap' },
     { id: 'settings', href: '/settings', label: 'Settings' },
   ];
@@ -84,22 +97,32 @@ const CoNav = (() => {
 
   /** Pages that are not themselves tabs, and the tab they belong under.
    *
-   *  EMPTY, and that is the current state rather than a stub. `/swap` used to
-   *  live here, mapped under `viewer`, so the bar would light SOMETHING on a
-   *  page that was not a tab. That was the honest-but-uncomfortable answer to
-   *  "which tab is current on /swap": Asset Viewer, a page you are not on.
-   *  Swap is its own tab now, so the question is gone.
+   *  A page listed here lights its parent; a page listed nowhere lights
+   *  nothing, which reads as broken and is why the map exists at all. It was
+   *  empty until 2026-09-25: `/swap` used to live here mapped under `viewer`,
+   *  which was the honest-but-uncomfortable answer to "which tab is current
+   *  on /swap" -- Asset Viewer, a page you are not on -- and Swap becoming
+   *  its own tab removed the question.
    *
-   *  The mechanism stays because the situation will recur -- the next route
-   *  that is a flow rather than a section needs somewhere to point, and
-   *  rediscovering that is worse than keeping eight lines. A page listed here
-   *  lights its parent; a page listed nowhere lights nothing, which reads as
-   *  broken and is why the map exists at all.
+   *  `/builddiff` is the situation the mechanism was kept for, and it is a
+   *  FLOW rather than a section: "what changed between one client build and
+   *  the next", read out of `<assets>/derived/patchdict/`, which most boxes
+   *  do not have -- the page's own refusal banner is the ordinary outcome. A
+   *  ninth tab spends a permanent slot in a bar everyone sees on a page most
+   *  sessions cannot use, and the bar's whole discipline is that it does not
+   *  grow casually.
+   *
+   *  UNDER `settings` because that is where the declared install set lives,
+   *  and "what changed between two builds" is a question about that set.
+   *  Settings is in `MODES.cco` as well, so the parent exists in both modes
+   *  and `under()` has nothing to derive for it.
    *
    *  THIS MAP IS MODE-INDEPENDENT. The tabs a MODE hides are handled by
    *  `under()` below, which derives them -- see there for why they are not
    *  written out as a second map beside `MODES`. */
-  const UNDER = {};
+  const UNDER = {
+    builddiff: 'settings',
+  };
 
   /** Which mode the server says this page is in.
    *

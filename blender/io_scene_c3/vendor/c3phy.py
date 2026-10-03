@@ -99,7 +99,51 @@ class Vertex:
                        participates (RVA 0x5A284); the GPU weight1 is
                        derived as 255-weight0, NOT read from here
       0x28 normal     absent in "PHY " / "PHY4" (generated instead)
-      0x34 uv1        present only in "PHY5"   -> GPU TEXCOORD1
+      0x34 uv1        present only in "PHY5". READ FROM FILE; its GPU
+                      destination is NOT established -- see below.
+
+    **THE uv1 LINE USED TO READ "-> GPU TEXCOORD1" AND THAT WAS NOT VERIFIED.**
+    It was the one entry in this block with no RVA beside it while all four of
+    its neighbours carry one, and the absence was the tell. Corrected
+    2026-09-21 by reading the shipped shader source out of
+    `Env_DX9/graphic.dll` (identical on 7878 and 7939):
+
+      * Across 64 vertex-shader sources, the TEXCOORD1 **input** slot holds
+        ``c3_BoneIndexWeight`` in **28** of them and ``c3_TexCoord1`` in 13;
+        four more put ``c3_TexCoord1`` on TEXCOORD2 because bones already
+        occupy slot 1. **So the slot is not fixed, and for a SKINNED mesh
+        TEXCOORD1 is bone index/weight data.** PHY5 meshes are skinned.
+      * A second vertex UV (``c3_TexCoord1``) therefore does exist, but this
+        field's mapping to it is unproven, and the slot depends on skinning.
+
+    What this field is NOT: the thing CCFL kind 9 drives. That annotation is
+    the uniform ``c3_UVAnimStep``, added to ``c3_TexCoord0`` in 25 of its 30
+    shader uses -- the PRIMARY UV. See `core/c3ccfl.KIND_UV_ANIM_STEP`.
+
+    `0x14 unknown4` above is the honest precedent for this shape: read from
+    file, no consumer found. Until a store into a vertex declaration or a
+    ``SetStreamSource``/declaration site is traced, `uv1` belongs in that
+    category rather than in the arrow-bearing one.
+
+    **AND THE ORIGINAL ARROW IS BUILD-DEPENDENT RATHER THAN SIMPLY WRONG.**
+    What made it false on the 32-bit DX9 client is that TEXCOORD1 was already
+    taken by the packed bone attribute. **CCO does not have that collision**
+    -- measured in `Classic Conquer 2.0/bin/64/graphic.dll` (64-bit, MSVC
+    2022, SM4):
+
+      * ``c3_BoneIndexWeight``  140 occurrences on 7878 -> **0** on CCO
+      * ``BLENDINDICES`` / ``BLENDWEIGHT``   1 / 1 on 7878 -> **35 / 35** on CCO
+
+    CCO moved skinning onto the real semantics, which frees TEXCOORD1. So in
+    CCO ``uv1 -> TEXCOORD1`` is plausible and untested, while on the 32-bit
+    DX9 renderer it is contradicted. **Do not carry either reading across
+    that boundary**; it is the same lesson as the RVAs above, which also do
+    not transfer between these DLLs.
+
+    (The same codebase spans both: ``CMyBitmap`` appears 152 times in CCO's
+    renderer and 155 in 7878's, and kind 9's ``c3_UVAnimStep`` is present in
+    both -- 88 occurrences in CCO against 69 -- still added to
+    ``c3_TexCoord0``/``c3_TexCoord1``. It is a port, not a rewrite.)
     """
     px: float = 0.0
     py: float = 0.0
@@ -158,7 +202,22 @@ class PhyMesh:
     matrix: tuple = ()                # 16 floats, row-major as stored
     frame_count: int = 0              # C3Phy+0x190
     keys: C3Key = field(default_factory=C3Key)
-    step: Optional[tuple[int, int]] = None
+    #: The ``STEP`` tag's two f32: the per-tick U/V scroll rate.
+    #:
+    #: **RETYPED 2026-09-16 (M8). It was `tuple[int, int]` and the dwords were
+    #: always floats.** `c3write` wrote them back as u32, so the round trip was
+    #: byte-exact ONLY BECAUSE THE WRONG READ AND THE WRONG WRITE CANCELLED --
+    #: correct output from two errors, which stops being correct the moment
+    #: either side is fixed alone. Measured on this tree:
+    #:
+    #:     baseline                  4,781 / 4,781 byte-exact   PASS
+    #:     ONE side moved            3,588 / 4,781, 1,193 fail  FAIL
+    #:     BOTH sides moved together 4,781 / 4,781 byte-exact   PASS
+    #:
+    #: The round-trip gate is loud about one side and STRUCTURALLY BLIND to
+    #: both; `tests/test_uv_step_retype.py` covers the half it cannot, by
+    #: pinning the rendered UVs from before the change in BOTH engines.
+    step: Optional[tuple[float, float]] = None
     two_sided: bool = False
     billboard: int = 0                # 0 none, 1 BILB, 2 BIB2, 3 BIB3, 4 BIB4
     step1: Optional[tuple[float, float]] = None
@@ -326,10 +385,27 @@ def parse_phy(tag: bytes, body: bytes, *, apply_matrix: bool = False) -> PhyMesh
         cnt = r.u32()
         setattr(m.keys, slot, [r.read(16) for _ in range(cnt)])
 
-    # ---- "STEP" -> two u32 (RVA 0x5B1FB) ----
+    # ---- "STEP" -> TWO f32 (RVA 0x5B1FB) ----
+    #
+    # This said "two u32" until 2026-09-16 and read them as u32, and
+    # `c3write` wrote them back as u32, so the round trip was byte-exact only
+    # because the two errors cancelled.
+    #
+    # MEASURED over the whole of RSDB section 1 on 7878, through this parser
+    # rather than a byte scan (`scratchpad/m8_step_values.py`): 156,815 chunks
+    # carry a STEP, 79,367 are non-zero, and EVERY non-zero component lands in
+    # 1e-5..1e0 -- no NaN, no Inf, no tail. As integers they would be
+    # arbitrary dwords with no reason to cluster in a band four decades wide.
+    # The f32 unpack/repack is byte-exact on all 434 distinct dwords in the
+    # corpus, which is what makes this retype safe for `c3write`.
+    #
+    # Four modules move together or the round trip breaks: this reader,
+    # `c3write` (writes `_f` now), `editbundle` (shows a human -0.017 instead
+    # of 3163243414) and `effects.EffectPart.uv_step`, whose reinterpretation
+    # is gone because the value arrives correct.
     if r.peek(4) == b"STEP":
         r.read(4)
-        m.step = (r.u32(), r.u32())
+        m.step = struct.unpack("<2f", r.read(8))
 
     # ---- "2SID" then optional billboard tag (RVA 0x5B274) ----
     nxt = r.peek(4)
