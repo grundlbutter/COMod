@@ -607,6 +607,19 @@ def build_family(target, root, ar, donor_gltf, a, log, motion_rows=None) -> tupl
              else R.Donor(donor_gltf, a.animation))
     ground = None if a.ground in (None, "", "off") else a.ground
     hop_cap = hop_cap_of(getattr(a, "hop_cap", R.GROUND_HOP_CAP)) if ground else None
+    # PER FAMILY, NOT PER RUN. One run builds both roles (the 2026-10-03 set:
+    # 14 NPC idles and 4 monster idles), and the client plays them at
+    # DIFFERENT rates -- so the rate and the frame count are resolved from
+    # THIS family's role, not from one flag for the whole run. An explicit
+    # --fps-ms / --frames still wins, for every family. Backlog item 44 step 1.
+    timing = rigtarget.resolve_timing(target, getattr(a, "fps_ms", None))
+    n_frames = rigtarget.resolve_frames(getattr(a, "frames", None), timing,
+                                        donor.duration)
+    fam["timing"] = timing.as_dict()
+    fam["framesTarget"] = n_frames
+    assumed = timing.warning()
+    if assumed:
+        log("  %-16s %s" % (target.family, assumed))
     rows = []
     for path in target.idle:
         data = ar.read(path)
@@ -625,10 +638,11 @@ def build_family(target, root, ar, donor_gltf, a, log, motion_rows=None) -> tupl
                    chunkTags=[tag.decode("latin-1").strip() for tag, _b in src_chunks],
                    tables=table_desc)
         try:
-            res = R.retarget_clip(data, rig, donor, fps_ms=a.fps_ms, tail=a.tail,
+            res = R.retarget_clip(data, rig, donor, fps_ms=timing.ms,
+                                  timing=timing, tail=a.tail,
                                   root_motion=a.root_motion, rest_offset=a.rest_offset,
                                   attach=None, fingers=False, mesh=mesh, garment=garment,
-                                  tables=tables, frames=a.frames, encoding=a.encoding,
+                                  tables=tables, frames=n_frames, encoding=a.encoding,
                                   ground=ground, follow=follow, assets=ar,
                                   hop_cap=hop_cap, drawn=drawn)
         except R.RetargetError as e:
@@ -641,6 +655,11 @@ def build_family(target, root, ar, donor_gltf, a, log, motion_rows=None) -> tupl
             "shaAfter": _sha(res.bytes), "bytesAfter": len(res.bytes),
             "frames": m["frames"], "framesBefore": m["frames"]["source"],
             "framesAfter": m["frames"]["written"],
+            # PER FILE, because the rate is per ROLE and a run spans roles.
+            # `timing` says where this file's ms came from; `fpsMs` is the
+            # number itself, so a reader never has to find the run's flag.
+            "fpsMs": m["fpsMs"], "timing": m["timing"],
+            "targetDurationS": m["targetDurationS"],
             "encodingBefore": m["encoding"]["source"], "encodingAfter": m["encoding"]["written"],
             "encodingNote": m["encoding"]["note"], "encodingChanged": m["encoding"]["changed"],
             "engineVerified": m["frames"]["engineVerified"],
@@ -679,15 +698,45 @@ def build_family(target, root, ar, donor_gltf, a, log, motion_rows=None) -> tupl
             dst.write_bytes(res.bytes)
             row["written"] = True
             row["out"] = str(dst)
-        log("  %-16s %-28s %s %d -> %d frames, %s -> %s, %d -> %d bytes  [%s; %d npc row(s)]%s%s"
+        log("  %-16s %-28s %s %d -> %d frames at %g ms/%s (%.2f s), %s -> %s, "
+            "%d -> %d bytes  [%s; %d npc row(s)]%s%s"
             % (target.family, path, "wrote" if row["written"] else "would write",
-               row["framesBefore"], row["framesAfter"], row["encodingBefore"],
+               row["framesBefore"], row["framesAfter"],
+               timing.ms, timing.provenance, m["targetDurationS"],
+               row["encodingBefore"],
                row["encodingAfter"], row["bytesBefore"], row["bytesAfter"],
                fam["route"], len(npc_rows),
                "" if row["engineVerified"] else "  [engine acceptance UNVERIFIED]",
                "" if not m["socketsCarried"] else "  sockets carried %d" % len(m["socketsCarried"])))
         rows.append(row)
     return rows, None
+
+
+def _timing_by_role(planned: list) -> dict:
+    """``{role: {fpsMs, provenance, evidence, how, assumed, files, paths}}``
+    -- what each role was ACTUALLY built at in this run.
+
+    A run spans roles and `--fps-ms auto` gives each its own rate, so one
+    top-level `fpsMs` would be a lie about every role but one. A role that
+    somehow came out at two rates is recorded as two entries rather than
+    averaged, because a disagreement here is a defect to read, not a number
+    to smooth."""
+    out: dict = {}
+    for r in planned:
+        t = r.get("timing") or {}
+        role = t.get("role") or r.get("kind") or "unknown"
+        key = "%s@%s" % (role, t.get("fpsMs"))
+        e = out.setdefault(key, {"role": role, "fpsMs": t.get("fpsMs"),
+                                 "provenance": t.get("provenance"),
+                                 "assumed": bool(t.get("assumed")),
+                                 "how": t.get("how"),
+                                 "evidence": t.get("evidence"),
+                                 "files": 0, "paths": []})
+        e["files"] += 1
+        e["paths"].append(r.get("path"))
+    for e in out.values():
+        e["paths"].sort()
+    return {k: out[k] for k in sorted(out)}
 
 
 def write_readme(out: Path, catalog: dict, refused: dict, head: str = "") -> Path:
@@ -701,10 +750,11 @@ def write_readme(out: Path, catalog: dict, refused: dict, head: str = "") -> Pat
     L.append("")
     L.append("The Mixamo \"Gangnam Style\" donor clip retargeted onto the IDLE of every monster")
     L.append("and NPC family on the CCO snapshot that a route accepts (own rig, a same-skeleton")
-    L.append("lender's rig, or the player's rig), written at %d frames (%g ms, ~%.1f s per"
-             % (catalog["frames"], catalog["fpsMs"], catalog["frames"] * catalog["fpsMs"] / 1000.0))
-    L.append("cycle), tail %s, grounded (`--ground %s`), at the SAME relative paths the client"
-             % (catalog["tail"], catalog["ground"]))
+    L.append("lender's rig, or the player's rig), sampled at the rate the client PLAYS EACH")
+    L.append("ROLE at (`rigtarget.SPEED_TABLE`, `--fps-ms %s` / `--frames %s`), tail %s,"
+             % (catalog.get("fpsMsSpec"), catalog.get("framesSpec"), catalog["tail"]))
+    L.append("grounded (`--ground %s`), at the SAME relative paths the client"
+             % catalog["ground"])
     L.append("reads them from. %d files for %d families, serving %d npc.json rows (%d names)."
              % (len(files), len({r["family"] for r in files}),
                 sum(r.get("npcRowCount", 0) for r in files),
@@ -721,6 +771,25 @@ def write_readme(out: Path, catalog: dict, refused: dict, head: str = "") -> Pat
              % catalog["root"])
     L.append("from or written to the live install. Donor: `%s`, sha256 `%s`."
              % (catalog["donor"]["path"], catalog["donor"]["sha256"]))
+    L.append("")
+    L.append("## The rate each role was built at, and where that number came from")
+    L.append("")
+    L.append("A C3 container carries NO time field, so a clip's frame interval is a property of")
+    L.append("the ROLE the client plays the file as, not of the file (`docs/animation.md` 5).")
+    L.append("Sampling every role at one constant is what makes a clip play fast: a file built")
+    L.append("at 41 ms and played at 33 runs 41/33 = **1.2424x** fast. These rows are")
+    L.append("`rigtarget.SPEED_TABLE`; a row marked `assumed` has NEVER been measured and the")
+    L.append("build warned about every file it wrote under one.")
+    L.append("")
+    L.append("| role | ms/frame | provenance | files | cycle | evidence |")
+    L.append("|---|---:|---|---:|---:|---|")
+    for e in (catalog.get("timingByRole") or {}).values():
+        ex = [r for r in files if (r.get("timing") or {}).get("role") == e["role"]]
+        cyc = max([r.get("targetDurationS") or 0.0 for r in ex] or [0.0])
+        L.append("| %s | %g | %s%s | %d | %.3f s | %s |"
+                 % (e["role"], e["fpsMs"] or 0.0, e["provenance"],
+                    " **(NEVER MEASURED)**" if e["assumed"] else "",
+                    e["files"], cyc, e["evidence"]))
     L.append("")
     L.append("## The owner's kill-test premise (measured 2026-10-01 on the live client)")
     L.append("")
@@ -743,8 +812,8 @@ def write_readme(out: Path, catalog: dict, refused: dict, head: str = "") -> Pat
     L.append("")
     L.append("## The files")
     L.append("")
-    L.append("| path | family | route | npc.json rows served (names) | frames | encoding | engine | hover c3 min/mean/max | ground offset min/mean/max | mesh container |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| path | family | route | npc.json rows served (names) | frames | ms/frame (provenance) | encoding | engine | hover c3 min/mean/max | ground offset min/mean/max | mesh container |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in files:
         names = r.get("npcNames") or []
         n_rows = r.get("npcRowCount", 0)
@@ -762,9 +831,13 @@ def write_readme(out: Path, catalog: dict, refused: dict, head: str = "") -> Pat
         if st:
             route = "%s (%d unconfirmed edge(s), %d mapped)" % (
                 route, st.get("unconfirmed") or 0, len(st.get("unconfirmedMapped") or []))
-        L.append("| `%s` | %s | %s | %s | %d -> %d | %s -> %s | %s | %s / %s / %s | %s | %s |" % (
+        tm = r.get("timing") or {}
+        ms_cell = "%g (%s%s)" % (tm.get("fpsMs") or 0.0, tm.get("provenance"),
+                                 ", NEVER MEASURED" if tm.get("assumed") else "")
+        L.append("| `%s` | %s | %s | %s | %d -> %d | %s | %s -> %s | %s | %s / %s / %s | %s | %s |" % (
             r["path"], r["family"], route, who,
-            r["framesBefore"], r["framesAfter"], r["encodingBefore"], r["encodingAfter"],
+            r["framesBefore"], r["framesAfter"], ms_cell,
+            r["encodingBefore"], r["encodingAfter"],
             "**verified**" if r.get("engineVerified") else "unverified",
             _fmt(hv.get("min")), _fmt(hv.get("mean")), _fmt(hv.get("max")),
             _fmt(r.get("groundOffset")), "PHY" if r.get("meshContainer") else "MOTI-only"))
@@ -947,7 +1020,9 @@ def _git_head() -> str:
         return ""
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The builder's own parser, so a gate can read its DEFAULTS
+    (`--fps-ms auto` / `--frames auto`) without running a build."""
     ap = argparse.ArgumentParser(
         description="Retarget the donor onto every humanoid monster and NPC idle.")
     ap.add_argument("--root", default=None, help="the VANILLA snapshot (never the live install)")
@@ -955,8 +1030,18 @@ def main(argv=None) -> int:
     ap.add_argument("--animation", type=int, default=0)
     ap.add_argument("--out", default=None,
                     help="output folder; default <export dir>/rig/%s" % DEFAULT_RUN)
-    ap.add_argument("--frames", type=int, default=302)
-    ap.add_argument("--fps-ms", type=float, default=R.DEFAULT_FPS_MS)
+    # PER ROLE, not per run: one run builds NPC and monster idles and the
+    # client plays them at different rates. `auto` takes each family's
+    # `rigtarget.SPEED_TABLE` row and one donor loop at that rate -- 375 at
+    # 33 ms for an NPC, 302 at 41 ms for a monster on the 12.367 s Gangnam
+    # donor. A number still wins, for every family. Backlog item 44 step 1.
+    ap.add_argument("--frames", default=rigtarget.AUTO,
+                    help="keys per file: 'auto' (default) is one donor loop at "
+                         "the role's rate, 'source' keeps each clip's own "
+                         "count, or a number")
+    ap.add_argument("--fps-ms", default=rigtarget.AUTO,
+                    help="frame interval, ms: 'auto' (default) is the "
+                         "SPEED_TABLE row for each family's ROLE, or a number")
     ap.add_argument("--tail", choices=R.TAILS, default="loop")
     ap.add_argument("--root-motion", choices=R.ROOT_MOTIONS, default="vertical")
     ap.add_argument("--rest-offset", choices=R.REST_OFFSETS, default="direction")
@@ -1005,6 +1090,11 @@ def main(argv=None) -> int:
                     help="skip files whose catalog row and output already match")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--quiet", action="store_true")
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
     a = ap.parse_args(argv)
 
     root = str(a.root or coroot.default_root())
@@ -1096,7 +1186,13 @@ def main(argv=None) -> int:
         "root": root,
         "donor": {"path": str(a.gltf), "sha256": _sha(donor_bytes)},
         "out": str(out),
-        "frames": a.frames, "fpsMs": a.fps_ms, "tail": a.tail,
+        # THE SPECS, not one resolved number: with `auto` each family takes
+        # the `rigtarget.SPEED_TABLE` row for its ROLE, so a run has as many
+        # rates as it has roles. `timingByRole` is what was actually used,
+        # and every file row carries its own `fpsMs` and `timing`.
+        "framesSpec": a.frames, "fpsMsSpec": a.fps_ms,
+        "timingByRole": _timing_by_role(planned),
+        "tail": a.tail,
         "rootMotion": a.root_motion, "restOffset": a.rest_offset, "encoding": a.encoding,
         "ground": a.ground, "hopCap": hop_cap_of(getattr(a, "hop_cap", R.GROUND_HOP_CAP)),
         "borrow": a.borrow, "skinTree": getattr(a, "skin_tree", "npc"),

@@ -18,23 +18,55 @@
           display: flex; align-items: baseline; gap: 1rem; }
 .sw-top h2 { margin: 0; font-size: 1.1rem; }
 .sw-top .sw-sub { opacity: .8; font-size: .9em; }
-.sw-body { flex: 1; display: grid; grid-template-columns: 1fr 15rem 1fr;
-           min-height: 0; }
-.sw-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.sw-pane + .sw-pane { border-left: 1px solid rgba(128,128,128,.25); }
-.sw-mid { border-left: 1px solid rgba(128,128,128,.25);
+/* THE TWO PANES SHARE ONE SET OF ROWS (owner, 2026-10-03: "the CCO asset
+   list gets cut off ... the 3d viewer should be at the same height"). Each
+   pane used to stack its own controls, stage, notes and list in a column
+   clamped to the window. The right pane's server picker and kind note sat
+   above its stage, so its stage started lower than the left one; and on a
+   short window the two 46%-high stages plus the notes left the list almost
+   nothing. Now `.sw-body` owns six rows and both panes take them through
+   `subgrid`:
+
+       head | controls | stage | filter bar | list | notes
+
+   so the stages start on the same line at the same height. The stage and
+   the list SHARE the height left over, 2 : 3, so a taller window grows both
+   and a shorter one shrinks both -- the stage to `--sw-stage-min`, the list
+   to `--sw-list-min` and never below. Past that, `.sw-body` scrolls, under
+   the title and the write-access banner, which stay on screen. EACH PANE
+   HAS EXACTLY SIX CHILDREN IN THAT ORDER: a seventh would be packed into
+   the last row. The middle column spans all six, and `contain: size` keeps
+   a long plan in it from stretching any row. */
+.sw-body { flex: 1 1 0; min-height: 0; overflow-y: auto;
+           --sw-stage-min: 8rem; --sw-list-min: 12rem;
+           display: grid; grid-template-columns: 1fr 15rem 1fr;
+           grid-template-rows: auto auto minmax(var(--sw-stage-min), 2fr) auto
+                               minmax(var(--sw-list-min), 3fr) auto; }
+.sw-pane { display: grid; grid-row: 1 / -1; grid-template-rows: subgrid;
+           min-width: 0; min-height: 0; }
+#pane-donor { grid-column: 1; }
+#pane-target { grid-column: 3; }
+.sw-mid { grid-column: 2; grid-row: 1 / -1; min-height: 0; contain: size;
+          border-left: 1px solid rgba(128,128,128,.25);
           border-right: 1px solid rgba(128,128,128,.25);
           padding: .8rem; overflow-y: auto; }
+/* Row 2. The rule under the controls belongs to the ROW, so it lines up
+   across the panes however many lines of controls each side has. */
+.sw-ctl { border-bottom: 1px solid rgba(128,128,128,.25); min-width: 0; }
+.sw-ctl > .sw-kinds { border-bottom: 0; }
+.sw-filterbar { padding: 0 .8rem; min-width: 0; }
+.sw-foot { border-top: 1px solid rgba(128,128,128,.25);
+           padding: .35rem .8rem; min-width: 0; }
 .sw-head { padding: .5rem .8rem; border-bottom: 1px solid rgba(128,128,128,.25); }
 .sw-role { font-weight: 600; }
 .sw-role small { font-weight: 400; opacity: .75; display: block; }
-.sw-stage { position: relative; height: 46%; min-height: 12rem;
+.sw-stage { position: relative; min-height: 0;
             background: rgba(128,128,128,.08); }
 .sw-stage canvas { width: 100%; height: 100%; display: block; }
 .sw-msg { position: absolute; inset: 0; display: flex; align-items: center;
           justify-content: center; text-align: center; padding: 1rem;
           pointer-events: none; opacity: .85; }
-.sw-pick { flex: 1; overflow-y: auto; min-height: 0; padding: .4rem .8rem; }
+.sw-pick { overflow-y: auto; min-height: 0; padding: .2rem .8rem .4rem; }
 .sw-kinds { display: flex; flex-wrap: wrap; gap: .3rem; padding: .5rem .8rem;
             border-bottom: 1px solid rgba(128,128,128,.25); }
 .sw-kind { padding: .25rem .6rem; border: 1px solid rgba(128,128,128,.4);
@@ -87,8 +119,6 @@
 /* An empty parts list is a fault until proven otherwise, so the states are
    not styled alike: `fault` and `unknown` are loud, `none` is a statement,
    and only `ok` is quiet. */
-.sw-parts { padding: .5rem .8rem; border-top: 1px solid rgba(128,128,128,.25);
-            max-height: 32%; overflow-y: auto; }
 .sw-state { padding: .5rem .6rem; border-radius: 4px; margin-bottom: .5rem; }
 .sw-state b { display: block; }
 .sw-state .sw-detail { font-size: .9em; opacity: .9; margin-top: .3rem; }
@@ -115,6 +145,7 @@
 .sw-basis { font-size: .8em; opacity: .7; margin-top: .35rem;
             font-style: italic; }
 .sw-pane.sw-refused .sw-kinds,
+.sw-pane.sw-refused .sw-filterbar,
 .sw-pane.sw-refused .sw-pick { opacity: .4; pointer-events: none; }
 .sw-cat-count { opacity: .6; font-size: .85em; margin-left: .25rem; }
 .sw-unknown { background: rgba(220,150,40,.16);
@@ -181,6 +212,21 @@
           background: rgba(128,128,128,.14); padding: .35rem; border-radius: 3px; }
 .sw-go { margin-top: .6rem; padding: .35rem .8rem; cursor: pointer; }
 .sw-step { margin: .5rem 0; }
+
+/* Explanations fold away (owner, 2026-10-03: "the info/tooltips are
+   collapsible"). The summary line stays visible and carries the headline,
+   so a warning still reads as one when closed; the body opens on a click
+   and scrolls on its own rather than pushing the list off the page. The
+   write-access banner is deliberately NOT one of these. */
+.sw-info { font-size: .85em; }
+.sw-info > summary { cursor: pointer; padding: .15rem 0; opacity: .9; }
+.sw-info > summary b { display: inline; }
+.sw-info > summary:focus-visible { outline: 2px solid rgba(90,140,220,.9);
+                                   outline-offset: 2px; border-radius: 2px; }
+.sw-info[open] > summary { margin-bottom: .3rem; }
+.sw-info-body { max-height: 30vh; overflow-y: auto; }
+.sw-info.sw-state { padding: .3rem .5rem; margin-bottom: 0; }
+.sw-mid .sw-info { margin: .5rem 0; }
 </style>
 </head>
 <!-- /swap is a tab of its own -- nav.js lists it in TABS -- and a document of
@@ -212,22 +258,15 @@
         <span class="sw-role">Your library
           <small>collect something first &mdash; this pane is never an install</small></span>
       </div>
-      <!-- The library's state is rendered BEFORE the list, and when the
-           state has no list it is rendered INSTEAD of one. Four states
-           (stocked / empty / unreadable / unconfigured) with four
-           sentences: an empty shelf and an unreadable folder are not the
-           same news, and the second must never wear the first's copy. -->
-      <div id="library-state"></div>
-      <div class="sw-kinds" id="library-cats"></div>
+      <!-- Six children, one per shared row: head, controls, stage, filter
+           bar, list, notes (the comment over `.sw-body`). The library's
+           state -- stocked / empty / unreadable / unconfigured, four
+           sentences -- is drawn INSTEAD of the list when there is no list,
+           by drawLibrary(). -->
+      <div class="sw-ctl"><div class="sw-kinds" id="library-cats"></div></div>
       <div class="sw-stage"><canvas id="gl-donor"></canvas>
         <div class="sw-msg" id="msg-donor">pick a kind</div></div>
-      <!-- WHICH INSTALL this entry's art came from, and therefore whose
-           `[Dumy]` list decided which chunks are attachment points and which
-           got drawn. Always shown once an entry is picked, resolved ones
-           included: the state a reader most needs to recognise -- "drawn with
-           the install on screen" -- is the one that looks like success. -->
-      <div id="donor-prov"></div>
-      <div class="sw-pick">
+      <div class="sw-filterbar">
         <input class="sw-search" id="donor-q" type="search"
                placeholder="filter" autocomplete="off">
         <div class="sw-filters" id="donor-filters">
@@ -236,9 +275,15 @@
             <input type="checkbox" id="swap-hide-noparts"><span>hide assets with no parts</span>
           </label>
         </div>
-        <div id="donor-list"></div>
       </div>
-      <div class="sw-parts" id="donor-parts"></div>
+      <div class="sw-pick"><div id="donor-list"></div></div>
+      <!-- WHICH INSTALL this entry's art came from, and therefore whose
+           `[Dumy]` list decided which chunks are attachment points and which
+           got drawn. Always shown once an entry is picked, resolved ones
+           included: the state a reader most needs to recognise -- "drawn with
+           the install on screen" -- is the one that looks like success. Its
+           headline stays on the summary line when the box is folded. -->
+      <div class="sw-foot" id="donor-prov"></div>
     </div>
 
     <div class="sw-mid" id="sw-mid">
@@ -254,13 +299,12 @@
     <div class="sw-pane" id="pane-target">
       <div class="sw-head">
         <span class="sw-role">The private server
-          <small>CCO &mdash; the NPC set from its own npc.json</small></span>
+          <small>CCO &mdash; <span id="target-sub">the NPC set from its own npc.json</span></small></span>
       </div>
-      <div id="target-state"></div>
-      <div class="sw-kinds" id="target-kinds"></div>
+      <div class="sw-ctl"><div class="sw-kinds" id="target-kinds"></div></div>
       <div class="sw-stage"><canvas id="gl-target"></canvas>
         <div class="sw-msg" id="msg-target">pick a kind</div></div>
-      <div class="sw-pick">
+      <div class="sw-filterbar">
         <input class="sw-search" id="target-q" type="search"
                placeholder="filter" autocomplete="off">
         <div class="sw-filters" id="target-filters">
@@ -282,9 +326,11 @@
             <input type="checkbox" id="swap-collapse"><span>collapse to groups</span>
           </label>
         </div>
-        <div id="target-list"></div>
       </div>
-      <div class="sw-parts" id="target-parts"></div>
+      <div class="sw-pick"><div id="target-list"></div></div>
+      <!-- What this kind of target is, and on what basis the install is
+           identified. Folded by default; drawTargets() fills it. -->
+      <div class="sw-foot" id="target-info"></div>
     </div>
 
   </div>

@@ -204,6 +204,73 @@ HAVE_PLAY_UI = (HERE / "webui" / "play.js").is_file()
 HAVE_PACKMEASURE = (HERE / "packmeasure.py").is_file()
 HAVE_TILESET = (HERE / "tileset.py").is_file()
 HAVE_EXTRACTOR = (HERE / "extract_comod.py").is_file()
+HAVE_ROUTEB = (PROJECT / "routeb" / "export_scenery.py").is_file()
+
+
+def requires_tool(*names: str, why: str = ""):
+    """Skip unless every named ``tools/`` module is present in THIS tree.
+
+    The capability flags above answer the same question one file at a time,
+    and this is the same answer for the long tail -- the modules a test reads
+    as *source* rather than imports. Those sites are the ones that went on
+    erroring after the flags landed, because a `read_text` on a file that was
+    never extracted raises `FileNotFoundError` from inside the test body,
+    where no `skipUnless` is looking.
+
+    Why a helper rather than one more ``HAVE_*`` constant per module: the set
+    is open. `extract_comod.py`'s manifest is an ALLOWLIST and its documented
+    default is that a new `tools/` module does NOT ship, so the number of
+    names a test might ask about only grows, and a constant per name is a
+    list that goes stale in the direction of erroring again.
+
+    The reason names the file, because "skipped" with no subject is the other
+    half of the problem this fixes.
+    """
+    missing = [n for n in names if not (HERE / n).is_file()]
+    reason = ("needs " + ", ".join(f"tools/{n}" for n in missing)
+              + ", not present in this tree")
+    if why:
+        reason += f" ({why})"
+    return unittest.skipUnless(not missing, reason)
+
+
+def _clients_corpus_present() -> bool:
+    """True when a `Clients/` tree on this box holds at least one client.
+
+    ``is_dir()`` on the search entries is NOT enough: this box has carried an
+    empty `Clients/` directory at a historical location while the corpus
+    lived elsewhere, and an empty directory answers "yes" to the cheap check
+    and "nothing" to every read that follows.  One client inside it is the
+    smallest fact that makes the box a box with game data on it.
+    """
+    try:
+        dirs = coroot.clients_search_dirs()
+    except Exception:                            # pragma: no cover
+        return False
+    for d in dirs:
+        try:
+            if any(c.is_dir() for c in Path(d).iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _box_has_game_data() -> bool:
+    """True when this machine holds Conquer Online game data of ANY kind.
+
+    Either a resolvable install root or a `Clients/` corpus with something in
+    it.  Deliberately broader than `HAVE_ROOT`: a box with a corpus but no
+    *configured* root still has data a test could have been looking at, and
+    the distinction this predicate exists to draw is "could the absence of
+    one named install mean anything here at all".
+
+    A FUNCTION rather than a constant so a test can ablate it.  The two arms
+    -- refuse, and skip -- are each other's control, and a constant computed
+    at import makes which arm runs a property of the machine, which is the
+    class of un-triageable result this whole file keeps closing.
+    """
+    return HAVE_ROOT or _clients_corpus_present()
 
 
 def _thumb_manifest(name: str):
@@ -321,6 +388,15 @@ def requires_base(*kinds: str, why: str = ""):
 # and the same sentence, after a nonexistent pin there turned a class into
 # `OK (skipped=24)`, a green verdict over an instrument that measured nothing.
 #
+# **...ON A BOX THAT HAS GAME DATA. Narrowed 2026-10-03, owner's decision.**
+# The sentence above is scoped to the hazard it names -- falling back to the
+# discovered install -- and that hazard needs an install to fall back to. On
+# a machine with no install root and no `Clients/` tree holding a client,
+# an absent pin SKIPS, naming the pin and its `why`. Nothing else moves: a
+# missing pin on a rig that has the corpus still FAILS, and a DRIFTED pin
+# fails everywhere. See `DeclaredInstall.path` for the argument and
+# `tests/test_pin_fingerprint.py` for both arms, each other's control.
+#
 # **The raise happens PER TEST, by name, never from `setUpClass`.** A
 # class-level raise removes every test in the class from `testsRun` and
 # records ONE holder -- see `_main`'s note on the same hazard -- so the test
@@ -410,6 +486,29 @@ class DeclaredInstall:
         -- an `AssertionError`, never a skip -- because "the pin is not here"
         and "the pin is not what it was" are both *this test measured
         nothing*, and a skip is a silence that gets read as an answer.
+
+        **ON A BOX WITH NO GAME DATA AT ALL, AN ABSENT PIN SKIPS.** Narrowed
+        2026-10-03 by owner's decision, and it is a narrowing of the scope of
+        the 2026-08-28 ruling, not a reversal of it. Read that ruling by its
+        reason: a pin must not FALL BACK to the discovered install, because
+        the numbers it asserts belong to one install and answering with
+        another's is a false regression -- `docs/two_reds_one_install_2026
+        -08-26.md`, a box that HAD the corpus and had modified part of it.
+        Where there is no corpus and no install, there is nothing to fall
+        back TO, the hazard is not present, and the rest of this suite has
+        already stood down for the same absence. What the unnarrowed rule
+        produced there was 27 red items on a fresh clone that are not the
+        cloner's doing -- which is itself an un-triageable report, the exact
+        thing the ruling exists to abolish, pointed the other way.
+
+        The teeth stay where the reason is. `_box_has_game_data` is TRUE for
+        a box with any client at all, so a renamed, mistyped or half-deleted
+        pin on a working rig still FAILS, loudly, exactly as before -- and
+        that, not the bare runner, is where a pin gets broken.
+
+        A DRIFTED pin is untouched and still fails everywhere: drift can only
+        be observed on a box that HAS the directory, so the case does not
+        arise on a bare one.
         """
         seen = [str(d) for d in coroot.clients_search_dirs()]
         found = None
@@ -419,6 +518,13 @@ class DeclaredInstall:
                 found = c
                 break
         if found is None:
+            if not _box_has_game_data():
+                raise unittest.SkipTest(
+                    f"declared install {self.name!r} is not here, and "
+                    f"neither is any other game data -- no install root "
+                    f"resolves and no Clients/ tree on this machine holds a "
+                    f"client, so there is no install to confuse this one "
+                    f"with. Pinned because: {self.why}")
             raise AssertionError(
                 f"declared install {self.name!r} is not present under any of "
                 f"{seen} -- this test is PINNED to it on purpose ({self.why}) "
@@ -642,7 +748,12 @@ def _index_reason(rel: str, present: bool = False, note: str = "") -> str:
         moved under an install that was written to (`docs/CORRECTIONS.md`
         C18, and `docs/handoff_fingerprint_stability.md`);
       * **partially built** -- the namespace is here and this artefact is not,
-        so the reader is told what it *does* hold.
+        so the reader is told what it *does* hold;
+      * **no kind declared** -- `base_id()` carries no plugin kind, so the
+        sibling test that distinguishes *orphaned* from *never built* cannot
+        be made at all, and saying either would be an invention.  Added after
+        the three above and not written down here until 2026-10-03, which is
+        how `TheIndexGate`'s state list came to be short by one.
 
     The fourth state, **broken code**, is deliberately not one of these: it is
     what a *failure* means once this gate is in place.  The gate is keyed on
@@ -2221,6 +2332,7 @@ class TheDeclaredMeshBeatsTheDerivedOne(unittest.TestCase):
                     "still resolve" % ident)
 
 
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
 class AnUnrecoveredNameIsNotAMissingFile(unittest.TestCase):
     r"""`Catalog.resolve_id` / `Catalog.exists` must answer about the INSTALL,
     not about `out/wdf/*_names.json`.
@@ -9151,10 +9263,20 @@ class IniDbDuplicatePolicy(unittest.TestCase):
         self.assertNotIn("matching the", head)
 
 
+@unittest.skipUnless(HAVE_PLAY_UI, "tools/webui/play.js not present in this tree")
 class GameClientPage(unittest.TestCase):
     """`tools/coplay.py` and its page. The seams that matter are the ones it
     shares with the viewer -- if those drift, the game client silently grows a
-    second copy of something that already works."""
+    second copy of something that already works.
+
+    `HAVE_PLAY_UI` on the CLASS, not on the reads inside `setUpClass`:
+    `coplay.py` and `webui/play.*` are left behind together by
+    `extract_comod.py`, and the extractor's own docstring already claims
+    "the suite notices their absence and skips (`HAVE_PLAY_UI`)". It did not
+    -- this class read all three files unguarded, so the claim was true of
+    `IniDbDuplicatePolicy` next door and false here, and the extracted tree
+    errored in `setUpClass` instead.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -10760,8 +10882,16 @@ class ParseRefusesANameAndStillTakesAPath(unittest.TestCase):
                       "same search the guard was meant to save")
         self.assertIn("desert", msg)
 
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
     def test_a_real_path_still_parses(self):
-        """The permitting direction. If this ever fails the guard is inert."""
+        """The permitting direction. If this ever fails the guard is inert.
+
+        Gated: `coroot.game_root()` RAISES `RootNotFound` with no install,
+        and this is the one test in the class that needs a real file -- the
+        two refusal arms beside it are synthetic and stay live everywhere,
+        so the guard is still watched in both directions wherever the install
+        is present and the permitting half is honestly absent where it is not.
+        """
         import dmap
         base = coroot.game_root()
         maps = sorted((Path(base) / "map" / "map").glob("*.DMap"))
@@ -12564,6 +12694,7 @@ class SceneSprites(unittest.TestCase):
                 self.assertTrue(cache.frames(p.ani, p.title), p.title)
 
 
+@unittest.skipUnless(HAVE_ROUTEB, "routeb/ not present in this tree")
 class SceneryExport(unittest.TestCase):
     """`routeb/export_scenery.py` -- the TERRAIN layers, packed for the DX11
     renderer as GPU-ready DXT plus a destination rectangle and a draw order.
@@ -13565,8 +13696,16 @@ class MapEditorWritesWhatTheRegistryNames(unittest.TestCase):
                          "map/map/somemap.DMap")
 
 
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
 class MapEditorStagedArt(unittest.TestCase):
-    """Staging a texture has to show on the map, or "stage" means nothing."""
+    """Staging a texture has to show on the map, or "stage" means nothing.
+
+    Needs the install: the stand-in edit is a REAL shipped tile, read out of
+    the install and written back into the stage, so there is no synthetic
+    version of this test. Without a root `MapEditor.assets` is None and the
+    read raises `AttributeError` several lines after the absence -- which
+    reads as a defect in the editor and is not one.
+    """
 
     def test_the_map_reads_through_the_stage_tree(self):
         import mapedit
@@ -18041,6 +18180,7 @@ class CcoIsTheReferenceInstall(unittest.TestCase):
             "here, so agreeing with one of them proves nothing about the "
             "other")
 
+    @unittest.skipUnless(HAVE_ROOT, "game install not present")
     def test_the_52_declared_dummies_are_not_the_art(self):
         r"""`RolePart.ini` here declares **13 parts and 52 dummies** -- v_head,
         v_misc, v_pelvis, v_back, v_mantle, shoulders, flaps -- and names
@@ -18642,8 +18782,23 @@ class CorrectionsRegister(unittest.TestCase):
 
     def test_a_removed_gate_fails_rather_than_passing_quietly(self):
         """`CORRECTIONS.md` present and the gate gone is the silent case, and
-        it is worse than a duplicate id: nothing is checking at all."""
-        verdict, detail = self._verdict(self.GATE.parent / "no-such-gate.py")
+        it is worse than a duplicate id: nothing is checking at all.
+
+        The register is a FIXTURE, not this tree's own. It used to be the
+        real `docs/CORRECTIONS.md`, which made the arm say nothing in any
+        tree that does not ship one: with neither file present the
+        substituted case takes the extraction route and SKIPS, and the arm
+        read `'skipped' != 'failed'` -- a red in COMod over a gate that is
+        working exactly as designed. `test_a_tree_carrying_neither_skips_and
+        _says_so` below is the arm that owns that route, and it supplies its
+        own empty directory for precisely this reason.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            register = Path(td) / "CORRECTIONS.md"
+            register.write_text("# C1 -- a register\n",
+                                encoding="utf-8")
+            verdict, detail = self._verdict(Path(td) / "no-such-gate.py",
+                                            register=register)
         self.assertEqual(verdict, "failed", detail)
         self.assertIn("the gate was removed", detail)
 
@@ -19156,6 +19311,9 @@ class PerBaseIndexes(unittest.TestCase):
         self.assertNotIn("readme.txt", got)
         self.assertNotIn("c3.wdf", got)
 
+    @requires_tool("dump_meta.py", "dump_exports.py", "dump_imports.py",
+                   "dump_strings.py", "dump_functions.py",
+                   "dump_rtti.py")
     def test_dump_tools_resolve_their_root_when_run_not_when_imported(self):
         """The actual defect behind "they accept an argument and discard it".
 
@@ -19378,6 +19536,11 @@ class StampedWriters(unittest.TestCase):
                              ("artcrawl.py", "provenance.write_json"),
                              ("thumbs.py", "provenance.stamp_file")):
             with self.subTest(tool=name):
+                # Per WRITER, for `ServerViewParseProfile`'s reason: only
+                # `artcrawl.py` is left behind by the extraction, and the
+                # other two writers are still worth watching there.
+                if not (HERE / name).is_file():
+                    self.skipTest(f"tools/{name} is not present in this tree")
                 src = (HERE / name).read_text("utf-8")
                 self.assertIn(needle, src)
 
@@ -19487,8 +19650,17 @@ class TheIndexGate(unittest.TestCase):
         self.assertIn(coroot.base_id(), reason, "the base id must be in it")
         self.assertIn(rel, reason, "the artefact must be in it")
         self.assertIn(coroot.derived_rel(rel), reason, "and the keyed path")
-        # exactly one of the three detectable states is claimed
-        states = [s for s in ("NEVER BUILT", "ORPHANED", "PARTIALLY BUILT")
+        # exactly one of the four detectable states is claimed
+        #
+        # NO KIND DECLARED was the fourth branch `_index_reason` grew and the
+        # only one not listed here, so on any box whose `base_id()` has no
+        # kind -- an undeclared install, or a machine with no install at all,
+        # where it is `unkeyed` -- this read `0 != 1 : ambiguous state: []`
+        # and accused a correct message of being ambiguous. The assertion is
+        # unchanged in strength: still EXACTLY one, so two states in one
+        # message still fails and so does none.
+        states = [s for s in ("NEVER BUILT", "ORPHANED", "PARTIALLY BUILT",
+                              "NO KIND DECLARED")
                   if s in reason]
         self.assertEqual(len(states), 1, f"ambiguous state: {states}")
 
@@ -19653,6 +19825,7 @@ class TheCcoFlatFamilyBody(unittest.TestCase):
         self.assertIsNotNone(self._base(paths, paths))
 
 
+@unittest.skipUnless(HAVE_ROOT, "game install not present")
 class NpcModelArtPins(unittest.TestCase):
     """The model page's NPC/mount art, pinned to the author's verified scan.
 
@@ -22303,6 +22476,13 @@ class ServerViewParseProfile(unittest.TestCase):
         for rel in ("tools/coviewer.py", "tools/meshtex.py",
                     "tools/artcrawl.py", "tools/collect.py"):
             with self.subTest(rel=rel):
+                # Per SITE, not per test: `artcrawl.py` and `collect.py` are
+                # not in `extract_comod.py`'s manifest, and skipping the whole
+                # census because two of its four members were left behind
+                # would stop watching `coviewer.py` -- the site that matters
+                # most -- in the tree where the rule is hardest to re-derive.
+                if not (PROJECT / rel).is_file():
+                    self.skipTest(f"{rel} is not present in this tree")
                 src = (PROJECT / rel).read_text("utf-8", errors="replace")
                 self.assertIn("table_profile_for", src)
                 self.assertNotIn("pl.table_profile()", src)
@@ -23196,9 +23376,22 @@ class TileSetForTheClient(unittest.TestCase):
         import tileset
         ga = (Path(__file__).resolve().parent.parent / "tests"
               / "test_ground_animation.py")
-        self.assertTrue(ga.is_file(),
-                        "the file this tripwire watches is gone -- it would "
-                        "pass by watching nothing")
+        if not ga.is_file():
+            # ABSENT and ABSENT-ON-PURPOSE are not the same fact.
+            # `tests/test_ground_animation.py` is not in `extract_comod.py`'s
+            # manifest, so in COMod this assertion fired over a file that was
+            # never meant to be there -- a tripwire reporting its own
+            # correct configuration as a defect. `HAVE_EXTRACTOR` is the
+            # distinction: only the SOURCE repo ships the extractor, and only
+            # there does a missing watched file mean the "watching nothing"
+            # case this guard is for -- where it still fails.
+            if HAVE_EXTRACTOR:
+                self.fail("the file this tripwire watches is gone -- it "
+                          "would pass by watching nothing")
+            self.skipTest("tests/test_ground_animation.py is not present in "
+                          "this tree; the branch this tripwire watches for "
+                          "cannot be merged into a tree that does not carry "
+                          "the file it would land in")
         src = ga.read_text("utf-8", errors="replace")
         if tileset.SLOT_BYTES > 2 and "GROUND_TILESET_U16_OVERFLOW" in src:
             self.fail(
@@ -24295,6 +24488,7 @@ class TextureBundle(unittest.TestCase):
             cat.close()
 
 
+@unittest.skipUnless(HAVE_ROUTEB, "routeb/ not present in this tree")
 class CoverAnchorConvention(unittest.TestCase):
     """Which cell a COVER's `origin` names -- `docs/map_scenery.md` §10.
 
@@ -25338,6 +25532,11 @@ class SettingsDirectoryManagement(unittest.TestCase):
         self.assertIn(str(copy), [r["root"] for r in doc["offlineClients"]])
         self.assertIn(str(src), [r["root"] for r in doc["privateServers"]])
 
+    @unittest.skipUnless(os.name == "nt",
+                         "the probe reads WINDOWS image paths: the "
+                         "fixture's backslash paths are not path "
+                         "separators on POSIX, so containment cannot "
+                         "be exercised there at all")
     def test_the_process_probe_keeps_could_not_tell_apart_from_nothing(self):
         r"""C25, applied to a second probe.
 
@@ -25614,6 +25813,10 @@ class TheBuildDiffPageSaysWHICHThingIsMissing(unittest.TestCase):
         self.assertEqual(why, coviewer.Handler.DIFF_NO_TOOL)
         self.assertNotEqual(why, coviewer.Handler.DIFF_NO_DB)
 
+    @requires_tool("patchlook.py",
+                   why="this arm monkeypatches the reader, so it needs "
+                       "the reader; the NO_TOOL arm beside it is the one "
+                       "that tests its absence and stays live everywhere")
     def test_the_dictionary_being_absent_reports_NO_DB_and_not_NO_TOOL(self):
         """The other direction, and the one that stops a lazy implementation.
 
@@ -25646,6 +25849,10 @@ class TheBuildDiffPageSaysWHICHThingIsMissing(unittest.TestCase):
         self.assertTrue(coviewer.Handler.DIFF_NO_TOOL.strip())
         self.assertTrue(coviewer.Handler.DIFF_NO_DB.strip())
 
+    @requires_tool("patchlook.py",
+                   why="this arm monkeypatches the reader, so it needs "
+                       "the reader; the NO_TOOL arm beside it is the one "
+                       "that tests its absence and stays live everywhere")
     def test_a_SystemExit_never_escapes_the_handler(self):
         """`SystemExit` does not inherit from `Exception`.
 

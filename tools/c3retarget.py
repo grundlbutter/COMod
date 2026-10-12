@@ -291,11 +291,15 @@ WHAT IT WILL NOT DO
   pronation and hand roll therefore carry the donor's roll relative to
   the donor's T-pose, which is the right quantity only if the two T-poses
   roll alike.
-* Change the clip's frame count or encoding UNLESS ASKED (`--frames`,
-  below). Without it the client reads the source's `frame_count`; 501
-  frames at `--fps-ms` 41 (INFERRED, docs/animation.md section 5; the 33
-  ms rival is a flag away) is 20.5 s against a 12.4 s donor, so the tail
-  is `--tail loop` (restart the dance) or `hold`.
+* Decide the frame interval from the clip. A C3 container has NO time
+  field, so the interval belongs to the ROLE the client plays the file as
+  (`rigtarget.SPEED_TABLE`: 33.0 ms MEASURED for an NPC, 41.0 rough for a
+  monster, 41.0 ASSUMED for a player). `--fps-ms auto` / `--frames auto`
+  take that row and one donor loop at it; `--frames source` keeps the
+  source's own `frame_count`, and 501 frames at 41 ms is 20.5 s against a
+  12.4 s donor, so the tail is `--tail loop` (restart the dance) or
+  `hold`. The rate, its provenance and its evidence are in every manifest
+  (`timing`), and an `assumed` rate WARNS -- backlog item 44 step 1.
 * Fingers beyond the first phalanx, or toes as anything but rigid.
 
 MONSTERS AND NPCs (2026-10-01; `tools/rigtarget.py`, `tools/reanimate_npcs.py`)
@@ -436,9 +440,62 @@ MIRROR_AXIS_MAP = ((-1.0, 0.0, 0.0),
                    (0.0, 0.0, -1.0),
                    (0.0, -1.0, 0.0))
 
-#: Frame interval, ms. INFERRED (docs/animation.md section 5): every
-#: action-locked 3DEffect row says 41; the engine's UV clock says 33.
-DEFAULT_FPS_MS = 41.0
+#: Frame interval, ms, when NO role is known. This is the pre-table constant
+#: and it is `rigtarget.DEFAULT_ROLE_TIMING`'s, so the two cannot drift: it is
+#: INFERRED (docs/animation.md section 5), every action-locked 3DEffect row
+#: says 41 and the engine's UV clock says 33.
+#:
+#: IT IS NOT THE RATE FOR EVERY ROLE. The client plays an NPC file at a
+#: MEASURED 33.0 ms (`rigtarget.SPEED_TABLE`), so a clip sampled at this
+#: constant and played as an NPC runs 41/33 = 1.2424x fast -- the 2026-10-03
+#: set runs the 12.367 s donor in 9.966 s. `rigtarget.resolve_timing(target)`
+#: is what a caller that knows its target's ROLE should use.
+#:
+#: WHAT A DEFAULT CALL KEEPS, AND WHAT IT DOES NOT. This constant remains
+#: `retarget_clip`'s signature default, so `retarget_clip(data, rig, donor)`
+#: still writes the same BYTES -- but not the same manifest and not the same
+#: warnings. Alternated 2026-10-12 on `c3/0003/000/003.c3` (shape 3, no
+#: garment, this tree against master at b5557a4c): `sha256(res.bytes)`
+#: 2e7e99f30868e46001fcf5fc15d7d29edeafe8364539e29a73271ae3381ad0fc and
+#: 2,851,824 bytes on BOTH, while `res.manifest` went 42 -> 43 top-level keys
+#: (the new one is `timing`, provenance `assumed`, role `unknown`) and
+#: `res.warnings` went 2 -> 3 (the assumed-rate line). So a caller asserting
+#: an exact manifest key set or an exact warnings list DOES see a change;
+#: only the output bytes are promised.
+#:
+#: AND DO NOT LEAN ON THE PINNED-SHA ARMS FOR THAT. `tests/test_c3retarget`'s
+#: `SHA_DEFAULT` / `SHA_SHIPPED` assertions sit behind `if "solved at" not in
+#: self.rig_from`, so they fire only on a root that already holds a saved p84
+#: rig. Checked 2026-10-12 on this box: the suite's ROOT is
+#: `CCO-snapshot-2026-08-24`, `bonerig.find_rig("p84", sh, ROOT)` is
+#: `(None, False)` for shapes 2, 3 and 4, `rig_from` is "solved at 1000
+#: frames", and all 115 arms pass GREEN with no byte comparison made. That
+#: guard is master's and predates this change -- but it means the byte-identity
+#: above is held up by the alternated two-tree run, not by those arms, and a
+#: future session must not read their green as a byte check.
+DEFAULT_FPS_MS = rigtarget.DEFAULT_ROLE_TIMING.ms
+
+
+def timing_of_number(fps_ms: float):
+    """The honest `rigtarget.ClipTiming` for a bare number with no role.
+
+    `DEFAULT_FPS_MS` is `DEFAULT_ROLE_TIMING` -- `assumed`, because that is
+    exactly what it is -- so a caller who passes no role and no timing is
+    told so rather than being handed a silent 41. Any other number is the
+    caller's (`explicit`): the tool does not know their evidence and does
+    not invent one."""
+    ms = float(fps_ms)
+    if ms == float(rigtarget.DEFAULT_ROLE_TIMING.ms):
+        d = rigtarget.DEFAULT_ROLE_TIMING
+        return rigtarget.ClipTiming(
+            ms=ms, provenance=d.provenance, evidence=d.evidence, role="unknown",
+            how="c3retarget.DEFAULT_FPS_MS (= rigtarget.DEFAULT_ROLE_TIMING); "
+                "no role was given, so no SPEED_TABLE row was consulted")
+    return rigtarget.ClipTiming(
+        ms=ms, provenance=rigtarget.EXPLICIT, role="unknown",
+        how="a number given to retarget_clip with no role and no timing",
+        evidence="the caller's number. Whoever passed it owns its evidence; "
+                 "the table was not asked")
 
 #: Mixamo joint (base name, prefix and `_nn` suffix stripped) -> c3 bone
 #: in the p84 space. The +x chain (8-14, 42-45) is the character's LEFT --
@@ -3287,7 +3344,8 @@ def retarget_clip(data: bytes, rig, donor: Donor, *, fps_ms: float = DEFAULT_FPS
                   tables: RigTables = None, frames: int = None,
                   body_ordinal: int = None, encoding: str = "keep",
                   ground: str = None, follow: dict = None,
-                  hop_cap: float = None, drawn=None) -> RetargetResult:
+                  hop_cap: float = None, drawn=None,
+                  timing=None) -> RetargetResult:
     """One clip. Returns the new bytes, the new body `Motion`, the manifest
     pieces (conventionResidual, anatomy, hover, connectivity, counts,
     offsets, sockets) and warnings. `garment` is the wearing body's `v_body`
@@ -3331,7 +3389,17 @@ def retarget_clip(data: bytes, rig, donor: Donor, *, fps_ms: float = DEFAULT_FPS
     `assets` (an `AssetRoot`), a socket host the rig gives no place and
     the attach does not cover is DERIVED from the family's clips
     (`socket_host_outside_rig`) and attached when it equals a rig bone;
-    either way such a host left carried is a WARNING, never silent."""
+    either way such a host left carried is a WARNING, never silent.
+
+    `timing` (a `rigtarget.ClipTiming`, from `rigtarget.resolve_timing`)
+    says WHERE `fps_ms` came from; its `ms` must equal `fps_ms` or the call
+    is refused, because a manifest claiming a provenance for a different
+    number than the one sampled is worse than no provenance. None derives
+    one from `fps_ms` alone: the module default is `assumed` (it is the
+    inferred 41 and nothing measured it), any other number is `explicit`.
+    An `assumed` timing adds a WARNING -- an assumed rate is never silent
+    (backlog item 44) -- and the manifest's ``timing`` block carries the
+    provenance and the evidence either way."""
     A = AXIS_MAP if axis_map is None else tuple(tuple(float(x) for x in r)
                                                 for r in axis_map)
     if tail not in TAILS:
@@ -3342,6 +3410,15 @@ def retarget_clip(data: bytes, rig, donor: Donor, *, fps_ms: float = DEFAULT_FPS
         raise RetargetError("--rest-offset must be one of %s" % (REST_OFFSETS,))
     if str(encoding).lower() not in ("keep", "raw"):
         raise RetargetError("--encoding must be keep or raw")
+    # WHERE fps_ms CAME FROM. A float alone cannot say, and a guessed 41.0
+    # and a measured 33.0 are the same float downstream (backlog item 44).
+    if timing is None:
+        timing = timing_of_number(fps_ms)
+    elif abs(float(timing.ms) - float(fps_ms)) > 1e-9:
+        raise RetargetError(
+            "timing says %g ms/frame (%s) and fps_ms is %g: a manifest "
+            "cannot carry one number's provenance for another number"
+            % (timing.ms, timing.provenance, fps_ms))
     if ground not in (None, "") and ground not in GROUNDS:
         raise RetargetError("--ground must be one of %s" % (GROUNDS,))
     ground = ground or None
@@ -3952,6 +4029,10 @@ def retarget_clip(data: bytes, rig, donor: Donor, *, fps_ms: float = DEFAULT_FPS
 
     res.manifest = {
         "fpsMs": fps_ms,
+        # WHERE `fpsMs` CAME FROM. Without this a guessed 41.0 and a measured
+        # 33.0 are indistinguishable in every manifest, catalog row and README
+        # line this tool writes (backlog item 44 step 1).
+        "timing": timing.as_dict(),
         "framesWritten": n_keys,
         "frameCount": out_frame_count,
         # `--frames`: the source's count, the written count, and whether the
@@ -4081,6 +4162,11 @@ def retarget_clip(data: bytes, rig, donor: Donor, *, fps_ms: float = DEFAULT_FPS
                           "skinnedBones": sorted(tgt.centroids),
                           "floorZ": tgt.floor_z},
     }
+    # AN ASSUMED RATE IS NEVER SILENT (backlog item 44 step 1). It goes last
+    # so it is the warning a reader sees beside the file it describes.
+    _assumed = timing.warning()
+    if _assumed:
+        warn.append(_assumed)
     return res
 
 
@@ -4111,8 +4197,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--target", default="c3/0003/000/003.c3")
     ap.add_argument("--rig", default=None, help="a saved rig json")
     ap.add_argument("--max-frames", type=int, default=bonerig.DEFAULT_MAX_FRAMES)
-    ap.add_argument("--fps-ms", type=float, default=DEFAULT_FPS_MS,
-                    help="frame interval, ms (41 inferred; 33 is the rival)")
+    ap.add_argument("--fps-ms", default=rigtarget.AUTO,
+                    help="frame interval, ms. 'auto' (the default) takes the "
+                         "`rigtarget.SPEED_TABLE` row for the TARGET'S ROLE: "
+                         "33 measured for an NPC, 41 rough for a monster, 41 "
+                         "ASSUMED for a player. A number wins and is recorded "
+                         "as provenance 'explicit'. The rate, its provenance "
+                         "and its evidence go in the manifest either way, and "
+                         "an assumed rate warns")
     ap.add_argument("--tail", choices=TAILS, default="loop",
                     help="frames past the donor's end: loop it or hold the "
                          "last pose")
@@ -4160,11 +4252,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "carrying a duplicate is REFUSED by name. --attach "
                          "defaults to the tables' (45:44,50:49 on p84; the "
                          "garment-only toes auto finds; none on a monster)")
-    ap.add_argument("--frames", type=int, default=None,
-                    help="write N keys at --fps-ms whatever the source holds "
-                         "(302 = one donor loop at 41 ms; the engine honours "
-                         "frameCount, proved on Guard 900 2026-10-01). Default: "
-                         "the source's count")
+    ap.add_argument("--frames", default=rigtarget.AUTO,
+                    help="how many keys to write at --fps-ms, whatever the "
+                         "source holds (the engine honours frameCount, proved "
+                         "on Guard 900 2026-10-01). 'auto' (the default) is ONE "
+                         "DONOR LOOP at the resolved rate, round(donor seconds "
+                         "/ ms): 302 at 41 ms and 375 at 33 ms on the 12.367 s "
+                         "Gangnam donor. 'source' keeps the source clip's own "
+                         "count (the pre-table default). A number wins")
     ap.add_argument("--encoding", choices=("keep", "raw"), default="keep",
                     help="with --frames: keep the source encoding where it "
                          "round-trips bit-exact (KKEY, XKEY; ZKEY falls to RAW "
@@ -4395,13 +4490,25 @@ def _main(argv=None) -> int:
     # derived from the clips; an explicit --attach is the user's set.
     attach = None if a.attach is None else _parse_attach(a.attach)
     attach_source = None if a.attach is None else "user (--attach %r)" % a.attach
+    # THE RATE COMES FROM THE TARGET'S ROLE (`--fps-ms auto`), and the frame
+    # count from ONE DONOR LOOP at that rate (`--frames auto`). An explicit
+    # number still wins, and the provenance of whichever number was used
+    # travels into the manifest. Backlog item 44 step 1.
+    timing = rigtarget.resolve_timing(target, a.fps_ms)
+    n_frames = rigtarget.resolve_frames(a.frames, timing, donor.duration)
+    if not a.quiet:
+        print("timing: %g ms/frame, %s -- %s"
+              % (timing.ms, timing.provenance, timing.how))
+        print("  frames: %s (--frames %s)"
+              % ("the source clip's own count" if n_frames is None else n_frames,
+                 a.frames))
     t1 = time.time()
-    res = retarget_clip(data, rig, donor, fps_ms=a.fps_ms, tail=a.tail,
+    res = retarget_clip(data, rig, donor, fps_ms=timing.ms, timing=timing, tail=a.tail,
                         root_motion=a.root_motion, rest_offset=a.rest_offset,
                         attach=attach, attach_source=attach_source, assets=ar,
                         fingers=bool(a.fingers),
                         garment=garment, progress=prog, mesh=mesh,
-                        tables=tables, frames=a.frames, encoding=a.encoding,
+                        tables=tables, frames=n_frames, encoding=a.encoding,
                         ground=a.ground, hop_cap=a.hop_cap,
                         follow=borrowed["follow"] if borrowed is not None else None,
                         drawn=borrowed.get("drawn") if borrowed is not None else None)
@@ -4460,9 +4567,11 @@ def _main(argv=None) -> int:
           % ("would write" if a.dry_run else "wrote", a.target,
              m["framesWritten"], m["body"]["encoding"], len(data),
              len(res.bytes), elapsed))
-    print("  donor %.3f s, %d of %d frames inside it, tail %s, %.0f ms/frame"
+    print("  donor %.3f s, %d of %d frames inside it, tail %s, %g ms/frame "
+          "(%s: %s)"
           % (m["donorDurationS"], m["framesWithinDonor"], m["framesWritten"],
-             m["tail"], m["fpsMs"]))
+             m["tail"], m["fpsMs"], m["timing"]["provenance"],
+             m["timing"]["how"]))
     print("  frames %d -> %d (%s), encoding %s, body ordinal %d in the container "
           "(rig %d), engine verified %s; tables: %s"
           % (m["frames"]["source"], m["frames"]["written"],

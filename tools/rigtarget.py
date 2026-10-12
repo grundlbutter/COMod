@@ -92,6 +92,228 @@ class TargetError(ValueError):
     """A shape or NPC key that resolves to nothing this install ships."""
 
 
+# ---------------------------------------------------------------------------
+# THE SPEED TABLE -- what the client plays a file AT, per role
+# ---------------------------------------------------------------------------
+# A C3 motion container carries NO time field. `effects.parse_moti`'s layout,
+# verified against graphic.dll!Motion_Load (0x557A0), is boneCount, frameCount,
+# encoding, the keys and extraChannels -- and that is all. `Phy_SetFrame` and
+# `Phy_NextFrame` take a frame INDEX, never a time (docs/animation.md section
+# 5). So the frame interval is not a property of a clip that can be read off
+# the clip: it is a property of the ROLE the client plays the file as, and it
+# lives in `ImConquer.exe`, which is packed on CCO.
+#
+# That is why these rows carry PROVENANCE. A builder that samples a donor at
+# one constant for every role writes files that play at the wrong speed in
+# every role but one, and nothing downstream can tell -- the 2026-10-03 set
+# wrote 18 NPC idles at 41.0 ms that the client plays at 33.0, so they run the
+# 12.367 s donor in 9.966 s. Backlog item 44; the numbers and how each was
+# obtained are in docs/retarget_speed_table_2026-10-12.md.
+
+#: What a `SPEED_TABLE` row's `provenance` may be, firmest first. `assumed` is
+#: NEVER silent: `ClipTiming.warning` is a line the caller must print.
+PROVENANCES = ("measured", "rough", "assumed")
+
+#: A resolved clip's provenance may also be `explicit` -- a number the caller
+#: named, whose evidence is the caller and no row at all.
+EXPLICIT = "explicit"
+CLIP_PROVENANCES = PROVENANCES + (EXPLICIT,)
+
+#: `--fps-ms auto` / `--frames auto`: take the row for the target's role.
+AUTO = "auto"
+#: `--frames source`: keep the source clip's own frame count (what the tool
+#: did before the table, and still what `frames=None` means to `retarget_clip`).
+SOURCE = "source"
+
+
+@dataclass(frozen=True)
+class RoleTiming:
+    """One row of `SPEED_TABLE`: ms per frame, where it came from, and the
+    recording or test that says so. `evidence` is a sentence a manifest
+    reader can act on -- never a bare "measured"."""
+    ms: float
+    provenance: str
+    evidence: str
+
+
+#: ONE ROW PER ROLE THE CLIENT PLAYS A FILE AS. Seeded 2026-10-12 from the
+#: measurements backlog item 44 records; steps 2-4 of that item are the
+#: calibration kit that would firm the `rough` and `assumed` rows.
+SPEED_TABLE = {
+    NPC: RoleTiming(
+        33.0, "measured",
+        "three town NPC idles loop in 9.97 s in the owner's 30 fps recording "
+        "Recording 2026-10-03 115311.mp4 (autocorrelation depth 0.26-0.42, "
+        "scratchpad/tempo_from_video_2026-10-03.py); an independent fit "
+        "against the donor's joint-speed timeline gives 32.9-34.3 ms. "
+        "Measured on NPCs built on their OWN rigs; a player-bodied NPC takes "
+        "this row by ROLE and that part is still a hypothesis "
+        "(PLAYER_BODIED_NPC_ROW)"),
+    MONSTER: RoleTiming(
+        41.0, "rough",
+        "the owner's Guard 900 kill test 2026-10-02 (the same donor resampled "
+        "to 302 frames) read 'about 12 seconds' BY EYE; in the 2026-10-03 "
+        "recording one guard cycle barely fits in 16 s and its boxes scatter "
+        "37-58 ms. Consistent with 41 and not better than +-4 ms"),
+    PLAYER: RoleTiming(
+        41.0, "assumed",
+        "NEVER MEASURED. docs/animation.md section 5: every one of the 6,051 "
+        "Action3DEffect.ini rows for the swing actions and the 375 for the "
+        "cast actions names an effect whose 3DEffect.ini FrameInterval is "
+        "exactly 41, and those effects are frame-locked to the body motion. "
+        "That is an inference about EFFECTS, not a reading of the body clock"),
+}
+
+#: The row a role with NO row in `SPEED_TABLE` falls back to. It is `assumed`
+#: BY CONSTRUCTION, so a role the table forgets is LOUD rather than quietly
+#: 41: deleting the NPC row must make an NPC build say `assumed`, which is the
+#: must-fire arm item 44 asks for.
+DEFAULT_ROLE_TIMING = RoleTiming(
+    41.0, "assumed",
+    "no row for this role; the pre-table constant (docs/animation.md section "
+    "5's inferred 41 ms). Nothing has measured this role")
+
+#: THE PLAYER-BODIED NPC DECISION (item 44 step 1, decided 2026-10-12).
+#: The four `c3/npc/99901xx100.c3` files are built on the p84 PLAYER rig
+#: (`player_body`) and take the NPC row, not the player row, because the row
+#: is keyed on `RigTarget.kind` -- the client plays the FILE as an NPC
+#: whatever rig built it. It is a HYPOTHESIS, not a measurement: no recording
+#: of one of those four has been measured. Its falsifier is a probe on
+#: `c3/npc/9990111100.c3` (the Sage) reading 41 +- 2 ms.
+PLAYER_BODIED_NPC_ROW = NPC
+
+
+@dataclass(frozen=True)
+class ClipTiming:
+    """The timing ONE clip was built at, with where the number came from.
+
+    This is what a manifest, a catalog row and a README line have to carry:
+    without it a guessed 41.0 and a measured 33.0 are the same float
+    downstream and no reader can tell which clips to distrust."""
+    ms: float
+    provenance: str
+    evidence: str
+    #: the role the row was looked up for (`PLAYER` / `MONSTER` / `NPC`, or
+    #: whatever kind was asked for when the table has no row for it)
+    role: str
+    #: how this number was arrived at -- the row, the default row, or the
+    #: caller
+    how: str
+
+    @property
+    def assumed(self) -> bool:
+        return self.provenance == "assumed"
+
+    def frames_for_donor(self, donor_seconds: float) -> int:
+        """ONE DONOR LOOP at this rate: ``round(donor seconds / ms)``. On the
+        12.3667 s Gangnam donor that is 302 at 41 ms and 375 at 33 ms."""
+        s = float(donor_seconds)
+        if not s > 0.0:
+            raise TargetError("donor duration %r is not positive; a frame count "
+                              "cannot be derived from it" % (donor_seconds,))
+        return max(1, int(round(s * 1000.0 / self.ms)))
+
+    def warning(self):
+        """The line to print when this timing is ASSUMED, else None. An
+        assumed rate is never silent (item 44 step 1)."""
+        if not self.assumed:
+            return None
+        return ("WARNING: the %g ms/frame this clip is built at is ASSUMED for "
+                "role %r, not measured (%s): %s. A clip sampled at an assumed "
+                "rate plays at the wrong speed by exactly the ratio the "
+                "assumption is wrong by, and the file cannot be told from a "
+                "measured one. Calibrate the role (backlog item 44 steps 2-4) "
+                "or pass an explicit --fps-ms."
+                % (self.ms, self.role, self.how, self.evidence))
+
+    def as_dict(self) -> dict:
+        return {"fpsMs": self.ms, "provenance": self.provenance,
+                "assumed": self.assumed, "role": self.role,
+                "how": self.how, "evidence": self.evidence}
+
+
+def _bad_rows() -> list:
+    """Rows of `SPEED_TABLE` that are not usable, by name. Empty on a good
+    table -- a gate asserts that, so a row added with a typo'd provenance or
+    a zero rate is caught here and not in a build's output."""
+    bad = []
+    for role, row in sorted(SPEED_TABLE.items()):
+        if row.provenance not in PROVENANCES:
+            bad.append("%s: provenance %r is not one of %s"
+                       % (role, row.provenance, list(PROVENANCES)))
+        if not (isinstance(row.ms, float) and row.ms > 0.0):
+            bad.append("%s: ms %r is not a positive float" % (role, row.ms))
+        if len(str(row.evidence).strip()) < 40:
+            bad.append("%s: evidence %r says too little to act on"
+                       % (role, row.evidence))
+    for role, row in sorted(SPEED_TABLE.items()):
+        if row.provenance == "assumed" and row.ms != DEFAULT_ROLE_TIMING.ms:
+            bad.append("%s: an assumed row at %g ms is not the pre-table "
+                       "constant %g -- an assumption nobody made"
+                       % (role, row.ms, DEFAULT_ROLE_TIMING.ms))
+    return bad
+
+
+def role_of(target) -> str:
+    """The role a `RigTarget` (or a bare kind string) is played as."""
+    kind = getattr(target, "kind", target)
+    return str(kind)
+
+
+def resolve_timing(target, fps_ms=None) -> ClipTiming:
+    """The `ClipTiming` for a target. `fps_ms` None or ``"auto"`` takes the
+    `SPEED_TABLE` row for the target's role; a NUMBER is the caller's and
+    WINS, recorded as `explicit` with no row consulted.
+
+    A role the table has no row for takes `DEFAULT_ROLE_TIMING`, which is
+    `assumed` -- the fallback is loud, never a quiet 41."""
+    role = role_of(target)
+    if fps_ms is not None and str(fps_ms).strip().lower() != AUTO:
+        try:
+            ms = float(fps_ms)
+        except (TypeError, ValueError):
+            raise TargetError("--fps-ms %r is neither %r nor a number"
+                              % (fps_ms, AUTO)) from None
+        if not ms > 0.0:
+            raise TargetError("--fps-ms %r is not a positive number of "
+                              "milliseconds" % (fps_ms,))
+        return ClipTiming(ms=ms, provenance=EXPLICIT, role=role,
+                          how="named by the caller (--fps-ms %g); no "
+                              "SPEED_TABLE row was consulted" % ms,
+                          evidence="the caller's number. Whoever passed it "
+                                   "owns its evidence; the table was not asked")
+    row = SPEED_TABLE.get(role)
+    if row is None:
+        row = DEFAULT_ROLE_TIMING
+        how = ("SPEED_TABLE has NO row for role %r; DEFAULT_ROLE_TIMING "
+               "(%g ms, %s)" % (role, row.ms, row.provenance))
+    else:
+        how = "SPEED_TABLE[%r] (%g ms, %s)" % (role, row.ms, row.provenance)
+    return ClipTiming(ms=row.ms, provenance=row.provenance,
+                      evidence=row.evidence, role=role, how=how)
+
+
+def resolve_frames(spec, timing: ClipTiming, donor_seconds: float):
+    """How many keys to write. ``None`` or ``"source"`` keeps the source
+    clip's own count (what `retarget_clip(frames=None)` means); ``"auto"``
+    is ONE DONOR LOOP at `timing.ms`; a number is the caller's and WINS."""
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if s == SOURCE:
+        return None
+    if s == AUTO:
+        return timing.frames_for_donor(donor_seconds)
+    try:
+        n = int(spec)
+    except (TypeError, ValueError):
+        raise TargetError("--frames %r is none of %r, %r or a whole number"
+                          % (spec, AUTO, SOURCE)) from None
+    if n < 1:
+        raise TargetError("--frames %r is not a positive frame count" % (spec,))
+    return n
+
+
 class RigCacheMismatch(TargetError):
     """A cached family rig that was solved for ANOTHER body than the target
     it was looked up for: another drawn mesh, another reference mesh or
