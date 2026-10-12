@@ -21,11 +21,21 @@ py -3 tests/test_sanitization.py    # no PII, no absolute paths
 py -3 tools/test_viewer.py          # the main suite
 ```
 
-Suites that need a game install skip cleanly when it is absent, so both run
-anywhere. CI runs the same two on every pull request — but CI can only check
-the committed hash list, so your own identifiers are caught only by the local
-run. That is the correct trade; the alternative is uploading everyone's names
-to a CI provider.
+Run both, and know what each can tell you:
+
+* `tests/test_sanitization.py` needs no install and is expected to pass. It
+  can only check the committed hash list, so **your own** identifiers are
+  caught only by a local run after `--init-local`. That is the correct trade;
+  the alternative is uploading everyone's names to a CI provider.
+* `tools/test_viewer.py` **does not skip all of its install-dependent arms.**
+  Many do skip -- 440 of 964 on the last CI run -- but that run still ended
+  `FAILED (failures=32, errors=17)` with no game present. So a green local run
+  without an install is a partial measurement. With an install it takes far
+  longer than CI's 38 s: the arms CI skips do real content scans.
+
+**CI is currently switched off** -- `.github/workflows/ci.yml` is disabled, so
+opening a pull request runs nothing at all. Do not read a missing check as a
+pass.
 
 ## House rules
 

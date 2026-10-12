@@ -365,8 +365,23 @@ blender --background --python tests\test_blender_roundtrip.py
 blender --background --python tests\test_addon_install.py
 ```
 
-Suites that need the game install skip cleanly when it is absent — CI runs
-them on a runner with no game.
+Most suites that need the game install skip when it is absent. **Not all of
+them do, and the suite is not green without one.** The last CI run on a runner
+with no game (2026-10-03) ended
+
+```
+Ran 964 tests in 38.479s
+FAILED (failures=32, errors=17, skipped=440)
+```
+
+so "it skips cleanly" was true of 440 arms and false of 49. A run without an
+install is a partial measurement, not a clean bill of health. With an install
+present expect it to take far longer than CI's 38 s, because the arms CI skips
+do real content scans over the asset tree.
+
+**CI is currently switched off.** `.github/workflows/ci.yml` is disabled, so
+nothing runs on a push or a pull request and an absent check is not a pass.
+Re-enabling it is the repository owner's call.
 
 ---
 
