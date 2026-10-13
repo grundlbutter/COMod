@@ -378,7 +378,14 @@ def resolve_effect(graph: "depclose.DepGraph", name: str, *,
     # THE CONNECTION WALK RUNS EVEN WHEN THE EFFECT IS NOT DEFINED, and that
     # is the whole point rather than a tolerance. A rule row that names an
     # effect `3DEffect` does not define is a REAL and reportable state --
-    # 32 such names on 5517 -- and it is a BROKEN RULE, which is a different
+    # **121** such names on 6271 and ZERO on 5517, measured 2026-10-12 and
+    # PINNED per base by `tests/test_effect_names_resolve.py`'s
+    # `EXPECT_READER`, which is the number to trust if this comment and the
+    # gate ever disagree. (121, not the 120 an earlier version of this
+    # comment said: 120 is the subset of those 121 that `c3.wdb`'s MAP table
+    # carries. The 32 it quoted for 5517 before that were the PARAMETERISED
+    # value form and are withdrawn -- see `effects.dangling_effect_names`.)
+    # It is a BROKEN RULE, which is a different
     # and more actionable finding than a broken effect. Returning early here
     # reported "nothing reaches this" for every one of them, which is exactly
     # the silently-empty answer backlog section 6 forbids: `effect_users`

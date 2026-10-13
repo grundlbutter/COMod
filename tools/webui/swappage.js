@@ -40,6 +40,33 @@
     return (e && e.message) || String(e);
   }
 
+  /* An explanation that folds away (owner, 2026-10-03: "the UI comes first
+     ... the info/tooltips are collapsible"). `summary` is the line that stays
+     visible, so it must carry the headline: a warning folded to "details"
+     would be a warning nobody reads. Open or closed is remembered per
+     browser under `coswap.info.<key>`; with no storage -- a private window,
+     blocked site data -- each box simply starts in its default state.
+
+     The write-access banner is NOT drawn with this. It stays a plain block. */
+  function infoBox(key, summary, cls, openByDefault) {
+    const d = el('details', 'sw-info' + (cls ? ' ' + cls : ''));
+    const s = el('summary');
+    if (summary && typeof summary === 'object') s.appendChild(summary);
+    else s.textContent = summary || '';
+    d.appendChild(s);
+    let open = !!openByDefault;
+    try {
+      const v = localStorage.getItem('coswap.info.' + key);
+      if (v === '1' || v === '0') open = v === '1';
+    } catch (e) { /* the default stands */ }
+    d.open = open;
+    d.addEventListener('toggle', () => {
+      try { localStorage.setItem('coswap.info.' + key, d.open ? '1' : '0'); }
+      catch (e) { /* remembered for this page view only */ }
+    });
+    return d;
+  }
+
   async function api(url, opts) {
     // `opts` is forwarded, not ignored: the staging and install routes are
     // POSTs, and a dropped method turns a write into a silent GET that 404s
@@ -119,17 +146,20 @@
     host.textContent = '';
     if (!p) return;
     const ui = PROV_UI[p.state] || PROV_UI.malformed;
-    const box = el('div', 'sw-state ' + ui.cls);
-    box.appendChild(el('b', null, ui.head(p)));
-    const d = el('div', 'sw-detail', p.note || '');
-    box.appendChild(d);
+    // The headline is the summary line, so the state -- and its colour --
+    // is readable with the box folded; only the explanation folds.
+    const box = infoBox('provenance', el('b', null, ui.head(p)),
+                        'sw-state ' + ui.cls, false);
+    const body = el('div', 'sw-info-body');
+    body.appendChild(el('div', 'sw-detail', p.note || ''));
     // Named explicitly rather than left to the note, because "the install on
     // screen" is only useful if you are told WHICH install that is.
     if (p.usingServed) {
-      box.appendChild(el('div', 'sw-detail',
+      body.appendChild(el('div', 'sw-detail',
         'Drawn with ' + (p.servedKind || 'the install on screen')
         + '’s socket list. Chunks it does not name are drawn as geometry.'));
     }
+    box.appendChild(body);
     host.appendChild(box);
   }
 
@@ -315,6 +345,7 @@
   let targetKind = 'npc';
   let WRITABLE = null;   // /api/swap/writable -- probed, not guessed
   let LASTSTAGE = null;  // what the last stage call reported
+  let SCOPE = 'one';     // 'one' = split (default), 'all' = replace shared art
   let RECORD = null;     // /api/swap/record entries -- what a full revert undoes
   let STAGEDIR = '';     // /api/stage's stageDir -- comod.STAGE, in its words
   let MODIFIED = null;   // /api/swap/modified -- comod's OWN install record
@@ -339,6 +370,56 @@
   };
   let TARGET_KINDS = [];
 
+  /** The target's kind as the noun this pane prints for one row.
+   *
+   *  The right pane said "NPC" whichever chip was picked: on CCO 2026-10-04,
+   *  Monster chip, the list read "showing 206 of 206 NPCs", each row "only
+   *  this NPC", and the middle "Now pick the NPC on the right". An NPC row is
+   *  an NPC; every other kind's row is one of that kind; collapsed, a row is
+   *  a motion group for NPCs and a LOOK for the rest (loadTargetList asks
+   *  browse for `group=look`). `n` pluralises -- "bodies", not "bodys".
+   *
+   *  `if`s rather than a ternary on purpose: tests/test_swap_target_kind.py
+   *  decides `kind === '<literal>'` per kind, and reads a ternary as both arms.
+   */
+  function kindNoun(kind, n, collapsed) {
+    let one = kind;
+    if (kind === 'npc') one = 'NPC';
+    if (collapsed) {
+      one = 'look';
+      if (kind === 'npc') one = 'group';
+    }
+    if (n === undefined || n === 1) return one;
+    if (one.charAt(one.length - 1) === 'y') return one.slice(0, -1) + 'ies';
+    return one + 's';
+  }
+
+  /** The target viewer's caption while nothing is picked. */
+  function pickPrompt(kind) {
+    if (kind === 'npc') return 'pick an NPC to replace';
+    return 'pick a ' + kindNoun(kind, 1) + ' to replace';
+  }
+
+  /** Where the right pane's rows come from, for its subtitle -- PER KIND.
+   *
+   *  The subtitle was static HTML, "CCO -- the NPC set from its own npc.json",
+   *  under monsters, weapons and bodies alike. `source` is the registry's own
+   *  word (swapplan.Kind.source, served by /api/swap/kinds), not a second copy
+   *  of which kind lives where:
+   *    npc       loadTargetList reads /api/swap/npcset -- ini/npc.json
+   *    models    browse reads the model catalogue (monster, mount)
+   *    builder   browse reads the builder's equipment tables (body, head,
+   *              weapon -- armor.ini, armet.ini, weapon.ini)
+   *  Unknown (the fallback list when /api/swap/kinds failed) claims neither.
+   */
+  function targetSource(kind, source) {
+    if (kind === 'npc') return 'the NPC set from its own npc.json';
+    const many = kindNoun(kind, 2);
+    if (source === 'models') return 'the ' + many + ' in its model catalogue';
+    if (source === 'builder') return 'the ' + many + ' in its equipment tables';
+    return 'the ' + many + ' it lists';
+  }
+
   /** Fill TARGET_KINDS from the server's registry. An UNUSABLE kind is kept
    *  and marked, not dropped: a kind missing from the pane and a kind whose
    *  install has no art for it look identical to a user, and only one of them
@@ -350,6 +431,7 @@
         key: k.key,
         label: k.label + (k.usable === false ? ' (none)' : ''),
         usable: k.usable !== false,
+        source: k.source || '',
         note: (TARGET_NOTES[k.key] || '') +
               (k.usable === false && k.reason ? ' -- ' + k.reason : '')
       }));
@@ -357,7 +439,8 @@
       // Fall back to the three that were hardcoded before, so a failed fetch
       // degrades to the old behaviour rather than an empty picker.
       TARGET_KINDS = ['npc', 'monster', 'weapon'].map(
-        k => ({ key: k, label: k, usable: true, note: TARGET_NOTES[k] || '' }));
+        k => ({ key: k, label: k, usable: true, source: '',
+                note: TARGET_NOTES[k] || '' }));
     }
     if (!TARGET_KINDS.some(k => k.key === targetKind) && TARGET_KINDS.length) {
       targetKind = TARGET_KINDS[0].key;
@@ -367,6 +450,13 @@
   function drawTargets() {
     const kinds = $('#target-kinds');
     kinds.textContent = '';
+    const info = $('#target-info');
+    if (info) info.textContent = '';
+    // The subtitle says where THIS kind's rows come from. Before the TARGETS
+    // check, because it describes the kind, not the install.
+    const sub = $('#target-sub');
+    const meta = TARGET_KINDS.filter(k => k.key === targetKind)[0];
+    if (sub) sub.textContent = targetSource(targetKind, meta && meta.source);
     if (!TARGETS) return;
 
     const all = TARGETS.targets || [];
@@ -415,6 +505,13 @@
         if (targetKind === k.key) return;
         targetKind = k.key;
         V.target.sel = null;
+        // The viewer still held the last kind's model and its caption -- "pick
+        // an NPC to replace" survived a switch to Monster. The selection that
+        // drew them is gone, so they go too.
+        const v = V.target.viewer, msg = $('#msg-target');
+        if (v) { v.clear(); v.draw(); }
+        msg.style.display = '';
+        msg.textContent = pickPrompt(targetKind);
         drawTargets();
         loadTargetList();
         drawMid();
@@ -423,19 +520,26 @@
     }
     kinds.appendChild(row);
 
+    // What this kind of target is, and how the install is identified. It
+    // lives in the pane's footer row, folded, so the controls, the stage and
+    // the list come first and the stage lines up with the library's.
     const cur = TARGET_KINDS.filter(k => k.key === targetKind)[0];
-    const note = el('div', 'sw-note');
-    if (!TARGETS.activeIsPrivateServer) {
-      // Say which install is open and that it is not the one the pane is
-      // for, rather than listing rows that cannot be drawn.
-      note.appendChild(el('strong', null, TARGETS.headline || ''));
-      note.appendChild(el('div', null, TARGETS.detail || ''));
-    }
-    note.appendChild(el('div', null, cur ? cur.note : ''));
+    const loud = !TARGETS.activeIsPrivateServer;
+    // Say which install is open and that it is not the one the pane is for,
+    // rather than listing rows that cannot be drawn -- on the summary line,
+    // so folding the box cannot hide it.
+    const note = infoBox('target',
+      loud ? el('b', null, TARGETS.headline || 'This is not the private server.')
+           : 'About ' + (cur ? cur.label : targetKind) + ' targets',
+      loud ? 'sw-state sw-unknown' : '', false);
+    const body = el('div', 'sw-info-body sw-note');
+    if (loud) body.appendChild(el('div', null, TARGETS.detail || ''));
+    body.appendChild(el('div', null, cur ? cur.note : ''));
     // The identity is a DECLARATION, not a measurement of bytes.
     const who = off.filter(t => t.path === targetPath)[0] || off[0];
-    note.appendChild(el('div', null, 'identity ' + who.basis));
-    kinds.appendChild(note);
+    body.appendChild(el('div', null, 'identity ' + who.basis));
+    note.appendChild(body);
+    (info || kinds).appendChild(note);
   }
 
   async function loadTargetList() {
@@ -646,6 +750,29 @@
     return sel;
   }
 
+  /** The target viewer's caption when a picked row's art does not resolve --
+   *  PER KIND, as missingArt() is for the middle.
+   *
+   *  It was the NPC sentence for every kind. On CCO 2026-10-04, Monster chip,
+   *  dimmed "Monster 001": "This NPC is in npc.json, but the art it names (no
+   *  path) is not in this install. Nothing to draw, and nothing to split
+   *  from." A monster has no npc.json row and is never split, and "(no path)"
+   *  was `g.paths.standby_motion || 'no path'` meeting a browse row whose
+   *  mesh is ''. The NPC sentence stays for NPC rows, word for word.
+   */
+  function undrawnCaption(g, kind) {
+    const path = (g.paths && g.paths.standby_motion) || '';
+    if (kind === 'npc') return 'This NPC is in npc.json, but the art it names ('
+      + (path || 'no path') + ') is not in this install. Nothing to draw, '
+      + 'and nothing to split from.';
+    // loadTargetList() puts browse's `mesh` in paths.standby_motion for these
+    // kinds, and browse marks a row unusable exactly when that mesh is ''.
+    return 'This ' + kind + ' is listed, but its art is not in this install: '
+      + (path ? 'its mesh, ' + path + ', does not resolve here.'
+              : 'no mesh path is known for it here.')
+      + ' Nothing to draw.';
+  }
+
   function drawNpcSet() {
     const host = $('#target-list');
     host.textContent = '';
@@ -658,7 +785,21 @@
       host.appendChild(b);
       return;
     }
-    host.appendChild(el('div', 'sw-note', NPCSET.detail || ''));
+    // The set's one-line summary is background, not a control: it goes in
+    // the pane's folded "About" box in the footer row, so the list starts
+    // with its rows. Replaced, not appended, because this painter runs again
+    // on every kind or install change.
+    const about = $('#target-info .sw-info-body');
+    if (about) {
+      const old = about.querySelector('.sw-npcset-detail');
+      if (old) old.remove();
+      if (NPCSET.detail) {
+        about.insertBefore(el('div', 'sw-npcset-detail', NPCSET.detail),
+                           about.firstChild);
+      }
+    } else {
+      host.appendChild(el('div', 'sw-note', NPCSET.detail || ''));
+    }
 
     // Rows the table named but this key could not read are STATED, never
     // dropped: a shorter list reads as "those NPCs do not exist".
@@ -674,7 +815,7 @@
     if (cut) {
       const b = el('div', 'sw-note');
       b.appendChild(el('strong', null,
-        cut + ' NPC(s) are not listed individually.'));
+        cut + ' ' + kindNoun(targetKind, 1) + '(s) are not listed individually.'));
       b.appendChild(el('div', null, 'Their groups returned more members than '
         + 'the endpoint sends. They are counted in every "N others move with '
         + 'it" below, but there is no row to click for them.'));
@@ -713,14 +854,16 @@
 
       for (const r of shown) rowHost.appendChild(collapsed ? groupRow(r)
                                                            : npcRow(r));
-      const unit = collapsed ? 'group' : 'NPC';
+      // The KIND's noun: "showing 206 of 206 NPCs" over a list of monsters
+      // was this line before kindNoun().
       count.textContent = 'showing ' + shown.length + ' of ' + all.length +
-        ' ' + unit + (all.length === 1 ? '' : 's') +
+        ' ' + kindNoun(targetKind, all.length, collapsed) +
         (shown.length === all.length ? '' : ' \u2014 ' +
          (all.length - shown.length) + ' hidden by the filters above');
       if (!shown.length) {
         rowHost.appendChild(el('div', 'sw-note',
-          all.length ? 'Nothing matches. ' + all.length + ' ' + unit + '(s) are '
+          all.length ? 'Nothing matches. ' + all.length + ' '
+                       + kindNoun(targetKind, 1, collapsed) + '(s) are '
                        + 'here; the search box and the toggles above hide the rest.'
                      : 'nothing matches'));
       }
@@ -745,19 +888,26 @@
       // `partial` means some action is missing while the standby draws
       // perfectly well, and refusing to draw it would hide a model the
       // install does ship. Measured on CCO: group 118 is exactly that case.
-      const standbyOk = g.resolves && g.resolves.standby_motion === true;
+      //
+      // OR no issue (`art` is 'ok'): browse rows -- every kind but npc --
+      // carry no `resolves` at all, only `art` (ok exactly when browse found
+      // a mesh). Keyed on `resolves` alone, EVERY monster landed here: on CCO
+      // 2026-10-04 Monster 103 (c3/monster/103/100.c3, which loads) drew
+      // nothing under "the art it names ... is not in this install". For an
+      // NPC row `ok` means all three motions resolve, standby among them, so
+      // NPC rows are decided exactly as before.
+      const standbyOk = (g.resolves && g.resolves.standby_motion === true)
+                        || !hasIssue(g);
       if (!standbyOk) {
-        // The row is listed because the TABLE names it -- dropping it would
-        // read as "that NPC does not exist". But asking the renderer for a
-        // file the install does not ship produces a failure that looks like a
-        // broken viewer instead of a client that never shipped the art. Say
-        // which it is, and draw nothing.
+        // The row is listed because the TABLE (or the catalogue) names it --
+        // dropping it would read as "that NPC does not exist". But asking the
+        // renderer for a file the install does not ship produces a failure
+        // that looks like a broken viewer instead of a client that never
+        // shipped the art. Say which it is, and draw nothing.
         const v = V.target.viewer, msg = $('#msg-target');
         if (v) { v.clear(); v.draw(); }
         msg.style.display = '';
-        msg.textContent = 'This NPC is in npc.json, but the art it names ('
-          + (g.paths.standby_motion || 'no path') + ') is not in this '
-          + 'install. Nothing to draw, and nothing to split from.';
+        msg.textContent = undrawnCaption(g, targetKind);
       } else {
         draw('target', g.paths.standby_motion, g.texture || '');
       }
@@ -773,13 +923,19 @@
       const row = el('div', 'sw-item swap-npc-row ' +
                      (g.count > 1 ? 'swap-shared' : 'swap-alone'));
       row.appendChild(el('span', 'sw-who', r.label));
+      // The row's KIND, not always the NPC's. An NPC shares a motion GROUP;
+      // every other kind's row was asked for with `group=look`, so what it
+      // shares is a LOOK -- "group Monster 001 \u00b7 only this NPC" was a monster.
+      const noun = kindNoun(targetKind, 1);
+      let unit = 'look ';
+      if (targetKind === 'npc') unit = 'group ';
       const tag = el('span', 'sw-id');
-      tag.appendChild(el('span', null, 'group ' + g.group + ' \u00b7 '));
+      tag.appendChild(el('span', null, unit + g.group + ' \u00b7 '));
       const others = g.count - 1;
       tag.appendChild(el('span', 'sw-share',
         others > 0 ? others + ' other' + (others === 1 ? '' : 's')
                      + ' move' + (others === 1 ? 's' : '') + ' with it'
-                   : 'only this NPC'));
+                   : 'only this ' + noun));
       if (hasIssue(g)) tag.appendChild(el('span', null, ' \u00b7 art ' + g.art));
       row.appendChild(tag);
       // WHICH others, by name, on the row itself. The full cohort is also
@@ -787,13 +943,13 @@
       const names = (g.members || []).filter(x => x !== m)
                                      .map(x => x.name || '(unnamed)');
       const who = others > 0
-        ? ('A swap here also moves, on group ' + g.group + ':\n  '
+        ? ('A swap here also moves, on ' + unit + g.group + ':\n  '
            + names.join('\n  ')
            + (names.length < others
               ? '\n  ... and ' + (others - names.length) + ' more not sent'
               : ''))
-        : ('Nothing else uses group ' + g.group + '; a swap here moves this '
-           + 'NPC alone.');
+        : ('Nothing else uses ' + unit + g.group + '; a swap here moves this '
+           + noun + ' alone.');
       row.title = who + (hasIssue(g) ? '\n\n' + (g.artNote || '') : '');
       if (hasIssue(g)) row.classList.add('sw-dim');
       if (isModified(g, m)) {
@@ -814,8 +970,12 @@
       const who = g.count === 1 ? (g.members[0].name || '(unnamed)')
                                 : g.members[0].name + ' +' + (g.count - 1) + ' more';
       row.appendChild(el('span', null, who));
+      // A motion group of NPCs, or a look shared by items of another kind.
+      let unit = 'look ';
+      if (targetKind === 'npc') unit = 'group ';
       const tag = (g.count > 1
-                     ? 'group ' + g.group + ' \u00b7 ' + g.count + ' NPC(s)'
+                     ? unit + g.group + ' \u00b7 ' + g.count + ' '
+                       + kindNoun(targetKind, 1) + '(s)'
                      : String(g.group)) +
                   (hasIssue(g) ? ' \u00b7 art ' + g.art : '');
       row.appendChild(el('span', 'sw-id', tag));
@@ -911,6 +1071,56 @@
     return n;
   }
 
+  /** What to say when the target's art does not resolve -- PER KIND.
+   *
+   *  This used to be one NPC-shaped sentence printed for every kind, so a
+   *  dimmed Monster row read "This NPC's art is not in this install ...
+   *  ini/npc.json names ?, which does not resolve here. A split copies that
+   *  file". A monster has no npc.json row and is never split, and the "?" was
+   *  `T.paths.standby_motion || '?'` meeting a browse row whose mesh is ''.
+   *  Seen on CCO 2026-10-04: Monster chip, "Monster 001".
+   *
+   *  Each kind names the file ITS planner acts on, or says plainly that none
+   *  is known -- never a "?":
+   *    npc          npcsplit COPIES the standby motion ini/npc.json names
+   *    every other  tools/lookswap.py WRITES the donor's mesh and texture over
+   *                 the target's own, and refuses a target with no mesh path
+   *                 ("nothing to replace")
+   *  tests/test_swap_mid_art.py reads both arms per kind.
+   */
+  function missingArt(T, kind) {
+    const paths = T.paths || {};
+    const why = T.artNote ? ' ' + T.artNote : '';
+    if (kind === 'npc') {
+      const motion = paths.standby_motion || '';
+      return {
+        headline: 'This NPC’s art is not in this install.',
+        detail: (motion
+          ? 'ini/npc.json names ' + motion + ', which does not resolve here. '
+            + 'A split copies that file, so there is nothing to copy.'
+          : 'ini/npc.json names no standby motion for this NPC, so a split '
+            + 'has no source file to copy.') + why
+      };
+    }
+    // loadTargetList() carries browse's `mesh` in paths.standby_motion and its
+    // `texture` in T.texture for these kinds -- the same two paths lookswap's
+    // look_rows() reads, because both are sourced the way browse sources them.
+    const mesh = paths.standby_motion || '';
+    const tex = T.texture || '';
+    return {
+      headline: 'This ' + kind + '’s art is not in this install.',
+      detail: (mesh
+        ? 'This install names ' + mesh + ' as its mesh, which does not resolve '
+          + 'here. tools/lookswap.py writes the donor’s mesh and texture '
+          + 'over the target’s own paths.'
+        : 'No mesh path is known for this ' + kind + ' in this install, so '
+          + 'tools/lookswap.py has nothing to replace: it writes the donor’s '
+          + 'mesh and texture over the target’s own, and refuses a target '
+          + 'that has none.')
+        + (tex ? ' Its texture path is ' + tex + '.' : '') + why
+    };
+  }
+
   function drawMid() {
     const host = $('#mid-body');
     host.textContent = '';
@@ -946,35 +1156,47 @@
     }
 
     if (!D || !T) {
+      // The KIND that is picked on the right, not always "the NPC".
+      const noun = kindNoun(targetKind, 1);
       host.appendChild(el('div', null,
-        !D && !T ? 'Pick something from your library, then the NPC it replaces.'
+        !D && !T ? 'Pick something from your library, then the ' + noun
+                   + ' it replaces.'
                  : !D ? 'Now pick the library entry you want to bring.'
-                      : 'Now pick the NPC on the right that it replaces.'));
+                      : 'Now pick the ' + noun + ' on the right that it replaces.'));
       return;
     }
     // Name the NPC, not just the group. The pane now lets you pick a member
     // that is not the representative, so "group 001" alone no longer says
     // which of its 38 rows is about to change.
+    //
+    // Every other kind says WHICH kind instead: its "group" is a browse look
+    // whose label is usually the row's own name, so "Monster 001 (group
+    // Monster 001)" said nothing; the look is named only when it differs.
     const picked = (T.members && T.members[0] && T.members[0].name) || '';
-    host.appendChild(el('div', null, (D.name || D.id) + ' → ' +
-      (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group)));
+    let where;
+    if (targetKind === 'npc') {
+      where = picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group;
+    } else {
+      where = (picked || T.group) + '  (' + kindNoun(targetKind, 1)
+        + (picked && picked !== T.group ? ', look ' + T.group : '') + ')';
+    }
+    host.appendChild(el('div', null, (D.name || D.id) + ' → ' + where));
 
     // What a swap here DOES, and it is always a SPLIT: sharing is the common
     // case -- most standby groups on CCO are used by more than one NPC -- so
     // the one NPC on screen gets private art and the rest keep theirs.
     const standbyResolves = T.resolves && T.resolves.standby_motion === true;
     if (T.art && T.art !== 'ok' && !standbyResolves) {
-      // npcsplit refuses this case too ("the current motion path did not
-      // resolve, so there is no source file to name"). Offering the button
-      // and letting it fail later would move a knowable refusal to the far
-      // side of a click.
+      // The planner refuses this case too -- npcsplit ("the current motion
+      // path did not resolve, so there is no source file to name") and
+      // lookswap ("has no mesh path in this install, so there is nothing to
+      // replace"). Offering the button and letting it fail later would move
+      // a knowable refusal to the far side of a click. The words are the
+      // KIND's, not always the NPC's: missingArt() holds both.
+      const said = missingArt(T, targetKind);
       const b = el('div', 'sw-note');
-      b.appendChild(el('strong', null,
-        'This NPC\u2019s art is not in this install.'));
-      b.appendChild(el('div', null,
-        'ini/npc.json names ' + (T.paths && T.paths.standby_motion || '?')
-        + ', which does not resolve here. A split copies that file, so there '
-        + 'is nothing to copy. ' + (T.artNote || '')));
+      b.appendChild(el('strong', null, said.headline));
+      b.appendChild(el('div', null, said.detail));
       host.appendChild(b);
       return;
     }
@@ -987,20 +1209,37 @@
       // npcsplit about an ini/npc.json row -- so every monster and every
       // weapon came back `exit 2, matches 0 rows`. The single action offered
       // here failed for 100% of rows.
+      // The buttons first, the explanation after (owner, 2026-10-03: "the
+      // UI comes first").
+      const acts = el('div', 'sw-row');
+      const go2 = el('button', 'sw-go', 'Show me what to change');
+      go2.onclick = () => lookSwap(D, T, true);
+      acts.appendChild(go2);
+      const doit = el('button', 'sw-go', 'Stage this replacement');
+      doit.onclick = () => lookSwap(D, T, false);
+      acts.appendChild(doit);
+      host.appendChild(acts);
       host.appendChild(el('div', 'sw-note',
         'Each ' + targetKind + ' has its own art, so there is nothing to '
         + 'split -- this is a straight replacement.'));
-      const go2 = el('button', 'sw-go', 'Show me what to change');
-      go2.onclick = () => lookSwap(D, T, true);
-      host.appendChild(go2);
-      const doit = el('button', 'sw-go', 'Stage this replacement');
-      doit.onclick = () => lookSwap(D, T, false);
-      host.appendChild(doit);
-      host.appendChild(el('div', 'sw-note',
+      const how = infoBox('staging', 'Staging does not touch the game', '', false);
+      how.appendChild(el('div', 'sw-info-body sw-note',
         'Staging writes into COMod’s staging area only. Nothing reaches '
         + 'the game until you press Install in Mod staging.'));
+      host.appendChild(how);
       return;
     }
+    // The buttons first, the cohort and the explanation after (owner,
+    // 2026-10-03: "the UI comes first"). The cohort stays unfolded: who else
+    // is on this art is the thing to read before pressing either button.
+    const row = el('div', 'sw-row');
+    const stage = el('button', 'sw-go', 'Stage this swap');
+    stage.onclick = () => stageSplit(D, T);
+    row.appendChild(stage);
+    const go = el('button', 'sw-go', 'Show me what is being changed');
+    go.onclick = () => showInstructions(D, T);
+    row.appendChild(go);
+    host.appendChild(row);
     if (T.count > 1) {
       const warn = el('div', 'sw-note');
       warn.appendChild(el('strong', null,
@@ -1030,27 +1269,39 @@
       // Replacing the shared art in place is not a mode of the stager; when
       // it becomes one, the choice comes back WITH the parameter that carries
       // it to the server (tests/test_swap_scope.py holds that join).
-      host.appendChild(el('div', 'sw-note',
-        'Staging gives ' + (picked || 'this NPC') + ' private art; the other '
-        + (T.count - 1) + ' keep theirs. Replacing the art of all ' + T.count
-        + ' at once is not something staging does.'));
+      // THE CHOICE IS BACK, AND IT IS CARRIED. It was removed when the
+      // server had no whole-family mode, so the pick reached nothing.
+      // post_swap_stage now reads `scope` and passes `--scope all` to
+      // npcstage; NoChoiceStagingDrops fails if that join ever breaks,
+      // so this cannot quietly go back to being decorative.
+      const pick = el('div', 'sw-row');
+      const bOne = el('button', SCOPE === 'one' ? 'sw-go' : null,
+                      'Replace ' + (picked || 'this NPC') + ' only');
+      bOne.onclick = () => { SCOPE = 'one'; drawMid(); };
+      pick.appendChild(bOne);
+      const bAll = el('button', SCOPE === 'all' ? 'sw-go' : null,
+                      'Replace all ' + T.count);
+      bAll.onclick = () => { SCOPE = 'all'; drawMid(); };
+      pick.appendChild(bAll);
+      host.appendChild(pick);
+      // The sentence describes the SELECTED scope, not one of them.
+      host.appendChild(el('div', 'sw-note', SCOPE === 'all'
+        ? ('Staging replaces the shared art itself, so ' + (picked || 'this NPC')
+           + ' and the other ' + (T.count - 1) + ' all change. No new group is'
+           + ' allocated and nothing is repointed. Needs a library donor.')
+        : ('Staging gives ' + (picked || 'this NPC') + ' private art; the other '
+           + (T.count - 1) + ' keep theirs.')));
     } else {
       host.appendChild(el('div', 'sw-note',
         'Only one NPC uses this art, so there is nothing to split from.'));
     }
 
-    const row = el('div', 'sw-row');
-    const stage = el('button', 'sw-go', 'Stage this swap');
-    stage.onclick = () => stageSplit(D, T);
-    row.appendChild(stage);
-    const go = el('button', 'sw-go', 'Show me what is being changed');
-    go.onclick = () => showInstructions(D, T);
-    row.appendChild(go);
-    host.appendChild(row);
-    host.appendChild(el('div', 'sw-note',
+    const how = infoBox('staging', 'Staging does not touch the game', '', false);
+    how.appendChild(el('div', 'sw-info-body sw-note',
       'Staging writes into ' + stageDir() + ' only. Nothing reaches the game '
       + 'install until you press Install in Mod staging, which backs up every '
       + 'file it displaces and can be reverted.'));
+    host.appendChild(how);
   }
 
   /* ------------------------------------------------------------ staging */
@@ -1146,7 +1397,10 @@
       // appearance fork, because the donor's mesh on a shared simple_object
       // would either change nothing or change it for every NPC on that slot.
       const donor = D && D.id ? '&donor=' + encodeURIComponent(D.id) : '';
-      res = await api('/api/swap/stage?' + q + donor + '&root=' +
+      // of the join NoChoiceStagingDrops checks.
+      // Every choice drawn above must reach the server -- the page's half
+      const scope = '&scope=' + encodeURIComponent(SCOPE);
+      res = await api('/api/swap/stage?' + q + donor + scope + '&root=' +
                       encodeURIComponent(targetPath || ''), { method: 'POST' });
     } catch (e) {
       host.textContent = '';
@@ -1508,6 +1762,11 @@
     host.appendChild(el('div', null, (D.name || D.id) + ' \u2192 ' +
       (picked ? picked + '  (group ' + T.group + ')' : 'group ' + T.group) +
       '  (this NPC only)'));
+    // Back is offered first and on every outcome, the refusal included: it
+    // used to sit under the whole plan and was missing when there was none.
+    const back = el('button', 'sw-go', 'Back');
+    back.onclick = drawMid;
+    host.appendChild(back);
 
     if (plan.headline) {
       const b = el('div', 'sw-note');
@@ -1529,24 +1788,23 @@
       return;
     }
 
-    const pre = el('pre', 'sw-plan', plan.text);
-    host.appendChild(pre);
+    host.appendChild(el('div', 'sw-note',
+      'COMod describes the change; it does not apply it. Nothing below has ' +
+      'been written to your install.'));
+
+    // Asked for with a click, so it opens unfolded the first time.
+    const what = infoBox('plan', 'What would change (from npcsplit)', '', true);
+    what.appendChild(el('pre', 'sw-plan', plan.text));
+    host.appendChild(what);
 
     if (plan.command) {
-      host.appendChild(el('div', 'sw-note', 'The same answer from a terminal:'));
+      const term = infoBox('plan-cmd', 'The same answer from a terminal', '', false);
       const c = el('pre', 'sw-cmd', plan.command);
       c.title = 'click to copy';
       c.onclick = () => navigator.clipboard && navigator.clipboard.writeText(plan.command);
-      host.appendChild(c);
+      term.appendChild(c);
+      host.appendChild(term);
     }
-
-    host.appendChild(el('div', 'sw-note',
-      'COMod describes the change; it does not apply it. Nothing above has ' +
-      'been written to your install.'));
-
-    const back = el('button', 'sw-go', 'Back');
-    back.onclick = drawMid;
-    host.appendChild(back);
   }
 
   /* ---------------------------------------------------------------- boot */
@@ -1555,7 +1813,7 @@
     V.donor.viewer = makeViewer('donor');
     V.target.viewer = makeViewer('target');
     $('#msg-donor').textContent = 'pick from your library';
-    $('#msg-target').textContent = 'pick an NPC to replace';
+    $('#msg-target').textContent = pickPrompt(targetKind);
 
     // Populate SIDES before drawMid() reads it. Its own guard treats null as
     // "no verdict", so a failed fetch degrades to the previous behaviour rather

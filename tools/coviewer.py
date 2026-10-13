@@ -7716,6 +7716,22 @@ class Handler(BaseHTTPRequestHandler):
             cmd += ["--donor", donor, "--fork-appearance"]
         elif arg("fork", "") == "1":
             cmd += ["--fork-appearance"]
+        # SCOPE. 'one' (default) splits the named NPC onto private art.
+        # 'all' replaces the family's SHARED art in place, so every NPC on
+        # it changes. An unknown value is REFUSED rather than defaulting:
+        # a request that asks for the whole family and quietly gets a
+        # split of one is the defect test_swap_scope.py exists for.
+        scope = str(arg("scope", "one") or "one").strip().lower()
+        if scope not in ("one", "all"):
+            return self._error(
+                400, "scope must be 'one' or 'all', not %r" % scope)
+        if scope == "all":
+            if not donor:
+                return self._error(
+                    400, "scope=all replaces the shared art, which needs a "
+                         "donor= library entry; without one it would write "
+                         "each file over itself and change nothing")
+            cmd += ["--scope", "all"]
         if dry:
             cmd += ["--dry-run"]
         try:
@@ -13931,7 +13947,14 @@ class Handler(BaseHTTPRequestHandler):
         A FOURTH state, and it is not "a broken effect" -- it is a BROKEN
         RULE, which is a different and more actionable finding: the art is
         not missing, the rule names something that was never authored, and
-        the client has nothing to play for those rows. 32 such names on 5517.
+        the client has nothing to play for those rows. **121 such names on
+        6271 and ZERO on 5517, measured 2026-10-12** and pinned per base by
+        `tests/test_effect_names_resolve.py`'s `EXPECT_READER` -- that gate,
+        not this docstring, is the number of record. (121, not the 120 an
+        earlier version of this docstring said: 120 is the subset of the 121
+        that `c3.wdb`'s MAP table carries. The 32 it quoted for 5517 before
+        that were the parameterised value form and are withdrawn -- see
+        `effects.dangling_effect_names`.)
 
         THEY ARE NOT IN `names`, AND THAT IS WHY THIS EXISTS. The list comes
         from `EffectPlayer.names()`, which is the DEFINED effects, so without

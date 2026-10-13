@@ -2430,6 +2430,24 @@ function restoreModelState() {
     B.model.key = '';
     if (h.get('zoom')) B.model.zoom = +h.get('zoom') || 100;
   }
+  syncModelControls();
+}
+
+/** Put the restored filters INTO the controls that set them.
+ *
+ *  The search text and the clip toggle come back from localStorage, and
+ *  nothing wrote them into `#model-search` / `#chk-clips`. So a search typed
+ *  in one session filtered every later one through an EMPTY box: the
+ *  owner's Firefox had saved `wind` and showed "3 models shown of 2400"
+ *  under a blank search, while a private window -- no storage -- showed all
+ *  2398 (2026-10-03). Ctrl+F5 cannot clear it; it is not a cache. A filter
+ *  you cannot see is a filter you cannot clear, so the control always shows
+ *  what the list is filtered by. */
+function syncModelControls() {
+  const q = $('#model-search');
+  if (q && q.value !== B.model.q) q.value = B.model.q;
+  const c = $('#chk-clips');
+  if (c) c.checked = !!B.model.distinctOnly;
 }
 
 function saveModelState() {
@@ -2502,6 +2520,10 @@ function setMode(mode) {
 
 // ---------------------------------------------------------------- the list
 async function loadModelList({ select = '' } = {}) {
+  // Every change to the search or the kind chip lands here, so this is where
+  // it is remembered. It used to be saved only when a MODEL was picked: clear
+  // the search, pick nothing, reload, and the old search came back.
+  saveModelState();
   renderModelSource();
   if (B.model.source === 'path') return loadPathList();
   const host = $('#model-list');

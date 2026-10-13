@@ -194,6 +194,13 @@ def find_donor(library: Path, entry_id: str) -> dict:
             d = json.loads(p.read_text(encoding="utf-8", errors="replace"))
         except ValueError:
             continue
+        # NOT EVERY .json UNDER Collection/ IS AN ENTRY SIDECAR. A map entry
+        # collects its GameMap config beside it, and that file is a LIST --
+        # `base-sary02-new__config-gamemap.json` on this box. Calling .get()
+        # on it raised AttributeError and took out --donor for EVERY donor,
+        # not just map ones, because this loop walks the whole tree.
+        if not isinstance(d, dict):
+            continue
         if d.get("id") == entry_id:
             d["_dir"] = str(base)
             return d
@@ -276,11 +283,63 @@ def build_motion_rows(text: str, rows: list) -> str:
         lines.insert(at, new_line)
     return "".join(lines)
 
+def shared_texture_path(view, mesh_path: str) -> str:
+    """The texture the COHORT already uses, READ out of the tables.
+
+    `mesh_path` is the shared mesh a split would have copied FROM, e.g.
+    ``c3/npc/999006100.c3``. The object table names it under some key; the
+    texture table gives that key a path. Both lookups are reads.
+
+    Deriving the key from the group number instead ("006" -> "9990060") would
+    be a locally-derived answer that happens to hold on this install. The same
+    reasoning is why `npcsplit` allocates ids rather than assuming them.
+    """
+    try:
+        obj = view.read("ini/3dobj.ini").decode("utf-8", "replace")
+    except Exception as exc:                                  # noqa: BLE001
+        raise Refused("could not read ini/3dobj.ini: %s" % exc)
+    want = (mesh_path or "").strip().lower()
+    keys = [ln.split("=", 1)[0].strip() for ln in obj.splitlines()
+            if "=" in ln and ln.split("=", 1)[1].strip().lower() == want]
+    if not keys:
+        raise Refused(
+            "no ini/3dobj.ini row points at %s, so the object id that owns "
+            "this art cannot be read. Replacing in place needs it to find the "
+            "texture row." % mesh_path)
+    if len(set(keys)) > 1:
+        raise Refused(
+            "ini/3dobj.ini gives %s more than one object id (%s). Which "
+            "texture row to overwrite is ambiguous, so nothing is written."
+            % (mesh_path, ", ".join(sorted(set(keys)))))
+    key = keys[0]
+    try:
+        tex = view.read("ini/3dtexture.ini").decode("utf-8", "replace")
+    except Exception as exc:                                  # noqa: BLE001
+        raise Refused("could not read ini/3dtexture.ini: %s" % exc)
+    rows = [ln.split("=", 1)[1].strip() for ln in tex.splitlines()
+            if "=" in ln and ln.split("=", 1)[0].strip() == key]
+    if not rows:
+        raise Refused(
+            "ini/3dtexture.ini has no row for object id %s, so there is "
+            "nowhere to put the donor's skin." % key)
+    return rows[0]
+
+
 def stage(root: str, npc: str, control: str = "",
           stage_dir: Path = STAGE, dry: bool = False, npc_type=None,
           fork: bool = False, donor_id: str = "",
-          library: str = "") -> dict:
-    """Plan the split and write it into the stage tree. Returns what it did."""
+          library: str = "", scope: str = "one") -> dict:
+    """Plan the split and write it into the stage tree. Returns what it did.
+
+    ``scope="one"`` (the default) splits: the named NPC gets private art
+    at a freshly allocated group and only its row is repointed.
+
+    ``scope="all"`` replaces the cohort's shared art IN PLACE, so every
+    NPC on that art changes. It writes no table edits at all -- nothing
+    is repointed, because the files themselves change.
+    """
+    if scope not in ("one", "all"):
+        raise Refused("scope must be 'one' or 'all', not %r" % scope)
     plan = plan_for(root, npc, control, npc_type, fork)
     check_plan(plan)
     view = coassets.AssetRoot(Path(root))
@@ -296,6 +355,47 @@ def stage(root: str, npc: str, control: str = "",
     # Collected in full before anything lands, so an interrupted run cannot
     # leave the stage tree holding half a split.
     pending: list[tuple[Path, bytes, str]] = []
+
+    if scope == "all":
+        # REPLACE THE FAMILY'S SHARED ART IN PLACE.
+        #
+        # Without a donor this would copy each file over itself: a stage tree
+        # full of no-ops that installs and changes nothing. Refused rather than
+        # staged, so "nothing happened" is never the outcome of a click.
+        if donor is None:
+            raise Refused(
+                "replacing the whole family needs a donor -- without one this "
+                "would write each shared file over itself and change nothing. "
+                "Pass --donor <library entry id>.")
+        for a in plan["adds"]:
+            action = Path(a["path"]).stem[-3:]
+            data, why = donor_file_for(donor, action)
+            if not data:
+                raise Refused("the donor's art for %s read as empty" % a["source"])
+            dest = safepath.confine(stage_dir, a["source"])
+            pending.append((dest, data, "%s  <- %s  (shared, in place)"
+                            % (a["source"], why)))
+        texpath = shared_texture_path(view, plan["adds"][0]["source"])
+        skin, srel = donor_skin(donor)
+        pending.append((safepath.confine(stage_dir, texpath), skin,
+                        "%s  <- %s  (shared, in place)" % (texpath, srel)))
+
+        # NO TABLE EDITS. A split repoints one row at new ids; this changes the
+        # bytes every member already points at, so there is nothing to repoint.
+        wrote = []
+        if not dry:
+            for dest, data, label in pending:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                wrote.append(label)
+        cohort = plan.get("cohort", []) or []
+        return {"ok": True, "dry": dry, "plan": plan, "scope": "all",
+                "donor": (donor or {}).get("name", ""),
+                "staged": [lbl for _, _, lbl in pending],
+                "wrote": wrote, "stageDir": str(stage_dir),
+                "group": plan["group"], "npc": plan.get("rowName") or npc,
+                "cohort": cohort, "affected": len(cohort) or 1,
+                "report": plan.get("report", "")}
 
     for a in plan["adds"]:
         if donor is not None:
@@ -410,7 +510,7 @@ def stage(root: str, npc: str, control: str = "",
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             wrote.append(label)
-    return {"ok": True, "dry": dry, "plan": plan,
+    return {"ok": True, "dry": dry, "plan": plan, "scope": "one",
             "donor": (donor or {}).get("name", ""),
             "staged": [lbl for _, _, lbl in pending],
             "wrote": wrote, "stageDir": str(stage_dir),
@@ -436,6 +536,11 @@ def main(argv=None) -> int:
     ap.add_argument("--fork-appearance", action="store_true",
                     help="also fork the simple_object chain, so a new LOOK "
                          "lands on this NPC alone")
+    ap.add_argument("--scope", choices=("one", "all"), default="one",
+                    help="one: split this NPC onto private art (default). "
+                         "all: replace the whole family's SHARED art in "
+                         "place, so every NPC on it changes. 'all' needs "
+                         "--donor and writes no table edits.")
     ap.add_argument("--dry-run", action="store_true",
                     help="decide every write and print it, writing nothing")
     args = ap.parse_args(argv)
@@ -446,7 +551,7 @@ def main(argv=None) -> int:
             return 2
         res = stage(str(root), args.npc, args.control, dry=args.dry_run,
                     npc_type=args.type, fork=args.fork_appearance,
-                    donor_id=args.donor, library=args.library)
+                    donor_id=args.donor, library=args.library, scope=args.scope)
     except Refused as e:
         print("REFUSED -- nothing was staged.\n\n%s" % e)
         return 2
@@ -454,8 +559,21 @@ def main(argv=None) -> int:
     print("%s %s" % (verb, res["stageDir"]))
     for line in res["staged"]:
         print("    " + line)
-    print("\n%s splits off group %s; the other %d NPC(s) on its old group are "
-          "untouched." % (res["npc"], res["group"], len(res["cohort"])))
+    # THE SUMMARY MUST MATCH THE SCOPE. Printing the split's sentence
+    # after a whole-family replace is the defect test_swap_scope.py was
+    # written for: words on screen that contradict what the request did.
+    if res.get("scope") == "all":
+        # cohort EXCLUDES the named NPC (measured: 11 for a family of 12), so it
+        # is already the count of others. Subtracting one here said 10.
+        others = len(res.get("cohort") or [])
+        print("")
+        print("%s and the %d other NPC(s) sharing this art ALL change: "
+              "the shared files are replaced in place. Nothing was "
+              "repointed and no new group was allocated."
+              % (res.get("npc") or "this NPC", others))
+    else:
+        print("\n%s splits off group %s; the other %d NPC(s) on its old group are "
+              "untouched." % (res["npc"], res["group"], len(res["cohort"])))
     print("\nNothing has been applied to the game install. To review and "
           "apply:")
     print("    py -3 tools/comod.py diff")

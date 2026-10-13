@@ -2606,16 +2606,46 @@ def effect_state_index(db: "EffectDB",
                     lay[key + "_ok"] += 1
 
     # The FOURTH state, and it is a different population -- see the block
-    # comment above `EFFECT_WHOLE`. Same derivation `coverage()` uses.
-    referenced: set[str] = set()
-    for r in db.action_rules:
-        referenced.add(r.effect)
-    for r in db.action_map:
-        referenced.add(r.effect)
-    for w in db.weapon_impact.values():
-        referenced.update((w.hit_effect, w.blk_effect))
-    referenced = {n for n in referenced if n and n.lower() != "none"}
-    undefined = sorted(referenced - set(db.effects))
+    # comment above `EFFECT_WHOLE`.
+    #
+    # CALLED, not copied. This was a second spelling of `coverage()`'s
+    # derivation sitting eleven lines below a comment that said it was the
+    # same one.
+    #
+    # **IT HAD NOT DRIFTED. AN EARLIER VERSION OF THIS COMMENT SAID IT HAD,
+    # AND THAT CLAIM IS WITHDRAWN (2026-10-12).** It read "the census and the
+    # coverage report answered the same question differently on every client
+    # after 6609", which was manufactured causation: a real repair inferred
+    # from the shape of the arrangement instead of measured. MEASURED on
+    # master (b5557a4c) by driving BOTH spellings over the same `EffectDB`,
+    # ten baseline bases, `(referenced, undefined)` from each:
+    #
+    #     5017 1140/0     5165 1172/0     5517 1397/32   6090 1715/44
+    #     6271 1773/601   6609 1857/130   7205  888/644  7622 1243/1203
+    #     7867 1575/1535  7878 1607/1567
+    #
+    # Symmetric difference 0 on every base, undefined-set difference 0 on
+    # every base. The ONLY textual difference between the two spellings was a
+    # `.strip()` in the `none` filter, which bounds any divergence to a
+    # whitespace-padded `none`, and the corpus carries zero of those.
+    #
+    # SO THIS IS PREVENTION, NOT A REPAIR -- and it is prevention of a
+    # divergence THIS CHANGE WOULD OTHERWISE HAVE CREATED. The four-form
+    # grammar reached `referenced_effect_names` in the SAME commit that
+    # deleted this copy (02ac0756), so no tree ever shipped the two
+    # disagreeing. Had they landed apart, MEASURED by diffing the raw
+    # derivation against the parsed one on this tree, the two would have
+    # disagreed on EIGHT of the ten bases -- symmetric difference 5517 64,
+    # 6090 86, 6271 100, 6609 381, 7205 1120, 7622 2633, 7867 3927,
+    # 7878 4017, and 0 on 5017 and 5165, which carry neither the
+    # parameterised nor the comma-list form. Not "after 6609": the
+    # parameterised form reaches back to 5517.
+    #
+    # Two spellings of one set is how this project's sentinel bugs have
+    # started every time (CORRECTIONS C35). That is the REASON to call it
+    # rather than copy it, and a reason is not a measurement.
+    referenced = referenced_effect_names(db)
+    undefined = dangling_effect_names(db)
 
     census = {
         "effects": len(db.effects),
@@ -3350,10 +3380,22 @@ def effect_names(value: str) -> list:
     `_p_21_..._l_weapon`, `_p_30_..._l_foot`. That is the owner's "multi
     effect skill" in the newest clients' own data.
 
-    THE COST OF NOT PARSING IT, measured before this existed: taking the whole
-    string as one table key resolved **1.6% of 7878's rule values**; parsing
-    it resolves **84.6%**. A grammar the reader does not know looks exactly
-    like data that is not there.
+    THE COST OF NOT PARSING IT, and **BOTH RATES NOW NAME THEIR DENOMINATOR,
+    BECAUSE THEY DO NOT SHARE ONE.**  Taking the whole string as one table key
+    resolves **25 of 7878's 1,592 distinct rule VALUES (1.6%)**; parsing the
+    grammar and resolving each part resolves **3,947 of its 4,395 REFERENCES
+    (89.8%)**, because a comma-list is one value and up to nineteen
+    references.  A grammar the reader does not know looks exactly like data
+    that is not there.
+
+    *This said "parsing it resolves 84.6%" until 2026-10-12.  That was the
+    same per-reference measurement taken WITHOUT the case fold
+    `wdb.ResourceDb.by_path` applies to its own keys -- 227 references on
+    7878 -- and it is superseded, not disputed; see
+    `EffectDB.effect_asset_dirs`.  Both figures are pinned per base by
+    `tests/test_effect_names_resolve.py` (`EXPECT` and `EXPECT_PARSED`),
+    which is the number of record if this docstring and that gate ever
+    disagree.*
 
     **The `~parameters` are NOT decoded.** `~100~100~100~1` beside `~80~80~80`
     reads like scale plus a flag, and nothing here acts on them -- they are
@@ -3504,6 +3546,10 @@ class EffectDB:
         self._form_cache: dict[str, tuple[set[str], str]] = {}
         #: effect name -> form set, built by `form_index()` on first use.
         self._form_index: Optional[dict[str, set[str]]] = None
+        #: Lower-cased `c3/effect/<family>/<NAME>/` directory names, built by
+        #: `effect_asset_dirs` on first use.  `None` = not built yet; an
+        #: install with no `ini/c3.wdb` builds an EMPTY one and is not retried.
+        self._effect_dirs: Optional[frozenset] = None
 
         # -- effect definitions.  GraphicData.dll names BOTH `ini/3DEffect.ini`
         # (.rdata 0x921A8) and `ini/3DEffect.dbc` (0x369A8); where the compiled
@@ -4015,6 +4061,126 @@ class EffectDB:
             return ""
         return hit[0] if hit else ""
 
+    @property
+    def effect_asset_dirs(self) -> frozenset:
+        r"""The `c3/effect/<family>/<NAME>/` directory names this install ships.
+
+        **FORM TWO OF THE `Action3DEffect.ini` VALUE GRAMMAR, which this
+        reader could not see at all.** Backlog item 27's four forms are
+
+            410009                     a row in the 3DEffect table
+            _p_24_wing10_open          a `c3/effect/...` ASSET DIRECTORY
+            195040~100~100~100~1       either of those, PARAMETERISED
+            a,b,c~100~100~100~1        a COMMA-SEPARATED LIST of them
+
+        and `effect_names` has parsed the last two since 2026-09-10.  The
+        SECOND one is not a parse problem: `_p_24_wing10_open` is
+
+            c3/effect/wing/_p_24_wing10_open/1.c3 .. 4.c3
+
+        -- a directory of art with no table row anywhere.  `self.effects` is
+        an index of NAMED ROWS, which is simply the wrong index to look a
+        directory up in, and until this property existed the reader had no
+        other.  MEASURED on 7878: of the 3,947 rule references that resolve,
+        **3,922 resolve only here** -- 25 are table rows.  The table is not
+        where the newest clients keep their effects.
+
+        **NOT MERGED INTO `self.effects`, and that is load-bearing.**  See
+        `_map_effect` and `resolve`: merging a second population into that
+        dict took `test_effect_names_resolve` from 1 failure to 3, and making
+        it a separate table consulted UNCONDITIONALLY broke
+        `test_effect_closure` instead.  This is a third index, reachable only
+        through `resolution_of`, and nothing that counts `self.effects` moves.
+
+        **THE LEAF DIRECTORY ONLY -- the one the `.c3` files sit in.**  The
+        obvious wider rule is "any path segment", which also admits the
+        FAMILY directory (`wing`, `ghost`) -- short real words, and
+        `core/wdb.py`'s own caution is that a `c3.wdb` hit on a narrow key is
+        not evidence.  MEASURED, because the narrow rule is only worth
+        choosing if it costs nothing: across 6090, 6271, 7205, 7622 and 7878,
+        the family and intermediate segments resolve **0** references that the
+        leaf does not.  The two rules agree to the reference on every base,
+        so this takes the one that cannot over-match.  (Zephyr, a mixed
+        community container and no baseline member, is the single exception
+        in the corpus at one reference.)
+
+        **LOWER-CASED, and the case fold is the directory's, not the table's.**
+        `wdb.ResourceDb.by_path` lowercases its own keys and `path_ids`
+        lowercases the query, because a Windows path lookup is
+        case-insensitive.  Comparing a mixed-case rule value against that
+        index without folding is what held the recorded ceiling down:
+        **7878 reads 84.6% folded one way and 89.8% folded correctly**, 227
+        references, and 186 of 7205's.  The CONTROL that keeps this from
+        being a free upgrade applied everywhere: folding the 3DEffect TABLE
+        lookup the same way gains **0 references on every base in the
+        corpus**, so the table stays an exact-match table.  One of those two
+        folds is a fact about NTFS and the other is a guess about the
+        client's ini parser; only the measured one is here.
+        """
+        if self._effect_dirs is None:
+            out: set[str] = set()
+            self._rsdb_path(0)                   # owns the lazy open
+            db = getattr(self, "_rsdb", False)
+            paths = getattr(db, "by_path", None) if db else None
+            for p in (paths or ()):
+                if not p.startswith("c3/effect/"):
+                    continue
+                segs = p.split("/")[2:-1]
+                if segs:
+                    out.add(segs[-1].lower())
+            self._effect_dirs = frozenset(out)
+        return self._effect_dirs
+
+    def resolution_of(self, name: str) -> Optional[str]:
+        r"""What resolves one effect NAME: `"table"`, `"assets"`, or None.
+
+        Three states rather than a boolean, because they are three different
+        repairs and two different KINDS of thing.  A `"table"` name has a
+        definition -- layers, timing, ids -- and `resolve()` returns it.  An
+        `"assets"` name has **no definition anywhere**, so a consumer that
+        treats the two alike will call `resolve()` on the second and read
+        None as "missing".
+
+        **WHAT `"assets"` ACTUALLY PROVES, AND IT IS NARROWER THAN "THE
+        CLIENT PLAYS THE DIRECTORY".**  An earlier version of this docstring
+        said the client plays the directory; that is an inference about the
+        client, not a property of the index, and it is withdrawn (2026-10-12).
+        What `effect_asset_dirs` establishes is only: **`ini/c3.wdb` indexes
+        a `c3/effect/<family>/<NAME>/` directory under this name.**  It does
+        not establish that the directory holds a mesh.  MEASURED 2026-10-12
+        over the `assets` verdicts, counting the extensions `c3.wdb` indexes
+        under each resolved directory:
+
+            base   `assets` names   of those, NO `.c3` indexed (`.dds` only)
+            6271         480                       65
+            6609          26                        1
+            7205       1,099                       24
+            7622       2,587                      134
+            7867       3,768                      134
+            7878       3,856                      134
+
+        A `.dds`-only directory is most likely a texture-driven particle
+        effect with no mesh to load, which would make `"assets"` right about
+        it -- but that is UNESTABLISHED and nothing here or downstream is
+        gated on the distinction.  Do not read `"assets"` as "playable";
+        read it as "named by the asset tree".
+
+        Pass a PARSED name (`effect_names`), not a raw rule value: a
+        comma-list is not a name and will answer None for the whole row.
+
+        `none` is the table's explicit "no effect" sentinel and is not a name
+        either; it is filtered in `referenced_effect_names`, upstream of here,
+        so this does not have to guess what an empty answer meant.
+        """
+        nm = str(name or "").strip()
+        if not nm:
+            return None
+        if nm in self.effects:
+            return "table"
+        if nm.lower() in self.effect_asset_dirs:
+            return "assets"
+        return None
+
     @staticmethod
     def _table_get(table: dict[str, str], key: str) -> str:
         """One id looked up so a **padding difference cannot read as absence.**
@@ -4293,37 +4459,97 @@ def _base_identity(db: EffectDB) -> dict:
 
 
 def referenced_effect_names(db: EffectDB) -> set:
-    r"""Every effect name a RULE TABLE points at, `none` excluded.
+    r"""Every effect NAME a rule table points at, `none` excluded.
+
+    **PARSED, not raw.**  The value column carries four forms (backlog 27,
+    `effect_names`), and this used to add the whole string: a comma-list went
+    in as one 200-character pseudo-name that no index could ever hold, and a
+    parameterised `610009~80~80~80` as a name that differs from the real one
+    by a suffix.  The cost was not a miscount, it was a WRONG DIAGNOSIS --
+    see `dangling_effect_names`.
 
     `none` is an explicit "no effect" row -- the hurt/die actions carry it on
-    every weapon -- so counting it would manufacture a dangling reference on
-    every base in the corpus.
+    every weapon, 1,104 of 6271's 10,946 rows -- so counting it would
+    manufacture a dangling reference on every base in the corpus.  Filtered
+    after the parse, so a `none` inside a list is dropped too.
     """
     ref: set = set()
     for r in db.action_rules:
-        ref.add(r.effect)
+        ref.update(effect_names(r.effect))
     for r in db.action_map:
-        ref.add(r.effect)
+        ref.update(effect_names(r.effect))
     for w in db.weapon_impact.values():
-        ref.update((w.hit_effect, w.blk_effect))
+        ref.update(effect_names(w.hit_effect))
+        ref.update(effect_names(w.blk_effect))
     return {n for n in ref if n and n.strip().lower() != "none"}
 
 
-def dangling_effect_names(db: EffectDB) -> list:
-    r"""Names a rule table points at that `3DEffect` does NOT define.
+def undefined_effect_names(db: EffectDB) -> list:
+    r"""Referenced names with no row in the `3DEffect` table.
 
-    A FOURTH state, and it is not "a broken effect": it is a BROKEN RULE.
-    The art is not missing -- the rule names something that was never
-    authored, and the client has nothing to play for those rows. Calling it a
-    broken effect sends someone hunting for a mesh that was never referenced.
+    **NOT THE SAME QUESTION AS `dangling_effect_names`, and the gap between
+    them is the whole of backlog item 27.**  A name can be absent from the
+    table and still be perfectly playable art -- `_p_24_wing10_open` is a
+    `c3/effect/...` directory, and on 7878 **3,922 of the 3,947 references
+    that resolve resolve that way.**  So "no table row" is a fact about the
+    TABLE, and reporting it as a broken reference is what made the newest
+    clients look 98% broken.
 
-    32 such names on 5517. **They are absent from `EffectDB.effects`**, which
-    is what every list in this project is built from, so nothing that
-    enumerates effects can surface one of these by filtering; a caller that
-    wants to show them has to ask for them by name. That is why this is a
-    function rather than a line inside `coverage`.
+    Kept as its own function because the two are different repairs: a missing
+    table row is a table edit, and a missing directory is missing art.
     """
-    return sorted(referenced_effect_names(db) - set(db.effects))
+    return sorted(n for n in referenced_effect_names(db)
+                  if n not in db.effects)
+
+
+def dangling_effect_names(db: EffectDB) -> list:
+    r"""Names a rule table points at that **nothing on this install resolves**.
+
+    Neither a `3DEffect` row nor a `c3/effect/...` asset directory -- see
+    `EffectDB.resolution_of`.  A FOURTH state, and it is not "a broken
+    effect": it is a BROKEN RULE.  The art is not missing; the rule names
+    something that was never authored, and the client has nothing to play for
+    those rows.  Calling it a broken effect sends someone hunting for a mesh
+    that was never referenced.
+
+    **THE 32 NAMES THIS DOCSTRING USED TO QUOTE FOR 5517 WERE NOT BROKEN
+    RULES, AND THE NUMBER IS WITHDRAWN.**  Measured 2026-10-12: all 32 are
+    `610009~80~80~80` -- the PARAMETERISED form, whose base name is in
+    5517's own table.  They were an artefact of asking the question with the
+    raw string, and 5517 has **zero** broken rules.  So does every base from
+    5165 to 6609 bar one (6090 keeps exactly 1).  The population that is real
+    starts at 6271 and the asset-directory index is most of the answer to it:
+
+        base   BEFORE   AFTER   what resolved the ones that stopped
+        5517       32       0   32 by the PARSE alone
+        6090       44       1   43 by the parse
+        6609      130       9   109 parse, 21 directory index
+        6271      601     121   481 directory index, 0 parse
+        7205      644     102   57 parse, 534 directory index
+        7622    1,203     405   1,098 directory index, 0 parse
+        7867    1,535     444   1,430 directory index, 0 parse
+        7878    1,567     448   1,462 directory index, 0 parse
+
+    **The two columns count different kinds of thing and the sets are not
+    nested.**  BEFORE is raw value STRINGS, AFTER is parsed NAMES, and
+    parsing a comma-list CREATES names that were never raw values -- which is
+    why 6609's 130 all disappear and 9 new ones arrive.  The counts are
+    comparable because both answer "how many did the reader report as broken
+    rules"; the sets are not, so a diff of them is not a repair list.
+
+    A standing figure quoted in five places for two months, wrong because
+    the question was asked of the wrong string.  *A grammar the reader does
+    not know looks exactly like data that is not there* -- and so does a
+    population measured through it.
+
+    **They are absent from `EffectDB.effects`**, which is what every list in
+    this project is built from, so nothing that enumerates effects can
+    surface one of these by filtering; a caller that wants to show them has
+    to ask for them by name.  That is why this is a function rather than a
+    line inside `coverage`.
+    """
+    return sorted(n for n in referenced_effect_names(db)
+                  if db.resolution_of(n) is None)
 
 
 def coverage(db: EffectDB) -> dict:
@@ -4365,6 +4591,12 @@ def coverage(db: EffectDB) -> dict:
     out["effect_names_referenced"] = len(referenced_effect_names(db))
     out["effect_names_defined"] = len(db.effects)
     out["effect_names_referenced_but_undefined"] = dangling_effect_names(db)
+    # THE TWO ARE A DIFFERENT QUESTION FROM 6271 ON, and the key above keeps
+    # the one every caller already means by it: "we cannot find this". The
+    # finer split -- no table ROW, versus nothing at all -- is the one that
+    # says whether the repair is a table edit or missing art.
+    out["effect_names_without_a_table_row"] = len(undefined_effect_names(db))
+    out["effect_asset_directories"] = len(db.effect_asset_dirs)
 
     # The full/partial/broken rule is `effect_state`, NOT a copy of it. It was
     # lifted out of this loop when the Effects Viewer needed the same answer

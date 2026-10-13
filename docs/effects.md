@@ -1117,6 +1117,50 @@ compiled twin anywhere, so the *referenced* side of this comparison is the same
 file before and after, on every base. A number that should not have moved did
 not, which is what makes the two that did move readable.
 
+#### 2026-10-12: THE 32 AND THE 44 ARE WITHDRAWN, AND §4's DIAGNOSIS WITH THEM
+
+The table above is left as the record of that change and must keep reading as
+one. **The key moved again**, and this time because the reader was asking the
+question with the wrong string.
+
+`effect_names_referenced_but_undefined` looked the RAW `Action3DEffect.ini`
+value up in the table. That value column has four forms (backlog 27), and the
+survivors above are the PARAMETERISED one:
+
+| base | was | now | what resolved the ones that stopped being reported |
+|---|---:|---:|---|
+| 5517 | 32 | **0** | 32 by the PARSE alone, every one `NAME~80~80~80` |
+| 6090 | 44 | **1** | 43 by the parse; `_p_4_targetm` is the one survivor |
+| 6609 | 130 | **9** | 109 parse, 21 directory index |
+| 6271 | 601 | **121** | 481 directory index, 0 parse |
+| 7205 | 644 | **102** | 57 parse, 534 directory index |
+| 7622 | 1,203 | **405** | 1,098 directory index, 0 parse |
+| 7867 | 1,535 | **444** | 1,430 directory index, 0 parse |
+| 7878 | 1,567 | **448** | 1,462 directory index, 0 parse |
+
+**The two columns count different kinds of thing and the sets are not
+nested**: before is raw value STRINGS, after is parsed NAMES, and parsing a
+comma-list creates names that were never raw values -- which is why 6609's
+130 all disappear and 9 new ones arrive. The counts are comparable because
+both answer *"how many did the reader report as broken rules"*; the sets are
+not, so a diff of them is not a repair list. An earlier draft of this table
+said 4 / 120 / 404 / 447: a probe that counted only `Action3DEffect.ini`
+values, quoted as the function that counts all three rule tables.
+
+So the paragraph above is wrong where it says the 44 survivors are *"the
+dual-wield composite spellings of §4, which no table defines under that name
+on any base"*. It read the `~` correctly as a composite and then drew the
+conclusion backwards: **`610009` is in 5517's and 6090's own tables.** The
+suffix is a parameter, not part of the name, and stripping it resolves 43 of
+the 44. §4's composite reading of the SPELLING stands; its claim about what
+the tables contain does not.
+
+**5517 and 6090 have essentially no broken rules.** The population that is
+real begins at 6271, and most of it is not a table question at all -- it is
+the `c3/effect/...` asset-directory form, which had no index to resolve
+against until `EffectDB.effect_asset_dirs` existed. Pinned per base by
+`tests/test_effect_names_resolve.py`.
+
 ### Which effect names the plaintext lineage covers
 
 | plaintext catalogue | sections | present in 6090's `.dbc` | absent from it |

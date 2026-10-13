@@ -582,6 +582,29 @@ def build_armature(all_bones, name: str, opts, mesh=None,
     bpy.context.collection.objects.link(ao)
 
     placed, unplaced, tree = {}, list(all_bones), {}
+    # `labels` IS READ UNCONDITIONALLY at the bottom of this function -- by
+    # `_group_bones`, by the per-bone naming loop and by `c3_bone_labels` --
+    # while until 1.2.16 its ONLY two assignments sat two `if`s and a `try`
+    # deep inside the SKIN branch.  So LADDER placement, and SKIN with the
+    # hierarchy unticked, reached those reads with the name never bound and
+    # the import died with `UnboundLocalError: cannot access local variable
+    # 'labels'`.  Both are shipped menu options, not internal states.
+    #
+    # An empty mapping is the right default and not merely a silencer, but
+    # NOT because every read is a `.get` -- an earlier wording of this
+    # comment said that and it is false.  The four reads are three shapes,
+    # and `{}` is correct for each on its own terms (grep the name, do not
+    # trust a line number here):
+    #   `labels.get(int(idx))`       -- a miss already means "this bone has
+    #                                   no anatomical name"
+    #   `labels[int(idx)]`           -- a bare SUBSCRIPT, reached only
+    #                                   behind that same `.get` test
+    #   `_group_bones(arm, labels, placed)`
+    #                                -- the whole mapping, and that function
+    #                                   returns early on `not labels`
+    #   `labels.get(int(b), "")`     -- defaulted at the call site
+    # Which is exactly true when no tree was solved to derive a name from.
+    labels = {}
     mode = str(opts.get("bone_placement", "SKIN")).upper()
     if mode == "SKIN" and mesh is not None:
         try:

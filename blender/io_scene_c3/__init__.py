@@ -41,7 +41,7 @@ bl_info = {
     #:   master 1.2.14 | #219 1.0.0 | #233 1.0.0 | #261 1.2.14 | here 1.2.15
     #: #219 and #233 carry 1.0.0 because they branched before the 1.2 line, not
     #: because they are neutral. 1.2.15 is unclaimed; `versioncheck` exits 0.
-    "version": (1, 2, 15),
+    "version": (1, 2, 17),
     "blender": (4, 2, 0),
     "location": "File > Import/Export > Conquer Online Mesh (.c3)",
     "description": "Import and export Conquer Online PHY meshes and MOTI "
